@@ -1,0 +1,119 @@
+{
+  "note": "Shared canonical-JSON vectors consumed by both the Node protocol tests and the Flutter client tests (apps/remote_client/test/vectors_test.dart). The canonical form must byte-match Node JSON.stringify and Dart jsonEncode; numbers outside the JS safe integer range are rejected by both sides.",
+  "vectors": [
+    {
+      "input": {
+        "z": 1,
+        "a": {
+          "b": true,
+          "a": "text"
+        }
+      },
+      "expected": "{\"a\":{\"a\":\"text\",\"b\":true},\"z\":1}"
+    },
+    {
+      "input": {
+        "arr": [
+          1,
+          2,
+          {
+            "k": "v"
+          }
+        ],
+        "empty": {}
+      },
+      "expected": "{\"arr\":[1,2,{\"k\":\"v\"}],\"empty\":{}}"
+    },
+    {
+      "input": {
+        "unicode": "h?llo w?rld ??? ??",
+        "n": null,
+        "f": false
+      },
+      "expected": "{\"f\":false,\"n\":null,\"unicode\":\"h?llo w?rld ??? ??\"}"
+    },
+    {
+      "input": {
+        "small": 123,
+        "neg": -42,
+        "zero": 0,
+        "frac": 123.5,
+        "negfrac": -0.25
+      },
+      "expected": "{\"frac\":123.5,\"neg\":-42,\"negfrac\":-0.25,\"small\":123,\"zero\":0}"
+    },
+    {
+      "input": {
+        "expneg": 1e-7,
+        "exp2": 0.000015
+      },
+      "expected": "{\"exp2\":0.000015,\"expneg\":1e-7}"
+    },
+    {
+      "input": {
+        "nested": {
+          "a": {
+            "b": {
+              "c": [
+                true,
+                null,
+                "x",
+                1.5
+              ]
+            }
+          }
+        }
+      },
+      "expected": "{\"nested\":{\"a\":{\"b\":{\"c\":[true,null,\"x\",1.5]}}}}"
+    },
+    {
+      "input": {
+        "control": "line\nbreak\ttab \"quote\" \\backslash"
+      },
+      "expected": "{\"control\":\"line\\nbreak\\ttab \\\"quote\\\" \\\\backslash\"}"
+    },
+    {
+      "input": {
+        "wholeDouble": 123,
+        "zeroish": 0
+      },
+      "expected": "{\"wholeDouble\":123,\"zeroish\":0}"
+    },
+    {
+      "input": {
+        "emptyList": [],
+        "deep": {
+          "a": [
+            {
+              "b": []
+            }
+          ]
+        }
+      },
+      "expected": "{\"deep\":{\"a\":[{\"b\":[]}]},\"emptyList\":[]}"
+    },
+    {
+      "input": {
+        "credential": {
+          "payload": "abc",
+          "signature": "def"
+        },
+        "actionId": "action_1",
+        "issuedAt": "2026-08-08T12:00:00.000Z",
+        "expiresAt": "2026-08-08T12:01:00.000Z",
+        "action": {
+          "type": "session.send_message",
+          "sessionId": "host-vector/codex/thread-1",
+          "content": "hello"
+        }
+      },
+      "expected": "{\"action\":{\"content\":\"hello\",\"sessionId\":\"host-vector/codex/thread-1\",\"type\":\"session.send_message\"},\"actionId\":\"action_1\",\"credential\":{\"payload\":\"abc\",\"signature\":\"def\"},\"expiresAt\":\"2026-08-08T12:01:00.000Z\",\"issuedAt\":\"2026-08-08T12:00:00.000Z\"}"
+    }
+  ],
+  "rejected": [
+    1e+21,
+    -1e+21,
+    1e+30,
+    123456789012345680000
+  ]
+}

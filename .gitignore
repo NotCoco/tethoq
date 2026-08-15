@@ -1,0 +1,52 @@
+# Dependencies and generated build output
+node_modules/
+dist/
+build/
+out/
+coverage/
+*.tsbuildinfo
+**/.test-dist/
+**/.example-dist/
+apps/desktop_companion/release/
+apps/desktop_companion/release-*/
+apps/desktop_harness/release/
+apps/desktop_harness/release-*/
+apps/web/.next/
+artifacts/
+qa-artifacts-*/
+qa-artifacts/
+/apps/remote_client/assets/provider_logos/codex-contained.png
+/apps/remote_client/assets/provider_logos/grok-cutout.png
+
+# Local runtime, test, and browser state
+.runtime/
+.tmp-appserver-schema/
+.playwright-cli/
+tmp/
+work/
+*.log
+apps/agent_bridge/data/
+services/relay/data/
+
+# Flutter and Dart state
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+
+# Local configuration and signing material
+.env
+.env.*
+!.env.example
+TETHOQ_ACCOUNT_CREDENTIALS.md
+*.jks
+*.keystore
+*.p12
+*.pfx
+
+# Local, non-repository working files belong here
+/local-artifacts/
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db

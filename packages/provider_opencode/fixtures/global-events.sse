@@ -1,0 +1,5 @@
+data: {"directory":"/workspace/project","payload":{"type":"server.connected","properties":{}}}
+
+data: {"directory":"/workspace/project","payload":{"type":"message.part.updated","properties":{"part":{"id":"part_1","sessionID":"session_1","messageID":"message_1","type":"text","text":"Hello"},"delta":"Hello"}}}
+
+data: {"directory":"/workspace/project","payload":{"type":"permission.updated","properties":{"id":"permission_1","type":"bash","sessionID":"session_1","messageID":"message_1","title":"Run tests","metadata":{},"time":{"created":1760000000}}}}

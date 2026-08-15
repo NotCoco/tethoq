@@ -1,0 +1,192 @@
+import { readFile, readdir } from "node:fs/promises"
+import { homedir } from "node:os"
+import { join } from "node:path"
+import { createConnection } from "node:net"
+import { tool } from "@opencode-ai/plugin"
+
+const configuredRuntimePath = process.env.UAR_MESH_RUNTIME
+const legacyRuntimePath = join(homedir(), ".tethoq", "mesh-tool-runtime.json")
+const runtimeDirectory = join(homedir(), ".tethoq", "mesh-runtimes")
+
+async function call(sessionID, name, input) {
+  const runtimes = await matchingRuntimes(name)
+  let lastError
+  for (const runtime of runtimes) {
+    try {
+      return await callRuntime(runtime, sessionID, name, input)
+    } catch (error) {
+      lastError = error
+    }
+  }
+  throw lastError || new Error("No active Tethoq tool runtime supports this command")
+}
+
+async function matchingRuntimes(name) {
+  if (configuredRuntimePath) return [JSON.parse(await readFile(configuredRuntimePath, "utf8"))]
+  let paths = [legacyRuntimePath]
+  try {
+    paths.push(...(await readdir(runtimeDirectory)).filter((file) => file.endsWith(".json")).map((file) => join(runtimeDirectory, file)))
+  } catch {}
+  const runtimes = []
+  for (const path of paths) {
+    try {
+      const runtime = JSON.parse(await readFile(path, "utf8"))
+      if (!Array.isArray(runtime.tools) || runtime.tools.includes(name)) runtimes.push(runtime)
+    } catch {}
+  }
+  return runtimes.sort((left, right) => String(right.startedAt || "").localeCompare(String(left.startedAt || "")))
+}
+
+async function callRuntime(runtime, sessionID, name, input) {
+  const parentSessionId = [runtime.hostId, "opencode", sessionID].map(encodeURIComponent).join("/")
+  return await new Promise((resolve, reject) => {
+    const socket = createConnection(runtime.pipePath)
+    let buffer = ""
+    socket.setEncoding("utf8")
+    socket.once("error", reject)
+    socket.on("data", (chunk) => {
+      buffer += chunk
+      const newline = buffer.indexOf("\n")
+      if (newline < 0) return
+      socket.destroy()
+      try {
+        const response = JSON.parse(buffer.slice(0, newline))
+        if (!response.ok) throw new Error(response.error ?? "Mesh tool failed")
+        resolve(JSON.stringify(response.result))
+      } catch (error) {
+        reject(error)
+      }
+    })
+    socket.once("connect", () => socket.write(`${JSON.stringify({
+      token: runtime.token,
+      parentSessionId,
+      tool: name,
+      input,
+    })}\n`))
+  })
+}
+
+export const list_children = tool({
+  description: "List cross-harness child sessions delegated by this parent, including stable IDs and live states.",
+  args: {},
+  async execute(_args, context) {
+    return await call(context.sessionID, "mesh_list_children", {})
+  },
+})
+
+export const message_child = tool({
+  description: "Send a follow-up instruction to an existing delegated child session.",
+  args: {
+    child_session_id: tool.schema.string(),
+    message: tool.schema.string(),
+  },
+  async execute(args, context) {
+    return await call(context.sessionID, "mesh_message_child", args)
+  },
+})
+
+export const wait = tool({
+  description: "Optionally wait for selected delegated children when the current response needs their result. Children remain tracked if the parent finishes first.",
+  args: {
+    child_session_ids: tool.schema.array(tool.schema.string()).optional(),
+    timeout_seconds: tool.schema.number().int().min(1).max(300).optional(),
+  },
+  async execute(args, context) {
+    return await call(context.sessionID, "mesh_wait", args)
+  },
+})
+
+export const read_result = tool({
+  description: "Read the latest available assistant result and transcript tail, including after the parent has finished an earlier turn.",
+  args: { child_session_id: tool.schema.string() },
+  async execute(args, context) {
+    return await call(context.sessionID, "mesh_read_result", args)
+  },
+})
+
+export const ask_eyes = tool({
+  description: "Ask this session's configured visual-support model a focused question about the most recently attached image.",
+  args: { question: tool.schema.string() },
+  async execute(args, context) {
+    return await call(context.sessionID, "ask_eyes", args)
+  },
+})
+
+export const browser_get_state = tool({
+  description: "List this session's isolated Tethoq browser tabs and active tab.",
+  args: {},
+  async execute(_args, context) {
+    return await call(context.sessionID, "browser_get_state", {})
+  },
+})
+
+export const browser_open = tool({
+  description: "Open an HTTP(S) address or web search in this session's isolated Tethoq browser.",
+  args: { url_or_search: tool.schema.string().min(1).max(8192) },
+  async execute(args, context) {
+    return await call(context.sessionID, "browser_open", args)
+  },
+})
+
+export const browser_navigate = tool({
+  description: "Navigate a Tethoq browser tab to an HTTP(S) address or web search.",
+  args: {
+    tab_id: tool.schema.string().optional(),
+    url_or_search: tool.schema.string().min(1).max(8192),
+  },
+  async execute(args, context) {
+    return await call(context.sessionID, "browser_navigate", args)
+  },
+})
+
+export const browser_inspect = tool({
+  description: "Read bounded visible page text and semantic references for visible controls.",
+  args: { tab_id: tool.schema.string().optional() },
+  async execute(args, context) {
+    return await call(context.sessionID, "browser_inspect", args)
+  },
+})
+
+export const browser_click = tool({
+  description: "Click one semantic control reference returned by browser_inspect.",
+  args: { tab_id: tool.schema.string().optional(), ref: tool.schema.string() },
+  async execute(args, context) {
+    return await call(context.sessionID, "browser_click", args)
+  },
+})
+
+export const browser_type = tool({
+  description: "Replace the contents of a safe text-field reference in the Tethoq browser.",
+  args: {
+    tab_id: tool.schema.string().optional(),
+    ref: tool.schema.string(),
+    text: tool.schema.string().max(20000),
+    submit: tool.schema.boolean().optional(),
+  },
+  async execute(args, context) {
+    return await call(context.sessionID, "browser_type", args)
+  },
+})
+
+export const browser_scroll = tool({
+  description: "Scroll a Tethoq browser page by bounded pixel deltas.",
+  args: {
+    tab_id: tool.schema.string().optional(),
+    delta_x: tool.schema.number().int().min(-4000).max(4000).optional(),
+    delta_y: tool.schema.number().int().min(-4000).max(4000).optional(),
+  },
+  async execute(args, context) {
+    return await call(context.sessionID, "browser_scroll", args)
+  },
+})
+
+export const browser_capture = tool({
+  description: "Capture the page and ask the configured visual-support model a focused question.",
+  args: {
+    tab_id: tool.schema.string().optional(),
+    question: tool.schema.string().max(2000).optional(),
+  },
+  async execute(args, context) {
+    return await call(context.sessionID, "browser_capture", args)
+  },
+})

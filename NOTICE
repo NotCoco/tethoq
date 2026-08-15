@@ -1,0 +1,22 @@
+Tethoq
+Copyright 2026 Tethoq contributors
+
+This product includes software developed by Tethoq contributors and
+third-party open-source dependencies identified in the package lockfiles and
+their respective distributions.
+
+Except where a third-party file states otherwise, first-party source in this
+repository is licensed under the MIT License. The connector SDK keeps its
+nested copy of the same MIT License for independent distribution.
+
+The MIT License grants copyright permissions for covered files. It does not
+grant trademark rights or permission to imply endorsement. Third-party files
+retain their own licenses and are not relicensed by the repository's MIT
+grant. See TRADEMARKS.md and THIRD_PARTY_NOTICES.md.
+
+OpenAI, Codex, ChatGPT, OpenCode, Grok, xAI, Google, Gemini, Antigravity,
+Vercel, Z.ai, CrofAI, OpenRouter,
+DeepSeek, Groq, Mistral, Together AI, Fireworks AI, Cerebras, Perplexity,
+Cloudflare, and other product names are trademarks of their respective owners.
+Their mention does not imply sponsorship, endorsement, partnership, or
+affiliation.

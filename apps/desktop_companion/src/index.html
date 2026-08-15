@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; font-src 'self'; media-src 'none'; worker-src 'none'"
+    />
+    <title>Tethoq Bridge</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="renderer.js" defer></script>
+  </head>
+  <body>
+    <main class="companion" aria-label="Tethoq Bridge">
+      <header class="titlebar">
+        <div class="brand window-drag">
+          <span class="brand-mark" aria-hidden="true">
+            <img id="bridge-mark" src="assets/tethoq-bridge.png" alt="" draggable="false" />
+          </span>
+          <span class="brand-copy"><strong>Tethoq</strong><small>Bridge</small></span>
+        </div>
+        <div class="window-controls" aria-label="Window controls">
+          <button id="window-minimize" class="window-control" type="button" aria-label="Minimize">
+            <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 7.5h6" /></svg>
+          </button>
+          <button id="window-close" class="window-control close" type="button" aria-label="Close to tray">
+            <svg viewBox="0 0 12 12" aria-hidden="true"><path d="m3.5 3.5 5 5m0-5-5 5" /></svg>
+          </button>
+        </div>
+      </header>
+
+      <section id="summary" class="summary" aria-labelledby="bridge-title">
+        <div class="bridge-visual" aria-hidden="true">
+          <span class="connector-node left"></span>
+          <span class="connector-line"></span>
+          <span class="connector-node right"></span>
+        </div>
+        <div class="summary-copy">
+          <div class="status-label"><i id="status-dot"></i><span id="status-label">Bridge ready</span></div>
+          <h1 id="bridge-title">Connect Tethoq to this PC</h1>
+          <p id="bridge-detail">Runs quietly in your tray. Your coding tools and credentials stay on this computer.</p>
+        </div>
+        <button id="show-pairing" class="primary-action" type="button">
+          <svg viewBox="0 0 18 18" aria-hidden="true"><path d="M3 3h4v4H3zm8 0h4v4h-4zM3 11h4v4H3zm8 0h2v2h-2zm2 2h2v2h-2z" /></svg>
+          <span id="pair-action-label">Pair a phone</span>
+        </button>
+      </section>
+
+      <section id="pairing-panel" class="pairing-panel" hidden aria-labelledby="pairing-title">
+        <div class="pairing-heading">
+          <button id="pairing-back" class="back-button" type="button" aria-label="Back to Bridge status">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m10 4-4 4 4 4" /></svg>
+          </button>
+          <div>
+            <h2 id="pairing-title">Pair your phone</h2>
+            <p>In Tethoq on your phone, choose <strong>Scan QR code</strong>.</p>
+          </div>
+        </div>
+
+        <div id="pairing-loading" class="pairing-loading" role="status" aria-live="polite">
+          <span id="pairing-spinner" class="spinner" aria-hidden="true"></span>
+          <div>
+            <strong id="pairing-status">Preparing a secure code…</strong>
+            <small id="pairing-detail">Nothing connects until you scan it.</small>
+            <button id="retry-pairing" class="retry-button" type="button" hidden>Generate a new code</button>
+          </div>
+        </div>
+
+        <div id="pairing-ready" class="pairing-ready" hidden>
+          <div class="qr-frame"><img id="pairing-qr" alt="One-time Tethoq pairing QR code" /></div>
+          <strong>Scan with Tethoq</strong>
+          <small id="pairing-expiry">Expires in 5 min.</small>
+        </div>
+      </section>
+
+      <span id="version-label" class="companion-version">Tethoq Bridge</span>
+    </main>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  </body>
+</html>

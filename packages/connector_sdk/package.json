@@ -1,0 +1,42 @@
+{
+  "name": "@tethoq/connector-sdk",
+  "version": "0.1.0",
+  "description": "Public, GUI-independent connector protocol and TypeScript SDK for Tethoq coding harnesses.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./schema": "./tethoq.connector.schema.json"
+  },
+  "files": [
+    "dist",
+    "examples/echo/connector.js",
+    "examples/echo/tethoq.connector.json",
+    "examples/echo/README.md",
+    "tethoq.connector.schema.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/build-example.mjs",
+    "build:example": "node scripts/build-example.mjs",
+    "prepack": "npm run build",
+    "typecheck": "tsc -p tsconfig.test.json --noEmit",
+    "test": "node scripts/test.mjs",
+    "verify": "npm run typecheck && npm test && npm run build"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.15",
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
+    "typescript": "5.8.3"
+  }
+}

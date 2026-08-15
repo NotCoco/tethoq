@@ -1,0 +1,72 @@
+appId: app.tethoq.desktop
+productName: Tethoq
+executableName: Tethoq
+copyright: Copyright (c) 2026 Tethoq
+asar: true
+asarUnpack:
+  - node_modules/uiohook-napi/**
+files:
+  - out/**/*
+  - package.json
+extraResources:
+  - from: ../../LICENSE
+    to: legal/TETHOQ-LICENSE.txt
+  - from: ../../THIRD_PARTY_NOTICES.md
+    to: legal/THIRD_PARTY_NOTICES.md
+  - from: ../../third_party
+    to: legal/third_party
+    filter:
+      - "**/*"
+  - from: build/icons/tethoq.png
+    to: assets/tethoq-icon.png
+  - from: ../agent_bridge/assets/opencode/uar_mesh.txt
+    to: provider-tools/opencode/uar_mesh.txt
+  - from: ../agent_bridge/assets/pi/tethoq_tools.txt
+    to: provider-tools/pi/tethoq_tools.txt
+  - from: ../../packages/connector_sdk/tethoq.connector.schema.json
+    to: connector-sdk/tethoq.connector.schema.json
+  - from: ../../packages/connector_sdk/package.json
+    to: connector-sdk/package.json
+  - from: ../../packages/connector_sdk/dist
+    to: connector-sdk/dist
+    filter:
+      - "**/*"
+  - from: ../../packages/connector_sdk/README.md
+    to: connector-sdk/README.md
+  - from: ../../packages/connector_sdk/LICENSE
+    to: connector-sdk/LICENSE
+  - from: ../../packages/connector_sdk/examples/echo
+    to: connector-sdk/examples/echo
+    filter:
+      - connector.js
+      - tethoq.connector.json
+      - README.md
+  - from: build/bridge-companion
+    to: bridge-companion
+    filter:
+      - "**/*"
+directories:
+  output: release
+win:
+  icon: build/icons/tethoq.ico
+  legalTrademarks: Tethoq
+  requestedExecutionLevel: asInvoker
+  target:
+    - nsis
+artifactName: Tethoq-Desktop-${version}-${arch}.${ext}
+nsis:
+  include: build/installer.nsh
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Tethoq
+  menuCategory: Tethoq
+  uninstallDisplayName: Tethoq Desktop ${version}
+  installerIcon: build/icons/tethoq.ico
+  uninstallerIcon: build/icons/tethoq.ico
+  installerHeader: build/installer/installer-header.bmp
+  installerSidebar: build/installer/installer-sidebar.bmp
+  uninstallerSidebar: build/installer/uninstaller-sidebar.bmp
+  deleteAppDataOnUninstall: false

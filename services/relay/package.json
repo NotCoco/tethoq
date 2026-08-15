@@ -1,0 +1,11 @@
+{
+  "name": "@uar/relay",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": {
+    "start": "node ../../dist/services/relay/src/main.js"
+  }
+}

@@ -1,0 +1,85 @@
+{
+  "name": "@tethoq/desktop-companion",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "A lightweight, secure local connector for Tethoq.",
+  "author": "Tethoq",
+  "copyright": "Copyright (c) 2026 Tethoq",
+  "main": "src/main.cjs",
+  "scripts": {
+    "dev": "electron .",
+    "preview:connected": "electron . --preview-state=connected",
+    "test": "node --test test/*.test.cjs",
+    "verify": "npm test",
+    "qa:pairing": "electron test/pairing_visual.qa.cjs",
+    "build:brand-assets": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-brand-assets.ps1",
+    "stage:runtime": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stage-runtime.ps1",
+    "smoke:packaged-runtime": "node scripts/packaged-runtime-smoke.cjs",
+    "release:metadata": "node scripts/write-release-metadata.cjs",
+    "package:dir:win": "npm run build:brand-assets && npm run stage:runtime && electron-builder --dir --win --x64 --publish never && npm run smoke:packaged-runtime",
+    "pack:win": "npm run build:brand-assets && npm run stage:runtime && electron-builder --win nsis --x64 --publish never && npm run smoke:packaged-runtime && npm run release:metadata"
+  },
+  "devDependencies": {
+    "electron": "43.4.0",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "app.tethoq.bridge",
+    "productName": "Tethoq Bridge",
+    "copyright": "Copyright (c) 2026 Tethoq",
+    "asar": true,
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/bridge-runtime",
+        "to": "bridge",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../../LICENSE",
+        "to": "legal/TETHOQ-LICENSE.txt"
+      },
+      {
+        "from": "../../THIRD_PARTY_NOTICES.md",
+        "to": "legal/THIRD_PARTY_NOTICES.md"
+      }
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "icon": "src/assets/tethoq-bridge.ico",
+      "artifactName": "Tethoq-Bridge-${version}-${arch}.${ext}",
+      "legalTrademarks": "Tethoq",
+      "requestedExecutionLevel": "asInvoker",
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Tethoq Bridge",
+      "menuCategory": "Tethoq",
+      "uninstallDisplayName": "Tethoq Bridge ${version}",
+      "installerIcon": "src/assets/tethoq-bridge.ico",
+      "uninstallerIcon": "src/assets/tethoq-bridge.ico",
+      "installerHeader": "build/installer/installer-header.bmp",
+      "installerSidebar": "build/installer/installer-sidebar.bmp",
+      "uninstallerSidebar": "build/installer/uninstaller-sidebar.bmp",
+      "deleteAppDataOnUninstall": false
+    }
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

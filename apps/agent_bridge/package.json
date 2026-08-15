@@ -1,0 +1,16 @@
+{
+  "name": "@uar/agent-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "qrcode": "^1.5.4",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/qrcode": "^1.5.6"
+  }
+}

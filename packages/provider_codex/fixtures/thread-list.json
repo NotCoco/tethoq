@@ -1,0 +1,22 @@
+{
+  "data": [
+    {
+      "id": "01912345-6789-7abc-8def-0123456789ab",
+      "sessionId": "session_fixture",
+      "preview": "Implement the refresh coordinator",
+      "modelProvider": "openai",
+      "createdAt": 1760000000,
+      "updatedAt": 1760000300,
+      "recencyAt": 1760000300,
+      "status": { "type": "idle" },
+      "path": "/tmp/codex/session.jsonl",
+      "cwd": "/workspace/tethoq",
+      "cliVersion": "fixture",
+      "source": "appServer",
+      "gitInfo": null,
+      "name": "Refresh subsystem",
+      "turns": []
+    }
+  ],
+  "nextCursor": null
+}

@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tethoq.dev/schemas/connector-manifest-v1.json",
+  "title": "Tethoq Connector Manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["manifestVersion", "id", "name", "version", "runtime", "permissions"],
+  "properties": {
+    "$schema": { "type": "string", "minLength": 1, "maxLength": 2048 },
+    "manifestVersion": { "const": 1 },
+    "id": { "type": "string", "minLength": 2, "maxLength": 64, "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+    "version": { "type": "string", "minLength": 1, "maxLength": 80, "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$" },
+    "description": { "type": "string", "minLength": 1, "maxLength": 500 },
+    "homepage": { "type": "string", "minLength": 1, "maxLength": 2048, "format": "uri", "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://" },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transport", "command"],
+      "properties": {
+        "transport": { "const": "stdio-jsonl" },
+        "command": { "type": "string", "minLength": 1, "maxLength": 32768 },
+        "args": { "type": "array", "maxItems": 128, "items": { "type": "string", "minLength": 1, "maxLength": 32768 } },
+        "cwd": { "type": "string", "minLength": 1, "maxLength": 32768 },
+        "env": { "type": "array", "maxItems": 64, "uniqueItems": true, "items": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "maxLength": 128 } }
+      }
+    },
+    "permissions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filesystem", "network", "spawnProcesses"],
+      "properties": {
+        "filesystem": { "enum": ["none", "workspace", "unrestricted"] },
+        "network": { "type": "boolean" },
+        "spawnProcesses": { "type": "boolean" }
+      }
+    },
+    "capabilities": { "$ref": "#/$defs/capabilities" },
+    "models": {
+      "type": "array",
+      "maxItems": 500,
+      "items": { "$ref": "#/$defs/model" },
+      "not": {
+        "contains": {
+          "type": "object",
+          "required": ["isDefault"],
+          "properties": { "isDefault": { "const": true } }
+        },
+        "minContains": 2
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["models"],
+        "properties": { "models": { "type": "array", "minItems": 1 } }
+      },
+      "then": {
+        "required": ["capabilities"],
+        "properties": {
+          "capabilities": {
+            "type": "object",
+            "required": ["modelEnumeration"],
+            "properties": { "modelEnumeration": { "const": true } }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "authentication": { "type": "boolean" },
+        "listSessions": { "type": "boolean" },
+        "paginatedSessions": { "type": "boolean" },
+        "sessionHistory": { "type": "boolean" },
+        "createSession": { "type": "boolean" },
+        "resumeSession": { "type": "boolean" },
+        "sendMessage": { "type": "boolean" },
+        "messageQueue": { "type": "boolean" },
+        "steering": { "type": "boolean" },
+        "streamingText": { "type": "boolean" },
+        "toolEvents": { "type": "boolean" },
+        "commandEvents": { "type": "boolean" },
+        "fileChanges": { "type": "boolean" },
+        "approvals": { "type": "boolean" },
+        "userInput": { "type": "boolean" },
+        "interrupt": { "type": "boolean" },
+        "modelEnumeration": { "type": "boolean" },
+        "projectAssociation": { "type": "boolean" },
+        "sessionRelationships": { "type": "boolean" },
+        "messageEditing": { "type": "boolean" },
+        "attachments": { "type": "boolean" },
+        "reasoningEfforts": { "type": "boolean" }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "displayName", "isDefault"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "description": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "isDefault": { "type": "boolean" },
+        "reasoningEfforts": { "type": "array", "maxItems": 32, "items": { "type": "string", "minLength": 1, "maxLength": 80 } },
+        "metadata": { "type": "object" }
+      }
+    }
+  }
+}

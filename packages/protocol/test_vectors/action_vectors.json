@@ -1,0 +1,56 @@
+{
+  "note": "Device-signed actions signed with the RFC 8032 Ed25519 test key (device). The host side (Node) verifies with verifyActionSignature; the Flutter client verifies with DeviceSecurity.verifySignedAction.",
+  "devicePublicKeyPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAPUAXw+hDiVqStwqnTRt+vJyYLM8uxJaMwM1V8Sr0Zgw=\n-----END PUBLIC KEY-----\n",
+  "vectors": [
+    {
+      "signed": {
+        "credential": {
+          "payload": "eyJjcmVkZW50aWFsSWQiOiJjcmVkX3ZlY3Rvcl9ob3N0X2EiLCJkZXZpY2VJZCI6ImRldmljZS12ZWN0b3ItYSIsImRldmljZVB1YmxpY0tleVBlbSI6Ii0tLS0tQkVHSU4gUFVCTElDIEtFWS0tLS0tXG5NQ293QlFZREsyVndBeUVBUFVBWHcraERpVnFTdHdxblRSdCt2SnlZTE04dXhKYU13TTFWOFNyMFpndz1cbi0tLS0tRU5EIFBVQkxJQyBLRVktLS0tLVxuIiwiaG9zdElkIjoiaG9zdC12ZWN0b3IiLCJpc3N1ZWRBdCI6IjIwMjYtMDgtMDhUMTI6MDA6MDAuMDAwWiIsInZlcnNpb24iOjF9",
+          "signature": "vG_rNTAr6oI4D5zAnluRlwCLG3o8sHsR4Ly4zQ7njwv_jvpu509JL3PwYs2vi4wv1LlpZgBEEWtzxF5HJQUaDQ"
+        },
+        "actionId": "action_vector_1",
+        "issuedAt": "2026-08-08T12:00:00.000Z",
+        "expiresAt": "2026-08-08T12:01:00.000Z",
+        "action": {
+          "type": "session.send_message",
+          "sessionId": "host-vector/codex/thread-1",
+          "content": "Run the full test suite and report failures",
+          "modelId": "deepseek-flash-v4-7311"
+        },
+        "signature": "BaqQ6p33S0tmmfJhAmc_tkOuoWoHbeG0Eceno7QtHC0dUPiR4nICD4Euwmpq4VZpX812PC1WntwYEOSNIDjwAQ"
+      },
+      "expectedAction": {
+        "type": "session.send_message",
+        "sessionId": "host-vector/codex/thread-1",
+        "content": "Run the full test suite and report failures",
+        "modelId": "deepseek-flash-v4-7311"
+      }
+    },
+    {
+      "signed": {
+        "credential": {
+          "payload": "eyJjcmVkZW50aWFsSWQiOiJjcmVkX3ZlY3Rvcl9ob3N0X2EiLCJkZXZpY2VJZCI6ImRldmljZS12ZWN0b3ItYSIsImRldmljZVB1YmxpY0tleVBlbSI6Ii0tLS0tQkVHSU4gUFVCTElDIEtFWS0tLS0tXG5NQ293QlFZREsyVndBeUVBUFVBWHcraERpVnFTdHdxblRSdCt2SnlZTE04dXhKYU13TTFWOFNyMFpndz1cbi0tLS0tRU5EIFBVQkxJQyBLRVktLS0tLVxuIiwiaG9zdElkIjoiaG9zdC12ZWN0b3IiLCJpc3N1ZWRBdCI6IjIwMjYtMDgtMDhUMTI6MDA6MDAuMDAwWiIsInZlcnNpb24iOjF9",
+          "signature": "vG_rNTAr6oI4D5zAnluRlwCLG3o8sHsR4Ly4zQ7njwv_jvpu509JL3PwYs2vi4wv1LlpZgBEEWtzxF5HJQUaDQ"
+        },
+        "actionId": "action_vector_2",
+        "issuedAt": "2026-08-08T12:00:00.000Z",
+        "expiresAt": "2026-08-08T12:01:00.000Z",
+        "action": {
+          "type": "approval.respond",
+          "sessionId": "host-vector/grok/session-2",
+          "requestId": "approval-vector-9",
+          "choiceId": "allow_once",
+          "respondedAt": "2026-08-08T12:02:30.000Z"
+        },
+        "signature": "n8V3aBC_RIY3bsK0qTsv790XQdviGRZj03-pbu6auhlDMPy2t5a-WhVAvtUxRk6rH5u_0ynjmhTRzvZ3A_qVBA"
+      },
+      "expectedAction": {
+        "type": "approval.respond",
+        "sessionId": "host-vector/grok/session-2",
+        "requestId": "approval-vector-9",
+        "choiceId": "allow_once",
+        "respondedAt": "2026-08-08T12:02:30.000Z"
+      }
+    }
+  ]
+}

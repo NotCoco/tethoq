@@ -1,0 +1,12 @@
+{
+  "name": "@tethoq/bridge-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "qrcode": "1.5.4",
+    "zod": "3.25.76"
+  }
+}

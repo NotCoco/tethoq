@@ -1,0 +1,93 @@
+import { Type } from "typebox"
+import { createConnection } from "node:net"
+import { readFile, readdir } from "node:fs/promises"
+import { homedir } from "node:os"
+import { join } from "node:path"
+
+const configuredRuntimePath = process.env.UAR_MESH_RUNTIME
+const legacyRuntimePath = join(homedir(), ".tethoq", "mesh-tool-runtime.json")
+const runtimeDirectory = join(homedir(), ".tethoq", "mesh-runtimes")
+
+async function call(sessionID, name, input) {
+  const runtimes = await matchingRuntimes(name)
+  let lastError
+  for (const runtime of runtimes) {
+    try {
+      return await callRuntime(runtime, sessionID, name, input)
+    } catch (error) {
+      lastError = error
+    }
+  }
+  throw lastError || new Error("No active Tethoq tool runtime supports this command")
+}
+
+async function matchingRuntimes(name) {
+  if (configuredRuntimePath) return [JSON.parse(await readFile(configuredRuntimePath, "utf8"))]
+  let paths = [legacyRuntimePath]
+  try {
+    paths.push(...(await readdir(runtimeDirectory)).filter((file) => file.endsWith(".json")).map((file) => join(runtimeDirectory, file)))
+  } catch {}
+  const runtimes = []
+  for (const path of paths) {
+    try {
+      const runtime = JSON.parse(await readFile(path, "utf8"))
+      if (!Array.isArray(runtime.tools) || runtime.tools.includes(name)) runtimes.push(runtime)
+    } catch {}
+  }
+  return runtimes.sort((left, right) => String(right.startedAt || "").localeCompare(String(left.startedAt || "")))
+}
+
+async function callRuntime(runtime, sessionID, name, input) {
+  const parentSessionId = [runtime.hostId, "pi", sessionID].map(encodeURIComponent).join("/")
+  return await new Promise((resolve, reject) => {
+    const socket = createConnection(runtime.pipePath)
+    let buffer = ""
+    socket.setEncoding("utf8")
+    socket.once("error", reject)
+    socket.on("data", (chunk) => {
+      buffer += chunk
+      const newline = buffer.indexOf("\n")
+      if (newline < 0) return
+      socket.destroy()
+      try {
+        const response = JSON.parse(buffer.slice(0, newline))
+        if (!response.ok) throw new Error(response.error || "Tethoq tool failed")
+        resolve(response.result)
+      } catch (error) {
+        reject(error)
+      }
+    })
+    socket.once("connect", () => socket.write(`${JSON.stringify({ token: runtime.token, parentSessionId, tool: name, input })}\n`))
+  })
+}
+
+export default function tethoqTools(pi) {
+  const tools = [
+    ["mesh_list_children", "List delegated children", "List cross-harness child sessions delegated by this parent.", Type.Object({})],
+    ["mesh_message_child", "Message delegated child", "Send a follow-up instruction to a delegated child.", Type.Object({ child_session_id: Type.String(), message: Type.String() })],
+    ["mesh_wait", "Wait for delegated children", "Wait for selected delegated children when their result is needed.", Type.Object({ child_session_ids: Type.Optional(Type.Array(Type.String())), timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 300 })) })],
+    ["mesh_read_result", "Read delegated result", "Read the latest result and transcript tail from a delegated child.", Type.Object({ child_session_id: Type.String() })],
+    ["ask_eyes", "Ask visual support", "Ask the configured visual-support model about the most recently attached image.", Type.Object({ question: Type.String({ maxLength: 8000 }) })],
+    ["browser_get_state", "Get browser state", "List this session's isolated Tethoq browser tabs.", Type.Object({})],
+    ["browser_open", "Open browser tab", "Open an HTTP(S) address or web search in the Tethoq browser.", Type.Object({ url_or_search: Type.String({ maxLength: 8192 }) })],
+    ["browser_navigate", "Navigate browser tab", "Navigate a Tethoq browser tab.", Type.Object({ tab_id: Type.Optional(Type.String()), url_or_search: Type.String({ maxLength: 8192 }) })],
+    ["browser_inspect", "Inspect browser page", "Read bounded visible page text and semantic control references.", Type.Object({ tab_id: Type.Optional(Type.String()) })],
+    ["browser_click", "Click browser control", "Click one control reference returned by browser_inspect.", Type.Object({ tab_id: Type.Optional(Type.String()), ref: Type.String() })],
+    ["browser_type", "Type in browser field", "Replace the contents of a safe browser text field.", Type.Object({ tab_id: Type.Optional(Type.String()), ref: Type.String(), text: Type.String({ maxLength: 20000 }), submit: Type.Optional(Type.Boolean()) })],
+    ["browser_scroll", "Scroll browser page", "Scroll a browser page by bounded pixel deltas.", Type.Object({ tab_id: Type.Optional(Type.String()), delta_x: Type.Optional(Type.Integer({ minimum: -4000, maximum: 4000 })), delta_y: Type.Optional(Type.Integer({ minimum: -4000, maximum: 4000 })) })],
+    ["browser_capture", "Inspect browser visually", "Capture the page and ask the configured visual-support model a focused question.", Type.Object({ tab_id: Type.Optional(Type.String()), question: Type.Optional(Type.String({ maxLength: 2000 })) })],
+  ]
+  for (const [name, label, description, parameters] of tools) {
+    pi.registerTool({
+      name,
+      label,
+      description,
+      parameters,
+      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+        if (signal?.aborted) return { content: [{ type: "text", text: "Cancelled" }], details: {} }
+        const value = await call(ctx.sessionManager.getSessionId(), name, params)
+        return { content: [{ type: "text", text: JSON.stringify(value) }], details: value }
+      },
+    })
+  }
+}

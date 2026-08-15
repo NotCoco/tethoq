@@ -1,0 +1,350 @@
+/* Instant session panel (experimental features). */
+
+.live-session-panel {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.live-session-status {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 2px 0;
+}
+
+.live-session-status > span:last-child {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.live-session-status strong {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.live-session-status small {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.live-session-dot {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: #494944;
+  flex: none;
+}
+
+.live-session-dot.live {
+  background: #f2766c;
+  box-shadow: 0 0 0 4px rgba(242, 118, 108, 0.14);
+}
+
+.live-session-start,
+.live-session-record-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 13px 15px;
+  border: 1px solid #3c3c39;
+  border-radius: 10px;
+  background: #1b1b19;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.live-session-start:hover:not(:disabled) {
+  border-color: #555550;
+  background: #232321;
+}
+
+.live-session-start:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.live-session-start svg {
+  width: 21px;
+  height: 21px;
+  color: #d0d4d0;
+  flex: none;
+}
+
+.live-session-start > span,
+.live-session-record-bar > span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.live-session-start strong,
+.live-session-record-bar strong {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.live-session-start small,
+.live-session-record-bar small {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.live-session-record-bar {
+  border-color: rgba(242, 118, 108, 0.55);
+  background: rgba(242, 118, 108, 0.08);
+}
+
+.live-session-record-bar svg {
+  width: 19px;
+  height: 19px;
+  color: #ff9a91;
+  flex: none;
+}
+
+.live-session-rec-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #f2766c;
+  flex: none;
+  animation: live-session-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes live-session-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.live-session-eyes {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #3c3c39;
+  border-radius: 10px;
+  background: #1b1b19;
+}
+
+.live-session-eyes header span {
+  display: grid;
+  gap: 2px;
+}
+
+.live-session-eyes strong {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.live-session-eyes small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.live-session-eyes .vision-picker-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.live-session-eyes .vision-picker-fields label {
+  display: grid;
+  gap: 4px;
+}
+
+.live-session-eyes .vision-picker-fields label > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.live-session-eyes .vision-picker-fields select {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid #3c3c39;
+  border-radius: 7px;
+  background: #141413;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.live-session-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.live-session-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 11px;
+  border: 1px solid rgba(242, 118, 108, 0.5);
+  border-radius: 8px;
+  background: rgba(242, 118, 108, 0.08);
+  color: #ffb3ad;
+  font-size: 12.5px;
+}
+
+.live-session-error svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+}
+
+.live-session-utterances {
+  display: grid;
+  gap: 8px;
+  max-height: 300px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 2px 4px 2px 0;
+  list-style: none;
+}
+
+.live-session-utterance {
+  display: grid;
+  gap: 5px;
+  padding: 9px 11px;
+  border: 1px solid #33332f;
+  border-radius: 9px;
+  background: #161615;
+}
+
+.live-session-utterance-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.live-session-utterance-head b {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.live-session-utterance-head i {
+  font-size: 11.5px;
+  font-style: normal;
+  color: var(--muted);
+}
+
+.live-session-utterance-sent .live-session-utterance-head i {
+  color: #6edc91;
+}
+
+.live-session-utterance-error .live-session-utterance-head i {
+  color: #ff9a91;
+}
+
+.live-session-utterance q {
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.live-session-utterance em {
+  font-size: 12px;
+  font-style: normal;
+  color: #ff9a91;
+}
+
+.live-session-utterance-thumb {
+  width: 148px;
+  max-width: 100%;
+  border: 1px solid #3c3c39;
+  border-radius: 7px;
+}
+
+.live-session-eyes-note {
+  margin: 0;
+  padding: 9px 11px;
+  border: 1px solid #33332f;
+  border-radius: 9px;
+  background: #161615;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.live-session-eyes-note strong {
+  color: var(--text);
+}
+
+.live-session-privacy {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.live-session-privacy strong {
+  color: var(--text);
+}
+
+/* Experimental features toggle in Settings. */
+
+.experimental-features-block .settings-list article {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.experimental-features-block .settings-list article > span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.experimental-features-block .settings-list article small {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.settings-toggle {
+  position: relative;
+  width: 40px;
+  height: 22px;
+  border: 1px solid #494944;
+  border-radius: 999px;
+  background: #262622;
+  cursor: pointer;
+  flex: none;
+  padding: 0;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.settings-toggle i {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #8f938f;
+  transition: transform 0.15s ease, background 0.15s ease;
+}
+
+.settings-toggle.on {
+  border-color: rgba(110, 220, 145, 0.6);
+  background: rgba(110, 220, 145, 0.16);
+}
+
+.settings-toggle.on i {
+  transform: translateX(18px);
+  background: #6edc91;
+}
+
+.settings-toggle:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}

@@ -1,0 +1,44 @@
+{
+  "$schema": "../../tethoq.connector.schema.json",
+  "manifestVersion": 1,
+  "id": "community.echo",
+  "name": "Echo Connector",
+  "version": "0.1.0",
+  "description": "Minimal connector that exposes two models and streams an echoed response.",
+  "runtime": {
+    "transport": "stdio-jsonl",
+    "command": "node",
+    "args": ["./connector.js"]
+  },
+  "permissions": {
+    "filesystem": "none",
+    "network": false,
+    "spawnProcesses": false
+  },
+  "capabilities": {
+    "listSessions": true,
+    "sessionHistory": true,
+    "createSession": true,
+    "sendMessage": true,
+    "streamingText": true,
+    "modelEnumeration": true,
+    "projectAssociation": true,
+    "reasoningEfforts": true
+  },
+  "models": [
+    {
+      "id": "echo-fast",
+      "displayName": "Echo Fast",
+      "description": "Immediate echo responses.",
+      "isDefault": true,
+      "reasoningEfforts": ["low", "medium"]
+    },
+    {
+      "id": "echo-careful",
+      "displayName": "Echo Careful",
+      "description": "Demonstrates a second model-picker entry.",
+      "isDefault": false,
+      "reasoningEfforts": ["medium", "high"]
+    }
+  ]
+}

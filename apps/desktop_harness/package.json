@@ -1,0 +1,58 @@
+{
+  "name": "@tethoq/desktop-harness",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "Tethoq Desktop brings local coding tools, remote control, workflows, and an isolated Chromium workspace together.",
+  "productName": "Tethoq",
+  "author": {
+    "name": "Tethoq"
+  },
+  "copyright": "Copyright (c) 2026 Tethoq",
+  "main": "out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.mjs",
+    "verify": "npm run typecheck && npm test && npm run build",
+    "qa:visual": "npm run build && electron scripts/visual-qa.cjs",
+    "build:brand-assets": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-brand-assets.ps1",
+    "install:release-dependencies": "npm ci --prefix ../.. --no-audit --no-fund",
+    "build:connector-sdk": "npm --prefix ../../packages/connector_sdk run build",
+    "smoke:packaged": "node scripts/packaged-smoke.cjs",
+    "build:bridge": "npm --prefix ../.. run build",
+    "package:bridge": "powershell -NoProfile -ExecutionPolicy Bypass -File ../../scripts/release/build-bridge-portable.ps1",
+    "stage:bridge-companion": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stage-bridge-companion.ps1",
+    "smoke:embedded-bridge": "node scripts/verify-embedded-bridge.cjs",
+    "release:metadata": "node scripts/write-release-metadata.cjs",
+    "pack:win": "npm run build:brand-assets && npm run install:release-dependencies && npm run build:connector-sdk && npm run package:bridge && npm run stage:bridge-companion && npm run build && electron-builder --win nsis --x64 --publish never && npm run smoke:embedded-bridge && npm run smoke:packaged && npm run release:metadata"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "qrcode": "^1.5.4",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-markdown": "^10.1.0",
+    "remark-breaks": "^4.0.0",
+    "remark-gfm": "^4.0.1",
+    "uiohook-napi": "^1.5.5",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.15",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "electron": "43.4.0",
+    "electron-builder": "26.15.3",
+    "electron-vite": "5.0.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.6"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

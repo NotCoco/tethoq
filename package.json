@@ -1,0 +1,33 @@
+{
+  "name": "tethoq",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Provider-neutral local and remote workspace for coding agents.",
+  "license": "MIT",
+  "workspaces": [
+    "apps/agent_bridge",
+    "services/relay",
+    "packages/*"
+  ],
+  "scripts": {
+    "clean": "node scripts/clean.mjs",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node scripts/run-tests.mjs",
+    "quality": "node scripts/quality-gate.mjs",
+    "publication": "node scripts/publication-gate.mjs",
+    "verify": "npm run clean && npm run typecheck && npm test && npm run quality && npm run publication",
+    "release:bridge:win": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release/build-bridge-portable.ps1",
+    "start:bridge": "node dist/apps/agent_bridge/src/main.js",
+    "phone:pair": "node dist/apps/agent_bridge/src/main.js --phone-pair",
+    "start:relay": "node dist/services/relay/src/main.js"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.15",
+    "typescript": "5.8.3"
+  }
+}

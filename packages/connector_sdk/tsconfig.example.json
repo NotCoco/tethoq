@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.test.json",
+  "compilerOptions": {
+    "outDir": ".example-dist",
+    "baseUrl": ".",
+    "paths": {
+      "@tethoq/connector-sdk": ["./src/index.ts"]
+    }
+  },
+  "include": ["src/**/*.ts", "examples/echo/connector.ts"],
+  "exclude": ["src/**/*.test.ts"]
+}
