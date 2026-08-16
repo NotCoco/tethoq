@@ -30,6 +30,7 @@ import { WorkflowSettings } from "./WorkflowSettings";
 import { LocalOpenProvider, WorkspaceLocalOpenControl, previewLocalOpenState, useLocalOpen, type LocalOpenLocation } from "./LocalOpen";
 import { maximumUiSearchCharacters, normalizeUiSearchQuery } from "./search_helpers";
 import { compareOrganizedSessions, isHiddenByArchive, organizeSessions } from "./task_organization";
+import { anchoredScrollTop, clampScrollTop, distanceFromEnd, isAtBottom, shouldRequestOlder } from "./conversation_scroll";
 import {
   Button,
   EmptyState,
@@ -2074,13 +2075,45 @@ function Conversation({ timeline, approvals, inputs, session, provider, notify, 
   const measuredComposerClearance = useRef(0);
   const lastScrollTop = useRef(0);
   const loadingOlderRef = useRef(false);
+  // Distance from the end of the content, held for as long as a history load is
+  // in flight. A prepend never changes that distance, so re-anchoring against it
+  // keeps the reader on the same line no matter how tall the arriving page is.
+  const historyAnchor = useRef<number | null>(null);
+  const anchoredSignature = useRef<string | null>(null);
+  // The offset our last write left behind, so the scroll event it echoes can be told
+  // apart from one the reader caused. Following a streaming reply writes every frame,
+  // and a blanket "ignore while we are writing" flag would swallow their scrolls.
+  const writtenScrollTop = useRef<number | null>(null);
+  const releaseFrame = useRef<number | undefined>(undefined);
+  const loadOlderProp = useRef(onLoadOlder);
+  const timelineSignature = useMemo(
+    () => timeline ? `${timeline.length}:${timeline[0]?.id ?? ""}:${timeline[timeline.length - 1]?.id ?? ""}` : "none",
+    [timeline],
+  );
+  const signature = useRef(timelineSignature);
+  const applyScrollTop = useCallback((element: HTMLDivElement, top: number) => {
+    const next = clampScrollTop(element, top);
+    if (Math.abs(element.scrollTop - next) < 1) {
+      lastScrollTop.current = element.scrollTop;
+      return;
+    }
+    element.scrollTop = next;
+    writtenScrollTop.current = element.scrollTop;
+    lastScrollTop.current = element.scrollTop;
+  }, []);
   const scrollToLatest = useCallback(() => {
     const element = scroller.current;
-    if (element) {
-      pinnedToBottom.current = true;
-      element.scrollTop = element.scrollHeight;
-      lastScrollTop.current = element.scrollTop;
-    }
+    if (!element) return;
+    pinnedToBottom.current = true;
+    applyScrollTop(element, element.scrollHeight);
+  }, [applyScrollTop]);
+  const releaseHistoryAnchor = useCallback(() => {
+    historyAnchor.current = null;
+    anchoredSignature.current = null;
+    loadingOlderRef.current = false;
+  }, []);
+  useEffect(() => () => {
+    if (releaseFrame.current !== undefined) window.cancelAnimationFrame(releaseFrame.current);
   }, []);
   useLayoutEffect(() => {
     const element = scroller.current;
@@ -2094,8 +2127,7 @@ function Conversation({ timeline, approvals, inputs, session, provider, notify, 
       const next = Math.max(0, Math.ceil(viewportBounds.bottom - composerBounds.top + LIVE_OUTPUT_GAP_PX));
       if (measuredComposerClearance.current === next) return;
       measuredComposerClearance.current = next;
-      const visuallyAtBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 72;
-      const shouldFollow = pinnedToBottom.current || visuallyAtBottom;
+      const shouldFollow = historyAnchor.current === null && (pinnedToBottom.current || isAtBottom(element));
       spacer.style.height = `${next}px`;
       if (followFrame !== undefined) window.cancelAnimationFrame(followFrame);
       if (shouldFollow) {
@@ -2117,47 +2149,82 @@ function Conversation({ timeline, approvals, inputs, session, provider, notify, 
       window.removeEventListener("resize", measure);
     };
   }, [scrollToLatest, session.id]);
+  // One writer for the scroll position, so the history anchor and the follow-the-tail
+  // behaviour can never both act on the same commit and fight each other.
   useLayoutEffect(() => {
-    const changedSession = activeSession.current !== session.id;
-    if (changedSession || pinnedToBottom.current) scrollToLatest();
-    activeSession.current = session.id;
-  }, [approvals.length, inputs.length, scrollToLatest, session.id, timeline]);
+    loadOlderProp.current = onLoadOlder;
+    const element = scroller.current;
+    if (!element) return;
+    if (activeSession.current !== session.id) {
+      activeSession.current = session.id;
+      releaseHistoryAnchor();
+      signature.current = timelineSignature;
+      scrollToLatest();
+      return;
+    }
+    if (historyAnchor.current !== null) {
+      applyScrollTop(element, anchoredScrollTop(element, historyAnchor.current));
+      // Release only once the page itself is on screen: the spinner appearing is a
+      // separate commit, and letting go there would leave the real prepend unanchored.
+      if (anchoredSignature.current !== timelineSignature && !loadingOlder) releaseHistoryAnchor();
+      signature.current = timelineSignature;
+      return;
+    }
+    signature.current = timelineSignature;
+    if (pinnedToBottom.current) scrollToLatest();
+  });
   useEffect(() => {
     const element = conversation.current;
     if (!element || typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(() => {
-      if (pinnedToBottom.current) scrollToLatest();
+      if (historyAnchor.current === null && pinnedToBottom.current) scrollToLatest();
     });
     observer.observe(element);
     return () => observer.disconnect();
   }, [scrollToLatest, session.id]);
-  const loadOlder = async () => {
+  const loadOlder = useCallback(async () => {
     const element = scroller.current;
-    if (!element || !onLoadOlder || !olderAvailable || loadingOlder || loadingOlderRef.current) return;
+    const load = loadOlderProp.current;
+    if (!element || !load || !olderAvailable || loadingOlder || loadingOlderRef.current) return;
     loadingOlderRef.current = true;
-    const previousHeight = element.scrollHeight;
-    const previousTop = element.scrollTop;
+    anchoredSignature.current = signature.current;
+    historyAnchor.current = distanceFromEnd(element);
+    if (releaseFrame.current !== undefined) window.cancelAnimationFrame(releaseFrame.current);
     try {
-      await onLoadOlder();
-      window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
-        const current = scroller.current;
-        if (current) current.scrollTop = previousTop + Math.max(0, current.scrollHeight - previousHeight);
-      }));
+      await load();
     } finally {
-      loadingOlderRef.current = false;
+      // Nothing arrived — no page, or a rejected one. Hand scrolling back rather than
+      // leaving the reader pinned to a stale anchor.
+      releaseFrame.current = window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+        releaseFrame.current = undefined;
+        if (anchoredSignature.current === signature.current) releaseHistoryAnchor();
+      }));
     }
-  };
-  return <div className="conversation-scroll" ref={scroller} onScroll={(event) => {
+  }, [loadingOlder, olderAvailable, releaseHistoryAnchor]);
+  useEffect(() => {
+    // A page that lands entirely above the fold parks the reader on the ceiling with
+    // no further scroll event to ask for the next one.
+    const element = scroller.current;
+    if (element && historyAnchor.current === null && element.scrollTop <= 1) void loadOlder();
+  });
+  return <div className="conversation-scroll" ref={scroller} onWheel={(event) => {
+    // Unambiguous intent, and the only signal that survives a reply streaming in:
+    // stop following the moment the reader turns the wheel back.
+    if (event.deltaY < 0) pinnedToBottom.current = false;
+  }} onScroll={(event) => {
     const element = event.currentTarget;
-    const remaining = element.scrollHeight - element.scrollTop - element.clientHeight;
+    const echoed = writtenScrollTop.current !== null && Math.abs(element.scrollTop - writtenScrollTop.current) <= 1;
     const movedUp = element.scrollTop < lastScrollTop.current - 1;
+    writtenScrollTop.current = null;
     lastScrollTop.current = element.scrollTop;
-    if (remaining < 72) pinnedToBottom.current = true;
-    else if (movedUp) pinnedToBottom.current = false;
-    if (element.scrollTop < 48) void loadOlder();
+    if (isAtBottom(element)) pinnedToBottom.current = true;
+    else if (movedUp && !echoed) pinnedToBottom.current = false;
+    // Follow the reader through an in-flight load instead of yanking them back.
+    if (historyAnchor.current !== null && !echoed) historyAnchor.current = distanceFromEnd(element);
+    if (shouldRequestOlder(element)) void loadOlder();
   }}>
     <div className="conversation" ref={conversation}>
-      {loadingOlder ? <div className="history-loading" role="status" aria-label="Loading earlier messages"><span className="spinner" /></div> : null}
+      {olderAvailable || loadingOlder ? <div className="history-loading" data-busy={loadingOlder ? "true" : "false"} {...(loadingOlder ? { role: "status", "aria-label": "Loading earlier messages" } : { "aria-hidden": true })}><span className="spinner" /></div> : null}
       <div className="conversation-date"><span />Today<span /></div>
       {timeline === undefined ? <LoadingState label="Loading task history" /> : timeline.length === 0 && approvals.length === 0 && inputs.length === 0 ? <EmptyState icon={<ChatIcon />} title="No messages yet" description="Send the first instruction to begin this task." /> : null}
       {timeline ? <ChatTimeline timeline={timeline} providerId={session.providerId} provider={provider} onLinkOpen={onLinkOpen} onWorkflowOpen={onWorkflowOpen} reasoningDisplay={reasoningDisplay} isCompacting={isCompacting} compactionKind={compactionKind} active={session.state === "working"}/> : null}

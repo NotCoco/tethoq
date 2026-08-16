@@ -490,8 +490,10 @@ test("task history opens on the recent assistant tail and pages upward without j
   assert.match(app, /const messageId = item\.messageId \?\? item\.id/);
   assert.match(app, /loadSessionTimelinePage\(selected\)\.then\(\(page\)/);
   assert.match(app, /\[selected\]: \{ nextCursor: page\.nextCursor, revealStart: initialTimelineRevealStart\(page\.items\), loadingOlder: false \}/);
-  assert.match(app, /if \(element\.scrollTop < 48\) void loadOlder\(\)/);
-  assert.match(app, /current\.scrollTop = previousTop \+ Math\.max\(0, current\.scrollHeight - previousHeight\)/);
+  assert.match(app, /if \(shouldRequestOlder\(element\)\) void loadOlder\(\)/);
+  assert.match(app, /applyScrollTop\(element, anchoredScrollTop\(element, historyAnchor\.current\)\)/);
+  // A page landing wholly above the fold leaves no scroll event to ask for the next.
+  assert.match(app, /element\.scrollTop <= 1\) void loadOlder\(\)/);
 });
 
 test("renderer source reconciles live provider, session, and attention events", async () => {

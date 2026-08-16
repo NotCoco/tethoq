@@ -345,7 +345,7 @@ svg.refresh-icon { width: 20px !important; height: 20px !important; stroke-width
 .task-details-facts dt { color: #7f847f; }
 .task-details-facts dd { min-width: 0; margin: 0; overflow: hidden; color: #b8bcb8; text-overflow: ellipsis; white-space: nowrap; }
 .mobile-back { display: none; }
-.conversation-scroll { min-height: 0; overflow: auto; overflow-anchor: none; background: radial-gradient(circle at 72% -12%, rgba(255,255,255,.022), transparent 38%), #0f0f0e; scroll-behavior: auto; }
+.conversation-scroll { min-height: 0; overflow: auto; overflow-anchor: none; overscroll-behavior: contain; background: radial-gradient(circle at 72% -12%, rgba(255,255,255,.022), transparent 38%), #0f0f0e; scroll-behavior: auto; }
 .conversation-scroll { scrollbar-color: #4f4f4a transparent; scrollbar-gutter: stable; }
 .conversation-scroll::-webkit-scrollbar { width: 10px; }
 .conversation-scroll::-webkit-scrollbar-track { background: transparent; }
@@ -353,7 +353,8 @@ svg.refresh-icon { width: 20px !important; height: 20px !important; stroke-width
 .conversation-scroll::-webkit-scrollbar-thumb:hover { background: #7b7b74; }
 .conversation-scroll::-webkit-scrollbar-thumb:active { background: #9b9b92; }
 .conversation { width: min(780px, calc(100% - 38px)); min-height: 100%; margin: 0 auto; padding: 22px 0 32px; }
-.history-loading { height: 24px; display: grid; place-items: center; color: var(--muted); }
+.history-loading { height: 24px; display: grid; place-items: center; color: var(--muted); opacity: 0; transition: opacity 130ms ease; }
+.history-loading[data-busy="true"] { opacity: 1; }
 .history-loading .spinner { width: 15px; height: 15px; }
 .conversation-date { display: flex; align-items: center; gap: 12px; margin: 2px 0 20px; color: #737873; font-size: 9px; font-weight: 650; letter-spacing: .11em; text-transform: uppercase; }
 .conversation-date span { flex: 1; height: 1px; background: #242422; }

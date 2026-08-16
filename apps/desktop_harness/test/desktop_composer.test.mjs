@@ -621,12 +621,10 @@ test("composer and chat sources implement the reviewed compact interaction surfa
   assert.match(app, /const LIVE_OUTPUT_GAP_PX = 52/);
   assert.match(app, /viewportBounds\.bottom - composerBounds\.top \+ LIVE_OUTPUT_GAP_PX/);
   assert.match(app, /new ResizeObserver\(measure\)/);
-  assert.match(app, /const visuallyAtBottom = element\.scrollHeight - element\.scrollTop - element\.clientHeight < 72/);
-  assert.match(app, /const shouldFollow = pinnedToBottom\.current \|\| visuallyAtBottom;[\s\S]*spacer\.style\.height = `\$\{next\}px`;[\s\S]*requestAnimationFrame\(\(\) => \{[\s\S]*measuredComposerClearance\.current === next && pinnedToBottom\.current[\s\S]*scrollToLatest\(\)/);
-  assert.match(app, /if \(changedSession \|\| pinnedToBottom\.current\) scrollToLatest\(\)/);
-  assert.match(app, /const scrollToLatest = useCallback\(\(\) => \{[\s\S]*pinnedToBottom\.current = true;[\s\S]*element\.scrollTop = element\.scrollHeight/);
+  assert.match(app, /const shouldFollow = historyAnchor\.current === null && \(pinnedToBottom\.current \|\| isAtBottom\(element\)\);[\s\S]*spacer\.style\.height = `\$\{next\}px`;[\s\S]*requestAnimationFrame\(\(\) => \{[\s\S]*measuredComposerClearance\.current === next && pinnedToBottom\.current[\s\S]*scrollToLatest\(\)/);
+  assert.match(app, /const scrollToLatest = useCallback\(\(\) => \{[\s\S]*pinnedToBottom\.current = true;[\s\S]*applyScrollTop\(element, element\.scrollHeight\)/);
   assert.match(app, /const movedUp = element\.scrollTop < lastScrollTop\.current - 1/);
-  assert.match(app, /if \(remaining < 72\) pinnedToBottom\.current = true;[\s\S]*else if \(movedUp\) pinnedToBottom\.current = false/);
+  assert.match(app, /if \(isAtBottom\(element\)\) pinnedToBottom\.current = true;[\s\S]*else if \(movedUp && !echoed\) pinnedToBottom\.current = false/);
   assert.match(app, /className="conversation-tail-spacer" ref=\{tailSpacer\}/);
   assert.match(css, /\.conversation-tail-spacer[^{]*\{[^}]*height:\s*0/);
   assert.match(app, /if \(pinnedToBottom\.current\) scrollToLatest\(\)/);
