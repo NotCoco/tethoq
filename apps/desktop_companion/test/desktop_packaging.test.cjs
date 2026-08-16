@@ -67,6 +67,8 @@ test('Bridge runtime stages every built-in adapter and provider tool asset', () 
   assert.match(stageScript, /assets\\opencode\\uar_mesh\.txt/);
   assert.match(stageScript, /assets\\pi\\tethoq_tools\.txt/);
   assert.match(stageScript, /THIRD_PARTY_NOTICES\.md/);
+  assert.match(stageScript, /\[System\.Security\.Cryptography\.SHA256\]::Create\(\)/);
+  assert.doesNotMatch(stageScript, /\bGet-FileHash\b/);
   assert.ok(existsSync(path.join(repoRoot, 'apps', 'agent_bridge', 'assets', 'opencode', 'uar_mesh.txt')));
   assert.ok(existsSync(path.join(repoRoot, 'apps', 'agent_bridge', 'assets', 'pi', 'tethoq_tools.txt')));
 
