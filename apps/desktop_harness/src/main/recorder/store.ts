@@ -1,5 +1,5 @@
 import { createWriteStream, type WriteStream } from "node:fs";
-import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import type {
   RecorderPrivacy,
@@ -8,6 +8,7 @@ import type {
   WorkflowCaptureSummary,
   WorkflowDescriptor,
   WorkflowManifest,
+  WorkflowScreenshot,
 } from "./types.js";
 
 const MANIFEST_FILE = "workflow.json";
@@ -139,6 +140,29 @@ export class WorkflowStore {
     return (await this.list()).find((workflow) => workflow.id === id);
   }
 
+  public async screenshots(id: string): Promise<WorkflowScreenshot[]> {
+    const workflow = await this.get(id);
+    if (workflow === undefined) throw new Error("Workflow not found");
+    const directory = assertInside(workflow.path, join(workflow.path, "screens", "full"));
+    const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
+    return entries
+      .filter((entry) => entry.isFile() && !entry.isSymbolicLink() && /^frame-\d{6}\.jpg$/u.test(entry.name))
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .map((entry) => ({ frameId: entry.name.slice(0, -4), name: entry.name }));
+  }
+
+  public async screenshotBytes(id: string, frameId: string): Promise<{ readonly name: string; readonly bytes: Buffer }> {
+    validateFrameId(frameId);
+    const workflow = await this.get(id);
+    if (workflow === undefined) throw new Error("Workflow not found");
+    const name = `${frameId}.jpg`;
+    const candidate = assertInside(workflow.path, join(workflow.path, "screens", "full", name));
+    const info = await lstat(candidate);
+    if (!info.isFile() || info.isSymbolicLink()) throw new Error("Workflow screenshot is unavailable");
+    assertInside(await realpath(workflow.path), await realpath(candidate));
+    return { name, bytes: await readFile(candidate) };
+  }
+
   public async delete(id: string): Promise<void> {
     const descriptor = await this.get(id);
     if (descriptor === undefined) throw new Error("Workflow not found");
@@ -228,6 +252,10 @@ function validateWorkflowName(name: string): string {
 
 function validateId(id: string): void {
   if (!/^[a-f0-9-]{16,64}$/u.test(id)) throw new Error("Invalid workflow ID");
+}
+
+function validateFrameId(frameId: string): void {
+  if (!/^frame-\d{6}$/u.test(frameId)) throw new Error("Invalid workflow screenshot ID");
 }
 
 function slug(value: string): string {

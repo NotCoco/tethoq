@@ -16,6 +16,7 @@ import {
   JsonRpcPeer,
   ProviderAdapterError,
   ProviderEventHub,
+  providerPromptContent,
   resolveCommand,
   type AgentProviderAdapter,
   type AuthRequest,
@@ -34,6 +35,7 @@ import {
   type ProviderEventSink,
   type ProviderQueuedMessage,
   type ProviderUserInputResponse,
+  type RestoreProviderMessageRequest,
   type RpcId,
   type SendMessageRequest,
   type SendMessageResult,
@@ -43,6 +45,7 @@ import {
 import {
   CodexActivityReconciler,
   type CodexActivityReconcilerOptions,
+  type CodexContextObservation,
   type CodexObservedMessage,
   type CodexTurnMetadata,
 } from "./activity.js";
@@ -65,12 +68,16 @@ export interface CodexAdapterOptions {
   readonly cwd?: string;
   readonly transportFactory?: () => JsonRpcTransport;
   readonly requestTimeoutMs?: number;
+  /** Grace period before a bridge-approved idle transport is closed. */
+  readonly idleReleaseMs?: number;
   readonly now?: () => Date;
   /** Explicit opt-in to reading Codex-owned rollout and lock files. */
-  readonly localActivity?: false | Omit<CodexActivityReconcilerOptions, "onStateChanged" | "onMessage" | "onTurnMetadataChanged">;
+  readonly localActivity?: false | Omit<CodexActivityReconcilerOptions, "onStateChanged" | "onMessage" | "onTurnMetadataChanged" | "onContextChanged">;
   /** Explicit opt-in to Codex Desktop's private queue state and IPC surface. */
   readonly desktopQueue?: false | { readonly statePath?: string; readonly pipePath?: string };
 }
+
+const defaultIdleReleaseMs = 3_000;
 
 const capabilities: ProviderCapabilities = {
   authentication: true,
@@ -109,6 +116,8 @@ export class CodexAdapter implements AgentProviderAdapter {
   } as const;
   public readonly listQueuedMessages?: () => Promise<readonly ProviderQueuedMessage[]>;
   public readonly enqueueQueuedMessage?: (providerSessionId: string, request: EnqueueProviderMessageRequest) => Promise<ProviderQueuedMessage>;
+  public readonly restoreQueuedMessage?: (providerSessionId: string, request: RestoreProviderMessageRequest) => Promise<ProviderQueuedMessage>;
+  public readonly updateQueuedMessage?: (providerSessionId: string, messageId: string, content: string) => Promise<ProviderQueuedMessage | null>;
   public readonly cancelQueuedMessage?: (providerSessionId: string, messageId: string) => Promise<boolean>;
   readonly #events = new ProviderEventHub();
   readonly #pendingServerRequests = new Map<string, PendingServerRequest>();
@@ -119,14 +128,20 @@ export class CodexAdapter implements AgentProviderAdapter {
   readonly #cwd: string | undefined;
   readonly #transportFactory: (() => JsonRpcTransport) | undefined;
   readonly #requestTimeoutMs: number;
+  readonly #idleReleaseMs: number;
   readonly #now: () => Date;
   readonly #activity: CodexActivityReconciler | null;
   readonly #desktopQueue: CodexDesktopQueue | null;
   readonly #sessionStates = new Map<string, SessionState>();
   readonly #sessionMetadata = new Map<string, CodexTurnMetadata>();
-  readonly #sessionContext = new Map<string, Omit<SessionContextState, "sessionId" | "compactionThresholdTokens" | "minimumThresholdTokens" | "supportsThreshold" | "isCompacting">>();
+  readonly #sessionContext = new Map<string, Omit<SessionContextState, "sessionId" | "compactionThresholdTokens" | "minimumThresholdTokens" | "supportsThreshold" | "isCompacting" | "compactionKind">>();
   #peer: JsonRpcPeer | null = null;
+  #startingPeer: JsonRpcPeer | null = null;
   #initializing: Promise<JsonRpcPeer> | null = null;
+  #closing: Promise<void> | null = null;
+  #idleReleaseTimer: ReturnType<typeof setTimeout> | null = null;
+  #resourceGeneration = 0;
+  #disposed = false;
   #eventCounter = 0;
   #clientTooling: ProviderClientTooling | undefined;
 
@@ -137,6 +152,7 @@ export class CodexAdapter implements AgentProviderAdapter {
     this.#cwd = options.cwd;
     this.#transportFactory = options.transportFactory;
     this.#requestTimeoutMs = options.requestTimeoutMs ?? 60_000;
+    this.#idleReleaseMs = options.idleReleaseMs ?? defaultIdleReleaseMs;
     this.#now = options.now ?? (() => new Date());
     this.#activity = options.localActivity === undefined || options.localActivity === false
       ? null
@@ -145,6 +161,7 @@ export class CodexAdapter implements AgentProviderAdapter {
           onStateChanged: (providerSessionId, state) => this.emitSessionState(providerSessionId, state),
           onMessage: (providerSessionId, message) => this.emitObservedMessage(providerSessionId, message),
           onTurnMetadataChanged: (providerSessionId, metadata) => this.applySessionMetadata(providerSessionId, metadata, true),
+          onContextChanged: (providerSessionId, context) => this.applyObservedContext(providerSessionId, context),
         });
     this.#desktopQueue = options.desktopQueue === undefined || options.desktopQueue === false
       ? null
@@ -160,6 +177,8 @@ export class CodexAdapter implements AgentProviderAdapter {
         return desktopQueue.list();
       };
       this.enqueueQueuedMessage = async (providerSessionId, request) => await desktopQueue.enqueue(providerSessionId, request);
+      this.restoreQueuedMessage = async (providerSessionId, request) => await desktopQueue.restore(providerSessionId, request);
+      this.updateQueuedMessage = async (providerSessionId, messageId, content) => await desktopQueue.update(providerSessionId, messageId, content);
       this.cancelQueuedMessage = async (providerSessionId, messageId) => await desktopQueue.cancel(providerSessionId, messageId);
     }
   }
@@ -267,7 +286,22 @@ export class CodexAdapter implements AgentProviderAdapter {
       ...(options.parentProviderSessionId !== undefined ? { parentThreadId: options.parentProviderSessionId } : {}),
       archived: false,
     });
-    return { sessions: await this.normalizeThreads(response.data), nextCursor: response.nextCursor };
+    const sessions = [...await this.normalizeThreads(response.data)];
+    if (options.cursor === undefined && this.#activity !== null) {
+      const listed = new Set(response.data.map((thread) => thread.id));
+      const missingActiveIds = (await this.#activity.activeThreadIds()).filter((providerSessionId) => !listed.has(providerSessionId));
+      const activeThreads = await Promise.all(missingActiveIds.map(async (providerSessionId) => {
+        try {
+          return (await peer.request<ThreadResponse>("thread/read", { threadId: providerSessionId, includeTurns: false })).thread;
+        } catch {
+          return null;
+        }
+      }));
+      const activeSessions = await Promise.all((await this.normalizeThreads(activeThreads.filter((thread): thread is NonNullable<typeof thread> => thread !== null)))
+        .map(async (session) => this.withRecentActivityPreview(session)));
+      sessions.unshift(...activeSessions);
+    }
+    return { sessions, nextCursor: response.nextCursor };
   }
 
   public async getSession(providerSessionId: string): Promise<RemoteSession> {
@@ -279,28 +313,47 @@ export class CodexAdapter implements AgentProviderAdapter {
     const observed = await this.#activity?.recentMessages(providerSessionId) ?? [];
     if (observed.length > 0) {
       const sessionId = makeGlobalSessionId(this.#hostId, this.providerId, providerSessionId);
+      let latestLiveIndex = -1;
+      if (this.#sessionStates.get(providerSessionId) === "working") {
+        for (let index = observed.length - 1; index >= 0; index -= 1) {
+          const message = observed[index];
+          if (message?.role === "assistant" && (message.partType === "reasoning" || message.phase === "commentary")) {
+            latestLiveIndex = index;
+            break;
+          }
+        }
+      }
       return observed.map((message, index) => {
         const createdAt = validIsoTimestamp(message.createdAt) ?? new Date(index).toISOString();
+        const running = index === latestLiveIndex;
         return {
           id: `codex/rollout/${message.messageId}/${message.partType}`,
           sessionId,
           providerMessageId: message.messageId,
           role: message.role,
           createdAt,
-          completedAt: createdAt,
+          ...(running ? {} : { completedAt: createdAt }),
           parts: message.partType === "reasoning"
             ? [{ type: "reasoning" as const, text: message.text, redacted: false }]
-            : [{ type: "text" as const, text: message.text }],
-          status: "completed" as const,
+            : message.parts?.length
+              ? message.parts
+              : [{ type: "text" as const, text: message.text }],
+          status: running ? "streaming" as const : "completed" as const,
           nativeMetadata: {},
         };
       });
     }
-    const response = await (await this.peer()).request<ThreadResponse>("thread/read", { threadId: providerSessionId, includeTurns: true });
-    return messagesFromCodexThread(this.#hostId, response.thread);
+    try {
+      const response = await (await this.peer()).request<ThreadResponse>("thread/read", { threadId: providerSessionId, includeTurns: true });
+      return messagesFromCodexThread(this.#hostId, response.thread);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/thread\s+[0-9a-f-]+\s+is not materialized yet; includeTurns is unavailable before first user message/iu.test(message)) return [];
+      throw error;
+    }
   }
 
-  public async getSessionContext(providerSessionId: string): Promise<Omit<SessionContextState, "sessionId" | "compactionThresholdTokens" | "minimumThresholdTokens" | "supportsThreshold" | "isCompacting">> {
+  public async getSessionContext(providerSessionId: string): Promise<Omit<SessionContextState, "sessionId" | "compactionThresholdTokens" | "minimumThresholdTokens" | "supportsThreshold" | "isCompacting" | "compactionKind">> {
     return this.#sessionContext.get(providerSessionId) ?? {
       ...(this.#sessionMetadata.get(providerSessionId)?.modelId !== undefined ? { modelId: this.#sessionMetadata.get(providerSessionId)!.modelId } : {}),
       usedTokens: null,
@@ -374,7 +427,7 @@ export class CodexAdapter implements AgentProviderAdapter {
 
   public async sendMessage(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
     const input = [
-      { type: "text", text: request.content, text_elements: [] },
+      { type: "text", text: providerPromptContent(request), text_elements: [] },
       ...(request.attachments ?? []).map((attachment) => ({
         type: "image",
         url: `data:${attachment.mimeType};base64,${attachment.dataBase64}`,
@@ -404,7 +457,7 @@ export class CodexAdapter implements AgentProviderAdapter {
       throw new ProviderAdapterError(this.providerId, "NO_ACTIVE_TURN", "No active Codex turn is available to steer", false);
     }
     const input = [
-      { type: "text", text: request.content, text_elements: [] },
+      { type: "text", text: providerPromptContent(request), text_elements: [] },
       ...(request.attachments ?? []).map((attachment) => ({
         type: "image",
         url: `data:${attachment.mimeType};base64,${attachment.dataBase64}`,
@@ -502,24 +555,55 @@ export class CodexAdapter implements AgentProviderAdapter {
     pending.resolve({ answers: codexAnswersFromUserResponse(response.answers) });
   }
 
+  public async releaseIdleResources(): Promise<void> {
+    if (this.#disposed) return;
+    this.cancelIdleRelease();
+    const generation = this.#resourceGeneration;
+    const timer = setTimeout(() => {
+      if (this.#idleReleaseTimer === timer) this.#idleReleaseTimer = null;
+      void this.closeIdlePeer(generation).catch(() => undefined);
+    }, this.#idleReleaseMs);
+    timer.unref();
+    this.#idleReleaseTimer = timer;
+  }
+
   public async dispose(): Promise<void> {
+    if (this.#disposed) return;
+    this.#disposed = true;
+    this.#resourceGeneration += 1;
+    this.cancelIdleRelease();
     this.#desktopQueue?.dispose();
     this.#activity?.dispose();
     for (const pending of this.#pendingServerRequests.values()) pending.reject(new Error("Codex adapter disposed"));
     this.#pendingServerRequests.clear();
     this.#events.clear();
+    const startingPeer = this.#startingPeer;
+    if (startingPeer !== null) await startingPeer.close().catch(() => undefined);
+    const initializing = this.#initializing;
+    if (initializing !== null) await initializing.catch(() => undefined);
+    const closing = this.#closing;
+    if (closing !== null) await closing.catch(() => undefined);
     const peer = this.#peer;
     this.#peer = null;
-    if (peer !== null) await peer.close();
+    if (peer !== null) await peer.close().catch(() => undefined);
   }
 
-  private peer(): Promise<JsonRpcPeer> {
-    if (this.#peer !== null) return Promise.resolve(this.#peer);
-    if (this.#initializing !== null) return this.#initializing;
-    this.#initializing = this.initialize().finally(() => {
-      this.#initializing = null;
-    });
-    return this.#initializing;
+  private async peer(): Promise<JsonRpcPeer> {
+    if (this.#disposed) throw new ProviderAdapterError(this.providerId, "ADAPTER_DISPOSED", "Codex adapter has been disposed", false);
+    this.#resourceGeneration += 1;
+    this.cancelIdleRelease();
+    const closing = this.#closing;
+    if (closing !== null) await closing;
+    if (this.#disposed) throw new ProviderAdapterError(this.providerId, "ADAPTER_DISPOSED", "Codex adapter has been disposed", false);
+    if (this.#peer !== null) return this.#peer;
+    if (this.#initializing !== null) return await this.#initializing;
+    const initializing = this.initialize();
+    this.#initializing = initializing;
+    try {
+      return await initializing;
+    } finally {
+      if (this.#initializing === initializing) this.#initializing = null;
+    }
   }
 
   private async initialize(): Promise<JsonRpcPeer> {
@@ -537,6 +621,7 @@ export class CodexAdapter implements AgentProviderAdapter {
         payload: { message: error.message, source: "json_rpc_callback" },
       }),
     });
+    this.#startingPeer = peer;
     peer.onNotification((method, params) => this.handleNotification(method, params));
     peer.onRequest((method, params, id) => this.handleServerRequest(method, params, id));
     try {
@@ -545,11 +630,37 @@ export class CodexAdapter implements AgentProviderAdapter {
         capabilities: { experimentalApi: true },
       });
       await peer.notify("initialized", undefined);
+      if (this.#disposed) throw new Error("Codex adapter disposed during initialization");
       this.#peer = peer;
       return peer;
     } catch (error) {
       await peer.close();
       throw new ProviderAdapterError(this.providerId, "INITIALIZE_FAILED", `Codex App Server initialization failed: ${error instanceof Error ? error.message : String(error)}`, true, { cause: error });
+    } finally {
+      if (this.#startingPeer === peer) this.#startingPeer = null;
+    }
+  }
+
+  private cancelIdleRelease(): void {
+    if (this.#idleReleaseTimer === null) return;
+    clearTimeout(this.#idleReleaseTimer);
+    this.#idleReleaseTimer = null;
+  }
+
+  private async closeIdlePeer(generation: number): Promise<void> {
+    if (this.#disposed || generation !== this.#resourceGeneration) return;
+    const initializing = this.#initializing;
+    if (initializing !== null) await initializing.catch(() => undefined);
+    if (this.#disposed || generation !== this.#resourceGeneration) return;
+    const peer = this.#peer;
+    if (peer === null) return;
+    this.#peer = null;
+    const closing = peer.close();
+    this.#closing = closing;
+    try {
+      await closing;
+    } finally {
+      if (this.#closing === closing) this.#closing = null;
     }
   }
 
@@ -681,6 +792,7 @@ export class CodexAdapter implements AgentProviderAdapter {
     return sessions.map((session) => {
       const state = states.get(session.providerSessionId) ?? session.state;
       const observedMetadata = this.#activity?.turnMetadata(session.providerSessionId);
+      const observedContext = this.#activity?.context(session.providerSessionId);
       const knownMetadata = this.#sessionMetadata.get(session.providerSessionId);
       const metadata: CodexTurnMetadata = {
         ...(session.modelId !== undefined ? { modelId: session.modelId } : {}),
@@ -689,6 +801,7 @@ export class CodexAdapter implements AgentProviderAdapter {
         ...(knownMetadata ?? {}),
       };
       if (metadata.modelId !== undefined || metadata.reasoningEffort !== undefined) this.#sessionMetadata.set(session.providerSessionId, metadata);
+      if (observedContext !== undefined) this.applyObservedContext(session.providerSessionId, observedContext);
       this.#sessionStates.set(session.providerSessionId, state);
       return {
         ...session,
@@ -697,6 +810,26 @@ export class CodexAdapter implements AgentProviderAdapter {
         ...(metadata.reasoningEffort !== undefined ? { reasoningEffort: metadata.reasoningEffort } : {}),
       };
     });
+  }
+
+  private async withRecentActivityPreview(session: RemoteSession): Promise<RemoteSession> {
+    const observed = await this.#activity?.recentMessages(session.providerSessionId) ?? [];
+    let latest: CodexObservedMessage | undefined;
+    for (let index = observed.length - 1; index >= 0; index -= 1) {
+      const candidate = observed[index];
+      if (candidate?.partType === "text" && candidate.text.trim().length > 0) {
+        latest = candidate;
+        break;
+      }
+    }
+    if (latest === undefined) return session;
+    const preview = latest.text.trim().replace(/\s+/gu, " ").slice(0, 240);
+    const observedAt = validIsoTimestamp(latest.createdAt);
+    return {
+      ...session,
+      preview,
+      ...(observedAt !== undefined && observedAt > session.lastActivityAt ? { lastActivityAt: observedAt } : {}),
+    };
   }
 
   private async applySessionMetadata(providerSessionId: string, update: CodexTurnMetadata, emitChange: boolean): Promise<void> {
@@ -715,6 +848,27 @@ export class CodexAdapter implements AgentProviderAdapter {
       payload: {
         ...(next.modelId !== undefined ? { modelId: next.modelId } : {}),
         ...(next.reasoningEffort !== undefined ? { reasoningEffort: next.reasoningEffort } : {}),
+      },
+    });
+  }
+
+  private applyObservedContext(providerSessionId: string, context: CodexContextObservation): void {
+    const usedTokens = context.usedTokens;
+    const contextWindowTokens = context.contextWindowTokens;
+    this.#sessionContext.set(providerSessionId, {
+      ...(this.#sessionMetadata.get(providerSessionId)?.modelId !== undefined ? { modelId: this.#sessionMetadata.get(providerSessionId)!.modelId } : {}),
+      usedTokens,
+      contextWindowTokens,
+      usedPercent: usedTokens !== null && contextWindowTokens !== null && contextWindowTokens > 0
+        ? Math.max(0, Math.min(100, usedTokens / contextWindowTokens * 100))
+        : null,
+      supportsManualCompaction: true,
+      updatedAt: validIsoTimestamp(context.updatedAt) ?? this.#now().toISOString(),
+      usage: {
+        ...(context.inputTokens !== undefined ? { inputTokens: context.inputTokens } : {}),
+        ...(context.outputTokens !== undefined ? { outputTokens: context.outputTokens } : {}),
+        ...(context.cacheReadTokens !== undefined ? { cacheReadTokens: context.cacheReadTokens } : {}),
+        ...(context.totalTokens !== undefined ? { totalTokens: context.totalTokens } : {}),
       },
     });
   }

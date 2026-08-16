@@ -26,5 +26,11 @@
     "services/relay/**/*.ts",
     "packages/**/*.ts"
   ],
-  "exclude": ["dist", "node_modules"]
+  "exclude": [
+    "dist",
+    "node_modules",
+    "packages/connector_sdk/.example-dist",
+    "packages/connector_sdk/.test-dist",
+    "packages/connector_sdk/examples/**/*.ts"
+  ]
 }

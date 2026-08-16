@@ -2,6 +2,54 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:universal_agent_remote/src/models.dart';
 
 void main() {
+  test('transcription source keeps provider API key setup metadata', () {
+    final source = TranscriptionSource.fromJson(<String, Object?>{
+      'id': 'openai-stt',
+      'label': 'OpenAI speech-to-text',
+      'status': 'needs_credential',
+      'setupEnvironmentVariable': 'TETHOQ_OPENAI_API_KEY',
+      'credential': <String, Object?>{
+        'kind': 'api_key',
+        'label': 'OpenAI API key',
+        'setupUrl': 'https://platform.openai.com/api-keys',
+      },
+      'capabilities': <String, Object?>{
+        'batch': true,
+        'maxAudioBytes': 4 * 1024 * 1024,
+      },
+    });
+
+    expect(source.credentialLabel, 'OpenAI API key');
+    expect(source.credentialSetupUrl, 'https://platform.openai.com/api-keys');
+    expect(source.isReady, isFalse);
+  });
+
+  test('simplify settings match bridge bounds and omit empty guidance', () {
+    final defaultSettings = SimplifySettings(guidance: '   ');
+    final bounded = SimplifySettings(
+      maxWords: 9000,
+      guidance: ' Keep\n the concrete\t example. ',
+    );
+
+    expect(defaultSettings.toJson(), <String, Object?>{'maxWords': 100});
+    expect(bounded.maxWords, 2000);
+    expect(bounded.guidance, 'Keep the concrete example.');
+    expect(bounded.toJson(), <String, Object?>{
+      'maxWords': 2000,
+      'guidance': 'Keep the concrete example.',
+    });
+    expect(SimplifySettings(maxWords: 0).maxWords, 1);
+  });
+
+  test('simplify visible content mirrors previous and upcoming semantics', () {
+    expect(
+        simplifyVisibleContent('/simplify'), 'Simplify the previous answer.');
+    expect(simplifyVisibleContent('Please /simplify: explain the result'),
+        'Please explain the result');
+    expect(simplifyVisibleContent('/simplified is not a command'),
+        '/simplified is not a command');
+  });
+
   test('session model preserves provider-neutral fields', () {
     final session = RemoteSession.fromJson(<String, Object?>{
       'id': 'host/codex/thread',
@@ -43,6 +91,43 @@ void main() {
     });
 
     expect(provider.capabilities.sessionRelationships, isTrue);
+  });
+
+  test('side-chat sessions and cross-task message origins stay explicit', () {
+    final sideChat = RemoteSession.fromJson(<String, Object?>{
+      'id': 'host/codex/side',
+      'hostId': 'host',
+      'providerId': 'codex',
+      'providerSessionId': 'side',
+      'title': 'Check this approach',
+      'state': 'idle',
+      'lastActivityAt': '2026-08-15T12:00:00.000Z',
+      'needsApproval': false,
+      'stale': false,
+      'sessionKind': 'side_chat',
+      'parentSessionId': 'host/codex/parent',
+    });
+    final message = RemoteMessage.fromJson(<String, Object?>{
+      'id': 'cross-task-message',
+      'sessionId': 'host/codex/target',
+      'role': 'user',
+      'createdAt': '2026-08-15T12:01:00.000Z',
+      'status': 'completed',
+      'parts': <Object?>[
+        <String, Object?>{'type': 'text', 'text': 'Please verify this.'},
+      ],
+      'origin': <String, Object?>{
+        'kind': 'cross_session',
+        'envelopeId': 'envelope-1',
+        'sourceSessionId': 'host/codex/source',
+        'sourceTitle': 'Source task',
+      },
+    });
+
+    expect(sideChat.sessionKind, 'side_chat');
+    expect(message.origin?.kind, 'cross_session');
+    expect(message.origin?.envelopeId, 'envelope-1');
+    expect(message.origin?.sourceTitle, 'Source task');
   });
 
   test('handoff and branch results preserve source relationship metadata', () {
@@ -149,7 +234,8 @@ void main() {
       'minimumThresholdTokens': 8000,
       'supportsManualCompaction': true,
       'supportsThreshold': true,
-      'isCompacting': false,
+      'isCompacting': true,
+      'compactionKind': 'automatic',
       'updatedAt': '2026-08-14T10:00:00.000Z',
       'usage': <String, Object?>{
         'inputTokens': 39100,
@@ -164,6 +250,7 @@ void main() {
     expect(context.contextWindowTokens, 128000);
     expect(context.compactionThresholdTokens, 96000);
     expect(context.supportsThreshold, isTrue);
+    expect(context.compactionKind, 'automatic');
     expect(context.usage.totalTokens, 42800);
     expect(context.usage.cost, .42);
   });
@@ -209,6 +296,26 @@ void main() {
     expect(model.defaultReasoningEffort, 'high');
   });
 
+  test('model options omit automatic reasoning placeholders', () {
+    final model = RemoteModel.fromJson(<String, Object?>{
+      'id': 'gpt-5.6',
+      'providerId': 'codex',
+      'displayName': 'GPT-5.6',
+      'isDefault': true,
+      'nativeMetadata': <String, Object?>{
+        'supportedReasoningEfforts': <Object?>[
+          <String, Object?>{'reasoningEffort': 'auto'},
+          <String, Object?>{'reasoningEffort': 'default'},
+          <String, Object?>{'reasoningEffort': 'medium'},
+        ],
+        'defaultReasoningEffort': 'medium',
+      },
+    });
+
+    expect(
+        model.reasoningEfforts.map((effort) => effort.id), <String>['medium']);
+  });
+
   test('content parts expose normalized attachment fields without host paths',
       () {
     final image = ContentPart.fromJson(<String, Object?>{
@@ -242,6 +349,19 @@ void main() {
     });
     expect(rawImage.attachmentUri, 'data:image/jpeg;base64,AQID');
     expect(nestedImage.attachmentUri, 'https://example.test/image.png');
+
+    final workflow = ContentPart.fromJson(<String, Object?>{
+      'type': 'workflow',
+      'workflow': <String, Object?>{
+        'id': 'workflow-1',
+        'name': 'Comment workflow',
+        'eventCount': 442,
+        'screenshotCount': 18,
+      },
+    });
+    expect(workflow.summary, isEmpty,
+        reason:
+            'structured workflow metadata must not render as raw chat text');
   });
 
   test('model image support is inferred only from explicit input metadata', () {

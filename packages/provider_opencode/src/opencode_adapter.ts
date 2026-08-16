@@ -3,6 +3,7 @@ import { ExponentialBackoff, type JsonObject, type ProviderCapabilities, type Re
 import {
   ProviderAdapterError,
   ProviderEventHub,
+  providerPromptContent,
   type AgentProviderAdapter,
   type AuthStatus,
   type CreateSessionOptions,
@@ -152,11 +153,16 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     const value = await this.#client.request<unknown>("GET", "/provider", { query: this.query() });
     const providers = isRecord(value) && Array.isArray(value.all) ? value.all : Array.isArray(value) ? value : [];
     const defaults = isRecord(value) && isRecord(value.default) ? value.default : {};
+    const connected = isRecord(value) && Array.isArray(value.connected)
+      ? new Set(value.connected.filter((entry): entry is string => typeof entry === "string"))
+      : undefined;
     const result: RemoteModel[] = [];
     for (const providerValue of providers) {
       if (!isRecord(providerValue)) continue;
       const providerId = typeof providerValue.id === "string" ? providerValue.id : typeof providerValue.providerID === "string" ? providerValue.providerID : undefined;
       if (providerId === undefined) continue;
+      if (connected !== undefined && !connected.has(providerId)) continue;
+      const providerName = typeof providerValue.name === "string" ? providerValue.name : providerId;
       const models = isRecord(providerValue.models) ? Object.entries(providerValue.models) : [];
       for (const [modelKey, modelValue] of models) {
         const model = isRecord(modelValue) ? modelValue : {};
@@ -169,7 +175,12 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
           ...(typeof model.description === "string" ? { description: model.description } : {}),
           isDefault: defaults[providerId] === modelId,
           ...(modalities !== undefined ? { inputModalities: modalities } : {}),
-          nativeMetadata: asJsonObject(model),
+          nativeMetadata: {
+            ...asJsonObject(model),
+            sourceProviderId: providerId,
+            sourceProviderName: providerName,
+            source: "OpenCode",
+          },
         });
       }
     }
@@ -254,7 +265,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     return normalizeOpenCodeMessages(this.#hostId, providerSessionId, value);
   }
 
-  public async getSessionContext(providerSessionId: string): Promise<Omit<SessionContextState, "sessionId" | "compactionThresholdTokens" | "minimumThresholdTokens" | "supportsThreshold" | "isCompacting">> {
+  public async getSessionContext(providerSessionId: string): Promise<Omit<SessionContextState, "sessionId" | "compactionThresholdTokens" | "minimumThresholdTokens" | "supportsThreshold" | "isCompacting" | "compactionKind">> {
     const value = await this.rawMessages(providerSessionId);
     const entries = Array.isArray(value) ? value : [];
     const assistants = entries
@@ -347,7 +358,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       body: {
         messageID,
         parts: [
-          { type: "text", text: request.content },
+          { type: "text", text: providerPromptContent(request) },
           ...(request.attachments ?? []).map((attachment) => ({
             type: "file",
             mime: attachment.mimeType,

@@ -12,5 +12,7 @@ test("OpenCode mesh tools install with session-scoped context outside the real u
   const source = await readFile(openCodeMeshToolPath(userHome), "utf8");
   assert.match(source, /context\.sessionID/);
   assert.match(source, /mesh_message_child/);
+  assert.match(source, /mesh_list_sessions/);
+  assert.match(source, /mesh_message_session/);
   assert.doesNotMatch(source, /UAR_MESH_TOKEN/);
 });

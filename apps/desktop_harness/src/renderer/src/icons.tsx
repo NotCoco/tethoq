@@ -16,7 +16,8 @@ export const ChatIcon = (props: IconProps) => <Icon {...props}><path d="M4 5.5A2
 export const SettingsIcon = (props: IconProps) => <Icon {...props}><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21h-4v-.1A1.7 1.7 0 0 0 8.6 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H3v-4h.1A1.7 1.7 0 0 0 4.6 8.6a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1V3h4v.1A1.7 1.7 0 0 0 15.4 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9c.16.38.4.72.7 1 .3.26.68.4 1.1.4h.1v4h-.1a1.7 1.7 0 0 0-1.8.6Z"/></Icon>;
 export const SearchIcon = (props: IconProps) => <Icon {...props}><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></Icon>;
 export const PlusIcon = (props: IconProps) => <Icon {...props}><path d="M12 5v14M5 12h14"/></Icon>;
-export const RefreshIcon = (props: IconProps) => <Icon {...props}><path d="M20 7v5h-5M4 17v-5h5"/><path d="M18.5 10A7 7 0 0 0 6 6l-2 2m2 6a7 7 0 0 0 12.5 4l1.5-2"/></Icon>;
+export const RefreshIcon = (props: IconProps) => <Icon {...props}><path d="M4 8c2.7-5.2 10.6-6.2 16 0M20 16c-2.7 5.2-10.6 6.2-16 0"/><path d="m16.5 4.5 3.5 3.5-3.5 3.5M7.5 12.5 4 16l3.5 3.5"/></Icon>;
+export const CompactionIcon = (props: IconProps) => <Icon {...props}><path d="M4 6h16M7 12h10M9 18h6"/><path d="m4 9 3 3-3 3M20 9l-3 3 3 3"/></Icon>;
 export const ChevronDownIcon = (props: IconProps) => <Icon {...props}><path d="m6 9 6 6 6-6"/></Icon>;
 export const ChevronRightIcon = (props: IconProps) => <Icon {...props}><path d="m9 6 6 6-6 6"/></Icon>;
 export const ArrowLeftIcon = (props: IconProps) => <Icon {...props}><path d="m15 18-6-6 6-6"/></Icon>;
@@ -33,6 +34,13 @@ export const StopIcon = (props: IconProps) => <Icon {...props}><rect x="6" y="6"
 export const SendIcon = (props: IconProps) => <Icon {...props}><path d="m3 3 18 9-18 9 4-9zM7 12h14"/></Icon>;
 export const PaperclipIcon = (props: IconProps) => <Icon {...props}><path d="m20.5 11.5-8.8 8.8a6 6 0 0 1-8.5-8.5L13 2a4 4 0 0 1 5.7 5.7l-9.9 9.9a2 2 0 1 1-2.8-2.8l9.2-9.2"/></Icon>;
 export const FolderIcon = (props: IconProps) => <Icon {...props}><path d="M3 6h7l2 2h9v11H3z"/></Icon>;
+export const ExplorerIcon = (props: IconProps) => <Icon {...props}><path d="M3 7h7l2 2h9v10H3z"/><path d="M3 7V5h7l2 2M7 13h10M12 10l-3 3 3 3"/></Icon>;
+export const VSCodeIcon = (props: IconProps) => <Icon {...props}><path d="m16 3 5 2.3v13.4L16 21 7.5 13.5 4 16l-2-2 5.5-5.5L16 3Z"/><path d="M16 3v18M7.5 8.5 16 15"/></Icon>;
+export const CursorAppIcon = (props: IconProps) => <Icon {...props}><path d="M5 3.5 20 12 5 20.5Z"/><path d="m5 3.5 7 12.7L20 12"/></Icon>;
+export const WindsurfIcon = (props: IconProps) => <Icon {...props}><path d="M3 8c3.2 0 3.2-3 6.4-3s3.2 3 6.4 3S19 5 22 5M2 13c3.2 0 3.2-3 6.4-3s3.2 3 6.4 3S18 10 21 10M3 18c3.2 0 3.2-3 6.4-3s3.2 3 6.4 3S19 15 22 15"/></Icon>;
+export const SublimeIcon = (props: IconProps) => <Icon {...props}><path d="m4 7 16-4v6L4 13Zm0 8 16-4v6L4 21Z"/></Icon>;
+export const NotepadPlusIcon = (props: IconProps) => <Icon {...props}><rect x="4" y="3" width="13" height="18" rx="2"/><path d="M8 8h5M8 12h5M8 16h5M20 9v7M16.5 12.5h7"/></Icon>;
+export const ZedIcon = (props: IconProps) => <Icon {...props}><path d="M4 5h16L7 19h13M8 9h8M8 15h8"/></Icon>;
 export const CommandIcon = (props: IconProps) => <Icon {...props}><path d="M9 6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3z"/></Icon>;
 export const SlidersIcon = (props: IconProps) => <Icon {...props}><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="7" cy="18" r="2"/></Icon>;
 export const XIcon = (props: IconProps) => <Icon {...props}><path d="m6 6 12 12M18 6 6 18"/></Icon>;
@@ -52,6 +60,9 @@ export const KeyboardIcon = (props: IconProps) => <Icon {...props}><rect x="2" y
 export const ScreenshotIcon = (props: IconProps) => <Icon {...props}><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="12" cy="12" r="3"/><path d="m7 5 1.5-2h7L17 5"/></Icon>;
 export const MicrophoneIcon = (props: IconProps) => <Icon {...props}><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v5M8 22h8"/></Icon>;
 export const WalletIcon = (props: IconProps) => <Icon {...props}><path d="M4 6.5A2.5 2.5 0 0 1 6.5 4H19v16H6.5A2.5 2.5 0 0 1 4 17.5z"/><path d="M4 7h15M15 11h6v5h-6a2.5 2.5 0 0 1 0-5Z"/><circle cx="16.5" cy="13.5" r=".5"/></Icon>;
+export const PinIcon = (props: IconProps) => <Icon {...props}><path d="M9 3h6l-1 6 4 3.5V15H6v-2.5L10 9z"/><path d="M12 15v6"/></Icon>;
+export const RenameIcon = (props: IconProps) => <Icon {...props}><path d="M4 20h5l10.5-10.5a2.5 2.5 0 0 0-3.5-3.5L5.5 16.5z"/><path d="m14.5 6.5 3.5 3.5"/></Icon>;
+export const ArchiveIcon = (props: IconProps) => <Icon {...props}><rect x="3" y="4" width="18" height="4.5" rx="1"/><path d="M5 8.5V20h14V8.5M10 13h4"/></Icon>;
 export const BranchIcon = (props: IconProps) => <Icon {...props}><circle cx="6" cy="5" r="2"/><circle cx="18" cy="8" r="2"/><circle cx="18" cy="19" r="2"/><path d="M6 7v6a6 6 0 0 0 6 6h4M8 8h4a6 6 0 0 1 6 6v3"/></Icon>;
 export const ExternalLinkIcon = (props: IconProps) => <Icon {...props}><path d="M14 4h6v6M20 4l-9 9"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></Icon>;
 export const LogoMark = (props: IconProps) => <Icon {...props}><path d="M5 4h5v5H5zM14 4h5v5h-5zM5 15h5v5H5zM14 15h5v5h-5z"/><path d="M10 6.5h4M7.5 9v6M16.5 9v6M10 17.5h4"/></Icon>;

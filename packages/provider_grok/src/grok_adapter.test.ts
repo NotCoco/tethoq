@@ -14,13 +14,16 @@ class FakeTransport implements JsonRpcTransport {
   readonly listeners = new Set<(message: unknown) => void>();
   readonly methodResults = new Map<string, unknown>();
   readonly notificationsBeforeResult = new Map<string, readonly unknown[]>();
+  readonly blockedMethods = new Set<string>();
   readonly sent: unknown[] = [];
+  public closeCalls = 0;
 
   public async send(message: unknown): Promise<void> {
     this.sent.push(message);
     if (typeof message !== "object" || message === null) return;
     const record = message as Record<string, unknown>;
     if ((typeof record.id !== "string" && typeof record.id !== "number") || typeof record.method !== "string") return;
+    if (this.blockedMethods.has(record.method)) return;
     const result = this.methodResults.get(record.method) ?? {};
     for (const notification of this.notificationsBeforeResult.get(record.method) ?? []) this.push(notification);
     setTimeout(() => this.push({ id: record.id, result }), 1);
@@ -31,12 +34,73 @@ class FakeTransport implements JsonRpcTransport {
     return () => this.listeners.delete(listener);
   }
 
-  public async close(): Promise<void> {}
+  public async close(): Promise<void> { this.closeCalls += 1; }
 
   public push(message: unknown): void {
     for (const listener of [...this.listeners]) listener(message);
   }
 }
+
+test("ACP releases an idle process, resumes cached sessions, and keeps event subscriptions", async () => {
+  const transports: FakeTransport[] = [];
+  const events: ProviderEvent[] = [];
+  const adapter = createPublicAcpProviderAdapter("qwen", {
+    hostId: "host_idle",
+    idleReleaseMs: 5,
+    transportFactory: () => {
+      const transport = new FakeTransport();
+      transport.methodResults.set("initialize", {
+        protocolVersion: 1,
+        agentCapabilities: { sessionCapabilities: { resume: true }, loadSession: true },
+      });
+      transport.methodResults.set("session/new", { sessionId: "cached-session" });
+      transport.methodResults.set("session/resume", {});
+      transport.methodResults.set("session/prompt", { stopReason: "end_turn" });
+      transports.push(transport);
+      return transport;
+    },
+  });
+  await adapter.subscribe(null, (event) => { events.push(event); });
+  await adapter.createSession({ workingDirectory: "C:\\workspace" });
+
+  await adapter.releaseIdleResources();
+  await delay(15);
+  assert.equal(transports[0]?.closeCalls, 1);
+
+  await adapter.sendMessage("cached-session", { requestId: "after-idle", content: "Continue" });
+  await delay(15);
+  const reopenedMethods = transports[1]?.sent.flatMap((message) => {
+    if (typeof message !== "object" || message === null) return [];
+    const method = (message as Record<string, unknown>).method;
+    return typeof method === "string" ? [method] : [];
+  }) ?? [];
+  assert.ok(reopenedMethods.includes("session/resume"));
+  assert.ok(reopenedMethods.includes("session/prompt"));
+  assert.ok(events.some((event) => event.type === "agent.completed" && event.providerSessionId === "cached-session"));
+  await adapter.dispose();
+});
+
+test("ACP dispose closes a peer whose initialize request is still pending", async () => {
+  const transport = new FakeTransport();
+  transport.blockedMethods.add("initialize");
+  const adapter = createPublicAcpProviderAdapter("qwen", {
+    hostId: "host_dispose_initializing",
+    requestTimeoutMs: 1_000,
+    transportFactory: () => transport,
+  });
+  const initialization = adapter.getAuthStatus().then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+  while (!transport.sent.some((message) => typeof message === "object" && message !== null && (message as Record<string, unknown>).method === "initialize")) {
+    await delay(1);
+  }
+
+  await adapter.dispose();
+
+  assert.equal(transport.closeCalls, 1);
+  assert.ok(await initialization instanceof Error);
+});
 
 test("public ACP detection resolves Windows command shims through PATH and PATHEXT", {
   skip: process.platform !== "win32",
@@ -358,10 +422,12 @@ test("ACP agents without load or resume can prompt the session they just created
   transport.methodResults.set("initialize", { protocolVersion: 1, agentCapabilities: {} });
   transport.methodResults.set("session/new", { sessionId: "fresh-session" });
   transport.methodResults.set("session/prompt", { stopReason: "end_turn" });
-  const adapter = createPublicAcpProviderAdapter("goose", { hostId: "host_1", transportFactory: () => transport });
+  const adapter = createPublicAcpProviderAdapter("goose", { hostId: "host_1", idleReleaseMs: 5, transportFactory: () => transport });
 
   await adapter.createSession({ workingDirectory: "C:\\workspace", firstInstruction: "Inspect this project" });
   await new Promise((resolve) => setTimeout(resolve, 10));
+  await adapter.releaseIdleResources();
+  await delay(15);
 
   const methods = transport.sent.flatMap((message) => {
     if (typeof message !== "object" || message === null) return [];
@@ -371,6 +437,7 @@ test("ACP agents without load or resume can prompt the session they just created
   assert.ok(methods.includes("session/prompt"));
   assert.ok(!methods.includes("session/load"));
   assert.ok(!methods.includes("session/resume"));
+  assert.equal(transport.closeCalls, 0, "a non-resumable active ACP session must keep its process");
   await adapter.dispose();
 });
 

@@ -84,6 +84,25 @@ test("ACP streamed content chunks coalesce by messageId and complete in order", 
   assert.equal(messages[0]?.status, "completed");
 });
 
+test("ACP thinking chunks preserve readable sentence boundaries", () => {
+  const accumulator = createMessageAccumulator();
+  for (const text of ["Verify 480p then poll.", "Poll until done.", "Wait for completion.", "Fast finish."]) {
+    appendAcpContentChunk(
+      "host_1",
+      "grok-session-1",
+      "assistant",
+      { content: { type: "text", text } },
+      accumulator,
+      new Date("2026-08-07T10:00:00Z"),
+      true,
+      "assistant_prompt_prompt-1",
+      "reasoning",
+    );
+  }
+  const part = completeAcpMessages(accumulator)[0]?.parts[0];
+  assert.equal(part?.type === "reasoning" ? part.text : undefined, "Verify 480p then poll. Poll until done. Wait for completion. Fast finish.");
+});
+
 test("ACP history keeps Grok thinking separate from final output", () => {
   const accumulator = createMessageAccumulator();
   const metadata = { promptId: "prompt-1" };
@@ -113,6 +132,32 @@ test("ACP history keeps Grok thinking separate from final output", () => {
   assert.deepEqual(message?.parts, [
     { type: "reasoning", text: "Inspecting the project", redacted: false },
     { type: "text", text: "Final answer" },
+  ]);
+});
+
+test("ACP history preserves alternating reasoning and assistant text chronology", () => {
+  const accumulator = createMessageAccumulator();
+  const append = (text: string, partType: "text" | "reasoning") => appendAcpContentChunk(
+    "host_1",
+    "grok-session-1",
+    "assistant",
+    { content: { type: "text", text } },
+    accumulator,
+    new Date("2026-08-07T10:00:00Z"),
+    true,
+    "assistant_prompt_prompt-1",
+    partType,
+  );
+
+  append("First thought", "reasoning");
+  append("Visible update", "text");
+  append("Second thought", "reasoning");
+
+  const message = completeAcpMessages(accumulator)[0];
+  assert.deepEqual(message?.parts, [
+    { type: "reasoning", text: "First thought", redacted: false },
+    { type: "text", text: "Visible update" },
+    { type: "reasoning", text: "Second thought", redacted: false },
   ]);
 });
 

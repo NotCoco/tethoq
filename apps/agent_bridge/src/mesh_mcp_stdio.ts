@@ -12,6 +12,32 @@ const boundParentSessionId = process.env.UAR_MESH_PARENT_SESSION_ID;
 const bindingId = process.env.UAR_MESH_BINDING_ID;
 const server = new McpServer({ name: "uar-mesh", version: "0.1.0" });
 
+server.registerTool("mesh_list_sessions", {
+  title: "Find Tethoq tasks",
+  description: "Find other indexed Tethoq tasks on this host without scanning folders or session databases.",
+  inputSchema: {
+    query: z.string().max(200).optional(),
+    limit: z.number().int().min(1).max(25).optional(),
+    parent_session_id: z.string().optional(),
+  },
+}, async ({ query, limit, parent_session_id }) => result(await call(parent_session_id, "mesh_list_sessions", {
+  ...(query !== undefined ? { query } : {}),
+  ...(limit !== undefined ? { limit } : {}),
+})));
+
+server.registerTool("mesh_message_session", {
+  title: "Message Tethoq task",
+  description: "Send an isolated, queue-safe message to another indexed Tethoq task.",
+  inputSchema: {
+    target_session_id: z.string().min(1).max(16_384),
+    message: z.string().min(1).max(32_000),
+    request_id: z.string().min(1).max(256),
+    parent_session_id: z.string().optional(),
+  },
+}, async ({ target_session_id, message, request_id, parent_session_id }) => result(await call(parent_session_id, "mesh_message_session", {
+  target_session_id, message, request_id,
+})));
+
 server.registerTool("mesh_list_children", {
   title: "List delegated children",
   description: "List the cross-harness child sessions delegated by this parent, including stable IDs and live states.",
@@ -118,6 +144,9 @@ await server.connect(new StdioServerTransport());
 async function call(parentSessionId: string | undefined, tool: string, input: JsonObject) {
   if (bindingId !== undefined && bindingId.length > 0) {
     return await callMeshToolGateway(pipePath, token, undefined, tool, input, bindingId);
+  }
+  if (tool === "mesh_message_session" && boundParentSessionId === undefined) {
+    throw new Error("Cross-task messaging requires a Tethoq session-bound tool connection");
   }
   const resolvedParent = boundParentSessionId ?? parentSessionId;
   if (resolvedParent === undefined || resolvedParent.length === 0) throw new Error("parent_session_id is required for this shared mesh tool server");

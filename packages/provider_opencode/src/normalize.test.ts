@@ -95,3 +95,22 @@ test("OpenCode SSE parser yields every documented global event fixture", async (
     return typeof payload === "object" && payload !== null && "type" in payload ? payload.type : undefined;
   }), ["server.connected", "message.part.updated", "permission.updated"]);
 });
+
+test("OpenCode HTTP errors do not expose upstream response content", async () => {
+  const upstreamCredential = ["provider", "credential", "fixture"].join("-");
+  const upstreamPrompt = "confidential upstream prompt fixture";
+  const fetchLike: FetchLike = async () => new Response(JSON.stringify({
+    error: { message: `${upstreamCredential}: ${upstreamPrompt}` },
+  }), { status: 429 });
+  const client = new OpenCodeHttpClient({ baseUrl: "http://127.0.0.1:4096/", fetch: fetchLike });
+
+  await assert.rejects(client.request("POST", "/session", { body: { prompt: "Trigger a safe error" } }), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.message, "OpenCode returned 429");
+    assert.equal((error as { readonly code?: unknown }).code, "HTTP_429");
+    assert.equal((error as { readonly retryable?: unknown }).retryable, true);
+    assert.doesNotMatch(error.message, new RegExp(upstreamCredential, "u"));
+    assert.doesNotMatch(error.message, new RegExp(upstreamPrompt, "u"));
+    return true;
+  });
+});

@@ -72,6 +72,7 @@ function demoContext(sessionId: string, thresholdTokens = 96_000): SessionContex
     supportsManualCompaction: true,
     supportsThreshold: true,
     isCompacting: false,
+    compactionKind: null,
     updatedAt: new Date().toISOString(),
     usage: { inputTokens: 39_100, outputTokens: 3_700, totalTokens: 42_800, cost: 0.42, currency: "USD" },
   };
@@ -92,7 +93,7 @@ export async function request(type: string, payload: JsonObject = {}): Promise<R
       targets: [{
         providerId: "codex",
         displayName: "OpenAI Codex",
-        models: [{ id: "gpt-5.6-sol", providerId: "codex", displayName: "GPT-5.6 Sol", isDefault: true, inputModalities: ["text", "image"], nativeMetadata: { supportedReasoningEfforts: ["Low", "Medium", "High", "Ultra"] } }],
+        models: [{ id: "gpt-5.6-sol", providerId: "codex", displayName: "GPT-5.6 Sol", isDefault: true, inputModalities: ["text", "image"], nativeMetadata: { supportedReasoningEfforts: ["Low", "Medium", "High", "Ultra"], defaultReasoningEffort: "Medium" } }],
       }],
     };
     if (type === "session.vision.configure") {
@@ -101,12 +102,63 @@ export async function request(type: string, payload: JsonObject = {}): Promise<R
     }
     if (type === "session.context.get") {
       const sessionId = typeof payload.sessionId === "string" ? payload.sessionId : "";
-      return { context: demoContext(sessionId) };
+      const context = demoContext(sessionId);
+      if (location.hash === "#trace-compacting") {
+        context.isCompacting = true;
+        context.compactionKind = "automatic";
+      }
+      return { context };
     }
     if (type === "session.context.set_threshold") {
       const sessionId = typeof payload.sessionId === "string" ? payload.sessionId : "";
       const thresholdTokens = finiteNumber(payload.thresholdTokens) ?? 96_000;
       return { context: demoContext(sessionId, thresholdTokens) };
+    }
+    if (type === "dictation.source.list" || type === "dictation.source.configure") return {
+      sources: [
+        {
+          id: "openai-stt",
+          label: "OpenAI speech-to-text",
+          status: "needs_credential",
+          setupEnvironmentVariable: "TETHOQ_OPENAI_API_KEY",
+          credential: { kind: "api_key", label: "OpenAI API key", setupUrl: "https://platform.openai.com/api-keys" },
+          capabilities: { batch: true, maxAudioBytes: 4 * 1024 * 1024 },
+        },
+        {
+          id: "xai-stt",
+          label: "xAI speech-to-text",
+          status: "needs_credential",
+          setupEnvironmentVariable: "XAI_API_KEY",
+          credential: { kind: "api_key", label: "xAI API key", setupUrl: "https://console.x.ai/" },
+          capabilities: { batch: true, maxAudioBytes: 25 * 1024 * 1024 },
+        },
+      ],
+    };
+    if (type === "session.children") {
+      const parentSessionId = typeof payload.sessionId === "string" ? payload.sessionId : "desktop-harness";
+      const parent = demoSnapshot.sessions.find((session) => session.id === parentSessionId) ?? demoSnapshot.sessions[0];
+      return { sessions: parent ? [{
+        id: "preview-subagent-layout",
+        hostId: "desktop-preview",
+        providerId: "codex",
+        providerSessionId: "preview-subagent-layout",
+        title: "Review the desktop layout",
+        project: parent.project,
+        workingDirectory: parent.workingDirectory,
+        state: "working",
+        createdAt: parent.updatedAt,
+        lastActivityAt: parent.updatedAt,
+        preview: "Checking the current spacing and interaction details.",
+        modelId: "gpt-5.6-sol",
+        reasoningEffort: "high",
+        parentSessionId,
+        relationship: { kind: "subagent", sourceSessionId: parentSessionId, strategy: "native" },
+        agentNickname: "Layout review",
+        agentRole: "UI review",
+        needsApproval: false,
+        stale: false,
+        nativeMetadata: {},
+      }] : [] };
     }
     if (type === "wallet.get") {
       const providerId = typeof payload.providerId === "string" ? payload.providerId : "codex";
@@ -120,6 +172,31 @@ export async function request(type: string, payload: JsonObject = {}): Promise<R
       const workingDirectory = typeof payload.workingDirectory === "string" ? payload.workingDirectory : "C:\\Projects\\new-project";
       const instruction = typeof payload.firstInstruction === "string" ? payload.firstInstruction : "";
       return { session: { id: `preview-created-${Date.now()}`, providerId, title: instruction.trim().split(/\r?\n/u)[0]?.slice(0, 72) || "New task", state: instruction ? "working" : "idle", project: workingDirectory.split(/[\\/]/).filter(Boolean).at(-1) ?? "New project", workingDirectory, preview: instruction, lastActivityAt: now, ...(typeof payload.modelId === "string" ? { modelId: payload.modelId } : {}), ...(typeof payload.reasoningEffort === "string" ? { reasoningEffort: payload.reasoningEffort } : {}) } };
+    }
+    if (type === "side_chat.list") return { sessions: [] };
+    if (type === "side_chat.create") {
+      const parentSessionId = typeof payload.parentSessionId === "string" ? payload.parentSessionId : "";
+      const parent = demoSnapshot.sessions.find((session) => session.id === parentSessionId) ?? demoSnapshot.sessions[0];
+      if (!parent) throw new Error("Preview task is unavailable");
+      const prompt = typeof payload.prompt === "string" ? payload.prompt.trim() : "";
+      return { session: { ...parent, id: `preview-side-chat-${Date.now()}`, sessionKind: "side_chat", parentSessionId, title: `Side chat: ${parent.title}`, preview: prompt || "Ask about this task without leaving it.", lastActivityAt: new Date().toISOString() } };
+    }
+    if (type === "side_chat.promote") {
+      const source = demoSnapshot.sessions[0];
+      if (!source) throw new Error("Preview task is unavailable");
+      return { session: { ...source, id: `preview-promoted-${Date.now()}`, sessionKind: "task", title: "Promoted side chat", lastActivityAt: new Date().toISOString() } };
+    }
+    if (type === "message_queue.list" && (location.hash === "#queue-strip" || location.hash === "#queue-new-task")) return { messages: [
+      { id: "preview-queued-image", sessionId: payload.sessionId, content: "Review the latest desktop layout\nKeep the controls quiet until hover.", state: "queued", attachments: [{ id: "preview-image" }] },
+      { id: "preview-queued-text", sessionId: payload.sessionId, content: "Update the release notes after the review", state: "queued", attachments: [] },
+    ] };
+    if (type === "message_queue.list") return { messages: [] };
+    if (type === "message_queue.edit") return { message: { id: payload.messageId, content: payload.content } };
+    if (type === "message_queue.deliver") return { delivered: true };
+    if (type === "message_queue.move_to_new_task") {
+      const source = demoSnapshot.sessions[0];
+      if (!source) throw new Error("Preview task is unavailable");
+      return { session: { ...source, id: `preview-queued-task-${Date.now()}`, providerId: typeof payload.providerId === "string" ? payload.providerId : source.providerId, title: "Review the latest desktop layout", preview: "Review the latest desktop layout", state: "working", lastActivityAt: new Date().toISOString(), ...(typeof payload.modelId === "string" ? { modelId: payload.modelId } : {}), ...(typeof payload.reasoningEffort === "string" ? { reasoningEffort: payload.reasoningEffort } : {}) } };
     }
     if (type === "session.send_message") return { accepted: true };
     return {};
@@ -149,6 +226,7 @@ function mapSessionContext(value: unknown): SessionContextState {
     supportsManualCompaction: boolean(context.supportsManualCompaction),
     supportsThreshold: boolean(context.supportsThreshold),
     isCompacting: boolean(context.isCompacting),
+    compactionKind: context.compactionKind === "automatic" || context.compactionKind === "manual" ? context.compactionKind : null,
     updatedAt: string(context.updatedAt, new Date(0).toISOString()),
     usage: mappedUsage,
   };
@@ -192,12 +270,18 @@ function sessionState(value: string): SessionState {
   return value === "disconnected" || value === "unknown" ? "offline" : value as SessionState;
 }
 
-function mapSession(value: RemoteSession): Session | null {
-  if (value.parentSessionId) return null;
+function mapSession(value: RemoteSession, includeDerived = false): Session | null {
+  const sessionKind = value.sessionKind ?? "task";
+  if (sessionKind === "internal" || (!includeDerived && value.parentSessionId && sessionKind !== "side_chat")) return null;
   const metadata = object(value.nativeMetadata);
   const contextSummary = string(value.contextHandoffSummary) || string(metadata.tethoqHandoffSummary);
   return {
     id: value.id,
+    sessionKind,
+    ...(value.parentSessionId ? { parentSessionId: value.parentSessionId } : {}),
+    ...(value.relationship ? { relationshipKind: value.relationship.kind } : {}),
+    ...(value.agentNickname ? { agentNickname: value.agentNickname } : {}),
+    ...(value.agentRole ? { agentRole: value.agentRole } : {}),
     providerId: value.providerId,
     title: value.title,
     state: sessionState(value.state),
@@ -315,8 +399,20 @@ function nativeMetadataText(message: RemoteMessage, ...keys: string[]): string |
   return undefined;
 }
 
+function timelineOrigin(message: RemoteMessage): TimelineItem["origin"] | undefined {
+  const origin = message.origin;
+  if (!origin || origin.kind !== "cross_session" || typeof origin.envelopeId !== "string" || typeof origin.sourceSessionId !== "string" || typeof origin.sourceTitle !== "string") return undefined;
+  return {
+    kind: "cross_session",
+    envelopeId: origin.envelopeId,
+    sourceSessionId: origin.sourceSessionId,
+    sourceTitle: origin.sourceTitle,
+  };
+}
+
 function mapPart(message: RemoteMessage, part: ContentPart, index: number): TimelineItem | null {
-  const base = { id: `${message.id}-${index}`, messageId: message.providerMessageId || message.id, timestamp: message.createdAt };
+  const origin = timelineOrigin(message);
+  const base = { id: `${message.id}-${index}`, messageId: message.providerMessageId || message.id, timestamp: message.createdAt, ...(origin ? { origin } : {}) };
   switch (part.type) {
     case "text": {
       if (message.role === "tool") {
@@ -349,6 +445,8 @@ function mapPart(message: RemoteMessage, part: ContentPart, index: number): Time
     }
     case "file":
       return { ...base, kind: "file", title: part.name ?? "Attachment", body: part.mimeType ?? "Attached file", state: "completed" };
+    case "workflow":
+      return null;
   }
 }
 
@@ -366,6 +464,13 @@ export function renderableImageUri(value: unknown): string | undefined {
 
 function mapMessages(messages: RemoteMessage[]): TimelineItem[] {
   return messages.flatMap((message) => {
+    const workflows = message.parts.flatMap((part) => part.type === "workflow" ? [{
+      id: part.workflow.id,
+      name: part.workflow.name,
+      eventCount: part.workflow.eventCount,
+      screenshotCount: part.workflow.screenshotCount,
+      ...(part.workflow.applications?.length ? { applications: part.workflow.applications } : {}),
+    }] : []);
     const images = message.parts.flatMap((part, index) => {
       if (part.type !== "image") return [];
       return mapPart(message, part, index)?.images ?? [];
@@ -375,14 +480,36 @@ function mapMessages(messages: RemoteMessage[]): TimelineItem[] {
       const item = mapPart(message, part, index);
       return item ? [item] : [];
     });
-    if (!images.length) return items;
-    const messageIndex = items.findIndex((item) => item.kind === "user" || item.kind === "assistant");
-    if (messageIndex >= 0) {
-      return items.map((item, index) => index === messageIndex ? { ...item, images: [...(item.images ?? []), ...images] } : item);
+    let mappedItems = items;
+    if (!images.length) {
+      mappedItems = items;
+    } else {
+      const messageIndex = items.findIndex((item) => item.kind === "user" || item.kind === "assistant");
+      if (messageIndex >= 0) {
+        mappedItems = items.map((item, index) => index === messageIndex ? { ...item, images: [...(item.images ?? []), ...images] } : item);
+      } else {
+        const firstImageIndex = message.parts.findIndex((part) => part.type === "image");
+        const imageItem = mapPart(message, message.parts[firstImageIndex]!, firstImageIndex);
+        mappedItems = imageItem ? [...items, { ...imageItem, images }] : items;
+      }
     }
-    const firstImageIndex = message.parts.findIndex((part) => part.type === "image");
-    const imageItem = mapPart(message, message.parts[firstImageIndex]!, firstImageIndex);
-    return imageItem ? [...items, { ...imageItem, images }] : items;
+    if (workflows.length) {
+      const messageIndex = mappedItems.findIndex((item) => item.kind === "user" || item.kind === "assistant");
+      if (messageIndex >= 0) mappedItems = mappedItems.map((item, index) => index === messageIndex ? { ...item, workflows } : item);
+      else mappedItems = [{ id: `${message.id}-workflow`, messageId: message.providerMessageId || message.id, timestamp: message.createdAt, kind: message.role === "assistant" ? "assistant" : "user", body: "", workflows, state: "completed" }, ...mappedItems];
+    }
+
+    let originShown = false;
+    return mappedItems.map((item) => {
+      if (!item.origin) return item;
+      if (!originShown) {
+        originShown = true;
+        return item;
+      }
+      const rest = { ...item };
+      delete rest.origin;
+      return rest;
+    });
   });
 }
 
@@ -427,6 +554,7 @@ function modelOptions(values: unknown): ModelOption[] {
       const item = object(effort);
       return string(item.reasoningEffort || item.id || effort);
     }).filter(Boolean);
+    const defaultEffort = string(metadata.defaultReasoningEffort, string(metadata.default_reasoning_effort));
     const endpointId = string(metadata.endpointId, string(metadata.sourceProviderId, string(model.endpointId)));
     const endpointName = string(metadata.endpointName, string(metadata.sourceProviderName, string(model.endpointName)));
     const source = string(metadata.source, endpointName ? "Direct API" : string(model.source));
@@ -437,7 +565,8 @@ function modelOptions(values: unknown): ModelOption[] {
       id: string(model.id),
       name: string(model.displayName, string(model.id, "CLI default")),
       ...(model.isDefault === true ? { isDefault: true } : {}),
-      efforts: efforts.length ? efforts : ["Default"],
+      efforts,
+      ...(defaultEffort ? { defaultEffort } : {}),
       ...(inputModalities.length ? { inputModalities } : {}),
       ...(endpointId ? { endpointId } : {}),
       ...(endpointName ? { endpointName } : {}),
@@ -463,7 +592,11 @@ export async function loadProviderModels(providers: readonly Provider[]): Promis
 }
 
 export async function loadInitialSnapshot(): Promise<{ snapshot: DesktopSnapshot; bootstrap?: DesktopBootstrap }> {
-  if (isBrowserPreview) return { snapshot: structuredClone(demoSnapshot), bootstrap: structuredClone(demoBootstrap) };
+  if (isBrowserPreview) {
+    const snapshot = structuredClone(demoSnapshot);
+    if (location.hash === "#trace-collapsed" && snapshot.sessions[0]) snapshot.sessions[0].preview = "Building a polished desktop workspace, connecting provider-native controls, and validating the complete compact navigation experience across the current task list.";
+    return { snapshot, bootstrap: structuredClone(demoBootstrap) };
+  }
   const bootstrap = await window.tethoqDesktop.bootstrap();
   const [sessionResponse, approvalsResponse, inputsResponse] = await Promise.all([
     request("sessions.refresh"),
@@ -475,7 +608,7 @@ export async function loadInitialSnapshot(): Promise<{ snapshot: DesktopSnapshot
     connectorMetadata.set(connector.id, { name: connector.name, supportsAttachments: connector.capabilities.attachments });
   }
   const providers = bootstrap.providers.map(mapProvider);
-  const sessions = remoteSessions(sessionResponse.sessions).map(mapSession).filter((session): session is Session => session !== null);
+  const sessions = remoteSessions(sessionResponse.sessions).map((session) => mapSession(session)).filter((session): session is Session => session !== null);
   const models = await loadProviderModels(providers);
   return {
     bootstrap,
@@ -497,9 +630,20 @@ export interface SessionTimelinePage {
   nextCursor: string | null;
 }
 
-export async function loadSessionTimelinePage(sessionId: string, cursor?: string, limit = 40): Promise<SessionTimelinePage> {
-  if (isBrowserPreview) return { items: demoSnapshot.timelines[sessionId] ?? [], nextCursor: null };
-  const payload = await request("session.open", { sessionId, limit, ...(cursor ? { cursor } : {}) });
+export async function loadSessionTimelinePage(sessionId: string, cursor?: string, limit = 40, refresh = false): Promise<SessionTimelinePage> {
+  if (isBrowserPreview) {
+    const baseItems = demoSnapshot.timelines[sessionId] ?? [];
+    const items = location.hash === "#workflow-message" && sessionId === "desktop-harness"
+      ? baseItems.map((item, index) => index === 0 ? { ...item, workflows: [{ id: "preview-workflow-capture", name: "Test sending comment", eventCount: 442, screenshotCount: 18, applications: ["Codex", "Tethoq"] }] } : item)
+      : baseItems;
+    return {
+      items: location.hash === "#trace-compacted"
+        ? [...items, { id: `${sessionId}:automatic-compaction`, timestamp: new Date().toISOString(), kind: "assistant", title: "System", body: "Context automatically compacted", state: "completed" }]
+        : items,
+      nextCursor: null,
+    };
+  }
+  const payload = await request("session.open", { sessionId, limit, ...(cursor ? { cursor } : {}), ...(refresh ? { refresh: true } : {}) });
   return {
     items: mapMessages(await hydrateHistoryImages(sessionId, remoteMessages(payload.messages))),
     nextCursor: typeof payload.nextCursor === "string" ? payload.nextCursor : null,
@@ -611,6 +755,10 @@ function messageKind(event: AgentEvent): "assistant" | "reasoning" {
 
 export function eventToTimeline(event: AgentEvent): TimelineItem | null {
   const sessionId = event.sessionId ?? "host";
+  if (event.type === "context.compaction_completed") {
+    const automatic = event.payload.kind === "automatic";
+    return { id: `${sessionId}:compaction:${event.eventId}`, timestamp: event.occurredAt, kind: "assistant", title: "System", body: automatic ? "Context automatically compacted" : "Context compacted", state: "completed" };
+  }
   if (event.type.startsWith("tool.")) {
     const item = object(event.payload.item);
     const part = object(array(event.payload.parts)[0]);
@@ -647,7 +795,47 @@ export function subscribeToDesktop(
   onBatch: (batch: DesktopEventBatch) => void,
   onRuntime: (state: DesktopRuntimeState) => void,
 ): () => void {
-  if (isBrowserPreview) return () => undefined;
+  if (isBrowserPreview) {
+    if (location.hash === "#message-error") {
+      const error = window.setTimeout(() => onBatch({
+        latestSequence: 1,
+        replayGap: false,
+        events: [{
+          sequence: 1,
+          eventId: "visual-agent-error",
+          type: "agent.error",
+          hostId: "desktop-preview",
+          providerId: "codex",
+          sessionId: "desktop-harness",
+          occurredAt: new Date().toISOString(),
+          payload: { message: "exceeded retry limit, last status: 429 Too Many Requests, request id: visual-request-secret" },
+        }],
+      }), 60);
+      return () => window.clearTimeout(error);
+    }
+    if (location.hash !== "#composer-stream-follow") return () => undefined;
+    const streamPart = (start: number, count: number) => Array.from({ length: count }, (_, index) => `Streaming layout line ${start + index + 1}: keeping the current answer readable above the composer.\n`).join("");
+    const emit = (sequence: number, delta: string) => onBatch({
+      latestSequence: sequence,
+      replayGap: false,
+      events: [{
+        sequence,
+        eventId: `visual-stream-${sequence}`,
+        type: "message.delta",
+        hostId: "desktop-preview",
+        providerId: "codex",
+        sessionId: "desktop-harness",
+        occurredAt: new Date(Date.now() + sequence).toISOString(),
+        payload: { messageId: "visual-stream", delta },
+      }],
+    });
+    const first = window.setTimeout(() => emit(1, `QA_STREAM_START\n${streamPart(0, 20)}`), 40);
+    const second = window.setTimeout(() => emit(2, `${streamPart(20, 20)}QA_STREAM_END`), 100);
+    return () => {
+      window.clearTimeout(first);
+      window.clearTimeout(second);
+    };
+  }
   const removeBatch = window.tethoqDesktop.onEventBatch(onBatch);
   const removeRuntime = window.tethoqDesktop.onRuntimeState(onRuntime);
   return () => { removeBatch(); removeRuntime(); };
@@ -684,7 +872,22 @@ export async function refreshProviders(): Promise<Provider[]> {
 export async function refreshSessions(): Promise<Session[]> {
   if (isBrowserPreview) return demoSnapshot.sessions;
   const payload = await request("sessions.refresh");
-  return remoteSessions(payload.sessions).map(mapSession).filter((session): session is Session => session !== null);
+  return remoteSessions(payload.sessions).map((session) => mapSession(session)).filter((session): session is Session => session !== null);
+}
+
+/** Read the bridge's live session index without reconnecting or refreshing providers. */
+export async function listSessions(): Promise<Session[]> {
+  if (isBrowserPreview) return demoSnapshot.sessions;
+  const payload = await request("sessions.list");
+  return remoteSessions(payload.sessions).map((session) => mapSession(session)).filter((session): session is Session => session !== null);
+}
+
+/** Load real child tasks on demand without exposing hidden helpers in the main task list. */
+export async function listChildSessions(sessionId: string): Promise<Session[]> {
+  const payload = await request("session.children", { sessionId });
+  return remoteSessions(payload.sessions)
+    .map((session) => mapSession(session, true))
+    .filter((session): session is Session => session !== null && session.relationshipKind === "subagent");
 }
 
 export { boolean, object, string };

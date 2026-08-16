@@ -32,7 +32,7 @@ export const providers: Provider[] = [
     id: "grok",
     name: "Grok Build",
     version: "1.0",
-    state: "online",
+    state: globalThis.location?.hash === "#settings-agents" ? "offline" : "online",
     detected: true,
     authenticated: true,
     executable: "grok.exe",
@@ -363,10 +363,10 @@ export const demoSnapshot: DesktopSnapshot = {
       { id: "gpt-5.6-sol", name: "GPT-5.6 Sol", efforts: ["Low", "Medium", "High", "Ultra"] },
       { id: "gpt-5.6-terra", name: "GPT-5.6 Terra", efforts: ["Low", "Medium", "High", "Ultra"] },
     ],
-    opencode: [{ id: "opencode-default", name: "OpenCode default", efforts: ["Default", "High"] }],
-    grok: [{ id: "grok-code", name: "Grok Code", efforts: ["Default"] }],
+    opencode: [{ id: "openai/gpt-5.5", name: "GPT-5.5", efforts: [], endpointId: "openai", endpointName: "OpenAI", source: "OpenCode" }],
+    grok: [{ id: "grok-code", name: "Grok Code", efforts: [] }],
     direct: [
-      { id: "openai::gpt-5.6-sol", name: "GPT-5.6 Sol", efforts: ["Low", "Medium", "High"], inputModalities: ["text", "image"], endpointId: "openai", endpointName: "OpenAI API", source: "Direct API", walletKind: "user_api", apiKeyConfigured: false, caution: "Add an OpenAI API key before use." },
+      { id: "openai::gpt-5.6-sol", name: "GPT-5.6 Sol", efforts: ["Low", "Medium", "High"], inputModalities: ["text", "image"], endpointId: "openai", endpointName: "OpenAI API", source: "Direct API", walletKind: "user_api", apiKeyConfigured: true },
       { id: "vercel::zai/glm-5.2", name: "GLM-5.2 via Vercel", efforts: ["Default"], endpointId: "vercel", endpointName: "Vercel AI Gateway", source: "Direct API", walletKind: "user_api", apiKeyConfigured: false },
     ],
     "tethoq-example": [

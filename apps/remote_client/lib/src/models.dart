@@ -45,6 +45,7 @@ class RemoteSession {
     this.agentRole,
     this.relationship,
     this.contextHandoffSummary,
+    this.sessionKind = 'task',
   });
 
   factory RemoteSession.fromJson(Object? value) {
@@ -52,6 +53,11 @@ class RemoteSession {
     final nativeMetadata = json['nativeMetadata'] is Map<Object?, Object?>
         ? jsonMap(json['nativeMetadata'], name: 'session metadata')
         : const <String, Object?>{};
+    final relationship = json['relationship'] is Map<Object?, Object?>
+        ? SessionRelationship.fromJson(json['relationship'])
+        : null;
+    final declaredKind = optionalString(json, 'sessionKind') ??
+        optionalString(nativeMetadata, 'sessionKind');
     return RemoteSession(
       id: requireString(json, 'id'),
       hostId: requireString(json, 'hostId'),
@@ -73,12 +79,12 @@ class RemoteSession {
       parentSessionId: optionalString(json, 'parentSessionId'),
       agentNickname: optionalString(json, 'agentNickname'),
       agentRole: optionalString(json, 'agentRole'),
-      relationship: json['relationship'] is Map<Object?, Object?>
-          ? SessionRelationship.fromJson(json['relationship'])
-          : null,
+      relationship: relationship,
       contextHandoffSummary: optionalString(json, 'contextHandoffSummary') ??
           optionalString(nativeMetadata, 'contextHandoffSummary') ??
           optionalString(nativeMetadata, 'tethoqHandoffSummary'),
+      sessionKind: declaredKind ??
+          (relationship?.kind == 'side_chat' ? 'side_chat' : 'task'),
     );
   }
 
@@ -101,6 +107,7 @@ class RemoteSession {
     String? agentRole,
     SessionRelationship? relationship,
     String? contextHandoffSummary,
+    String? sessionKind,
   }) =>
       RemoteSession(
         id: id ?? this.id,
@@ -124,6 +131,7 @@ class RemoteSession {
         relationship: relationship ?? this.relationship,
         contextHandoffSummary:
             contextHandoffSummary ?? this.contextHandoffSummary,
+        sessionKind: sessionKind ?? this.sessionKind,
       );
 
   final String id;
@@ -146,6 +154,7 @@ class RemoteSession {
   final String? agentRole;
   final SessionRelationship? relationship;
   final String? contextHandoffSummary;
+  final String sessionKind;
 }
 
 class ContextHandoffResult {
@@ -242,6 +251,7 @@ class SessionContextState {
     required this.updatedAt,
     required this.usage,
     this.modelId,
+    this.compactionKind,
   });
 
   factory SessionContextState.fromJson(Object? value) {
@@ -261,6 +271,10 @@ class SessionContextState {
       supportsManualCompaction: json['supportsManualCompaction'] == true,
       supportsThreshold: json['supportsThreshold'] == true,
       isCompacting: json['isCompacting'] == true,
+      compactionKind: json['compactionKind'] == 'automatic' ||
+              json['compactionKind'] == 'manual'
+          ? json['compactionKind'] as String
+          : null,
       updatedAt: DateTime.tryParse(optionalString(json, 'updatedAt') ?? '') ??
           DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
       usage: SessionUsageTotals.fromJson(json['usage']),
@@ -277,6 +291,7 @@ class SessionContextState {
   final bool supportsManualCompaction;
   final bool supportsThreshold;
   final bool isCompacting;
+  final String? compactionKind;
   final DateTime updatedAt;
   final SessionUsageTotals usage;
 }
@@ -357,6 +372,8 @@ class ContentPart {
         return optionalString(data, 'summary') ??
             optionalString(data, 'action') ??
             'Agent activity';
+      case 'workflow':
+        return '';
       default:
         return data.toString();
     }
@@ -386,11 +403,72 @@ class RemoteAttachment {
       };
 }
 
+class SimplifySettings {
+  factory SimplifySettings({
+    int maxWords = defaultMaxWords,
+    String? guidance,
+  }) {
+    final normalizedGuidance = guidance
+        ?.replaceAll(RegExp(r'[\u0000-\u001f\u007f]'), ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    final boundedGuidance = normalizedGuidance == null ||
+            normalizedGuidance.isEmpty
+        ? null
+        : normalizedGuidance.substring(
+            0,
+            normalizedGuidance.length.clamp(0, maximumGuidanceLength).toInt(),
+          );
+    return SimplifySettings._(
+      maxWords.clamp(1, maximumMaxWords).toInt(),
+      boundedGuidance,
+    );
+  }
+
+  const SimplifySettings._(this.maxWords, this.guidance);
+
+  static const int defaultMaxWords = 100;
+  static const int maximumMaxWords = 2000;
+  static const int maximumGuidanceLength = 600;
+
+  final int maxWords;
+  final String? guidance;
+
+  JsonMap toJson() => <String, Object?>{
+        'maxWords': maxWords,
+        if (guidance != null) 'guidance': guidance,
+      };
+}
+
+final RegExp _simplifyCommand = RegExp(
+  r'(^|[\s(])/simplify\b[,:;]?',
+  caseSensitive: false,
+);
+
+String simplifyVisibleContent(String value) {
+  final source = value.trim();
+  if (!_simplifyCommand.hasMatch(source)) return source;
+  final content = source
+      .replaceAllMapped(
+        _simplifyCommand,
+        (match) => match.group(1) ?? '',
+      )
+      .replaceAllMapped(
+        RegExp(r'[ \t]+([,.;!?])'),
+        (match) => match.group(1)!,
+      )
+      .replaceAll(RegExp(r'[ \t]{2,}'), ' ')
+      .replaceFirst(RegExp(r'^\s*[,;:]\s*'), '')
+      .trim();
+  return content.isEmpty ? 'Simplify the previous answer.' : content;
+}
+
 class RemoteQueuedAttachment {
   const RemoteQueuedAttachment({
     required this.name,
     required this.mimeType,
     required this.byteLength,
+    this.dataBase64,
   });
 
   factory RemoteQueuedAttachment.fromJson(Object? value) {
@@ -403,12 +481,28 @@ class RemoteQueuedAttachment {
       name: requireString(json, 'name'),
       mimeType: requireString(json, 'mimeType'),
       byteLength: byteLength.toInt(),
+      dataBase64: optionalString(json, 'dataBase64'),
     );
   }
 
   final String name;
   final String mimeType;
   final int byteLength;
+  final String? dataBase64;
+
+  String? get localImageDataUri {
+    final encoded = dataBase64;
+    if (encoded == null || encoded.isEmpty || byteLength <= 0) return null;
+    if (!RegExp(r'^image/[a-z0-9.+-]+$', caseSensitive: false)
+        .hasMatch(mimeType)) {
+      return null;
+    }
+    if (encoded.length != ((byteLength + 2) ~/ 3) * 4 ||
+        !RegExp(r'^[A-Za-z0-9+/]*={0,2}$').hasMatch(encoded)) {
+      return null;
+    }
+    return 'data:$mimeType;base64,$encoded';
+  }
 }
 
 class RemoteQueuedMessage {
@@ -462,6 +556,7 @@ class RemoteMessage {
     required this.status,
     this.editable = false,
     this.providerMessageId,
+    this.origin,
   });
 
   factory RemoteMessage.fromJson(Object? value) {
@@ -478,6 +573,7 @@ class RemoteMessage {
       status: requireString(json, 'status'),
       editable: json['editable'] == true,
       providerMessageId: optionalString(json, 'providerMessageId'),
+      origin: _messageOriginFromJson(json),
     );
   }
 
@@ -489,6 +585,57 @@ class RemoteMessage {
   final String status;
   final bool editable;
   final String? providerMessageId;
+  final RemoteMessageOrigin? origin;
+}
+
+class RemoteMessageOrigin {
+  const RemoteMessageOrigin({
+    required this.kind,
+    required this.sourceSessionId,
+    this.sourceTitle,
+    this.envelopeId,
+  });
+
+  factory RemoteMessageOrigin.fromJson(Object? value) {
+    final json = jsonMap(value, name: 'message origin');
+    return RemoteMessageOrigin(
+      kind: optionalString(json, 'kind') ?? 'cross_session',
+      sourceSessionId: optionalString(json, 'sourceSessionId') ??
+          optionalString(json, 'sessionId') ??
+          '',
+      sourceTitle: optionalString(json, 'sourceTitle') ??
+          optionalString(json, 'title') ??
+          optionalString(json, 'taskTitle'),
+      envelopeId: optionalString(json, 'envelopeId'),
+    );
+  }
+
+  final String kind;
+  final String sourceSessionId;
+  final String? sourceTitle;
+  final String? envelopeId;
+}
+
+RemoteMessageOrigin? _messageOriginFromJson(JsonMap json) {
+  final direct = json['origin'];
+  if (direct is Map<Object?, Object?>) {
+    return RemoteMessageOrigin.fromJson(direct);
+  }
+  final metadata = json['nativeMetadata'];
+  if (metadata is Map<Object?, Object?>) {
+    final native = jsonMap(metadata, name: 'message metadata');
+    if (native['origin'] is Map<Object?, Object?>) {
+      return RemoteMessageOrigin.fromJson(native['origin']);
+    }
+  }
+  final sourceSessionId = optionalString(json, 'originSessionId');
+  final sourceTitle = optionalString(json, 'originTitle');
+  if (sourceSessionId == null && sourceTitle == null) return null;
+  return RemoteMessageOrigin(
+    kind: 'cross_session',
+    sourceSessionId: sourceSessionId ?? '',
+    sourceTitle: sourceTitle,
+  );
 }
 
 class ReasoningEffortOption {
@@ -545,7 +692,7 @@ class RemoteModel {
   List<ReasoningEffortOption> get reasoningEfforts =>
       jsonList(nativeMetadata['supportedReasoningEfforts'])
           .map(ReasoningEffortOption.fromJson)
-          .where((option) => option.id != 'default')
+          .where((option) => _isConcreteReasoningEffort(option.id))
           .toList(growable: false);
 
   String? get defaultReasoningEffort =>
@@ -600,6 +747,17 @@ class RemoteModel {
       optionalString(nativeMetadata, 'sourceName') ??
       optionalString(nativeMetadata, 'sourceProviderName') ??
       endpointId;
+}
+
+bool _isConcreteReasoningEffort(String value) {
+  final normalized = value.trim().toLowerCase().replaceAll('_', '-');
+  return normalized.isNotEmpty &&
+      normalized != 'auto' &&
+      normalized != 'automatic' &&
+      normalized != 'default' &&
+      normalized != 'model-default' &&
+      normalized != 'unknown' &&
+      normalized != 'unspecified';
 }
 
 class ProviderWalletEndpoint {
@@ -825,6 +983,8 @@ class TranscriptionSource {
     required this.setupEnvironmentVariable,
     required this.supportsBatch,
     required this.maxAudioBytes,
+    this.credentialLabel,
+    this.credentialSetupUrl,
   });
 
   factory TranscriptionSource.fromJson(Object? value) {
@@ -836,6 +996,9 @@ class TranscriptionSource {
       throw const FormatException(
           'transcription source maxAudioBytes must be positive');
     }
+    final credential = json['credential'] is Map
+        ? jsonMap(json['credential'], name: 'transcription credential')
+        : const <String, Object?>{};
     return TranscriptionSource(
       id: requireString(json, 'id'),
       label: requireString(json, 'label'),
@@ -843,6 +1006,8 @@ class TranscriptionSource {
       setupEnvironmentVariable: requireString(json, 'setupEnvironmentVariable'),
       supportsBatch: capabilities['batch'] == true,
       maxAudioBytes: maxAudioBytes.toInt(),
+      credentialLabel: optionalString(credential, 'label'),
+      credentialSetupUrl: optionalString(credential, 'setupUrl'),
     );
   }
 
@@ -852,6 +1017,8 @@ class TranscriptionSource {
   final String setupEnvironmentVariable;
   final bool supportsBatch;
   final int maxAudioBytes;
+  final String? credentialLabel;
+  final String? credentialSetupUrl;
 
   bool get isReady => status == 'ready';
 }

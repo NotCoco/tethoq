@@ -30,9 +30,32 @@ test("workflow rows disclose details accessibly and progressively", async () => 
   assert.match(component, /aria-expanded=\{isSelected\}/);
   assert.match(component, /aria-controls=\{detailId\}/);
   assert.match(component, /onSelectWorkflow\(isSelected \? null : workflow\.id\)/);
-  assert.match(component, /<details className="workflow-capture-details">/);
+  assert.match(component, /<details className="workflow-capture-details" onToggle=/);
   assert.match(component, /<summary>Capture details<\/summary>/);
   assert.match(component, /role="group" aria-label="Capture summary"/);
   assert.match(component, /className="workflow-detail-timing workflow-captured-data"/);
   assert.match(component, /className="workflow-action workflow-close-action"/);
+});
+
+test("capture details lazy-load a named screenshot slider and full preview", async () => {
+  const [component, styles, app] = await Promise.all([
+    source(join("src", "renderer", "src", "WorkflowSettings.tsx")),
+    source(join("src", "renderer", "src", "workflow-settings.css")),
+    source(join("src", "renderer", "src", "App.tsx")),
+  ]);
+
+  assert.match(component, /captureDetailsOpen && workflow\.summary\.screenshotCount > 0/);
+  assert.match(component, /onListScreenshots\(workflow\.id\)/);
+  assert.match(component, /new IntersectionObserver/);
+  assert.match(component, /variant: "thumbnail" \| "full"/);
+  assert.match(component, /role="list"/);
+  assert.match(component, /<small>\{screenshot\.name\}<\/small>/);
+  assert.match(component, /role="dialog" aria-modal="true" aria-label=\{`Preview/);
+  assert.match(component, /aria-label="Previous screenshot"/);
+  assert.match(component, /aria-label="Next screenshot"/);
+  assert.match(styles, /\.workflow-screenshot-strip \{[\s\S]*?grid-auto-flow: column;[\s\S]*?scroll-snap-type: inline mandatory;/);
+  assert.match(styles, /\.workflow-screenshot-strip:hover::-webkit-scrollbar-thumb/);
+  assert.match(styles, /\.workflow-screenshot-lightbox \{[\s\S]*?position: fixed;/);
+  assert.match(app, /type: "screenshots", id/);
+  assert.match(app, /type: "screenshot-data", id, frameId, variant/);
 });

@@ -1,17 +1,31 @@
 import { Notification, type BrowserWindow } from "electron";
 import type { AgentEvent } from "../../../../packages/protocol/src/index.js";
+import type { DesktopAlertLevel } from "../shared/desktop_api.js";
 
-const NOTIFIABLE_EVENTS = new Set<AgentEvent["type"]>([
+const ATTENTION_EVENTS = new Set<AgentEvent["type"]>([
   "approval.requested",
   "user_input.requested",
-  "agent.completed",
   "agent.error",
 ]);
 
-export function notifyForEvents(window: BrowserWindow, events: readonly AgentEvent[]): void {
-  if (window.isFocused() || !Notification.isSupported()) return;
+const ROUTINE_EVENTS = new Set<AgentEvent["type"]>([
+  "agent.completed",
+]);
+
+/**
+ * `attention` keeps every event that stops the work — a decision, a question, a
+ * failure — and drops the ones that only report success.
+ */
+export function isNotifiableEvent(type: AgentEvent["type"], alerts: DesktopAlertLevel): boolean {
+  if (alerts === "off") return false;
+  if (ATTENTION_EVENTS.has(type)) return true;
+  return alerts === "all" && ROUTINE_EVENTS.has(type);
+}
+
+export function notifyForEvents(window: BrowserWindow, events: readonly AgentEvent[], alerts: DesktopAlertLevel): void {
+  if (alerts === "off" || window.isFocused() || !Notification.isSupported()) return;
   for (const event of events) {
-    if (!NOTIFIABLE_EVENTS.has(event.type)) continue;
+    if (!isNotifiableEvent(event.type, alerts)) continue;
     const notification = notificationForEvent(event);
     notification.on("click", () => {
       if (window.isMinimized()) window.restore();

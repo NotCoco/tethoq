@@ -18,6 +18,7 @@ import {
 import {
   ProviderAdapterError,
   ProviderEventHub,
+  providerDeveloperInstructions,
   type AgentProviderAdapter,
   type AuthRequest,
   type AuthResult,
@@ -85,6 +86,7 @@ interface StoredMessage {
   readonly role: "user" | "assistant" | "system";
   readonly text: string;
   readonly images?: readonly StoredAttachment[];
+  readonly workflows?: SendMessageRequest["workflows"];
   readonly reasoning?: string;
   readonly createdAt: string;
 }
@@ -524,6 +526,7 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
       role: "user",
       text: request.content,
       ...(request.attachments?.length ? { images: request.attachments.map((attachment) => ({ ...attachment })) } : {}),
+      ...(request.workflows?.length ? { workflows: request.workflows.map((workflow) => ({ ...workflow })) } : {}),
       createdAt: now,
     };
     await this.mutate(async () => {
@@ -542,7 +545,7 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
     return { accepted: true, providerTurnId, details: [`Using ${definition.name} user API wallet`] };
   }
 
-  public async getSessionContext(providerSessionId: string): Promise<Omit<SessionContextState, "sessionId" | "compactionThresholdTokens" | "minimumThresholdTokens" | "supportsThreshold" | "isCompacting">> {
+  public async getSessionContext(providerSessionId: string): Promise<Omit<SessionContextState, "sessionId" | "compactionThresholdTokens" | "minimumThresholdTokens" | "supportsThreshold" | "isCompacting" | "compactionKind">> {
     const session = await this.requireSession(providerSessionId);
     const usedTokens = session.usage.totalTokens ?? null;
     return {
@@ -625,6 +628,10 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
 
   private async callChatCompletions(session: StoredSession, definition: EndpointDefinition, key: string, request: SendMessageRequest): Promise<{ readonly text: string; readonly reasoning?: string; readonly images: readonly StoredAttachment[]; readonly usage: SessionTokenUsage }> {
     const messages: Record<string, unknown>[] = session.messages.map((message) => chatMessage(message));
+    const developerInstructions = providerDeveloperInstructions(request);
+    if (developerInstructions !== undefined) {
+      messages.splice(Math.max(0, messages.length - 1), 0, { role: "system", content: developerInstructions });
+    }
     const tools = this.directTools(session, "chat_completions");
     let usage: SessionTokenUsage = {};
     for (let round = 0; round < 8; round += 1) {
@@ -673,12 +680,14 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
     }));
     const tools = this.directTools(session, "responses");
     let usage: SessionTokenUsage = {};
+    const developerInstructions = providerDeveloperInstructions(request);
     for (let round = 0; round < 8; round += 1) {
       const body: Record<string, unknown> = {
         model: session.modelId,
         input,
         store: false,
         include: ["reasoning.encrypted_content"],
+        ...(developerInstructions !== undefined ? { instructions: developerInstructions } : {}),
         ...(tools.length > 0 ? { tools } : {}),
         ...(request.reasoningEffort !== undefined && request.reasoningEffort.toLowerCase() !== "default" ? { reasoning: { effort: request.reasoningEffort.toLowerCase() } } : {}),
       };
@@ -903,6 +912,10 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
         ...(image.mimeType !== undefined ? { mimeType: image.mimeType } : {}),
         name: image.name,
       })),
+      ...(message.workflows ?? []).map((workflow): ContentPart => {
+        const { promptReference: _promptReference, ...visibleWorkflow } = workflow;
+        return { type: "workflow", workflow: visibleWorkflow };
+      }),
     ];
     return {
       id: `${this.providerId}/${message.id}`,
@@ -931,8 +944,11 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
           ...(init.headers ?? {}),
         },
       });
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new Error(`API request failed (${response.status})`);
+      }
       const text = await boundedResponseText(response, maximumApiResponseBytes);
-      if (!response.ok) throw new Error(`API request failed (${response.status}): ${text.slice(0, 500)}`);
       return text === "" ? {} : JSON.parse(text) as unknown;
     } finally {
       clearTimeout(timer);

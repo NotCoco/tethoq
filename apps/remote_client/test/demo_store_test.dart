@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -242,6 +242,39 @@ void main() {
     expect(find.text('Default OpenCode model'), findsOneWidget);
     expect(find.text('Model'), findsNothing);
     expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('Agent defaults choose reasoning for future phone tasks',
+      (tester) async {
+    tester.view.physicalSize = const Size(430, 820);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    FlutterSecureStorage.setMockInitialValues(<String, String>{});
+    final store = DemoRemoteAppStore();
+    await store.initialize();
+
+    await tester.pumpWidget(StoreScope(
+      store: store,
+      child: const MaterialApp(home: HostsScreen()),
+    ));
+    await tester.tap(find.byKey(const Key('settings-section-agent-defaults')));
+    await tester.pumpAndSettle();
+
+    final codex = find.byKey(const Key('agent-default-codex'));
+    await tester.ensureVisible(codex);
+    await tester.tap(codex);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('catalog-codex-gpt-5.6-sol')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('agent-default-reasoning-ultra')));
+    await tester.pumpAndSettle();
+
+    expect(store.agentDefaults['codex']?.modelId, 'gpt-5.6-sol');
+    expect(store.agentDefaults['codex']?.reasoningEffort, 'ultra');
+    final prepared = await store.startPreparedSession('codex');
+    expect(prepared.modelId, 'gpt-5.6-sol');
+    expect(prepared.reasoningEffort, 'ultra');
   });
 
   testWidgets('conversation surfaces a transcript loading error',
@@ -797,6 +830,11 @@ MEMORY.md:12-18|note=[Prior app context]
         attachmentIconRect.center.dy, closeTo(attachmentRect.center.dy, 0.5));
     expect(attachmentRect.center.dy, closeTo(composerRect.center.dy, 0.5));
     expect(find.text('NEXT TURN'), findsNothing);
+    expect(find.text('Analyzing'), findsNothing);
+    final reasoning = find.byKey(const ValueKey<String>(
+        'reasoning-toggle-role-assistant-part-0-thinking-0'));
+    tester.widget<InkWell>(reasoning).onTap!();
+    await tester.pump(const Duration(milliseconds: 200));
     expect(find.text('Analyzing'), findsOneWidget);
     expect(find.text('**Analyzing**'), findsNothing);
     expect(find.text('Assistant side'), findsOneWidget);
@@ -810,8 +848,8 @@ MEMORY.md:12-18|note=[Prior app context]
 
     final userAlign = tester.widget<Align>(
         find.byKey(const ValueKey<String>('message-align-role-user')));
-    final assistantAlign = tester.widget<Align>(
-        find.byKey(const ValueKey<String>('message-align-role-assistant')));
+    final assistantAlign = tester.widget<Align>(find.byKey(
+        const ValueKey<String>('message-align-role-assistant-visible-0')));
     expect(userAlign.alignment, Alignment.centerRight);
     expect(assistantAlign.alignment, Alignment.centerLeft);
     expect(
@@ -823,8 +861,8 @@ MEMORY.md:12-18|note=[Prior app context]
 
     final userBubble = tester.widget<Container>(
         find.byKey(const ValueKey<String>('message-bubble-role-user')));
-    final assistantBubble = tester.widget<Container>(
-        find.byKey(const ValueKey<String>('message-bubble-role-assistant')));
+    final assistantBubble = tester.widget<Container>(find.byKey(
+        const ValueKey<String>('message-bubble-role-assistant-visible-0')));
     expect((userBubble.decoration! as BoxDecoration).color,
         isNot((assistantBubble.decoration! as BoxDecoration).color));
 
@@ -1091,12 +1129,9 @@ Please inspect this screenshot.''',
     ));
     await tester.pump(const Duration(milliseconds: 80));
 
-    expect(
-        find.byKey(const ValueKey<String>('artifact-shimmer-newest-artifact')),
-        findsOneWidget);
-    expect(
-        find.byKey(const ValueKey<String>('artifact-shimmer-older-artifact')),
-        findsNothing);
+    expect(find.text('Reasoning'), findsOneWidget);
+    expect(find.text('Earlier reasoning'), findsNothing);
+    expect(find.text('Newest reasoning'), findsNothing);
     expect(find.byType(ShaderMask), findsOneWidget);
 
     store.sessions[sessionIndex] =
@@ -1116,12 +1151,10 @@ Please inspect this screenshot.''',
     store.selectProvider('all');
     await tester.pump();
 
-    expect(
-        find.byKey(const ValueKey<String>('artifact-shimmer-newest-artifact')),
-        findsNothing);
+    expect(find.byType(ShaderMask), findsNothing);
   });
 
-  testWidgets('thinking updates flow without boxes and keep turn identity',
+  testWidgets('thinking updates share one disclosure and keep turn identity',
       (tester) async {
     final store = DemoRemoteAppStore();
     await store.initialize();
@@ -1170,35 +1203,28 @@ Please inspect this screenshot.''',
     ));
     await tester.pump();
 
-    final thinkingContainer = tester.widget<Container>(
-        find.byKey(const ValueKey<String>('message-bubble-thinking-entry')));
-    final thinkingDecoration = thinkingContainer.decoration! as BoxDecoration;
-    expect(thinkingDecoration.border, isNull);
-    final thinkingText = tester.widget<SelectableText>(
-        find.widgetWithText(SelectableText, 'Inspecting live events'));
-    final thinkingStyle = thinkingText.textSpan?.style ?? thinkingText.style;
-    expect(thinkingStyle?.fontStyle, FontStyle.italic);
-    expect(thinkingStyle?.color?.a, lessThan(0.7));
-    expect(find.text('Inspecting live events'), findsOneWidget);
-    expect(find.text('Checking another detail'), findsOneWidget);
+    expect(find.text('Reasoning'), findsOneWidget);
+    expect(find.text('Inspecting live events'), findsNothing);
+    expect(find.text('Checking another detail'), findsNothing);
     expect(find.text('Final response'), findsOneWidget);
     expect(
-        find.byKey(const ValueKey<String>('assistant-identity-thinking-entry')),
+        find.byKey(const ValueKey<String>(
+            'assistant-identity-reasoning-thinking-entry-part-0-thinking-0')),
         findsOneWidget);
-    expect(
-        find.byKey(
-            const ValueKey<String>('assistant-identity-middle-thinking-entry')),
-        findsNothing);
     expect(find.byKey(const ValueKey<String>('assistant-identity-final-entry')),
         findsOneWidget);
     expect(
         find.byKey(const ValueKey<String>('final-answer-boundary-final-entry')),
         findsOneWidget);
-
-    expect(find.byKey(const Key('toggle-thinking-artifacts')), findsNothing);
+    final reasoning = find.byKey(const ValueKey<String>(
+        'reasoning-toggle-thinking-entry-part-0-thinking-0'));
+    tester.widget<InkWell>(reasoning).onTap!();
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(find.text('Inspecting live events'), findsOneWidget);
+    expect(find.text('Checking another detail'), findsOneWidget);
   });
 
-  testWidgets('Grok and OpenCode thinking stays distinct and unboxed',
+  testWidgets('Grok and OpenCode thinking stays private until expanded',
       (tester) async {
     final store = DemoRemoteAppStore();
     await store.initialize();
@@ -1236,25 +1262,36 @@ Please inspect this screenshot.''',
       ));
       await tester.pump();
 
-      expect(find.text('${entry.$2} private thought'), findsOneWidget);
+      expect(find.text('${entry.$2} private thought'), findsNothing);
       expect(find.text('${entry.$2} final output'), findsOneWidget);
-      expect(find.byKey(const Key('toggle-thinking-artifacts')), findsNothing);
-      final privateThought = tester.widget<SelectableText>(
-          find.widgetWithText(SelectableText, '${entry.$2} private thought'));
-      final privateStyle =
-          privateThought.textSpan?.style ?? privateThought.style;
-      expect(privateStyle?.fontStyle, FontStyle.italic);
-      expect(privateStyle?.color?.a, lessThan(0.7));
+      expect(find.text('Reasoning'), findsOneWidget);
       expect(
-          find.byKey(
-              ValueKey<String>('final-answer-boundary-${entry.$1}-assistant')),
+          find.byKey(ValueKey<String>(
+              'final-answer-boundary-${entry.$1}-assistant-visible-0')),
           findsOneWidget);
+      final reasoning = find.byKey(ValueKey<String>(
+          'reasoning-toggle-${entry.$1}-assistant-part-0-thinking-0'));
+      tester.widget<InkWell>(reasoning).onTap!();
+      await tester.pump(const Duration(milliseconds: 200));
+      expect(find.text('${entry.$2} private thought'), findsOneWidget);
     }
   });
 
   testWidgets(
       'conversation markdown renders structure safely and stays bounded on a phone',
       (tester) async {
+    String? clipboardText;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(SystemChannels.platform, (call) async {
+      if (call.method == 'Clipboard.setData') {
+        clipboardText =
+            (call.arguments as Map<Object?, Object?>)['text'] as String?;
+      }
+      return null;
+    });
+    addTearDown(() => TestDefaultBinaryMessengerBinding
+        .instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(SystemChannels.platform, null));
     tester.view.physicalSize = const Size(430, 900);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
@@ -1324,6 +1361,16 @@ const aVeryLongIdentifierForHorizontalScrolling = 'safe';
         ?.call('Blocked link', 'javascript:alert(1)', 'Unsafe scheme');
     await tester.pump();
     expect(find.text('This link type is blocked.'), findsOneWidget);
+
+    markdown.onTapLink
+        ?.call('Desktop file', 'file:///C:/work/main.dart', 'Local path');
+    await tester.pumpAndSettle();
+    expect(find.text('Desktop path'), findsOneWidget);
+    expect(find.byKey(const Key('copy-desktop-path')), findsOneWidget);
+    expect(find.textContaining('cannot open on this phone'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('copy-desktop-path')));
+    await tester.pumpAndSettle();
+    expect(clipboardText, 'file:///C:/work/main.dart');
   });
 
   testWidgets('raw markup-only messages leave no shell but images still render',
@@ -1421,6 +1468,18 @@ const aVeryLongIdentifierForHorizontalScrolling = 'safe';
         ],
         status: 'completed',
       ),
+      RemoteMessage(
+        id: 'automatic-compaction',
+        sessionId: sessionId,
+        role: 'system',
+        createdAt: DateTime.utc(2026, 8, 14, 12, 1),
+        parts: const <ContentPart>[
+          ContentPart(type: 'text', data: <String, Object?>{
+            'text': 'Context automatically compacted',
+          }),
+        ],
+        status: 'completed',
+      ),
     ];
 
     await tester.pumpWidget(StoreScope(
@@ -1434,6 +1493,7 @@ const aVeryLongIdentifierForHorizontalScrolling = 'safe';
             const ValueKey<String>('conversation-boundary-compacted-context')),
         findsOneWidget);
     expect(find.text('Context compacted'), findsOneWidget);
+    expect(find.text('Automatically compacted context'), findsOneWidget);
     expect(find.textContaining('Private raw summary'), findsNothing);
   });
 
@@ -1637,14 +1697,14 @@ const aVeryLongIdentifierForHorizontalScrolling = 'safe';
 
     expect(
       find.text(
-          'No dictation services were reported by this computer. Add an OpenAI or xAI API credential in Tethoq Bridge.'),
+          'No dictation source is enabled. No compatible source is available on this computer.'),
       findsOneWidget,
     );
     expect(find.text('Dictation source'), findsOneWidget);
     expect(recorder.started, isFalse);
   });
 
-  testWidgets('holding the mic chooses a source without starting recording',
+  testWidgets('dictation crescent chooses a source without starting recording',
       (tester) async {
     FlutterSecureStorage.setMockInitialValues(<String, String>{});
     tester.view.physicalSize = const Size(430, 780);
@@ -1666,7 +1726,7 @@ const aVeryLongIdentifierForHorizontalScrolling = 'safe';
     ));
 
     expect(find.byKey(const Key('dictation-menu-badge')), findsOneWidget);
-    await tester.longPress(find.byKey(const Key('dictation-button')));
+    await tester.tap(find.byKey(const Key('dictation-menu-badge')));
     await tester.pump(const Duration(milliseconds: 400));
     expect(find.text('Dictation source'), findsOneWidget);
     expect(
@@ -1681,10 +1741,13 @@ const aVeryLongIdentifierForHorizontalScrolling = 'safe';
           matching: find.byKey(const ValueKey<String>('provider-logo-grok')),
         ),
         findsOneWidget);
-    await tester.tap(find.text('xAI speech-to-text'));
+    tester
+        .widget<InkWell>(
+            find.byKey(const Key('dictation-source-option-openai-stt')))
+        .onTap!();
     await tester.pump(const Duration(milliseconds: 400));
 
-    expect(store.preferredDictationSourceIdForHarness('codex'), 'xai-stt');
+    expect(store.preferredDictationSourceIdForHarness('codex'), 'openai-stt');
     expect(recorder.started, isFalse);
   });
 
@@ -1754,6 +1817,8 @@ const aVeryLongIdentifierForHorizontalScrolling = 'safe';
       setupEnvironmentVariable: 'XAI_API_KEY',
       supportsBatch: true,
       maxAudioBytes: 25 * 1024 * 1024,
+      credentialLabel: 'xAI API key',
+      credentialSetupUrl: 'https://console.x.ai/',
     );
 
     await tester.pumpWidget(StoreScope(
@@ -1780,7 +1845,9 @@ const aVeryLongIdentifierForHorizontalScrolling = 'safe';
     await tester.pumpAndSettle();
 
     expect(find.text('Setup needed'), findsOneWidget);
-    expect(find.text('XAI_API_KEY'), findsOneWidget);
+    expect(find.text('xAI API key'), findsOneWidget);
+    expect(find.textContaining('XAI_API_KEY'), findsNothing);
+    expect(find.byKey(const Key('dictation-api-key-xai-stt')), findsOneWidget);
   });
 
   testWidgets('settings keeps computers and agents quiet until expanded',
@@ -1906,14 +1973,255 @@ const aVeryLongIdentifierForHorizontalScrolling = 'safe';
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 100));
 
-    expect(find.text('QUEUED NEXT'), findsOneWidget);
+    final queueStrip = find.byKey(const Key('queued-instruction-strip'));
+    expect(queueStrip, findsOneWidget);
+    expect(tester.getSize(queueStrip).height, lessThanOrEqualTo(104));
     expect(find.text('Check this after the build'), findsOneWidget);
+    final queued = store.queuedMessagesFor(sessionId).single;
+    expect(
+        tester
+            .getSize(
+                find.byKey(ValueKey<String>('queued-actions-${queued.id}')))
+            .height,
+        greaterThanOrEqualTo(44));
+    expect(
+        tester
+            .getSize(find.byKey(ValueKey<String>('cancel-queued-${queued.id}')))
+            .height,
+        greaterThanOrEqualTo(44));
+    expect(
+        tester.getBottomRight(queueStrip).dy,
+        lessThanOrEqualTo(tester
+            .getTopRight(find.byKey(const Key('session-composer-shell')))
+            .dy));
     expect(find.byKey(const Key('session-secondary-controls')), findsOneWidget);
     expect(store.queuedMessagesFor(sessionId), hasLength(1));
     expect(
         find.byKey(ValueKey<String>(
             'message-bubble-${store.queuedMessagesFor(sessionId).single.id}')),
         findsNothing);
+  });
+
+  testWidgets('cross-task messages show quiet source attribution',
+      (tester) async {
+    final store = DemoRemoteAppStore();
+    await store.initialize();
+    addTearDown(store.dispose);
+    const sessionId = 'demo-codex-api';
+    store.messages[sessionId] = <RemoteMessage>[
+      RemoteMessage(
+        id: 'cross-task-mobile',
+        sessionId: sessionId,
+        role: 'user',
+        createdAt: DateTime.utc(2026, 8, 15, 12),
+        parts: const <ContentPart>[
+          ContentPart(
+              type: 'text',
+              data: <String, Object?>{'text': 'Please verify this change.'}),
+        ],
+        status: 'completed',
+        origin: const RemoteMessageOrigin(
+          kind: 'cross_session',
+          envelopeId: 'envelope-mobile',
+          sourceSessionId: 'source-task',
+          sourceTitle: 'Source task',
+        ),
+      ),
+    ];
+
+    await tester.pumpWidget(StoreScope(
+      store: store,
+      child: const MaterialApp(home: SessionScreen(sessionId: sessionId)),
+    ));
+    await tester.pump();
+
+    expect(find.text('From another Tethoq task · Source task'), findsOneWidget);
+    expect(
+        find.byKey(const ValueKey<String>('message-origin-cross-task-mobile')),
+        findsOneWidget);
+  });
+
+  testWidgets('queued local images show a miniature with metadata fallback',
+      (tester) async {
+    tester.view.physicalSize = const Size(430, 820);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final store = DemoRemoteAppStore();
+    await store.initialize();
+    addTearDown(store.dispose);
+    const sessionId = 'demo-working';
+    const encoded =
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+    final byteLength = base64Decode(encoded).length;
+    store.queuedMessages.addAll(<String, RemoteQueuedMessage>{
+      'thumbnail': RemoteQueuedMessage(
+        id: 'thumbnail',
+        sessionId: sessionId,
+        content: 'Queued with a local image',
+        state: 'queued',
+        createdAt: DateTime.utc(2026, 8, 15, 12),
+        attachments: <RemoteQueuedAttachment>[
+          RemoteQueuedAttachment(
+            name: 'local.png',
+            mimeType: 'image/png',
+            byteLength: byteLength,
+            dataBase64: encoded,
+          ),
+        ],
+      ),
+      'metadata': RemoteQueuedMessage(
+        id: 'metadata',
+        sessionId: sessionId,
+        content: 'Queued with metadata only',
+        state: 'queued',
+        createdAt: DateTime.utc(2026, 8, 15, 12, 0, 1),
+        attachments: <RemoteQueuedAttachment>[
+          RemoteQueuedAttachment(
+            name: 'remote.png',
+            mimeType: 'image/png',
+            byteLength: byteLength,
+          ),
+        ],
+      ),
+    });
+
+    await tester.pumpWidget(StoreScope(
+      store: store,
+      child: const MaterialApp(home: SessionScreen(sessionId: sessionId)),
+    ));
+    await tester.pump();
+
+    expect(find.byKey(const ValueKey<String>('queued-image-preview-thumbnail')),
+        findsOneWidget);
+    final metadataRow =
+        find.byKey(const ValueKey<String>('queued-instruction-metadata'));
+    expect(
+        find.descendant(
+            of: metadataRow, matching: find.byIcon(Icons.image_outlined)),
+        findsOneWidget);
+    expect(find.byKey(const ValueKey<String>('queued-image-preview-metadata')),
+        findsNothing);
+    expect(find.descendant(of: metadataRow, matching: find.text('1')),
+        findsOneWidget);
+  });
+
+  testWidgets('queue actions open a touch-safe hidden side chat',
+      (tester) async {
+    tester.view.physicalSize = const Size(430, 820);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final store = DemoRemoteAppStore();
+    await store.initialize();
+    addTearDown(store.dispose);
+    const sessionId = 'demo-working';
+    final queued = RemoteQueuedMessage(
+      id: 'mobile-queued-actions',
+      sessionId: sessionId,
+      content: 'Review this in a smaller conversation',
+      state: 'queued',
+      createdAt: DateTime.utc(2026, 8, 15, 12),
+      attachments: const <RemoteQueuedAttachment>[
+        RemoteQueuedAttachment(
+          name: 'reference.png',
+          mimeType: 'image/png',
+          byteLength: 128,
+        ),
+      ],
+    );
+    store.queuedMessages[queued.id] = queued;
+
+    await tester.pumpWidget(StoreScope(
+      store: store,
+      child: const MaterialApp(home: SessionScreen(sessionId: sessionId)),
+    ));
+    await tester.pump();
+    expect(find.byKey(const Key('queued-instruction-strip')), findsOneWidget);
+    expect(find.text('Review this in a smaller conversation'), findsOneWidget);
+    expect(
+        find.descendant(
+          of: find.byKey(const Key('queued-instruction-strip')),
+          matching: find.text('1'),
+        ),
+        findsOneWidget);
+
+    await tester.tap(find
+        .byKey(const ValueKey<String>('queued-actions-mobile-queued-actions')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+    for (final key in <String>[
+      'queued-action-edit',
+      'queued-action-deliver',
+      'queued-action-side-chat',
+      'queued-action-new-task',
+      'queued-action-disable-queue',
+    ]) {
+      expect(tester.getSize(find.byKey(Key(key))).height,
+          greaterThanOrEqualTo(44));
+    }
+
+    await tester.tap(find.byKey(const Key('queued-action-new-task')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 700));
+    expect(find.byKey(const Key('queued-new-task-picker')), findsOneWidget);
+    expect(
+        find.byKey(const Key('queued-new-task-model-search')), findsOneWidget);
+    expect(find.text('Codex'), findsWidgets);
+    expect(find.byKey(const Key('queued-new-task-reasoning')), findsOneWidget);
+    await tester.tap(
+        find.byKey(const ValueKey<String>('queued-model-grok-grok/default')));
+    await tester.pump();
+    expect(find.byKey(const Key('queued-new-task-reasoning')), findsNothing);
+    await tester.tap(find.byTooltip('Close'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+
+    await tester.tap(find
+        .byKey(const ValueKey<String>('queued-actions-mobile-queued-actions')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+
+    await tester.tap(find.byKey(const Key('queued-action-side-chat')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.byKey(const Key('side-chat-composer')), findsOneWidget);
+    expect(find.byKey(const Key('promote-side-chat')), findsOneWidget);
+    expect(tester.getSize(find.byKey(const Key('side-chat-attachment'))).height,
+        greaterThanOrEqualTo(44));
+    expect(tester.getSize(find.byKey(const Key('side-chat-dictation'))).height,
+        greaterThanOrEqualTo(44));
+    expect(store.queuedMessagesFor(sessionId), isEmpty);
+    await tester.enterText(
+        find.byKey(const Key('side-chat-composer')), 'Keep this draft');
+    final sideChatId = store.sideChatsFor(sessionId).single.id;
+    expect(store.drafts[sideChatId], 'Keep this draft');
+
+    await tester.tap(find.byTooltip('Close side chat'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pumpWidget(StoreScope(
+      store: store,
+      child: const MaterialApp(home: SessionsScreen()),
+    ));
+    await tester.tap(find.byKey(const Key('task-filter-toggle')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.tap(find.byKey(const Key('task-filter-show-side-chats')));
+    await tester.pump();
+    Navigator.of(tester.element(find.byType(SwitchListTile))).pop();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+    final preview =
+        find.byKey(ValueKey<String>('side-chat-preview-$sideChatId'));
+    expect(preview, findsOneWidget);
+    await tester.tap(preview);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+    final reopenedComposer = tester.widget<TextField>(
+      find.byKey(const Key('side-chat-composer')),
+    );
+    expect(reopenedComposer.controller?.text, 'Keep this draft');
   });
 
   testWidgets('stopped Codex text keeps copy and edit in its long-press menu',
@@ -2006,7 +2314,7 @@ const aVeryLongIdentifierForHorizontalScrolling = 'safe';
     expect(find.text('Old response'), findsNothing);
   });
 
-  testWidgets('/mesh autocompletes only after its prefix is unambiguous',
+  testWidgets('slash palette opens immediately, filters, and inserts on Enter',
       (tester) async {
     final store = DemoRemoteAppStore();
     await store.initialize();
@@ -2016,14 +2324,27 @@ const aVeryLongIdentifierForHorizontalScrolling = 'safe';
       child: const MaterialApp(home: SessionScreen(sessionId: sessionId)),
     ));
 
-    await tester.enterText(find.byKey(const Key('session-composer')), '/me');
+    final composer = find.byKey(const Key('session-composer'));
+    await tester.enterText(composer, '/');
     await tester.pump();
-    expect(find.byKey(const Key('mesh-command-suggestion')), findsNothing);
-
-    await tester.enterText(find.byKey(const Key('session-composer')), '/mes');
-    await tester.pump();
+    expect(find.byKey(const Key('slash-command-palette')), findsOneWidget);
+    expect(
+        find.byKey(const Key('simplify-command-suggestion')), findsOneWidget);
     expect(find.byKey(const Key('mesh-command-suggestion')), findsOneWidget);
-    expect(find.text('Delegate to another connected harness'), findsOneWidget);
+    expect(tester.widget<TextField>(composer).controller!.text, '/');
+
+    await tester.enterText(composer, '/si');
+    await tester.pump();
+    expect(
+        find.byKey(const Key('simplify-command-suggestion')), findsOneWidget);
+    expect(find.byKey(const Key('mesh-command-suggestion')), findsNothing);
+    expect(tester.widget<TextField>(composer).controller!.text, '/si');
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.pump();
+    expect(tester.widget<TextField>(composer).controller!.text, '/simplify ');
+    expect(find.byKey(const Key('slash-command-palette')), findsNothing);
+    expect(find.byKey(const Key('simplify-composer-chip')), findsOneWidget);
   });
 
   testWidgets('delegated work renders as an expandable coordination rail',

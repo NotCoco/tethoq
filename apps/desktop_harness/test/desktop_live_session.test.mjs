@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -225,20 +225,41 @@ test("grounding prompts carry transcript, times, pointer, and hover context", ()
   assert.match(question, /normalized position \(0\.338, 0\.335\)/);
 });
 
-test("preferences default to experimental features off and persist the toggle", async (t) => {
+test("preferences persist experimental, reasoning-display, and concrete agent defaults", async (t) => {
   const path = join(outputDirectory, `preferences-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
   t.after(() => rm(path, { force: true }));
   const store = await preferencesModule.DesktopPreferencesStore.load(path);
   assert.equal(store.value().experimentalFeatures, false);
+  assert.equal(store.value().reasoningDisplay, "compact");
+  assert.equal(store.value().localOpenHandlerId, "system");
+  assert.deepEqual(store.value().agentDefaults, {});
+  assert.equal(store.value().globalAgentsPath, null);
   assert.equal(store.value().version, 1);
   const changed = [];
   store.onChange((value) => changed.push(value));
   await store.setExperimentalFeatures(true);
+  await store.setReasoningDisplay("expanded");
+  await store.setLocalOpenHandler("vscode");
+  await store.setAgentDefault("codex", { modelId: "gpt-5.6-sol", reasoningEffort: "medium" });
   assert.equal(store.value().experimentalFeatures, true);
-  assert.equal(changed.length, 1);
+  assert.equal(store.value().reasoningDisplay, "expanded");
+  assert.equal(store.value().localOpenHandlerId, "vscode");
+  assert.deepEqual(store.value().agentDefaults, { codex: { modelId: "gpt-5.6-sol", reasoningEffort: "medium" } });
+  assert.equal(changed.length, 4);
   const reloaded = await preferencesModule.DesktopPreferencesStore.load(path);
   assert.equal(reloaded.value().experimentalFeatures, true);
-  assert.deepEqual(preferencesModule.validateDesktopPreferences({ version: 9, experimentalFeatures: "yes", extra: 1 }), { version: 1, experimentalFeatures: false });
+  assert.equal(reloaded.value().reasoningDisplay, "expanded");
+  assert.equal(reloaded.value().localOpenHandlerId, "vscode");
+  assert.deepEqual(reloaded.value().agentDefaults, { codex: { modelId: "gpt-5.6-sol", reasoningEffort: "medium" } });
+  assert.deepEqual(preferencesModule.validateDesktopPreferences({ version: 9, experimentalFeatures: "yes", reasoningDisplay: "verbose", localOpenHandlerId: "unknown", agentDefaults: { codex: { modelId: "  gpt-5.6-sol  ", reasoningEffort: " high " }, bad: { modelId: "" } }, extra: 1 }), { version: 1, experimentalFeatures: false, reasoningDisplay: "compact", localOpenHandlerId: "system", closeAction: "tray", launchAtLogin: "off", alerts: "all", agentDefaults: { codex: { modelId: "gpt-5.6-sol", reasoningEffort: "high" } }, globalAgentsPath: null, taskOverrides: {} });
+
+  const agentsPath = join(outputDirectory, "AGENTS.md");
+  await writeFile(agentsPath, "Keep answers calm and concise.\n", "utf8");
+  await store.setGlobalAgentsPath(agentsPath);
+  assert.equal(store.value().globalAgentsPath, agentsPath);
+  assert.equal(await preferencesModule.readGlobalAgentInstructions(agentsPath), "Keep answers calm and concise.\n");
+  await store.setGlobalAgentsPath(null);
+  assert.equal(store.value().globalAgentsPath, null);
 });
 
 test("every instant-session entry point is gated and the backend rejects while disabled", async () => {
@@ -257,6 +278,8 @@ test("every instant-session entry point is gated and the backend rejects while d
 
   // Settings toggle drives the master preference; the panel cannot start while off.
   assert.match(app, /set-experimental-features/);
+  assert.match(app, /set-reasoning-display/);
+  assert.match(app, /Controls how reasoning opens\. It does not change model effort\./);
   assert.match(app, /role="switch"/);
   assert.match(app, /aria-checked=\{preferences\.experimentalFeatures\}/);
   assert.match(livePanel, /disabled=\{!experimental\}/);

@@ -155,7 +155,7 @@ export function EmptyState({ icon, title, description, action }: { icon: ReactNo
 }
 
 export function LoadingState({ label = "Loading your coding tools" }: { label?: string }) {
-  return <div className="loading-state" role="status"><span className="large-spinner" /><strong>{label}</strong><small>Connecting to the local Tethoq runtime…</small></div>;
+  return <div className="loading-state" role="status"><span className="large-spinner" /><strong>{label}</strong><small>Connecting to your coding tools on this computer…</small></div>;
 }
 
 export function ErrorBanner({ title, message, onRetry }: { title: string; message: string; onRetry?: () => void }) {

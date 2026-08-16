@@ -10,6 +10,7 @@ const testDirectory = dirname(fileURLToPath(import.meta.url));
 const appRoot = join(testDirectory, "..");
 const outputDirectory = join(tmpdir(), `tethoq-desktop-renderer-${process.pid}-${Date.now()}`);
 const bridgeBundle = join(outputDirectory, "bridge.mjs");
+const searchBundle = join(outputDirectory, "search-helpers.mjs");
 await mkdir(outputDirectory, { recursive: true });
 
 const calls = [];
@@ -164,10 +165,69 @@ await build({
   target: "node22",
   alias: { "@shared": join(appRoot, "src", "shared") },
 });
+await build({
+  entryPoints: [join(appRoot, "src", "renderer", "src", "search_helpers.ts")],
+  outfile: searchBundle,
+  bundle: true,
+  format: "esm",
+  platform: "node",
+  target: "node22",
+});
+const searchHelpers = await import(`file:///${searchBundle.replaceAll("\\", "/")}`);
 const bridge = await import(`file:///${bridgeBundle.replaceAll("\\", "/")}`);
 process.on("exit", () => { void rm(outputDirectory, { recursive: true, force: true }); });
 
 const source = async (path) => await readFile(join(appRoot, path), "utf8");
+
+test("desktop search stays bounded to normalized in-memory UI metadata", async () => {
+  assert.equal(searchHelpers.normalizeUiSearchQuery(" \u0000 ＤＥＦＡＵＬＴ\t ReAsoning "), "default reasoning");
+  assert.equal(searchHelpers.normalizeUiSearchQuery("x".repeat(400)).length, 160);
+
+  const [app, navigation] = await Promise.all([
+    source(join("src", "renderer", "src", "App.tsx")),
+    source(join("src", "renderer", "src", "NavigationPanels.tsx")),
+  ]);
+  const palette = app.match(/function CommandPalette[\s\S]*?(?=\n\}\n\nexport default)/u)?.[0] ?? "";
+  assert.match(app, /const settingsSearchCatalogue = \[/u);
+  assert.match(app, /default model reasoning effort provider agent/u);
+  // The palette indexes one pre-filtered list; internal, side-chat, and archived
+  // records are excluded before it ever sees them.
+  assert.match(app, /const activeSessions = useMemo\(\(\) => organizedSessions\.filter\(\(session\) => !session\.archived && session\.sessionKind !== "side_chat" && session\.sessionKind !== "internal"\)/u);
+  assert.match(app, /<CommandPalette snapshot=\{snapshot\} sessions=\{activeSessions\}/u);
+  assert.doesNotMatch(palette, /snapshot\.sessions/u);
+  assert.match(palette, /maxLength=\{maximumUiSearchCharacters\}/u);
+  assert.doesNotMatch(palette, /workingDirectory|window\.tethoqDesktop|request\(/u);
+  assert.match(navigation, /maxLength=\{maximumUiSearchCharacters\}/u);
+  assert.doesNotMatch(app.match(/const filteredSessions = useMemo[\s\S]*?\}, \[query/u)?.[0] ?? "", /workingDirectory/u);
+});
+
+test("settings expose only truthful model routes and independent compact cards", async () => {
+  const [defaults, app, navigation, styles] = await Promise.all([
+    source(join("src", "renderer", "src", "AgentDefaultsSettings.tsx")),
+    source(join("src", "renderer", "src", "App.tsx")),
+    source(join("src", "renderer", "src", "NavigationPanels.tsx")),
+    source(join("src", "renderer", "src", "styles.css")),
+  ]);
+
+  assert.match(defaults, /New tasks start here\. Existing tasks keep their latest choices\./u);
+  assert.match(defaults, /model\.walletKind !== "user_api" \|\| model\.apiKeyConfigured === true/u);
+  assert.match(defaults, /API key saved/u);
+  assert.match(defaults, /through \$\{model\.source/u);
+  assert.match(defaults, /<optgroup key=\{label\} label=\{label\}>/u);
+  assert.doesNotMatch(defaults, /Managed by agent/u);
+  assert.match(app, /API key required/u);
+  assert.match(app, /API providers · keys saved/u);
+  assert.doesNotMatch(app, /<small>v\{provider\.version\}<\/small>/u);
+  assert.match(app, /const closeSettings = useCallback/u);
+  assert.match(app, /className="settings-close-button"[^>]*aria-label="Close settings"[^>]*onClick=\{onClose\}/u);
+  assert.match(navigation, /className="sidebar-settings"[^>]*aria-label=\{view === "settings" \? "Close settings" : "Open settings"\}/u);
+  assert.doesNotMatch(navigation, /sidebar-settings \$\{view === "settings" \? "active"/u);
+  assert.match(styles, /\.settings-close-button \{[^}]*position: sticky;[^}]*width: 32px;[^}]*height: 32px;/u);
+  assert.match(styles, /\.settings-page::-webkit-scrollbar \{ width: 10px; \}/u);
+  assert.match(styles, /\.settings-page::-webkit-scrollbar-thumb:hover \{ background: #8a8a83; \}/u);
+  assert.match(styles, /\.settings-list\.provider-settings \{ overflow: visible; \}/u);
+  assert.match(styles, /\.settings-compact-grid \{[^}]*align-items: start;/u);
+});
 
 test("initial renderer snapshot preserves dynamic providers and keyed input answers", async () => {
   calls.length = 0;
@@ -239,10 +299,36 @@ test("desktop context control applies a model-bounded threshold from the enlarge
   assert.match(app, /Sets how full this task can get before it compacts automatically\./);
   assert.match(app, /onClick=\{\(\) => void save\(safeThreshold, true\)\}/);
   assert.match(app, /\} Apply<\/Button>/);
+  assert.match(app, /className="context-usage-tooltip"[^>]*><strong>Context window<\/strong><span>\{compactUsage\}<\/span>/);
+  assert.match(app, /<section className="context-usage-details"/);
+  assert.match(app, /<h3 id=\{`context-usage-details-/);
+  assert.match(app, /<dt>Compacts at<\/dt>/);
+  assert.match(app, /<dt>Capacity<\/dt>/);
+  assert.doesNotMatch(app, /<details className="context-usage-details"|<summary>Usage details<\/summary>/);
   assert.doesNotMatch(app, /pendingImmediateThreshold|Compact this conversation now\?|Save threshold/);
   assert.doesNotMatch(app, /percent === null \? "—"/);
   assert.match(styles, /\.context-expanded-track \{[^}]*height: 8px/);
   assert.match(styles, /\.context-threshold-meter input\[type="range"\] \{[^}]*position: absolute/);
+  assert.match(styles, /\.context-usage \{[^}]*transform: translateY\(2px\)/);
+  assert.match(styles, /\.context-usage-tooltip \{[^}]*right: calc\(100% \+ 8px\)/);
+  assert.match(styles, /\.context-usage-trigger \{[^}]*min-height: 28px[^}]*padding: 1px 3px 1px 9px/);
+  assert.match(styles, /\.context-usage-popover \{[^}]*background-color: #181817[^}]*opacity: 1[^}]*backdrop-filter: none/);
+});
+
+test("task header exposes concise child-task details instead of a duplicate interrupt action", async () => {
+  const [app, bridge, styles] = await Promise.all([
+    source(join("src", "renderer", "src", "App.tsx")),
+    source(join("src", "renderer", "src", "bridge.ts")),
+    source(join("src", "renderer", "src", "styles.css")),
+  ]);
+  assert.match(app, /function TaskDetailsControl/);
+  assert.match(app, />Sub-agents<\/h2>/);
+  assert.match(app, /No sub-agents for this task\./);
+  assert.match(app, /onOpenChild\(child\)/);
+  assert.match(app, /<TaskDetailsControl session=\{session\}/);
+  assert.doesNotMatch(app, /> Interrupt<\/Button>/);
+  assert.match(bridge, /export async function listChildSessions\(sessionId: string\)[\s\S]*request\("session\.children"/);
+  assert.match(styles, /\.task-details-popover \{[^}]*background-color: #181817[^}]*opacity: 1/);
 });
 
 test("streaming events reuse provider message identity through completion", () => {
@@ -398,7 +484,7 @@ test("task history opens on the recent assistant tail and pages upward without j
     source(join("src", "renderer", "src", "App.tsx")),
     source(join("src", "renderer", "src", "bridge.ts")),
   ]);
-  assert.match(rendererBridge, /loadSessionTimelinePage\(sessionId: string, cursor\?: string, limit = 40\)/);
+  assert.match(rendererBridge, /loadSessionTimelinePage\(sessionId: string, cursor\?: string, limit = 40, refresh = false\)/);
   assert.match(rendererBridge, /nextCursor: typeof payload\.nextCursor === "string" \? payload\.nextCursor : null/);
   assert.match(app, /initialTimelineRevealStart\(items: readonly TimelineItem\[\], assistantCount = 3\)/);
   assert.match(app, /const messageId = item\.messageId \?\? item\.id/);
@@ -440,7 +526,12 @@ test("composer resets per task and gates attachment support from provider metada
   ]);
 
   assert.match(app, /<Composer\s+key=\{session\.id\}/);
+  assert.match(app, /composerAttachments[\s\S]*?Record<string, readonly ComposerAttachment\[\]>/);
+  assert.match(app, /initialAttachments=\{composerAttachments\[selectedSession\?\.id \?\? ""\] \?\? \[\]\}/);
+  assert.match(app, /onAttachmentsChange=\{\(attachments\) =>/);
   assert.match(composer, /provider\?\.supportsAttachments === true/);
+  assert.match(composer, /useState<readonly ComposerAttachment\[\]>\(\(\) => initialAttachments\)/);
+  assert.match(composer, /attachmentsChangeRef\.current\?\.\(attachments\)/);
   assert.match(composer, /disabled=\{!canAttach\}/);
   assert.match(rendererBridge, /builtInImageEntryProviders[^;]+"direct"/);
 });
@@ -521,7 +612,7 @@ test("attention-blocked sessions queue follow-up messages", async () => {
   const composer = await source(join("src", "renderer", "src", "Composer.tsx"));
 
   assert.match(composer, /session\.state === "working" \|\| session\.state === "needs_approval" \|\| session\.state === "needs_input"/);
-  assert.match(composer, /const requestType = mode === "steer" \? "session\.steer_message" : attachments\.length \|\| blockedByAttention \? "message_queue\.enqueue" : "session\.send_message"/);
+  assert.match(composer, /const requestType = liveGuidance \? "session\.steer_message" : attachments\.length \|\| \(blockedByAttention && queueingEnabled\) \? "message_queue\.enqueue" : "session\.send_message"/);
 });
 
 test("workflow recorder progress refreshes live counts and pauses its lone timer while hidden", async () => {
@@ -593,7 +684,7 @@ test("desktop navigation keeps browser and workflow complexity session-scoped", 
   assert.match(composer, /Manage workflows/);
   assert.match(composer, /onManageWorkflow\(attachment\.id\)/);
   assert.match(app, /onBrowser=\{\(\) => setView\("browser"\)\}/);
-  assert.match(app, /setSelectedWorkflowId\(id \?\? null\); setView\("settings"\)/);
+  assert.match(app, /setSelectedWorkflowId\(id \?\? null\); openSettings\(\)/);
   assert.match(workflows, /workflow-detail-timing/);
   assert.match(workflows, /workflow-capture-metrics/);
   assert.match(workflows, /Captured apps/);
@@ -602,6 +693,22 @@ test("desktop navigation keeps browser and workflow complexity session-scoped", 
   assert.match(visualQa, /Manage workflows/);
   assert.match(packagedSmoke, /Open session browser/);
   assert.doesNotMatch(packagedSmoke, /primary-nav button[^\n]*Browser/);
+});
+
+test("startup loading state uses readable type and plain local-connection copy", async () => {
+  const [app, components, styles] = await Promise.all([
+    source(join("src", "renderer", "src", "App.tsx")),
+    source(join("src", "renderer", "src", "components.tsx")),
+    source(join("src", "renderer", "src", "styles.css")),
+  ]);
+
+  assert.match(components, /Connecting to your coding tools on this computer…/);
+  assert.doesNotMatch(components, /local Tethoq runtime/);
+  assert.match(styles, /\.loading-state strong[^{]*\{[^}]*font-size:\s*15px;[^}]*line-height:\s*1\.3/);
+  assert.match(styles, /\.loading-state small[^{]*\{[^}]*color:\s*#969b96;[^}]*font-size:\s*12\.5px;[^}]*line-height:\s*1\.45/);
+  assert.match(app, /const page = await loadSessionTimelinePage\(first\.id\);[\s\S]*setSnapshot\(initialSnapshot\)/);
+  assert.match(styles, /\.app-loading \{ position:\s*fixed; inset:\s*0;[\s\S]*place-items:\s*center/);
+  assert.match(styles, /@keyframes app-shell-enter[\s\S]*\.desktop-app[^{]*\{[^}]*animation:\s*app-shell-enter \.14s ease-out both/);
 });
 
 test("merged sidebar task search and composable agent filters stay compact", async () => {
@@ -613,8 +720,14 @@ test("merged sidebar task search and composable agent filters stay compact", asy
 
   assert.match(navigation, /className="sidebar-task-search"/);
   assert.match(navigation, /data-expanded=\{searchExpanded\}/);
-  assert.match(navigation, /setSearchOpen\(true\)/);
+  assert.match(navigation, /const searchExpanded = searchOpen \|\| Boolean\(query\)/);
+  assert.doesNotMatch(navigation, /searchOpen \|\| Boolean\(query\) \|\| filtersOpen/);
+  assert.match(navigation, /const openTaskSearch = \(\) => \{[\s\S]*?setSearchOpen\(true\);[\s\S]*?requestAnimationFrame\(\(\) => searchInput\.current\?\.focus\(\)\)/);
+  assert.match(navigation, /onClick=\{openTaskSearch\}/);
   assert.match(navigation, /searchInput\.current\?\.focus\(\)/);
+  assert.match(navigation, /<header className="sidebar-task-header">[\s\S]*?<h2>Tasks<\/h2>[\s\S]*?<div className="sidebar-task-tools"[\s\S]*?<button type="button" onClick=\{onNewTask\}/);
+  assert.match(navigation, /<\/div>\s*<button ref=\{filterButton\} type="button" className=\{filtersOpen \|\| activeFilterCount \? "sidebar-task-filter active" : "sidebar-task-filter"\}/);
+  assert.doesNotMatch(navigation, /className="sidebar-task-search"[^]*className=\{filtersOpen \|\| activeFilterCount \? "filter-toggle/);
   assert.match(navigation, /className="task-filter-popover"/);
   assert.match(navigation, />Agent</);
   assert.match(navigation, /All agents/);
@@ -629,7 +742,7 @@ test("merged sidebar task search and composable agent filters stay compact", asy
   assert.match(navigation, /if \(path\) onOpenDirectory\(path\)/);
   assert.doesNotMatch(navigation, /onOpenDirectory\(sessionMenu\.title|onOpenDirectory\(session\.project/);
   assert.match(app, /onOpenDirectory=\{openSessionDirectory\}/);
-  assert.match(app, /window\.tethoqDesktop\.revealPath\(path\)/);
+  assert.match(app, /window\.tethoqDesktop\.openLocalTarget\(\{ path, handlerId: "system" \}\)/);
   assert.match(navigation, /chooseProvider = \(value: ProviderFilter\) => \{ onProvider\(value\); setFiltersOpen\(false\); \}/);
   assert.match(navigation, /toggleProvider = \(value: ProviderId\)/);
   assert.match(navigation, /role="checkbox" aria-checked=\{isIncluded\}/);
@@ -640,30 +753,60 @@ test("merged sidebar task search and composable agent filters stay compact", asy
   assert.match(navigation, /chooseState = \(value: SessionFilter\) => \{ onFilter\(value\); setFiltersOpen\(false\); \}/);
   assert.doesNotMatch(navigation, /task-state-dot task-state-|className="task-state-slot"/);
   assert.doesNotMatch(navigation, /Refresh tasks|Provider diagnostics|All states|>Filtered<|<Status|session-list-collapse|quiet-refresh/);
-  assert.match(styles, /\.sidebar-task-search \{[\s\S]*?width: 38px/);
-  assert.match(styles, /\.sidebar-task-search:hover,[\s\S]*?\.sidebar-task-search\[data-expanded="true"\] \{[\s\S]*?width: 70%/);
+  assert.match(styles, /\.sidebar-task-search \{[\s\S]*?width: 34px/);
+  assert.match(styles, /\.sidebar-task-search\[data-expanded="true"\] \{[\s\S]*?width: auto;[\s\S]*?flex: 1 1 auto/);
+  assert.doesNotMatch(styles, /\.sidebar-task-search:(?:hover|focus-within),/);
   assert.match(styles, /transition: none/);
-  assert.match(styles, /\.sidebar-task-search:hover \.filter-toggle/);
+  assert.match(styles, /\.sidebar-task-filter \{[\s\S]*?width: 31px;[\s\S]*?height: 31px;[\s\S]*?margin-left: auto/);
+  assert.match(styles, /\.sidebar-task-tools \{[\s\S]*?align-items: center;[\s\S]*?gap: 6px/);
   assert.match(styles, /\.provider-filter-checkbox\[aria-checked="true"\]/);
   assert.match(styles, /\.provider-filter-option\.unavailable \{ opacity: \.3/);
   assert.match(styles, /\.session-row-top strong \{ font-size: 12\.5px/);
   assert.match(navigation, /className="session-row-trailing"/);
-  assert.match(navigation, /session-row-state-\$\{session\.state\}/);
-  assert.match(styles, /grid-template-columns: 23px minmax\(0, 1fr\) 48px/);
-  assert.match(styles, /\.session-row-trailing \{[\s\S]*?grid-template-columns: minmax\(0, 1fr\) 7px/);
-  assert.match(styles, /\.session-row-state-offline \{ visibility: hidden; \}/);
-  assert.match(styles, /\.session-row > p \{[\s\S]*?margin-left: 30px/);
-  assert.match(styles, /\.session-row-meta \{[\s\S]*?margin-left: 30px/);
+  // Pin and time occupy the same reserved trailing slot, so neither shifts the row.
+  assert.match(navigation, /<span className="session-row-trailing">\{session\.pinned \? <PinIcon className="session-row-pin" \/> : null\}<time>\{relativeTime\(session\.updatedAt\)\}<\/time><\/span>\s*\{session\.state === "working" \? <i className="session-row-working-spinner"/);
+  assert.doesNotMatch(navigation, /session-row-state-/);
+  assert.match(navigation, /aria-current=\{selected \? "page" : undefined\}/);
+  assert.match(styles, /\.session-row \{ min-height: 66px; grid-template-columns: 36px minmax\(0, 1fr\) 32px;[\s\S]*?align-content: center;[\s\S]*?row-gap: 3px/);
+  assert.doesNotMatch(styles, /\.session-row:hover,[\s\S]*?grid-template-columns/);
+  assert.match(styles, /\.session-row-top \{ display: contents; \}/);
+  assert.match(styles, /\.session-row-top \.provider-logo \{[^}]*grid-row: 1 \/ span 2;[^}]*align-self: center;[^}]*transform: translate\(-5px, -10px\)/);
+  assert.match(navigation, /<ProviderLogo providerId=\{session\.providerId\} provider=\{provider\} size=\{36\}\/>/);
+  assert.match(styles, /\.session-row-trailing \{[\s\S]*?grid-template-columns: minmax\(0, 1fr\);[\s\S]*?gap: 0/);
+  assert.match(styles, /\.session-row-working-spinner \{[^}]*width: 12px;[^}]*height: 12px;[^}]*grid-column: 1;[^}]*grid-row: 2;[^}]*align-self: end;[^}]*justify-self: center;[^}]*translate: -5px 0;[^}]*border-right-color:\s*transparent;[^}]*animation:\s*spin/);
+  assert.match(styles, /\.session-row-top time \{[\s\S]*?font-size: 11\.5px;[\s\S]*?opacity: 0;[\s\S]*?transform: translateY\(2px\)/);
+  assert.match(styles, /\.session-row:hover \.session-row-top time,[\s\S]*?\.session-row:focus-visible \.session-row-top time,[\s\S]*?\.session-row\.selected \.session-row-top time \{ opacity: 1; \}/);
+  assert.match(navigation, /<OverflowReveal axis="horizontal" className="session-row-title">/);
+  assert.match(navigation, /<OverflowReveal axis="vertical" className="session-row-preview">/);
+  assert.match(navigation, /const pixelsPerSecond = axis === "vertical" \? 18 : 28/);
+  assert.match(navigation, /const duration = distance \/ pixelsPerSecond/);
+  assert.match(navigation, /"--overflow-duration": `\$\{duration\.toFixed\(2\)\}s`/);
+  assert.match(styles, /\.overflow-reveal-horizontal\[data-overflow="true"\][\s\S]*mask-image:[^;]*transparent 100%/);
+  assert.match(styles, /\.session-row-title \{[^}]*margin-left: -6px/);
+  assert.match(styles, /\.session-row-preview \{[^}]*margin-left: -6px/);
+  assert.match(styles, /\.overflow-reveal-vertical\[data-overflow="true"\][^}]*calc\(100% - 3px\)[^}]*rgba\(0,0,0,\.72\) 100%/);
+  assert.match(styles, /\.overflow-reveal-horizontal\[data-overflow="true"\]:hover > span[\s\S]*translateX/);
+  assert.match(styles, /\.session-row:hover \.overflow-reveal-vertical\[data-overflow="true"\] > span[\s\S]*translateY/);
+  assert.match(styles, /transition: transform var\(--overflow-duration\) linear \.55s/);
+  assert.match(styles, /\.session-list-scroll \{[^}]*overflow-x: hidden;[^}]*overflow-y: auto;/);
+  assert.match(styles, /\.session-row-preview \{[^}]*grid-column: 2 \/ -1/);
+  assert.match(styles, /\.session-row-meta \{[\s\S]*?position: absolute;[\s\S]*?clip-path: inset\(50%\)/);
+  assert.match(styles, /\.session-list-scroll \{[\s\S]*?margin-right: -8px;[\s\S]*?scrollbar-gutter: stable/);
+  assert.match(styles, /\.session-list-scroll \{[\s\S]*?padding: 1px 0 8px/);
+  assert.match(styles, /\.session-list-scroll::-webkit-scrollbar \{ width: 10px; \}/);
+  assert.match(styles, /\.session-list-scroll::-webkit-scrollbar-thumb:hover \{ background: #8a8a83; \}/);
   assert.match(styles, /font-variant-numeric: tabular-nums/);
+  assert.match(styles, /\.session-row-top time \{[\s\S]*?font-size: 11\.5px/);
   assert.match(styles, /\.session-row\.selected \{[\s\S]*?box-shadow: none/);
   assert.match(styles, /\.session-context-menu \{[\s\S]*?position: fixed/);
   assert.doesNotMatch(styles, /\.task-state-working \{|\.provider-options > button i/);
 });
 
-test("sidebar owns the task list in one narrower navigation column", async () => {
-  const [navigation, styles] = await Promise.all([
+test("sidebar owns the task list in one resizable navigation column", async () => {
+  const [navigation, styles, app] = await Promise.all([
     source(join("src", "renderer", "src", "NavigationPanels.tsx")),
     source(join("src", "renderer", "src", "navigation.css")),
+    source(join("src", "renderer", "src", "App.tsx")),
   ]);
 
   assert.match(navigation, /export interface SidebarProps/);
@@ -676,19 +819,33 @@ test("sidebar owns the task list in one narrower navigation column", async () =>
   assert.match(navigation, />Dashboard</);
   assert.match(navigation, /className="sidebar-footer"/);
   assert.match(navigation, /sidebar-runtime-indicator/);
+  assert.match(styles, /\.sidebar-footer \{[^}]*margin-right: -8px;[^}]*margin-left: -5px;[^}]*padding: 7px 8px 0 5px;[^}]*border-top: 1px solid/);
+  assert.match(styles, /\.sidebar-footer \.sidebar-settings \{[^}]*padding: 0 27px 0 7px/);
   assert.doesNotMatch(navigation, />Agents<|sidebar-section|provider-nav|export function SessionList|session-list-new|Start a new task|<TerminalIcon|<kbd>Ctrl N/);
   assert.match(styles, /:root \{ --navigation-panel: 248px; \}/);
   assert.match(styles, /\.app-body,[\s\S]*?grid-template-columns: var\(--navigation-panel\) minmax\(400px, 1fr\)/);
   assert.match(styles, /\.new-task-row \.new-task-button \{[\s\S]*?font-size: 13px/);
+  assert.match(styles, /\.new-task-row \.new-task-button \{[\s\S]*?display: grid;[\s\S]*?grid-template-columns: 17px minmax\(0, 1fr\) 17px/);
+  assert.match(styles, /\.new-task-row \.new-task-button span \{ grid-column: 2; justify-self: center; \}/);
   assert.match(styles, /\.new-task-row \{[\s\S]*?grid-template-columns: minmax\(0, 1fr\) 38px/);
   assert.match(styles, /\.new-task-row \.new-task-button \{[\s\S]*?min-height: 38px/);
   assert.match(styles, /\.sidebar-command-search \{[\s\S]*?width: 38px;[\s\S]*?height: 38px/);
   assert.match(styles, /\.primary-nav \{[\s\S]*?grid-template-columns: minmax\(0, 1fr\) 38px/);
   assert.match(styles, /\.primary-nav button \{[\s\S]*?width: 100%;[\s\S]*?min-height: 38px/);
+  assert.match(styles, /\.primary-nav button \{[^}]*display: grid;[^}]*grid-template-columns: 18px minmax\(0, 1fr\) 18px/);
+  assert.match(styles, /\.primary-nav button span \{ grid-column: 2; justify-self: center; \}/);
   assert.match(styles, /\.sidebar \{[\s\S]*?padding-left: 5px/);
   assert.match(styles, /--navigation-panel: 232px/);
   assert.match(styles, /--navigation-panel: 270px/);
   assert.match(styles, /\.primary-nav button \{[\s\S]*?font-size: 12\.5px/);
+  assert.match(app, /navigationPanelStorageKey = "tethoq\.navigation-panel-width"/);
+  assert.match(app, /clampNavigationPanelWidth\(startWidth \+ moveEvent\.clientX - startX, window\.innerWidth\)/);
+  assert.match(app, /role="separator"[\s\S]*?aria-label="Resize task list"[\s\S]*?aria-orientation="vertical"/);
+  assert.match(app, /onPointerDown=\{beginSidebarResize\}/);
+  assert.match(app, /onKeyDown=\{resizeSidebarWithKeyboard\}/);
+  assert.match(app, /"--navigation-panel": `\$\{navigationPanelWidth\}px`/);
+  assert.match(styles, /\.navigation-resize-handle \{[\s\S]*?left: calc\(var\(--navigation-panel\) - 5px\);[\s\S]*?width: 10px;[\s\S]*?cursor: col-resize/);
+  assert.match(styles, /\.sidebar-resizing, \.sidebar-resizing \* \{ cursor: col-resize !important; user-select: none !important; \}/);
 });
 
 test("new task opens a local draft and materializes it once from the composer", async () => {
@@ -701,11 +858,15 @@ test("new task opens a local draft and materializes it once from the composer", 
   assert.match(types, /draft\?: boolean/);
   assert.match(app, /const startDraftTask = useCallback/);
   assert.match(app, /draft: true/);
-  assert.match(app, /sessions: \[\.\.\.current\.sessions\.filter\(\(session\) => session\.draft\), \.\.\.sessions\]/);
+  assert.match(app, /const localOnly = current\.sessions\.filter\(\(session\) => \(session\.draft \|\| session\.sessionKind === "side_chat"\) && !refreshedIds\.has\(session\.id\)\)/);
+  assert.match(app, /sessions: \[\.\.\.localOnly, \.\.\.sessions\]/);
   assert.doesNotMatch(app, /function NewSessionModal|<NewSessionModal/);
   assert.match(app, /const createDraftSend = useCallback/);
-  assert.match(app, /input\.attachmentIds\.length \? \{\} : \{ firstInstruction: input\.content \}/);
+  assert.match(app, /const separatedFirstTurn = input\.attachmentIds\.length > 0 \|\| input\.workflowIds\.length > 0/);
+  assert.match(app, /\.\.\.\(separatedFirstTurn \? \{\} : \{ firstInstruction: input\.content \}\)/);
   assert.match(app, /await request\("session\.send_message"/);
+  assert.match(app, /input\.workflowIds\.length \? \{ workflowIds: \[\.\.\.input\.workflowIds\] \} : \{\}/);
+  assert.match(app, /input\.workflows\.length \? \{ workflows: input\.workflows \} : \{\}/);
   assert.match(app, /Choose a project folder before starting this task/);
   assert.match(app, /onDraftSelectionChange=\{onDraftSelectionChange\}/);
   assert.match(app, /onCreateDraftSend=\{onCreateDraftSend\}/);
@@ -722,14 +883,18 @@ test("workspace keeps repeated path metadata hidden until intent", async () => {
   assert.match(app, /session\.draft \? "Choose the project folder" : session\.workingDirectory \|\| session\.project/);
   assert.match(styles, /\.workspace-location \{ opacity: 0/);
   assert.match(styles, /\.workspace-header:hover \.workspace-location/);
+  assert.match(styles, /\.workspace-title:not\(:has\(\.draft-location\)\) \{[^}]*align-self: stretch;[^}]*align-items: center/);
+  assert.match(styles, /\.workspace-title:not\(:has\(\.draft-location\)\) > button \{[^}]*position: absolute/);
+  assert.match(styles, /\.workspace-title \.status \{ transform: translateY\(1px\)/);
   assert.doesNotMatch(styles, /\.context-strip/);
 });
 
 test("desktop wallet UI exposes direct-key safety, local budgets, and custom endpoints", async () => {
-  const [app, bridge, styles] = await Promise.all([
+  const [app, bridge, styles, icons] = await Promise.all([
     source(join("src", "renderer", "src", "App.tsx")),
     source(join("src", "renderer", "src", "bridge.ts")),
     source(join("src", "renderer", "src", "styles.css")),
+    source(join("src", "renderer", "src", "icons.tsx")),
   ]);
   assert.match(app, /request\("wallet\.get"/);
   assert.match(app, /request\("wallet\.configure"/);
@@ -748,6 +913,11 @@ test("desktop wallet UI exposes direct-key safety, local budgets, and custom end
   assert.match(bridge, /sourceProviderId/);
   assert.match(styles, /\.wallet-user_api\s*\{\s*--wallet-tone:\s*#69aaf9/);
   assert.match(styles, /\.wallet-harness\s*\{\s*--wallet-tone:\s*#e9a15a/);
+  assert.doesNotMatch(app, /aria-label="Refresh wallet"/);
+  assert.match(app, /<RefreshIcon className="refresh-icon" \/>/);
+  assert.match(styles, /svg\.refresh-icon \{[^}]*width: 20px !important/);
+  assert.match(icons, /M4 8c2\.7-5\.2 10\.6-6\.2 16 0/);
+  assert.match(icons, /m16\.5 4\.5 3\.5 3\.5-3\.5 3\.5/);
 });
 
 test("task context menu can branch an online persisted task without replacing Explorer access", async () => {

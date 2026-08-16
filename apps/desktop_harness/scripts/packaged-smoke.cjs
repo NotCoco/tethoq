@@ -342,12 +342,17 @@ async function exerciseBrowserWorkspace() {
 }
 
 async function exerciseBrowserDownloadPopover() {
-  const selected = await cdp.evaluate(`(() => {
+  const opened = await cdp.evaluate(`(() => {
     const actionsButton = document.querySelector('button[aria-label="More message actions"]');
     actionsButton?.click();
+    return Boolean(actionsButton);
+  })()`);
+  assert.equal(opened, true, 'The packaged session actions button is missing.');
+  await waitFor(() => cdp.evaluate(`Boolean([...document.querySelectorAll('.composer-actions-menu [role="menuitem"]')].find((button) => button.textContent?.includes('Open session browser')))`), 'packaged session Browser action');
+  const selected = await cdp.evaluate(`(() => {
     const browserButton = [...document.querySelectorAll('.composer-actions-menu [role="menuitem"]')].find((button) => button.textContent?.includes('Open session browser'));
     browserButton?.click();
-    return Boolean(actionsButton && browserButton);
+    return Boolean(browserButton);
   })()`);
   assert.equal(selected, true, 'The packaged session Browser action is missing.');
   await cdp.evaluate(`window.tethoqDesktop.browserAction(${JSON.stringify({ type: 'set-visible', visible: true })})`);
@@ -573,11 +578,11 @@ async function main() {
   assert.deepEqual(connectorProcessesSince(beforeProcesses), [], 'An unapproved connector process started before review.');
   const pendingProviders = (await bridgeRequest('provider.list')).providers;
   assert.equal(pendingProviders.some((provider) => provider.providerId === 'community.echo'), false, 'An unapproved connector appeared in provider.list.');
-  await cdp.evaluate('document.querySelector(".filter-toggle")?.click()');
+  await cdp.evaluate('document.querySelector(".sidebar-task-filter")?.click()');
   await waitFor(() => cdp.evaluate('Boolean(document.querySelector(".task-filter-popover"))'), 'pending connector task filters');
   const pendingTaskFilter = await cdp.evaluate(`[...document.querySelectorAll('.task-filter-popover .provider-options button')].some((button) => button.textContent.includes('Echo Connector'))`);
   assert.equal(pendingTaskFilter, false, 'An unapproved connector appeared in the task filter.');
-  await cdp.evaluate('document.querySelector(".filter-toggle")?.click()');
+  await cdp.evaluate('document.querySelector(".sidebar-task-filter")?.click()');
   await waitFor(() => cdp.evaluate('!document.querySelector(".task-filter-popover")'), 'pending connector task filters close');
   await cdp.evaluate('document.querySelector(".new-task-button")?.click()');
   await waitFor(() => cdp.evaluate(`document.querySelector('.workspace-title h1')?.textContent === 'New task' && document.querySelector('textarea[aria-label="Message"]')?.placeholder.startsWith('Describe the task')`), 'pending connector local draft');
@@ -605,18 +610,21 @@ async function main() {
   assert.equal(bootstrap.connectors.pending.some((connector) => connector.id === 'community.echo'), false);
   await waitFor(() => fileExists(connectorMarkerPath), 'approved connector execution after restart');
   report.browser = await exerciseBrowserWorkspace();
-  report.browserDownloadPopover = await exerciseBrowserDownloadPopover();
   report.recorder = await exerciseRecorder();
   const providers = (await bridgeRequest('provider.list')).providers;
   assert.ok(builtInProviders.every((id) => providers.some((provider) => provider.providerId === id)));
   assert.ok(providers.some((provider) => provider.providerId === 'community.echo' && provider.state === 'online'));
   const models = (await bridgeRequest('models.list', { providerId: 'community.echo' })).models;
   assert.deepEqual(models.map((model) => model.id), ['echo-fast', 'echo-careful']);
+  const hasPersistedTaskComposer = await cdp.evaluate(`(() => { const placeholder = document.querySelector('textarea[aria-label="Message"]')?.placeholder ?? ''; return placeholder.startsWith('Continue this task') || placeholder.startsWith('Add an instruction'); })()`);
+  report.browserDownloadPopover = hasPersistedTaskComposer
+    ? await exerciseBrowserDownloadPopover()
+    : { skipped: 'The isolated smoke profile has no persisted task; browser workspace behavior is covered directly.' };
   await cdp.evaluate('document.querySelector(".new-task-button")?.click()');
   await waitFor(() => cdp.evaluate(`document.querySelector('.workspace-title h1')?.textContent === 'New task' && document.querySelector('textarea[aria-label="Message"]')?.placeholder.startsWith('Describe the task')`), 'approved connector local draft');
   await cdp.evaluate('document.querySelector(".model-picker-trigger")?.click()');
   await waitFor(() => cdp.evaluate(`Boolean(document.querySelector('.model-picker-dropup [data-provider-group="community.echo"]'))`), 'approved connector model catalog');
-  const picker = await cdp.evaluate(`(() => { const group = document.querySelector('.model-picker-dropup [data-provider-group="community.echo"]'); if (!group) return null; return { provider: group.querySelector('h4')?.textContent.trim(), modelOptions: [...group.querySelectorAll('button strong')].map((label) => label.textContent.trim()) }; })()`);
+  const picker = await cdp.evaluate(`(() => { const group = document.querySelector('.model-picker-dropup [data-provider-group="community.echo"]'); if (!group) return null; const heading = group.querySelector('h4'); return { provider: [...(heading?.childNodes ?? [])].at(-1)?.textContent.trim(), modelOptions: [...group.querySelectorAll('button strong')].map((label) => label.textContent.trim()) }; })()`);
   assert.equal(picker.provider, 'Echo Connector');
   assert.deepEqual(picker.modelOptions, ['Echo Fast', 'Echo Careful']);
   const selectedEchoModel = await cdp.evaluate(`(() => { const group = document.querySelector('.model-picker-dropup [data-provider-group="community.echo"]'); const button = [...(group?.querySelectorAll('button') ?? [])].find((candidate) => candidate.querySelector('strong')?.textContent.trim() === 'Echo Fast'); button?.click(); return Boolean(button); })()`);

@@ -17,6 +17,9 @@ const maximumTrackedFileBytes = 100 * 1024 * 1024;
 const credentialExtensions = new Set([
   '.jks', '.key', '.keystore', '.mobileprovision', '.p12', '.pem', '.pfx',
 ]);
+const sourceCodeExtensions = new Set([
+  '.cjs', '.cts', '.dart', '.js', '.jsx', '.mjs', '.mts', '.ts', '.tsx',
+]);
 const textExtensions = new Set([
   '', '.bat', '.cjs', '.cmd', '.css', '.dart', '.env', '.html', '.js', '.json',
   '.jsx', '.kt', '.kts', '.md', '.mjs', '.properties', '.ps1', '.sh', '.sql',
@@ -36,7 +39,7 @@ const allowedSecretFixtureLiterals = new Map([
     [desktopConfigPrivateKeyFixture],
   ],
 ]);
-const placeholderUsers = new Set(['example', 'person', 'public', 'test', 'user', 'username', 'you']);
+const placeholderUsers = new Set(['deploy', 'example', 'person', 'public', 'test', 'user', 'username', 'you']);
 const secretPatterns = [
   { reason: 'private key material', pattern: /-----BEGIN (?:DSA |EC |OPENSSH |PGP |RSA )?PRIVATE KEY-----/u },
   { reason: 'AWS access key identifier', pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/u },
@@ -109,6 +112,7 @@ function credentialFilenameReason(path) {
   if (name === '.env' || (name.startsWith('.env.') && name !== '.env.example')) return 'environment file';
   if (credentialExtensions.has(extension)) return `credential extension ${extension}`;
   if (name === 'key.properties' || name === 'credentials.json' || name === 'service-account.json') return 'credential filename';
+  if (sourceCodeExtensions.has(extension)) return undefined;
   if (/(?:^|[-_.])(credentials?|private[-_.]?key|secrets?)(?:[-_.]|$)/iu.test(name)) return 'credential-like filename';
   return undefined;
 }

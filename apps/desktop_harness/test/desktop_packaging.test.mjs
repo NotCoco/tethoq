@@ -21,16 +21,28 @@ function iconDirectory(buffer) {
   });
 }
 
-test("Windows brand assets cover shell, installer, and high-DPI icon sizes", async () => {
-  const [icon, runtimePng] = await Promise.all([
+test("Windows brand assets cover shell, tray, installer, and high-DPI icon sizes", async () => {
+  const [icon, runtimeIcon, runtimePng, trayIcon, runtimeTrayIcon, trayPng] = await Promise.all([
     source("../build/icons/tethoq.ico"),
+    source("../assets/tethoq-icon.ico"),
     source("../build/icons/tethoq.png"),
+    source("../build/icons/tethoq-tray.ico"),
+    source("../assets/tethoq-tray.ico"),
+    source("../build/icons/tethoq-tray.png"),
   ]);
+  assert.deepEqual(runtimeIcon, icon, "the checked-in runtime icon must match the generated Windows icon");
+  assert.deepEqual(runtimeTrayIcon, trayIcon, "the checked-in tray icon must match the generated Windows tray icon");
+  assert.notDeepEqual(trayIcon, icon, "the tray glyph must be enlarged independently of the application icon");
   const entries = iconDirectory(icon);
+  const trayEntries = iconDirectory(trayIcon);
   assert.deepEqual(entries.map((entry) => entry.width), [16, 20, 24, 32, 40, 48, 64, 128, 256]);
+  assert.deepEqual(trayEntries.map((entry) => entry.width), [16, 20, 24, 32, 40, 48, 64, 128, 256]);
   assert.ok(entries.every((entry) => entry.width === entry.height && entry.planes === 1 && entry.bits === 32));
+  assert.ok(trayEntries.every((entry) => entry.width === entry.height && entry.planes === 1 && entry.bits === 32));
   assert.ok(entries.every((entry) => entry.offset + entry.bytes <= icon.length));
+  assert.ok(trayEntries.every((entry) => entry.offset + entry.bytes <= trayIcon.length));
   assert.deepEqual([...runtimePng.subarray(1, 4)], [0x50, 0x4e, 0x47]);
+  assert.deepEqual([...trayPng.subarray(1, 4)], [0x50, 0x4e, 0x47]);
   assert.equal(runtimePng.readUInt32BE(16), 512);
   assert.equal(runtimePng.readUInt32BE(20), 512);
   assert.equal(runtimePng[25], 6, "runtime PNG must carry an alpha channel");
@@ -43,13 +55,14 @@ test("Windows brand assets cover shell, installer, and high-DPI icon sizes", asy
   }
 });
 
-test("Windows packaging applies Tethoq identity to executable, installer, shortcuts, and uninstall metadata", async () => {
-  const [config, viteConfig, packageJson, assetScript, assetsReadme] = await Promise.all([
+test("Windows packaging applies Tethoq identity to executable, installer, shortcuts, tray, and uninstall metadata", async () => {
+  const [config, viteConfig, packageJson, assetScript, assetsReadme, mainSource] = await Promise.all([
     source("../electron-builder.yml").then(String),
     source("../electron.vite.config.ts").then(String),
     source("../package.json").then(String),
     source("../scripts/build-brand-assets.ps1").then(String),
     source("../assets/README.md").then(String),
+    source("../src/main/index.ts").then(String),
   ]);
 
   assert.match(packageJson, /"productName":\s*"Tethoq"/);
@@ -63,6 +76,9 @@ test("Windows packaging applies Tethoq identity to executable, installer, shortc
   assert.match(config, /executableName:\s*Tethoq/);
   assert.match(config, /win:[\s\S]*?icon:\s*build\/icons\/tethoq\.ico/);
   assert.match(config, /from:\s*build\/icons\/tethoq\.png[\s\S]*?to:\s*assets\/tethoq-icon\.png/);
+  assert.match(config, /from:\s*build\/icons\/tethoq\.ico[\s\S]*?to:\s*assets\/tethoq-icon\.ico/);
+  assert.match(config, /from:\s*build\/icons\/tethoq-tray\.ico[\s\S]*?to:\s*assets\/tethoq-tray\.ico/);
+  assert.match(config, /from:\s*node_modules\/uiohook-napi\/binding\.gyp[\s\S]*?to:\s*app\.asar\.unpacked\/node_modules\/uiohook-napi\/binding\.gyp/);
   assert.match(config, /from:\s*\.\.\/agent_bridge\/assets\/opencode\/uar_mesh\.txt[\s\S]*?to:\s*provider-tools\/opencode\/uar_mesh\.txt/);
   assert.match(config, /from:\s*\.\.\/agent_bridge\/assets\/pi\/tethoq_tools\.txt[\s\S]*?to:\s*provider-tools\/pi\/tethoq_tools\.txt/);
   assert.match(viteConfig, /mesh_mcp_stdio:\s*resolve\(here, "\.\.\/agent_bridge\/src\/mesh_mcp_stdio\.ts"\)/);
@@ -77,7 +93,16 @@ test("Windows packaging applies Tethoq identity to executable, installer, shortc
   assert.match(config, /requestedExecutionLevel:\s*asInvoker/);
   assert.match(config, /deleteAppDataOnUninstall:\s*false/);
   assert.match(assetScript, /512x512/);
+  assert.match(assetScript, /\$trayContentScale\s*=\s*1\.25/i);
+  assert.match(assetScript, /Copy-Item[^\n]+tethoq\.ico[^\n]+tethoq-icon\.ico/);
+  assert.match(assetScript, /Copy-Item[^\n]+tethoq-tray\.ico[^\n]+tethoq-tray\.ico/);
   assert.match(assetsReadme, /deterministic output/);
+  assert.match(mainSource, /app\.setName\("Tethoq"\)/);
+  assert.match(mainSource, /app\.setAppUserModelId\("app\.tethoq\.desktop"\)/);
+  assert.match(mainSource, /process\.platform === "win32"[\s\S]*?tethoq-icon\.ico/);
+  assert.match(mainSource, /new Tray\(trayIconPath\(\)\)/);
+  assert.match(mainSource, /process\.platform === "win32"[\s\S]*?tethoq-tray\.ico/);
+  assert.doesNotMatch(mainSource, /nativeImage|\.resize\(\{\s*width:\s*18/);
   assert.doesNotMatch(`${config}\n${packageJson}\n${assetScript}`, /Claude/i);
 });
 

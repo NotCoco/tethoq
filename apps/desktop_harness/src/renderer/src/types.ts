@@ -27,6 +27,12 @@ export interface Session {
   id: string;
   /** Local unsent task. It becomes a provider session on the first send. */
   draft?: boolean;
+  /** Side chats are real provider sessions, but remain nested under their task. */
+  sessionKind?: "task" | "side_chat" | "internal";
+  parentSessionId?: string;
+  relationshipKind?: "handoff" | "branch" | "subagent" | "side_chat";
+  agentNickname?: string;
+  agentRole?: string;
   providerId: ProviderId;
   title: string;
   state: SessionState;
@@ -39,6 +45,11 @@ export interface Session {
   unread?: number;
   childCount?: number;
   contextSummary?: string;
+  /** True when `title` is the user's own local name rather than the provider's. */
+  renamed?: boolean;
+  /** Local task organisation. Neither flag is sent to a provider. */
+  pinned?: boolean;
+  archived?: boolean;
 }
 
 export interface SessionUsageTotals {
@@ -62,6 +73,7 @@ export interface SessionContextState {
   supportsManualCompaction: boolean;
   supportsThreshold: boolean;
   isCompacting: boolean;
+  compactionKind: "automatic" | "manual" | null;
   updatedAt: string;
   usage: SessionUsageTotals;
 }
@@ -89,6 +101,23 @@ export interface TimelineItem {
   state?: "running" | "completed" | "failed";
   timestamp: string;
   images?: TimelineImage[];
+  workflows?: TimelineWorkflow[];
+  origin?: TimelineOrigin;
+}
+
+export interface TimelineWorkflow {
+  id: string;
+  name: string;
+  eventCount: number;
+  screenshotCount: number;
+  applications?: readonly string[];
+}
+
+export interface TimelineOrigin {
+  kind: "cross_session";
+  envelopeId: string;
+  sourceSessionId: string;
+  sourceTitle: string;
 }
 
 export interface TimelineImage {
@@ -123,6 +152,7 @@ export interface ModelOption {
   name: string;
   isDefault?: boolean;
   efforts: string[];
+  defaultEffort?: string;
   inputModalities?: Array<"text" | "image" | "audio">;
   endpointId?: string;
   endpointName?: string;

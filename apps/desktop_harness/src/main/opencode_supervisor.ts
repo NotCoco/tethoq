@@ -38,6 +38,16 @@ export class OpenCodeSupervisor {
     return this.#status;
   }
 
+  /** Detects an existing server without starting a background process. */
+  public async probe(): Promise<OpenCodeProcessStatus> {
+    if (await this.isHealthy()) {
+      if (this.#child === undefined) this.#status = { state: "external", url: this.#url.toString(), managed: false };
+      return this.#status;
+    }
+    if (this.#child === undefined) this.#status = { state: "stopped", url: this.#url.toString(), managed: false };
+    return this.#status;
+  }
+
   public async ensureRunning(): Promise<OpenCodeProcessStatus> {
     if (await this.isHealthy()) {
       if (this.#child === undefined) this.#status = { state: "external", url: this.#url.toString(), managed: false };

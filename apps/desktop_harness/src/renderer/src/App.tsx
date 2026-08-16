@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type RefObject } from "react";
-import type { BrowserDownloadState, BrowserWorkspaceState, DesktopBootstrap, DesktopConnectorDescriptor, DesktopPreferencesState, DesktopRuntimeState, PendingDesktopConnectorDescriptor, RecorderState, WorkflowDescriptor } from "@shared/desktop_api";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
+import type { BrowserDownloadState, BrowserWorkspaceState, DesktopBootstrap, DesktopConnectorDescriptor, DesktopPreferencesState, DesktopRuntimeState, LocalOpenState, PendingDesktopConnectorDescriptor, PreferencesAction, RecorderState, TaskOverride, WorkflowDescriptor, WorkflowScreenshot, WorkflowScreenshotImage } from "@shared/desktop_api";
 import {
   eventToTimeline,
   demoBrowserState,
   isBrowserPreview,
   loadInitialSnapshot,
+  listChildSessions,
+  listSessions,
   loadProviderModels,
   loadSessionContext,
   loadSessionTimelinePage,
@@ -19,10 +21,15 @@ import {
   subscribeToDesktop,
 } from "./bridge";
 import { ChatTimeline } from "./ChatTimeline";
-import { Composer, type DraftModelSelection, type DraftSessionSendInput } from "./Composer";
+import { AgentDefaultsSettings } from "./AgentDefaultsSettings";
+import { Composer, DictationSettings, SideChatPanel, type ComposerAttachment, type DraftModelSelection, type DraftSessionSendInput, type SideChatDraft } from "./Composer";
+import { isAmbiguousSelectionValue, resolveConcreteModelSelection } from "./composer_helpers";
 import { LiveSessionPanel } from "./LiveSession";
-import { Sidebar, type NavigationView as View, type SessionFilter } from "./NavigationPanels";
+import { Sidebar, type NavigationView as View, type SessionFilter, type SideChatAnchor } from "./NavigationPanels";
 import { WorkflowSettings } from "./WorkflowSettings";
+import { LocalOpenProvider, WorkspaceLocalOpenControl, previewLocalOpenState, useLocalOpen, type LocalOpenLocation } from "./LocalOpen";
+import { maximumUiSearchCharacters, normalizeUiSearchQuery } from "./search_helpers";
+import { compareOrganizedSessions, isHiddenByArchive, organizeSessions } from "./task_organization";
 import {
   Button,
   EmptyState,
@@ -39,6 +46,7 @@ import {
 } from "./components";
 import {
   AlertIcon,
+  AgentIcon,
   ArrowLeftIcon,
   BrowserIcon,
   ChatIcon,
@@ -93,6 +101,31 @@ function useMedia(query: string): boolean {
   return matches;
 }
 
+const navigationPanelStorageKey = "tethoq.navigation-panel-width";
+const minimumNavigationPanelWidth = 210;
+const maximumNavigationPanelWidth = 440;
+
+function defaultNavigationPanelWidth(viewportWidth: number): number {
+  if (viewportWidth >= 1_800) return 270;
+  if (viewportWidth <= 1_180) return 232;
+  return 248;
+}
+
+function clampNavigationPanelWidth(width: number, viewportWidth: number): number {
+  const responsiveMaximum = Math.max(minimumNavigationPanelWidth, Math.min(maximumNavigationPanelWidth, viewportWidth - 560));
+  return Math.round(Math.min(responsiveMaximum, Math.max(minimumNavigationPanelWidth, width)));
+}
+
+function initialNavigationPanelWidth(): number {
+  const fallback = defaultNavigationPanelWidth(window.innerWidth);
+  try {
+    const stored = Number.parseFloat(window.localStorage.getItem(navigationPanelStorageKey) ?? "");
+    return clampNavigationPanelWidth(Number.isFinite(stored) ? stored : fallback, window.innerWidth);
+  } catch {
+    return clampNavigationPanelWidth(fallback, window.innerWidth);
+  }
+}
+
 function cloneSnapshot(snapshot: DesktopSnapshot): DesktopSnapshot {
   return { ...snapshot, providers: [...snapshot.providers], sessions: [...snapshot.sessions], timelines: { ...snapshot.timelines }, approvals: [...snapshot.approvals], inputRequests: [...snapshot.inputRequests], models: { ...snapshot.models } };
 }
@@ -107,6 +140,8 @@ function derivedSession(value: Record<string, unknown>, source: Session): Sessio
   const workingDirectory = typeof value.workingDirectory === "string" ? value.workingDirectory : source.workingDirectory;
   const state = value.state === "disconnected" || value.state === "unknown" ? "offline" : typeof value.state === "string" && ["working", "needs_approval", "needs_input", "idle", "completed", "failed", "offline"].includes(value.state) ? value.state as SessionState : "working";
   const metadata = value.nativeMetadata && typeof value.nativeMetadata === "object" && !Array.isArray(value.nativeMetadata) ? value.nativeMetadata as Record<string, unknown> : {};
+  const sessionKind = value.sessionKind === "side_chat" || value.sessionKind === "internal" ? value.sessionKind : "task";
+  const parentSessionId = typeof value.parentSessionId === "string" && value.parentSessionId ? value.parentSessionId : undefined;
   const contextSummary = typeof value.contextHandoffSummary === "string" && value.contextHandoffSummary
     ? value.contextHandoffSummary
     : typeof metadata.tethoqHandoffSummary === "string" && metadata.tethoqHandoffSummary
@@ -114,6 +149,8 @@ function derivedSession(value: Record<string, unknown>, source: Session): Sessio
       : undefined;
   return {
     id: value.id,
+    sessionKind,
+    ...(parentSessionId ? { parentSessionId } : {}),
     providerId,
     title: typeof value.title === "string" && value.title ? value.title : `${source.title} · continuation`,
     state,
@@ -125,6 +162,32 @@ function derivedSession(value: Record<string, unknown>, source: Session): Sessio
     effort: typeof value.reasoningEffort === "string" ? value.reasoningEffort : source.effort,
     ...(contextSummary !== undefined ? { contextSummary } : {}),
   };
+}
+
+function sideChatEventSession(value: unknown, sessions: readonly Session[], occurredAt: string): Session | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.id !== "string" || !raw.id) return null;
+  const parentSessionId = typeof raw.parentSessionId === "string" ? raw.parentSessionId : undefined;
+  const existing = sessions.find((session) => session.id === raw.id);
+  const parent = parentSessionId ? sessions.find((session) => session.id === parentSessionId) : undefined;
+  const fallbackProviderId = typeof raw.providerId === "string" ? raw.providerId : existing?.providerId ?? parent?.providerId;
+  if (!fallbackProviderId) return null;
+  const workingDirectory = typeof raw.workingDirectory === "string" ? raw.workingDirectory : existing?.workingDirectory ?? parent?.workingDirectory ?? "";
+  const source: Session = existing ?? parent ?? {
+    id: raw.id,
+    providerId: fallbackProviderId,
+    title: typeof raw.title === "string" && raw.title ? raw.title : "Side chat",
+    state: "idle",
+    project: workingDirectory.split(/[\\/]/u).filter(Boolean).at(-1) ?? "Task",
+    workingDirectory,
+    preview: typeof raw.preview === "string" ? raw.preview : "",
+    updatedAt: occurredAt,
+    model: typeof raw.modelId === "string" ? raw.modelId : "",
+    effort: typeof raw.reasoningEffort === "string" ? raw.reasoningEffort : "Default",
+  };
+  try { return derivedSession(raw, source); }
+  catch { return null; }
 }
 
 function createdSession(value: unknown, input: DraftSessionSendInput, state: SessionState, preview: string): Session {
@@ -145,7 +208,7 @@ function createdSession(value: unknown, input: DraftSessionSendInput, state: Ses
   const mapped = derivedSession(raw, source);
   return {
     ...mapped,
-    title: typeof raw.title === "string" && raw.title.trim() ? raw.title : source.title,
+    title: source.title,
     state,
     preview,
     model: typeof raw.modelId === "string" ? raw.modelId : input.modelId,
@@ -239,39 +302,164 @@ function reconcileTimelinePage(page: readonly TimelineItem[], live: readonly Tim
 const providerFor = (providers: Provider[], providerId: ProviderId): Provider | undefined =>
   providers.find((provider) => provider.id === providerId);
 
+function providerConnectionDetail(provider: Provider, models: readonly ModelOption[]): string | undefined {
+  if (provider.id === "direct") {
+    const endpoints = [...new Set(models
+      .filter((model) => model.walletKind === "user_api" && model.apiKeyConfigured === true)
+      .map((model) => model.endpointName)
+      .filter((name): name is string => Boolean(name)))];
+    if (endpoints.length === 0) return "API key required";
+    if (endpoints.length === 1) return `${endpoints[0]} · API key saved`;
+    return `${endpoints.length} API providers · keys saved`;
+  }
+  if (!provider.version) return undefined;
+  return provider.version.replace(/^v(?=\d)/iu, "");
+}
+
+const emptySideChatDraft: SideChatDraft = { content: "", attachments: [] };
+const initialDesktopPreferences: DesktopPreferencesState = {
+  version: 1,
+  experimentalFeatures: false,
+  reasoningDisplay: "compact",
+  localOpenHandlerId: "system",
+  closeAction: "tray",
+  launchAtLogin: "off",
+  alerts: "all",
+  agentDefaults: {},
+  globalAgentsPath: null,
+  taskOverrides: {},
+};
+
+const previewWorkflowId = "preview-workflow-capture";
+const previewWorkflowScreenshots: readonly WorkflowScreenshot[] = Object.freeze([
+  { frameId: "frame-000001", name: "frame-000001.jpg" },
+  { frameId: "frame-000002", name: "frame-000002.jpg" },
+  { frameId: "frame-000003", name: "frame-000003.jpg" },
+  { frameId: "frame-000004", name: "frame-000004.jpg" },
+]);
+const previewWorkflow = Object.freeze<WorkflowDescriptor>({
+  id: previewWorkflowId,
+  name: "Import footage into CapCut",
+  status: "saved",
+  path: "C:\\Tethoq\\workflows\\preview-workflow-capture",
+  manifestPath: "C:\\Tethoq\\workflows\\preview-workflow-capture\\manifest.json",
+  eventsPath: "C:\\Tethoq\\workflows\\preview-workflow-capture\\events.jsonl",
+  startedAt: "2026-08-16T11:08:00.000Z",
+  stoppedAt: "2026-08-16T11:09:34.000Z",
+  durationMs: 94_000,
+  stopReason: "user",
+  summary: { apps: ["CapCut", "File Explorer"], eventCount: 46, screenshotCount: previewWorkflowScreenshots.length, clickCount: 9, dragCount: 2, keyEventCount: 14, droppedFrames: 0, contextErrors: 0, bytesWritten: 1_284_000 },
+  privacy: { localOnly: true, neverUploadedAutomatically: true, capturesScreen: true, capturesGlobalInput: true, capturesKeyCodesNotText: true, sensitiveDataPossible: true, warning: "Recording may capture sensitive screen and input context.", limitations: [] },
+});
+
+function previewWorkflowScreenshot(frameId: string): WorkflowScreenshotImage {
+  const index = Math.max(0, previewWorkflowScreenshots.findIndex((item) => item.frameId === frameId));
+  const labels = ["Select footage", "Open import", "Choose folder", "Confirm media"];
+  const accents = ["#8e9bff", "#85d6bc", "#d7a977", "#b89bda"];
+  const label = labels[index] ?? "Captured step";
+  const accent = accents[index] ?? "#8e9bff";
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720"><rect width="1280" height="720" fill="#111211"/><rect x="24" y="24" width="1232" height="62" rx="12" fill="#242523"/><circle cx="57" cy="55" r="10" fill="${accent}"/><text x="82" y="64" fill="#f5f6f3" font-family="Segoe UI,Arial" font-size="25" font-weight="600">${label}</text><rect x="24" y="110" width="250" height="586" rx="12" fill="#1b1c1a"/><rect x="298" y="110" width="958" height="586" rx="12" fill="#191a18"/><rect x="328" y="148" width="380" height="26" rx="7" fill="#31332f"/><rect x="328" y="194" width="786" height="18" rx="5" fill="#292a27"/><rect x="328" y="226" width="680" height="18" rx="5" fill="#292a27"/><rect x="328" y="284" width="898" height="340" rx="10" fill="#222320"/><rect x="352" y="310" width="212" height="154" rx="8" fill="${accent}" fill-opacity=".26"/><path d="M760 380 L760 455 L783 437 L801 478 L821 468 L803 428 L831 426 Z" fill="#090a09" stroke="#f5f6f3" stroke-width="7" stroke-linejoin="round"/><text x="328" y="666" fill="#aeb3ad" font-family="Segoe UI,Arial" font-size="20">Pointer location is captured with this frame</text></svg>`;
+  const screenshot = previewWorkflowScreenshots[index] ?? previewWorkflowScreenshots[0]!;
+  return { ...screenshot, dataUrl: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`, width: 1280, height: 720 };
+}
+type SideChatDraftUpdate = SideChatDraft | ((current: SideChatDraft) => SideChatDraft);
+
 function App() {
   const [snapshot, setSnapshot] = useState<DesktopSnapshot | null>(null);
   const [bootstrap, setBootstrap] = useState<DesktopBootstrap | undefined>();
   const [runtime, setRuntime] = useState<DesktopRuntimeState>({ state: "starting" });
   const [view, setView] = useState<View>("workspace");
+  const settingsReturnView = useRef<Exclude<View, "settings">>("workspace");
   const [selectedProvider, setSelectedProvider] = useState<ProviderFilterSelection>("all");
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [stateFilter, setStateFilter] = useState<SessionFilter>("all");
   const [listCollapsed, setListCollapsed] = useState(false);
+  const [navigationPanelWidth, setNavigationPanelWidth] = useState(initialNavigationPanelWidth);
+  const [sidebarResizing, setSidebarResizing] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [queueRevision, setQueueRevision] = useState(0);
+  const [showSideChats, setShowSideChats] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
+  const [openSideChats, setOpenSideChats] = useState<readonly { id: string; anchor: SideChatAnchor }[]>([]);
   const [selectedWorkflowId, setSelectedWorkflowId] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [toast, setToast] = useState<{ message: string; tone?: "normal" | "error" } | null>(null);
   const [browser, setBrowser] = useState<BrowserWorkspaceState | null>(isBrowserPreview ? demoBrowserState : null);
   const [browserAddressFocusToken, setBrowserAddressFocusToken] = useState(0);
   const [recorder, setRecorder] = useState<RecorderState>({ phase: "idle", supported: true, privacy: { localOnly: true, neverUploadedAutomatically: true, capturesScreen: true, capturesGlobalInput: true, capturesKeyCodesNotText: true, sensitiveDataPossible: true, warning: "Recording may capture sensitive screen and input context.", limitations: [] } });
-  const [workflows, setWorkflows] = useState<readonly WorkflowDescriptor[]>([]);
+  const [workflows, setWorkflows] = useState<readonly WorkflowDescriptor[]>(isBrowserPreview ? [previewWorkflow] : []);
   const [saveWorkflowOpen, setSaveWorkflowOpen] = useState(false);
-  const [preferences, setPreferences] = useState<DesktopPreferencesState>({ version: 1, experimentalFeatures: false });
+  const [preferences, setPreferences] = useState<DesktopPreferencesState>(initialDesktopPreferences);
+  const [localOpenState, setLocalOpenState] = useState<LocalOpenState>(isBrowserPreview ? previewLocalOpenState : { defaultHandlerId: "system", handlers: [{ id: "system", label: "File Explorer", icon: "explorer" }] });
   const [liveSessionOpen, setLiveSessionOpen] = useState(false);
   const [handoffSummaries, setHandoffSummaries] = useState<Record<string, string>>({});
   const [composerDrafts, setComposerDrafts] = useState<Record<string, string>>({});
+  const [composerAttachments, setComposerAttachments] = useState<Record<string, readonly ComposerAttachment[]>>({});
+  const [sideChatDrafts, setSideChatDrafts] = useState<Record<string, SideChatDraft>>({});
+  const [queueingBySession, setQueueingBySession] = useState<Record<string, boolean>>({});
+  const [compactionsBySession, setCompactionsBySession] = useState<Record<string, { isCompacting: boolean; kind: "automatic" | "manual" | null }>>({});
   const [timelineWindows, setTimelineWindows] = useState<Record<string, TimelineWindowState>>({});
   const narrow = useMedia("(max-width: 780px)");
   const selectedSessionIdRef = useRef<string | null>(null);
   const refreshInFlight = useRef(false);
+  const visibleRefreshInFlight = useRef(false);
   const openingSessionIdsRef = useRef(new Set<string>());
   const revokedConnectorIdsRef = useRef(new Set<string>());
+  const sideChatsHydratedRef = useRef(false);
+  const sidebarResizeCleanupRef = useRef<(() => void) | null>(null);
 
   useEffect(() => { selectedSessionIdRef.current = selectedSessionId; }, [selectedSessionId]);
+
+  useEffect(() => {
+    if (narrow) return;
+    try { window.localStorage.setItem(navigationPanelStorageKey, String(navigationPanelWidth)); }
+    catch { /* A blocked preference store must not prevent resizing for this window. */ }
+  }, [narrow, navigationPanelWidth]);
+
+  useEffect(() => {
+    const clampToViewport = () => setNavigationPanelWidth((current) => clampNavigationPanelWidth(current, window.innerWidth));
+    window.addEventListener("resize", clampToViewport);
+    return () => window.removeEventListener("resize", clampToViewport);
+  }, []);
+
+  useEffect(() => () => sidebarResizeCleanupRef.current?.(), []);
+
+  const beginSidebarResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (narrow || event.button !== 0) return;
+    event.preventDefault();
+    sidebarResizeCleanupRef.current?.();
+    const startX = event.clientX;
+    const startWidth = navigationPanelWidth;
+    const resize = (moveEvent: PointerEvent) => {
+      setNavigationPanelWidth(clampNavigationPanelWidth(startWidth + moveEvent.clientX - startX, window.innerWidth));
+    };
+    const finish = () => {
+      window.removeEventListener("pointermove", resize);
+      window.removeEventListener("pointerup", finish);
+      window.removeEventListener("pointercancel", finish);
+      sidebarResizeCleanupRef.current = null;
+      setSidebarResizing(false);
+    };
+    sidebarResizeCleanupRef.current = finish;
+    setSidebarResizing(true);
+    window.addEventListener("pointermove", resize);
+    window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", finish);
+  }, [narrow, navigationPanelWidth]);
+
+  const resizeSidebarWithKeyboard = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
+    const maximum = clampNavigationPanelWidth(maximumNavigationPanelWidth, window.innerWidth);
+    let next: number | null = null;
+    if (event.key === "ArrowLeft") next = navigationPanelWidth - (event.shiftKey ? 24 : 8);
+    if (event.key === "ArrowRight") next = navigationPanelWidth + (event.shiftKey ? 24 : 8);
+    if (event.key === "Home") next = minimumNavigationPanelWidth;
+    if (event.key === "End") next = maximum;
+    if (next === null) return;
+    event.preventDefault();
+    setNavigationPanelWidth(clampNavigationPanelWidth(next, window.innerWidth));
+  }, [navigationPanelWidth]);
 
   const notify = useCallback((message: string, tone?: "normal" | "error") => {
     setToast(tone ? { message, tone } : { message });
@@ -280,20 +468,52 @@ function App() {
 
   const openSessionDirectory = useCallback((path: string) => {
     if (isBrowserPreview) return;
-    void window.tethoqDesktop.revealPath(path).then((opened) => {
-      if (!opened) notify("File Explorer could not open this task folder.", "error");
-    }).catch((error: unknown) => notify(error instanceof Error ? error.message : String(error), "error"));
+    void window.tethoqDesktop.openLocalTarget({ path, handlerId: "system" }).catch((error: unknown) => notify(error instanceof Error ? error.message : String(error), "error"));
+  }, [notify]);
+
+  const openLocalTarget = useCallback(async (location: LocalOpenLocation, handlerId?: LocalOpenState["defaultHandlerId"], rememberAsDefault?: boolean) => {
+    if (isBrowserPreview) return;
+    try {
+      const result = await window.tethoqDesktop.openLocalTarget({ ...location, ...(handlerId ? { handlerId } : {}), ...(rememberAsDefault ? { rememberAsDefault: true } : {}) });
+      setLocalOpenState(result.state);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : String(error), "error");
+    }
   }, [notify]);
 
   const initialize = useCallback(async () => {
     setLoadError(null);
     try {
-      const result = await loadInitialSnapshot();
-      setSnapshot(result.snapshot);
+      const [result, persistedPreferences] = await Promise.all([
+        loadInitialSnapshot(),
+        isBrowserPreview ? Promise.resolve(initialDesktopPreferences) : window.tethoqDesktop.preferencesState().catch(() => initialDesktopPreferences),
+      ]);
+      const tasks = result.snapshot.sessions.filter((session) => session.sessionKind !== "side_chat" && session.sessionKind !== "internal");
+      const firstAttention = tasks.find((session) => session.state === "needs_approval" || session.state === "needs_input");
+      const first = tasks.find((session) => session.state === "working") ?? firstAttention ?? tasks[0];
+      let initialSnapshot = result.snapshot;
+      if (first) {
+        try {
+          const page = await loadSessionTimelinePage(first.id);
+          const items = reconcileTimelinePage(page.items, result.snapshot.timelines[first.id] ?? []);
+          initialSnapshot = { ...result.snapshot, timelines: { ...result.snapshot.timelines, [first.id]: items } };
+          setTimelineWindows((current) => ({
+            ...current,
+            [first.id]: { nextCursor: page.nextCursor, revealStart: initialTimelineRevealStart(items), loadingOlder: false },
+          }));
+        } catch {
+          const items = result.snapshot.timelines[first.id] ?? [];
+          initialSnapshot = { ...result.snapshot, timelines: { ...result.snapshot.timelines, [first.id]: items } };
+          setTimelineWindows((current) => ({
+            ...current,
+            [first.id]: { nextCursor: null, revealStart: initialTimelineRevealStart(items), loadingOlder: false },
+          }));
+        }
+      }
+      setPreferences(persistedPreferences);
+      setSnapshot(initialSnapshot);
       setBootstrap(result.bootstrap);
       setRuntime({ state: "ready" });
-      const firstAttention = result.snapshot.sessions.find((session) => session.state === "needs_approval" || session.state === "needs_input");
-      const first = result.snapshot.sessions.find((session) => session.state === "working") ?? firstAttention ?? result.snapshot.sessions[0];
       setSelectedSessionId((current) => current ?? first?.id ?? null);
     } catch (error) {
       setLoadError(error instanceof Error ? error.message : String(error));
@@ -304,11 +524,36 @@ function App() {
   useEffect(() => { void initialize(); }, [initialize]);
 
   useEffect(() => {
+    if (!snapshot || sideChatsHydratedRef.current) return;
+    sideChatsHydratedRef.current = true;
+    void request("side_chat.list", {}).then((response) => {
+      if (!Array.isArray(response.sessions)) return;
+      const sessions = response.sessions;
+      setSnapshot((current) => {
+        if (!current) return current;
+        const mapped: Session[] = sessions.flatMap((value: unknown) => {
+          if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+          const raw = value as Record<string, unknown>;
+          const parentSessionId = typeof raw.parentSessionId === "string" ? raw.parentSessionId : "";
+          const parent = current.sessions.find((session) => session.id === parentSessionId && session.sessionKind !== "side_chat");
+          if (!parent) return [];
+          try { return [{ ...derivedSession(raw, parent), sessionKind: "side_chat" as const, parentSessionId }]; }
+          catch { return []; }
+        });
+        if (!mapped.length) return current;
+        const ids = new Set(mapped.map((session: Session) => session.id));
+        return { ...current, sessions: [...mapped, ...current.sessions.filter((session) => !ids.has(session.id))] };
+      });
+    }).catch(() => undefined);
+  }, [snapshot]);
+
+  useEffect(() => {
     if (isBrowserPreview) return;
     void window.tethoqDesktop.browserState().then(setBrowser).catch((error: unknown) => notify(error instanceof Error ? error.message : String(error), "error"));
     void window.tethoqDesktop.recorderState().then(setRecorder).catch(() => undefined);
     void window.tethoqDesktop.recorderAction({ type: "list" }).then((value) => { if (Array.isArray(value)) setWorkflows(value as unknown as WorkflowDescriptor[]); }).catch(() => undefined);
     void window.tethoqDesktop.preferencesState().then(setPreferences).catch(() => undefined);
+    void window.tethoqDesktop.localOpenHandlers().then(setLocalOpenState).catch(() => undefined);
     const removePreferences = window.tethoqDesktop.onPreferencesState(setPreferences);
     const removeBrowser = window.tethoqDesktop.onBrowserState(setBrowser);
     const removeBrowserNotice = window.tethoqDesktop.onBrowserNotice((notice) => {
@@ -365,15 +610,20 @@ function App() {
       const models = await loadProviderModels(visibleProviders);
       const selected = selectedSessionIdRef.current;
       const timelinePage = selected ? await loadSessionTimelinePage(selected).catch(() => null) : null;
-      setSnapshot((current) => current ? {
-        ...current,
-        sessions: [...current.sessions.filter((session) => session.draft), ...sessions],
-        providers: visibleProviders,
-        models,
-        approvals: attention.approvals,
-        inputRequests: attention.inputRequests,
-        timelines: selected && timelinePage ? { ...current.timelines, [selected]: reconcileTimelinePage(timelinePage.items, current.timelines[selected] ?? []) } : current.timelines,
-      } : current);
+      setSnapshot((current) => {
+        if (!current) return current;
+        const refreshedIds = new Set(sessions.map((session) => session.id));
+        const localOnly = current.sessions.filter((session) => (session.draft || session.sessionKind === "side_chat") && !refreshedIds.has(session.id));
+        return {
+          ...current,
+          sessions: [...localOnly, ...sessions],
+          providers: visibleProviders,
+          models,
+          approvals: attention.approvals,
+          inputRequests: attention.inputRequests,
+          timelines: selected && timelinePage ? { ...current.timelines, [selected]: reconcileTimelinePage(timelinePage.items, current.timelines[selected] ?? []) } : current.timelines,
+        };
+      });
       if (selected && timelinePage) {
         setTimelineWindows((current) => ({
           ...current,
@@ -388,12 +638,66 @@ function App() {
     }
   }, [notify]);
 
+  const refreshVisibleState = useCallback(async () => {
+    if (visibleRefreshInFlight.current) return;
+    visibleRefreshInFlight.current = true;
+    try {
+      const selected = selectedSessionIdRef.current;
+      const [sessions, timelinePage] = await Promise.all([
+        listSessions(),
+        selected ? loadSessionTimelinePage(selected).catch(() => null) : Promise.resolve(null),
+      ]);
+      setSnapshot((current) => {
+        if (!current) return current;
+        const refreshedIds = new Set(sessions.map((session) => session.id));
+        const localOnly = current.sessions.filter((session) => (session.draft || session.sessionKind === "side_chat") && !refreshedIds.has(session.id));
+        return {
+          ...current,
+          sessions: [...localOnly, ...sessions],
+          timelines: selected && timelinePage ? { ...current.timelines, [selected]: reconcileTimelinePage(timelinePage.items, current.timelines[selected] ?? []) } : current.timelines,
+        };
+      });
+      if (selected && timelinePage) setTimelineWindows((current) => ({
+        ...current,
+        [selected]: { nextCursor: timelinePage.nextCursor, revealStart: initialTimelineRevealStart(timelinePage.items), loadingOlder: false },
+      }));
+    } finally {
+      visibleRefreshInFlight.current = false;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!snapshot || isBrowserPreview) return;
+    const refreshWhenVisible = () => { if (!document.hidden) void refreshVisibleState().catch(() => undefined); };
+    window.addEventListener("focus", refreshWhenVisible);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    return () => {
+      window.removeEventListener("focus", refreshWhenVisible);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
+  }, [refreshVisibleState, snapshot !== null]);
+
   useEffect(() => subscribeToDesktop(
     (batch) => {
+      const compactionEvents = batch.events.filter((event) => event.sessionId && (event.type === "context.compaction_started" || event.type === "context.compaction_completed"));
+      if (compactionEvents.length) {
+        setCompactionsBySession((current) => {
+          const next = { ...current };
+          for (const event of compactionEvents) {
+            const sessionId = event.sessionId!;
+            const kind = event.payload.kind === "automatic" || event.payload.kind === "manual" ? event.payload.kind : null;
+            next[sessionId] = { isCompacting: event.type === "context.compaction_started", kind };
+          }
+          return next;
+        });
+      }
+      const remotelyUpdatedSessionIds = [...new Set(batch.events.flatMap((event) => event.type === "message.remote_received" && event.sessionId ? [event.sessionId] : []))];
       let refreshSessionsNeeded = batch.replayGap;
       let refreshProvidersNeeded = batch.replayGap;
       let refreshAttentionNeeded = batch.replayGap;
       let refreshSelectedTimeline = batch.replayGap;
+      if (remotelyUpdatedSessionIds.length) refreshSessionsNeeded = true;
+      if (selectedSessionIdRef.current && remotelyUpdatedSessionIds.includes(selectedSessionIdRef.current)) refreshSelectedTimeline = true;
       if (batch.replayGap || batch.events.some((event) => event.sessionId === selectedSessionIdRef.current && (event.type === "message.queued" || event.type === "message.queue_updated" || event.type === "message.queue_removed"))) {
         setQueueRevision((current) => current + 1);
       }
@@ -410,6 +714,10 @@ function App() {
           if (event.type === "session.created" || event.type === "session.updated") {
             refreshSessionsNeeded = true;
           }
+          if (event.type === "side_chat.created" || event.type === "side_chat.updated" || event.type === "side_chat.promoted") {
+            const session = sideChatEventSession(event.payload.session, next.sessions, event.occurredAt);
+            if (session) next.sessions = [session, ...next.sessions.filter((candidate) => candidate.id !== session.id)];
+          }
           if (event.type === "approval.requested" || event.type === "approval.resolved" || event.type === "user_input.requested") {
             refreshAttentionNeeded = true;
             refreshSessionsNeeded = true;
@@ -420,6 +728,9 @@ function App() {
           if (event.type === "session.status_changed") {
             const state = typeof event.payload.state === "string" ? event.payload.state : undefined;
             if (state) next.sessions = replaceSession(next.sessions, event.sessionId, { state: state === "disconnected" || state === "unknown" ? "offline" : state as SessionState, updatedAt: event.occurredAt });
+          }
+          if (event.type === "message.started" || event.type === "message.delta" || event.type === "tool.started" || event.type === "command.started") {
+            next.sessions = replaceSession(next.sessions, event.sessionId, { state: "working", updatedAt: event.occurredAt });
           }
           if (event.type === "agent.completed" || event.type === "agent.interrupted" || event.type === "agent.error") {
             const state: SessionState = event.type === "agent.completed" ? "completed" : event.type === "agent.interrupted" ? "idle" : "failed";
@@ -445,6 +756,12 @@ function App() {
             ...current,
             [selected]: { nextCursor: page.nextCursor, revealStart: initialTimelineRevealStart(page.items), loadingOlder: false },
           }));
+        }).catch(() => undefined);
+      }
+      for (const sessionId of remotelyUpdatedSessionIds) {
+        if (sessionId === selectedSessionIdRef.current) continue;
+        void loadSessionTimelinePage(sessionId).then((page) => {
+          setSnapshot((current) => current ? { ...current, timelines: { ...current.timelines, [sessionId]: reconcileTimelinePage(page.items, current.timelines[sessionId] ?? []) } } : current);
         }).catch(() => undefined);
       }
     },
@@ -511,6 +828,68 @@ function App() {
     }
   }, [insertDerivedSession, notify, snapshot]);
 
+  const openSideChatPanel = useCallback((sessionId: string, anchor: SideChatAnchor) => {
+    setOpenSideChats((current) => {
+      const existing = current.find((item) => item.id === sessionId);
+      if (existing) return current.map((item) => item.id === sessionId ? { ...item, anchor } : item);
+      return [...current.slice(-1), { id: sessionId, anchor }];
+    });
+    if (snapshot?.timelines[sessionId] !== undefined) return;
+    setSnapshot((current) => current ? { ...current, timelines: { ...current.timelines, [sessionId]: [] } } : current);
+    void loadSessionTimelinePage(sessionId).then((page) => {
+      setSnapshot((current) => current ? { ...current, timelines: { ...current.timelines, [sessionId]: reconcileTimelinePage(page.items, current.timelines[sessionId] ?? []) } } : current);
+    }).catch((error: unknown) => notify(error instanceof Error ? error.message : String(error), "error"));
+  }, [notify, snapshot?.timelines]);
+
+  const createSideChat = useCallback(async (parentSessionId: string, prompt?: string, queuedMessageId?: string) => {
+    const source = snapshot?.sessions.find((session) => session.id === parentSessionId && session.sessionKind !== "side_chat");
+    if (!source) throw new Error("The parent task is no longer available.");
+    const response = await request("side_chat.create", { parentSessionId, ...(prompt?.trim() ? { prompt: prompt.trim() } : {}), ...(queuedMessageId ? { queuedMessageId } : {}) });
+    if (!response.session || typeof response.session !== "object" || Array.isArray(response.session)) throw new Error("Bridge did not return the side chat.");
+    const next = derivedSession(response.session as Record<string, unknown>, source);
+    const sideChat: Session = { ...next, sessionKind: "side_chat", parentSessionId, ...(prompt?.trim() ? { preview: prompt.trim() } : {}) };
+    setSnapshot((current) => current ? { ...current, sessions: [sideChat, ...current.sessions.filter((session) => session.id !== sideChat.id)] } : current);
+    const parentElement = document.querySelector<HTMLElement>(`[data-session-id="${CSS.escape(parentSessionId)}"]`);
+    const bounds = parentElement?.getBoundingClientRect();
+    openSideChatPanel(sideChat.id, { x: bounds?.right ?? 248, y: bounds ? bounds.top + bounds.height / 2 : Math.max(110, window.innerHeight - 210) });
+  }, [openSideChatPanel, snapshot?.sessions]);
+
+  const promoteSideChat = useCallback(async (sessionId: string) => {
+    const response = await request("side_chat.promote", { sessionId });
+    const source = snapshot?.sessions.find((session) => session.id === sessionId);
+    if (!source || !response.session || typeof response.session !== "object" || Array.isArray(response.session)) throw new Error("Bridge did not return the promoted task.");
+    const promoted: Session = { ...derivedSession(response.session as Record<string, unknown>, source), sessionKind: "task" };
+    delete promoted.parentSessionId;
+    setSnapshot((current) => current ? { ...current, sessions: [promoted, ...current.sessions.filter((session) => session.id !== promoted.id)] } : current);
+    setOpenSideChats((current) => current.filter((item) => item.id !== sessionId));
+    setSelectedSessionId(promoted.id);
+    setView("workspace");
+    void openSession(promoted.id, true);
+    notify("Side chat copied to a full task");
+  }, [notify, openSession, snapshot?.sessions]);
+
+  const updateSideChatDraft = useCallback((sessionId: string, update: SideChatDraftUpdate) => {
+    setSideChatDrafts((current) => {
+      const previous = current[sessionId] ?? emptySideChatDraft;
+      const nextDraft = typeof update === "function" ? update(previous) : update;
+      if (previous.content === nextDraft.content && previous.attachments === nextDraft.attachments) return current;
+      return { ...current, [sessionId]: nextDraft };
+    });
+  }, []);
+
+  const discardSideChatDraft = useCallback((sessionId: string) => {
+    setSideChatDrafts((current) => {
+      if (!(sessionId in current)) return current;
+      const next = { ...current };
+      delete next[sessionId];
+      return next;
+    });
+  }, []);
+
+  const updateSideChatAnchor = useCallback((sessionId: string, anchor: SideChatAnchor) => {
+    setOpenSideChats((current) => current.map((item) => item.id === sessionId && (item.anchor.x !== anchor.x || item.anchor.y !== anchor.y) ? { ...item, anchor } : item));
+  }, []);
+
   const loadOlderHistory = useCallback(async (sessionId: string) => {
     const windowState = timelineWindows[sessionId];
     if (!windowState || windowState.loadingOlder) return;
@@ -560,7 +939,7 @@ function App() {
       return;
     }
     const models = snapshot.models[preferredProvider.id] ?? [];
-    const model = models.find((item) => item.isDefault) ?? models[0];
+    const selection = resolveConcreteModelSelection(models, {}, preferences.agentDefaults[preferredProvider.id]);
     const workingDirectory = source?.workingDirectory ?? "";
     const now = new Date().toISOString();
     const draft: Session = {
@@ -573,8 +952,8 @@ function App() {
       workingDirectory,
       preview: "",
       updatedAt: now,
-      model: model?.id ?? "default",
-      effort: model?.efforts[0] ?? "Default",
+      model: selection?.modelId ?? "default",
+      effort: selection?.reasoningEffort ?? "",
     };
     setSnapshot((current) => current ? {
       ...current,
@@ -587,7 +966,7 @@ function App() {
     setSelectedSessionId(draft.id);
     setView("workspace");
     if (narrow) setListCollapsed(true);
-  }, [narrow, notify, selectedSessionId, snapshot]);
+  }, [narrow, notify, preferences.agentDefaults, selectedSessionId, snapshot]);
 
   const updateDraftSelection = useCallback((draftSessionId: string, selection: DraftModelSelection) => {
     setSnapshot((current) => current ? {
@@ -614,16 +993,19 @@ function App() {
   const createDraftSend = useCallback(async (input: DraftSessionSendInput) => {
     if (!input.workingDirectory) throw new Error("Choose a project folder before starting this task.");
     const modelFields = {
-      ...(input.modelId !== "default" ? { modelId: input.modelId } : {}),
-      ...(input.effort !== "Default" ? { reasoningEffort: input.effort.toLowerCase() } : {}),
+      ...(!isAmbiguousSelectionValue(input.modelId) ? { modelId: input.modelId } : {}),
+      ...(!isAmbiguousSelectionValue(input.effort) ? { reasoningEffort: input.effort.toLowerCase() } : {}),
     };
+    const separatedFirstTurn = input.attachmentIds.length > 0 || input.workflowIds.length > 0;
     const response = await request("session.create", {
       providerId: input.providerId,
       workingDirectory: input.workingDirectory,
+      title: input.content.trim().split(/\r?\n/u)[0]?.slice(0, 96) || "New task",
       ...modelFields,
-      ...(input.attachmentIds.length ? {} : { firstInstruction: input.content }),
+      ...(separatedFirstTurn ? {} : { firstInstruction: input.content }),
+      ...(!separatedFirstTurn && input.simplify !== undefined ? { simplify: input.simplify } : {}),
     });
-    const pending = createdSession(response.session, input, input.attachmentIds.length ? "idle" : "working", input.attachmentIds.length ? "" : input.content);
+    const pending = createdSession(response.session, input, separatedFirstTurn ? "idle" : "working", separatedFirstTurn ? "" : input.content);
 
     const commit = (session: Session, retainedDraft: string, includeOptimisticMessage: boolean) => {
       const now = new Date().toISOString();
@@ -633,7 +1015,7 @@ function App() {
         const draftTimeline = timelines[input.draftSessionId] ?? [];
         delete timelines[input.draftSessionId];
         timelines[session.id] = includeOptimisticMessage
-          ? [...draftTimeline, { id: `local-${Date.now()}`, kind: "user", body: input.content, timestamp: now, state: "completed" }]
+          ? [...draftTimeline, { id: `local-${Date.now()}`, kind: "user", body: input.content, ...(input.workflows.length ? { workflows: input.workflows } : {}), timestamp: now, state: "completed" }]
           : draftTimeline;
         return {
           ...current,
@@ -648,6 +1030,12 @@ function App() {
         else delete next[session.id];
         return next;
       });
+      setComposerAttachments((current) => {
+        const next = { ...current };
+        delete next[input.draftSessionId];
+        delete next[session.id];
+        return next;
+      });
       setTimelineWindows((current) => {
         const next = { ...current };
         delete next[input.draftSessionId];
@@ -658,13 +1046,15 @@ function App() {
       setView("workspace");
     };
 
-    if (input.attachmentIds.length) {
+    if (separatedFirstTurn) {
       try {
         await request("session.send_message", {
           sessionId: pending.id,
           content: input.content,
           ...modelFields,
           attachmentIds: [...input.attachmentIds],
+          ...(input.workflowIds.length ? { workflowIds: [...input.workflowIds] } : {}),
+          ...(input.simplify !== undefined ? { simplify: input.simplify } : {}),
         });
       } catch (error) {
         commit(pending, input.content, false);
@@ -673,7 +1063,7 @@ function App() {
       }
     }
 
-    const active = input.attachmentIds.length ? { ...pending, state: "working" as const, preview: input.content } : pending;
+    const active = separatedFirstTurn ? { ...pending, state: "working" as const, preview: input.content } : pending;
     commit(active, "", true);
     void openSession(active.id, true);
   }, [openSession]);
@@ -695,19 +1085,95 @@ function App() {
     return () => window.removeEventListener("keydown", handle);
   }, [refreshAll, startDraftTask]);
 
-  const selectedSession = snapshot?.sessions.find((session) => session.id === selectedSessionId) ?? null;
+  const organizedSessions = useMemo(() => organizeSessions(snapshot?.sessions ?? [], preferences.taskOverrides), [preferences.taskOverrides, snapshot]);
+  const selectedSession = useMemo(() => organizedSessions.find((session) => session.id === selectedSessionId && session.sessionKind !== "side_chat" && session.sessionKind !== "internal") ?? null, [organizedSessions, selectedSessionId]);
+  useEffect(() => {
+    if (isBrowserPreview || view !== "workspace" || !selectedSession || selectedSession.draft || selectedSession.state !== "working") return;
+    const sessionId = selectedSession.id;
+    let disposed = false;
+    let timer: number | undefined;
+    const schedule = () => {
+      if (!disposed) timer = window.setTimeout(() => void reconcile(), 850);
+    };
+    const reconcile = async () => {
+      if (disposed) return;
+      if (document.hidden) {
+        schedule();
+        return;
+      }
+      try {
+        const page = await loadSessionTimelinePage(sessionId, undefined, 40, true);
+        if (disposed) return;
+        setSnapshot((current) => current ? {
+          ...current,
+          timelines: { ...current.timelines, [sessionId]: reconcileTimelinePage(page.items, current.timelines[sessionId] ?? []) },
+        } : current);
+        setTimelineWindows((current) => {
+          const existing = current[sessionId];
+          return {
+            ...current,
+            [sessionId]: existing
+              ? { ...existing, nextCursor: page.nextCursor }
+              : { nextCursor: page.nextCursor, revealStart: initialTimelineRevealStart(page.items), loadingOlder: false },
+          };
+        });
+      } catch {
+        // Provider events remain the fast path; a brief snapshot failure is retried only while this visible task is working.
+      } finally {
+        schedule();
+      }
+    };
+    void reconcile();
+    return () => {
+      disposed = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [selectedSession?.draft, selectedSession?.id, selectedSession?.state, view]);
   const filteredSessions = useMemo(() => {
     if (!snapshot) return [];
-    const lowered = query.trim().toLowerCase();
+    const lowered = normalizeUiSearchQuery(query);
     const availableProviders = new Set(snapshot.providers.filter((provider) => provider.detected).map((provider) => provider.id));
     const providerFilters = selectedProvider === "all" ? [] : Array.isArray(selectedProvider) ? selectedProvider : [selectedProvider];
-    return snapshot.sessions.filter((session) => {
+    return organizedSessions.filter((session) => {
+      if (session.sessionKind === "side_chat" || session.sessionKind === "internal") return false;
+      if (isHiddenByArchive(session, showArchived, selectedSessionId)) return false;
       if (providerFilters.length && !providerFilters.some((providerId) => providerId === "available" ? availableProviders.has(session.providerId) : session.providerId === providerId)) return false;
       if (stateFilter !== "all" && session.state !== stateFilter) return false;
-      if (lowered && !`${session.title} ${session.project} ${session.preview} ${session.workingDirectory}`.toLowerCase().includes(lowered)) return false;
+      if (lowered && !normalizeUiSearchQuery(`${session.title} ${session.project} ${session.preview}`, 4_000).includes(lowered)) return false;
       return true;
-    }).sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt));
-  }, [query, selectedProvider, snapshot, stateFilter]);
+    }).sort(compareOrganizedSessions);
+  }, [organizedSessions, query, selectedProvider, selectedSessionId, showArchived, snapshot, stateFilter]);
+  const archivedCount = useMemo(() => organizedSessions.filter((session) => session.archived && session.sessionKind !== "side_chat" && session.sessionKind !== "internal").length, [organizedSessions]);
+  /** Everything the dashboard and command palette may surface: real tasks the user has not put away. */
+  const activeSessions = useMemo(() => organizedSessions.filter((session) => !session.archived && session.sessionKind !== "side_chat" && session.sessionKind !== "internal"), [organizedSessions]);
+  const setTaskOverride = useCallback(async (sessionId: string, override: TaskOverride) => {
+    if (isBrowserPreview) { setPreferences((current) => ({ ...current, taskOverrides: { ...current.taskOverrides, [sessionId]: { ...current.taskOverrides[sessionId], ...override } } })); return; }
+    try { setPreferences(await window.tethoqDesktop.preferencesAction({ type: "set-task-override", sessionId, override })); }
+    catch (error) { notify(error instanceof Error ? error.message : String(error), "error"); }
+  }, [notify]);
+
+  const openSettings = useCallback(() => {
+    setView((current) => {
+      if (current !== "settings") settingsReturnView.current = current;
+      return "settings";
+    });
+  }, []);
+  const closeSettings = useCallback(() => {
+    const next = settingsReturnView.current;
+    setView(next);
+    if (next === "workspace") setListCollapsed(false);
+    setSelectedWorkflowId(null);
+  }, []);
+  const navigateToView = useCallback((next: View) => {
+    if (next === "settings") {
+      if (view === "settings") closeSettings();
+      else openSettings();
+      return;
+    }
+    setView(next);
+    if (next === "workspace") setListCollapsed(false);
+    setSelectedWorkflowId(null);
+  }, [closeSettings, openSettings, view]);
 
   if (!snapshot) {
     return <div className="app-loading">{loadError ? <ErrorBanner title="Tethoq could not start" message={loadError} onRetry={() => void initialize()} /> : <LoadingState />}</div>;
@@ -720,12 +1186,13 @@ function App() {
   };
 
   return (
-    <div className={`desktop-app ${listCollapsed ? "list-collapsed" : ""} ${narrow ? "narrow" : ""}`} data-provider={Array.isArray(selectedProvider) ? selectedProvider.join(",") : selectedProvider} data-runtime-state={runtime.state}>
+    <LocalOpenProvider state={localOpenState} onOpen={openLocalTarget}>
+    <div className={`desktop-app ${listCollapsed ? "list-collapsed" : ""} ${narrow ? "narrow" : ""} ${sidebarResizing ? "sidebar-resizing" : ""}`} style={narrow ? undefined : { "--navigation-panel": `${navigationPanelWidth}px` } as CSSProperties} data-provider={Array.isArray(selectedProvider) ? selectedProvider.join(",") : selectedProvider} data-runtime-state={runtime.state}>
       <TitleBar snapshot={snapshot} session={selectedSession} notify={notify} onDirectModels={(models) => setSnapshot((current) => current ? { ...current, models: { ...current.models, direct: models } } : current)} />
       <div className="app-body">
         <Sidebar
           sessions={filteredSessions}
-          allSessions={snapshot.sessions}
+          allSessions={organizedSessions}
           providers={snapshot.providers}
           selected={selectedSessionId}
           selectedProvider={selectedProvider}
@@ -740,16 +1207,52 @@ function App() {
           onOpen={openSession}
           onBranch={(sessionId) => void branchSessionFromList(sessionId)}
           onOpenDirectory={openSessionDirectory}
-          onView={(next) => {
-            setView(next);
-            if (next === "workspace") setListCollapsed(false);
-            if (next !== "settings") setSelectedWorkflowId(null);
-          }}
+          onView={navigateToView}
           onNewTask={startDraftTask}
           onCommandSearch={() => setPaletteOpen(true)}
+          showSideChats={showSideChats}
+          activeSideChatIds={openSideChats.map((item) => item.id)}
+          onShowSideChats={setShowSideChats}
+          onCreateSideChat={(parentSessionId) => createSideChat(parentSessionId)}
+          onOpenSideChat={openSideChatPanel}
+          onSideChatAnchor={updateSideChatAnchor}
+          showArchived={showArchived}
+          archivedCount={archivedCount}
+          onShowArchived={setShowArchived}
+          onTaskOverride={(sessionId, override) => void setTaskOverride(sessionId, override)}
         />
-        {view === "dashboard" ? <Dashboard snapshot={snapshot} onOpen={openSession} onNew={startDraftTask} onProvider={setProvider} /> : null}
-        {view === "settings" ? <SettingsPage snapshot={snapshot} {...(bootstrap ? { bootstrap } : {})} recorder={recorder} workflows={workflows} selectedWorkflowId={selectedWorkflowId} onSelectWorkflow={setSelectedWorkflowId} setWorkflows={setWorkflows} onSaveWorkflow={() => setSaveWorkflowOpen(true)} preferences={preferences} onSetExperimentalFeatures={async (enabled) => {
+        {!narrow ? <div
+          className="navigation-resize-handle"
+          role="separator"
+          aria-label="Resize task list"
+          aria-orientation="vertical"
+          aria-valuemin={minimumNavigationPanelWidth}
+          aria-valuemax={clampNavigationPanelWidth(maximumNavigationPanelWidth, window.innerWidth)}
+          aria-valuenow={navigationPanelWidth}
+          tabIndex={0}
+          onPointerDown={beginSidebarResize}
+          onKeyDown={resizeSidebarWithKeyboard}
+        /> : null}
+        {view === "dashboard" ? <Dashboard snapshot={snapshot} sessions={activeSessions} onOpen={openSession} onNew={startDraftTask} onProvider={setProvider} /> : null}
+        {view === "settings" ? <SettingsPage snapshot={snapshot} {...(bootstrap ? { bootstrap } : {})} recorder={recorder} workflows={workflows} selectedWorkflowId={selectedWorkflowId} onSelectWorkflow={setSelectedWorkflowId} setWorkflows={setWorkflows} onSaveWorkflow={() => setSaveWorkflowOpen(true)} onClose={closeSettings} preferences={preferences} onSetReasoningDisplay={async (value) => {
+          if (!isBrowserPreview) {
+            const next = await window.tethoqDesktop.preferencesAction({ type: "set-reasoning-display", value });
+            setPreferences(next);
+          }
+          notify(value === "expanded" ? "Reasoning will open expanded" : "Reasoning will open compact");
+        }} onSetDesktopBehavior={async (action) => {
+          if (isBrowserPreview) { notify("Desktop behavior is available in the installed desktop app"); return; }
+          try { setPreferences(await window.tethoqDesktop.preferencesAction(action)); }
+          catch (error) { notify(error instanceof Error ? error.message : String(error), "error"); }
+        }} onSetAgentDefault={async (providerId, modelId, reasoningEffort) => {
+          if (isBrowserPreview) {
+            setPreferences((current) => ({ ...current, agentDefaults: { ...current.agentDefaults, [providerId]: { modelId, ...(reasoningEffort ? { reasoningEffort } : {}) } } }));
+          } else {
+            const next = await window.tethoqDesktop.preferencesAction({ type: "set-agent-default", providerId, modelId, ...(reasoningEffort ? { reasoningEffort } : {}) });
+            setPreferences(next);
+          }
+          notify("Model default updated");
+        }} onSetExperimentalFeatures={async (enabled) => {
           if (!isBrowserPreview) {
             const next = await window.tethoqDesktop.preferencesAction({ type: "set-experimental-features", enabled });
             setPreferences(next);
@@ -779,34 +1282,74 @@ function App() {
             onNew={startDraftTask}
             onBrowser={() => setView("browser")}
             onLinkOpen={(url) => void openTimelineLink(url)}
-            onManageWorkflow={(id) => { setSelectedWorkflowId(id ?? null); setView("settings"); }}
+            onManageWorkflow={(id) => { setSelectedWorkflowId(id ?? null); openSettings(); }}
             onDraftSelectionChange={(selection) => { if (selectedSession?.draft) updateDraftSelection(selectedSession.id, selection); }}
             onCreateDraftSend={createDraftSend}
             onDraftDirectory={() => { if (selectedSession?.draft) void chooseDraftDirectory(selectedSession.id, selectedSession.workingDirectory); }}
             handoffSummary={handoffSummaries[selectedSession?.id ?? ""] ?? selectedSession?.contextSummary}
             initialDraft={composerDrafts[selectedSession?.id ?? ""] ?? ""}
             onDraftChange={(value) => { if (selectedSession) setComposerDrafts((current) => current[selectedSession.id] === value ? current : { ...current, [selectedSession.id]: value }); }}
+            initialAttachments={composerAttachments[selectedSession?.id ?? ""] ?? []}
+            onAttachmentsChange={(attachments) => {
+              if (!selectedSession) return;
+              setComposerAttachments((current) => {
+                if (current[selectedSession.id] === attachments) return current;
+                const next = { ...current };
+                if (attachments.length) next[selectedSession.id] = attachments;
+                else delete next[selectedSession.id];
+                return next;
+              });
+            }}
             onDerivedSession={(value, summary, draft) => {
               if (selectedSession) insertDerivedSession(selectedSession, value, summary, draft);
+            }}
+            onOpenChild={(child) => {
+              setSnapshot((current) => current ? { ...current, sessions: [child, ...current.sessions.filter((item) => item.id !== child.id)] } : current);
+              void openSession(child.id, true);
             }}
             notify={notify}
             updateSnapshot={setSnapshot}
             timelineWindow={selectedSession ? timelineWindows[selectedSession.id] : undefined}
             onLoadOlder={selectedSession ? () => loadOlderHistory(selectedSession.id) : undefined}
+            reasoningDisplay={preferences.reasoningDisplay}
+            agentDefaults={preferences.agentDefaults}
             experimental={preferences.experimentalFeatures}
             onInstantSession={() => setLiveSessionOpen(true)}
+            onCreateSideChat={createSideChat}
             queueRevision={queueRevision}
+            queueingEnabled={queueingBySession[selectedSession?.id ?? ""] ?? true}
+            onQueueingEnabledChange={(enabled) => { if (selectedSession) setQueueingBySession((current) => ({ ...current, [selectedSession.id]: enabled })); }}
+            reportedCompaction={selectedSession ? compactionsBySession[selectedSession.id] : undefined}
           />
         : null}
       </div>
+      {openSideChats.length ? <SideChatLayer
+        items={openSideChats}
+        snapshot={snapshot}
+        drafts={sideChatDrafts}
+        notify={notify}
+        onClose={(sessionId) => setOpenSideChats((current) => current.filter((item) => item.id !== sessionId))}
+        onPromote={promoteSideChat}
+        onDraftChange={updateSideChatDraft}
+        onDiscardDraft={discardSideChatDraft}
+        onSent={(sessionId, item) => setSnapshot((current) => current ? { ...current, timelines: { ...current.timelines, [sessionId]: [...(current.timelines[sessionId] ?? []), item] }, sessions: replaceSession(current.sessions, sessionId, { preview: item.body, state: "working", updatedAt: item.timestamp }) } : current)}
+      /> : null}
       {liveSessionOpen && selectedSession ? <LiveSessionPanel session={selectedSession} experimental={preferences.experimentalFeatures} notify={notify} onClose={() => setLiveSessionOpen(false)} /> : null}
       {saveWorkflowOpen && recorder.phase === "staged" ? <SaveWorkflowModal recorder={recorder} onClose={() => { setSaveWorkflowOpen(false); }} onDiscard={async () => { if (!isBrowserPreview) await window.tethoqDesktop.recorderAction({ type: "discard" }); setSaveWorkflowOpen(false); }} onSaved={(workflow) => { setWorkflows((current) => [workflow, ...current.filter((item) => item.id !== workflow.id)]); setSaveWorkflowOpen(false); notify("Workflow saved locally"); }} /> : null}
       {recorder.phase === "recording" ? <RecordingBar recorder={recorder} onStop={async () => { if (!isBrowserPreview) await window.tethoqDesktop.recorderAction({ type: "stop", reason: "user" }); }} /> : null}
-      {paletteOpen ? <CommandPalette snapshot={snapshot} onClose={() => setPaletteOpen(false)} onAction={(action) => {
+      {paletteOpen ? <CommandPalette snapshot={snapshot} sessions={activeSessions} onClose={() => setPaletteOpen(false)} onAction={(action) => {
         setPaletteOpen(false);
         if (action === "new") startDraftTask();
         else if (action === "refresh") void refreshAll();
-        else if (action === "settings") setView("settings");
+        else if (action === "settings") openSettings();
+        else if (action.startsWith("settings:")) {
+          const targetId = settingsTargetForAction(action);
+          if (!targetId) return;
+          openSettings();
+          window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+            document.getElementById(targetId)?.scrollIntoView({ block: "start" });
+          }));
+        }
         else if (action === "shortcuts") setShortcutsOpen(true);
         else if (action.startsWith("session:")) void openSession(action.slice(8));
         else if (action.startsWith("provider:")) setProvider(action.slice(9));
@@ -816,7 +1359,69 @@ function App() {
       {bootstrap?.app.version ? <span className="app-version-stamp" aria-label={`Tethoq version ${bootstrap.app.version}`}>v{bootstrap.app.version}</span> : null}
       {isBrowserPreview ? <span className="preview-badge">Browser preview</span> : null}
     </div>
+    </LocalOpenProvider>
   );
+}
+
+function SideChatLayer({ items, snapshot, drafts, notify, onClose, onPromote, onDraftChange, onDiscardDraft, onSent }: {
+  items: readonly { id: string; anchor: SideChatAnchor }[];
+  snapshot: DesktopSnapshot;
+  drafts: Readonly<Record<string, SideChatDraft>>;
+  notify: (message: string, tone?: "normal" | "error") => void;
+  onClose: (sessionId: string) => void;
+  onPromote: (sessionId: string) => Promise<void>;
+  onDraftChange: (sessionId: string, update: SideChatDraftUpdate) => void;
+  onDiscardDraft: (sessionId: string) => void;
+  onSent: (sessionId: string, item: TimelineItem) => void;
+}) {
+  const viewportWidth = Math.max(640, window.innerWidth);
+  const viewportHeight = Math.max(440, window.innerHeight);
+  const width = Math.min(430, viewportWidth - 286);
+  const left = Math.min(viewportWidth - width - 12, 266);
+  const topInset = 66;
+  const bottomInset = 12;
+  const panelGap = 10;
+  const availableHeight = viewportHeight - topInset - bottomInset;
+  const panelHeight = items.length > 1
+    ? Math.max(150, Math.min(315, Math.floor((availableHeight - panelGap) / 2)))
+    : Math.min(350, availableHeight);
+  const positions: number[] = Array.from({ length: items.length }, () => topInset);
+  if (items.length === 1) {
+    positions[0] = Math.max(topInset, Math.min(viewportHeight - bottomInset - panelHeight, items[0]!.anchor.y - 42));
+  } else if (items.length > 1) {
+    const ordered = items.map((item, index) => ({ item, index })).sort((leftItem, rightItem) => leftItem.item.anchor.y - rightItem.item.anchor.y);
+    const groupHeight = panelHeight * 2 + panelGap;
+    const desiredTop = ordered[0]!.item.anchor.y - 42;
+    const groupTop = Math.max(topInset, Math.min(viewportHeight - bottomInset - groupHeight, desiredTop));
+    positions[ordered[0]!.index] = groupTop;
+    positions[ordered[1]!.index] = groupTop + panelHeight + panelGap;
+  }
+  return <div className="side-chat-layer" aria-label="Open side chats">
+    <svg className="side-chat-connectors" width={viewportWidth} height={viewportHeight} viewBox={`0 0 ${viewportWidth} ${viewportHeight}`} aria-hidden="true">{items.map((item, index) => {
+      const targetY = (positions[index] ?? 66) + 42;
+      const middle = item.anchor.x + Math.max(6, (left - item.anchor.x) / 2);
+      return <path key={item.id} d={`M ${item.anchor.x} ${item.anchor.y} C ${middle} ${item.anchor.y}, ${middle} ${targetY}, ${left} ${targetY}`}/>;
+    })}</svg>
+    {items.map((item, index) => {
+      const session = snapshot.sessions.find((candidate) => candidate.id === item.id && candidate.sessionKind === "side_chat");
+      if (!session) return null;
+      const provider = snapshot.providers.find((candidate) => candidate.id === session.providerId);
+      return <div className="side-chat-floating" key={session.id} style={{ left, top: positions[index], width, height: panelHeight }}><SideChatPanel
+        session={session}
+        provider={provider}
+        timeline={snapshot.timelines[session.id] ?? []}
+        request={request}
+        selectImages={selectImages}
+        notify={notify}
+        draft={drafts[session.id] ?? emptySideChatDraft}
+        onDraftChange={(update) => onDraftChange(session.id, update)}
+        onDiscardDraft={() => onDiscardDraft(session.id)}
+        onSent={(timelineItem) => onSent(session.id, timelineItem)}
+        onClose={() => onClose(session.id)}
+        onPromote={async () => { try { await onPromote(session.id); } catch (error) { notify(error instanceof Error ? error.message : String(error), "error"); } }}
+      /></div>;
+    })}
+  </div>;
 }
 
 type WalletKind = "user_api" | "harness" | "subscription";
@@ -992,7 +1597,7 @@ function WalletDropdown({ snapshot, session, notify, onDirectModels }: { snapsho
   return <div className={`wallet-dropdown wallet-${kind} ${open ? "open" : ""}`} ref={root}>
     <button className={`wallet-trigger ${status?.kind === "user_api" && !status.apiKeyConfigured ? "wallet-trigger-caution" : ""}`} data-tooltip={label} type="button" aria-label={`${label}. Open wallet`} aria-haspopup="dialog" aria-expanded={open} onClick={() => { setOpen((current) => !current); if (!open) void refresh(); }}><WalletIcon /></button>
     {open ? <section className="wallet-popover" role="dialog" aria-label="Wallet and billing source">
-      <header><span className="wallet-mark"><WalletIcon /></span><span><strong>{status?.label ?? "Billing source unavailable"}</strong><small>{status?.detail ?? "The local bridge did not report a wallet for this coding tool."}</small></span><button type="button" aria-label="Refresh wallet" onClick={() => void refresh()}><RefreshIcon /></button></header>
+      <header><span className="wallet-mark"><WalletIcon /></span><span><strong>{status?.label ?? "Billing source unavailable"}</strong><small>{status?.detail ?? "The local bridge did not report a wallet for this coding tool."}</small></span></header>
       {status ? <><dl className="wallet-stats"><div><dt>Route</dt><dd>{status.kind === "user_api" ? "Direct API" : status.kind === "harness" ? "Agent-managed" : "Subscription"}</dd></div>{status.balance !== undefined ? <div><dt>Local budget</dt><dd>{walletAmount(status.balance, status.currency)}</dd></div> : null}{status.spent !== undefined ? <div><dt>Observed spend</dt><dd>{walletAmount(status.spent, status.currency)}</dd></div> : null}{status.kind === "user_api" ? <div><dt>API key</dt><dd>{status.apiKeyConfigured ? "Saved" : "Not added"}</dd></div> : null}</dl>{status.caution || (status.kind === "user_api" && !status.apiKeyConfigured) ? <p className="wallet-caution"><AlertIcon />{status.caution ?? "Add your API key before using a direct model. The key stays in the local Bridge and is never displayed again."}</p> : null}</> : null}
       {providerId !== "direct" ? <button className="wallet-route-switch" type="button" disabled={loading} onClick={() => status?.providerId === "direct" ? void refresh() : void showDirectWallet()}>{status?.providerId === "direct" ? <ArrowLeftIcon /> : <WalletIcon />}{status?.providerId === "direct" ? "Back to current task billing" : "Configure Direct API"}</button> : null}
       {status?.kind === "user_api" ? <div className="wallet-direct-settings">
@@ -1107,7 +1712,7 @@ function BrowserWorkspace({ state, focusAddressToken, notify, onReturn }: { stat
     <div className="browser-toolbar">
       <IconButton label="Back" disabled={!active?.canGoBack} onClick={() => active && void act({ type: "back", tabId: active.id })}><ArrowLeftIcon /></IconButton>
       <IconButton label="Forward" disabled={!active?.canGoForward} onClick={() => active && void act({ type: "forward", tabId: active.id })}><ChevronRightIcon /></IconButton>
-      <IconButton label={active?.loading ? "Stop loading" : "Reload"} onClick={() => active && void act({ type: active.loading ? "stop" : "reload", tabId: active.id })}>{active?.loading ? <XIcon /> : <RefreshIcon />}</IconButton>
+      <IconButton label={active?.loading ? "Stop loading" : "Reload"} onClick={() => active && void act({ type: active.loading ? "stop" : "reload", tabId: active.id })}>{active?.loading ? <XIcon /> : <RefreshIcon className="refresh-icon" />}</IconButton>
       <IconButton label="Home" onClick={() => active && void act({ type: "navigate", tabId: active.id, input: "https://www.google.com/" })}><HomeIcon /></IconButton>
       <form className="browser-address" onSubmit={submit}><LockIcon /><input ref={addressInput} aria-label="Address and search" value={address} onChange={(event) => setAddress(event.target.value)} onFocus={(event) => event.currentTarget.select()} spellCheck={false}/>{active?.url ? <span>{active.url.startsWith("https://") ? "Secure" : "Web"}</span> : null}</form>
       <button ref={downloadsButton} className={`browser-downloads ${downloadsOpen ? "active" : ""}`} type="button" aria-label="Downloads" aria-haspopup="dialog" aria-expanded={downloadsOpen} aria-controls="browser-download-panel" disabled={!isBrowserPreview && current?.visible !== true} onClick={() => setDownloadsOpen((open) => !open)}><DownloadIcon />{current?.downloads.some((item) => item.state === "progressing") ? <span>{current.downloads.filter((item) => item.state === "progressing").length}</span> : null}</button>
@@ -1187,36 +1792,144 @@ function SaveWorkflowModal({ recorder, onClose, onDiscard, onSaved }: { recorder
   return <Modal title="Save recorded workflow" eyebrow="Everything is still local" onClose={onClose}><form className="save-workflow-form" onSubmit={async (event) => { event.preventDefault(); if (!name.trim()) return; setBusy(true); try { if (isBrowserPreview) return; const result = await window.tethoqDesktop.recorderAction({ type: "finalize", name: name.trim() }); if (result && !Array.isArray(result) && "id" in result) onSaved(result as WorkflowDescriptor); } finally { setBusy(false); } }}><div className="workflow-capture-summary"><WorkflowIcon /><span><strong>{staged?.summary.eventCount ?? 0} timed events</strong><small>{staged?.summary.screenshotCount ?? 0} screenshots · {recordingDuration(staged?.durationMs ?? 0)} total</small></span></div><label className="form-label"><span>Workflow name</span><input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. Import a folder into CapCut" maxLength={120}/></label><p className="save-warning"><ShieldIcon />Screen content and key codes may contain sensitive information. Nothing is uploaded automatically.</p><div className="modal-actions"><Button type="button" variant="danger" onClick={() => void onDiscard()}><TrashIcon /> Discard</Button><span className="modal-spacer"/><Button type="button" onClick={onClose}>Keep unsaved</Button><Button type="submit" variant="primary" disabled={!name.trim() || busy}>{busy ? <span className="spinner" /> : <CheckIcon />} Save locally</Button></div></form></Modal>;
 }
 
-function Workspace({ snapshot, session, onBack, onNew, onBrowser, onLinkOpen, onManageWorkflow, onDraftSelectionChange, onCreateDraftSend, onDraftDirectory, handoffSummary, initialDraft, onDraftChange, onDerivedSession, notify, updateSnapshot, timelineWindow, onLoadOlder, experimental, onInstantSession, queueRevision }: {
+function childStateLabel(state: Session["state"]): string {
+  if (state === "working") return "Working";
+  if (state === "needs_approval") return "Needs approval";
+  if (state === "needs_input") return "Needs input";
+  if (state === "offline") return "Offline";
+  if (state === "failed") return "Stopped with an issue";
+  return state === "completed" ? "Completed" : "Idle";
+}
+
+function TaskDetailsControl({ session, providers, onOpenChild, notify }: {
+  session: Session;
+  providers: readonly Provider[];
+  onOpenChild: (session: Session) => void;
+  notify: (message: string, tone?: "normal" | "error") => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [children, setChildren] = useState<readonly Session[]>([]);
+  const root = useRef<HTMLDivElement>(null);
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try { setChildren(await listChildSessions(session.id)); }
+    catch (error) { notify(error instanceof Error ? error.message : String(error), "error"); }
+    finally { setLoading(false); }
+  }, [notify, session.id]);
+
+  useEffect(() => { setOpen(false); setChildren([]); }, [session.id]);
+  useEffect(() => {
+    if (!open) return;
+    const closeOutside = (event: MouseEvent) => { if (!root.current?.contains(event.target as Node)) setOpen(false); };
+    const closeEscape = (event: globalThis.KeyboardEvent) => { if (event.key === "Escape") setOpen(false); };
+    window.addEventListener("mousedown", closeOutside);
+    window.addEventListener("keydown", closeEscape);
+    return () => { window.removeEventListener("mousedown", closeOutside); window.removeEventListener("keydown", closeEscape); };
+  }, [open]);
+
+  return <div className={`task-details ${open ? "task-details-open" : ""}`} ref={root}>
+    <button type="button" className="task-details-trigger" title="Task details" aria-label="Task details" aria-expanded={open} onClick={() => { const next = !open; setOpen(next); if (next) void refresh(); }}><InfoIcon /></button>
+    {open ? <section className="task-details-popover" aria-label="Task details">
+      <header><strong>Task details</strong><button type="button" aria-label="Close task details" onClick={() => setOpen(false)}><XIcon /></button></header>
+      <section className="task-details-section" aria-labelledby={`task-subagents-${session.id}`}>
+        <h2 id={`task-subagents-${session.id}`}>Sub-agents</h2>
+        {loading ? <p className="task-details-empty"><span className="spinner" /> Checking this task…</p> : children.length ? <div className="task-child-list">{children.map((child) => {
+          const childProvider = providers.find((provider) => provider.id === child.providerId);
+          return <button type="button" key={child.id} onClick={() => { onOpenChild(child); setOpen(false); }}>
+            <span className="task-child-icon"><AgentIcon /></span>
+            <span><strong>{child.agentNickname || child.title}</strong><small>{providerDisplayName(child.providerId, childProvider)} · {childStateLabel(child.state)}</small></span>
+            <ChevronRightIcon />
+          </button>;
+        })}</div> : <p className="task-details-empty">No sub-agents for this task.</p>}
+      </section>
+      <section className="task-details-section task-details-facts" aria-labelledby={`task-location-${session.id}`}>
+        <h2 id={`task-location-${session.id}`}>Location</h2>
+        <dl><div><dt>Project</dt><dd title={session.project}>{session.project}</dd></div><div><dt>Folder</dt><dd title={session.workingDirectory || "Not reported"}>{session.workingDirectory || "Not reported"}</dd></div></dl>
+      </section>
+    </section> : null}
+  </div>;
+}
+
+function Workspace({ snapshot, session, onBack, onNew, onBrowser, onLinkOpen, onManageWorkflow, onDraftSelectionChange, onCreateDraftSend, onDraftDirectory, handoffSummary, initialDraft, onDraftChange, initialAttachments, onAttachmentsChange, onDerivedSession, onOpenChild, notify, updateSnapshot, timelineWindow, onLoadOlder, reasoningDisplay, agentDefaults, experimental, onInstantSession, onCreateSideChat, queueRevision, queueingEnabled, onQueueingEnabledChange, reportedCompaction }: {
   snapshot: DesktopSnapshot; session: Session | null; onBack: () => void; onNew: () => void; onBrowser: () => void; onLinkOpen: (url: string) => void; onManageWorkflow: (id?: string) => void;
   onDraftSelectionChange: (selection: DraftModelSelection) => void; onCreateDraftSend: (input: DraftSessionSendInput) => Promise<void>; onDraftDirectory: () => void;
-  handoffSummary: string | undefined; initialDraft: string; onDraftChange: (value: string) => void; onDerivedSession: (value: Record<string, unknown>, summary?: string, draft?: string) => void;
+  handoffSummary: string | undefined; initialDraft: string; onDraftChange: (value: string) => void; initialAttachments: readonly ComposerAttachment[]; onAttachmentsChange: (value: readonly ComposerAttachment[]) => void; onDerivedSession: (value: Record<string, unknown>, summary?: string, draft?: string) => void;
+  onOpenChild: (session: Session) => void;
   notify: (message: string, tone?: "normal" | "error") => void; updateSnapshot: (value: DesktopSnapshot | ((current: DesktopSnapshot | null) => DesktopSnapshot | null) | null) => void;
-  timelineWindow: TimelineWindowState | undefined; onLoadOlder: (() => Promise<void>) | undefined;
-  experimental: boolean; onInstantSession: () => void; queueRevision: number;
+  timelineWindow: TimelineWindowState | undefined; onLoadOlder: (() => Promise<void>) | undefined; reasoningDisplay: DesktopPreferencesState["reasoningDisplay"];
+  agentDefaults: DesktopPreferencesState["agentDefaults"];
+  experimental: boolean; onInstantSession: () => void; onCreateSideChat: (parentSessionId: string, prompt?: string, queuedMessageId?: string) => Promise<void>; queueRevision: number; queueingEnabled: boolean; onQueueingEnabledChange: (enabled: boolean) => void;
+  reportedCompaction?: { isCompacting: boolean; kind: "automatic" | "manual" | null } | undefined;
 }) {
+  const localOpen = useLocalOpen();
+  const [contextCompaction, setContextCompaction] = useState<{ isCompacting: boolean; kind: "automatic" | "manual" | null }>({ isCompacting: false, kind: null });
+  const updateContextCompaction = useCallback((isCompacting: boolean, kind: "automatic" | "manual" | null = null) => {
+    setContextCompaction((current) => current.isCompacting === isCompacting && current.kind === (isCompacting ? kind : null)
+      ? current
+      : { isCompacting, kind: isCompacting ? kind : null });
+  }, []);
+  useEffect(() => {
+    if (reportedCompaction) updateContextCompaction(reportedCompaction.isCompacting, reportedCompaction.kind);
+  }, [reportedCompaction, updateContextCompaction]);
+  useEffect(() => {
+    let disposed = false;
+    let timer: number | undefined;
+    if (!session || session.draft) {
+      updateContextCompaction(false);
+      return;
+    }
+    const active = session.state === "working" || session.state === "needs_approval" || session.state === "needs_input";
+    const poll = async () => {
+      let keepPolling = active;
+      try {
+        const context = await loadSessionContext(session.id);
+        keepPolling ||= context.isCompacting;
+        if (!disposed) updateContextCompaction(context.isCompacting, context.compactionKind);
+      } catch {
+        if (!disposed) updateContextCompaction(false);
+      } finally {
+        if (!disposed && keepPolling) timer = window.setTimeout(() => void poll(), 650);
+      }
+    };
+    updateContextCompaction(false);
+    void poll();
+    return () => {
+      disposed = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [session?.draft, session?.id, session?.state, updateContextCompaction]);
   if (!session) return <main className="workspace empty-workspace"><EmptyState icon={<ChatIcon />} title="Choose a task" description="Open an existing task from the list, or start a fresh one with any connected coding tool." action={<Button variant="primary" onClick={onNew}><PlusIcon /> New task</Button>} /></main>;
   const timeline = snapshot.timelines[session.id];
   const approvals = snapshot.approvals.filter((approval) => approval.sessionId === session.id);
   const inputs = snapshot.inputRequests.filter((input) => input.sessionId === session.id);
-  const working = session.state === "working";
   const provider = snapshot.providers.find((item) => item.id === session.providerId);
   const canInterrupt = provider?.capabilities.includes("Interrupt") === true;
+  const interruptSession = async () => {
+    try {
+      await request("session.interrupt", { sessionId: session.id });
+      updateSnapshot((current) => current ? { ...current, sessions: replaceSession(current.sessions, session.id, { state: "idle" }) } : current);
+      notify("Task interrupted");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : String(error), "error");
+    }
+  };
   const visibleTimeline = timelineWindow ? timeline?.slice(timelineWindow.revealStart) : undefined;
   const olderAvailable = Boolean((timelineWindow?.revealStart ?? 0) > 0 || timelineWindow?.nextCursor);
   return <main className="workspace">
     <header className="workspace-header">
       <IconButton label="Show task list" className="mobile-back" onClick={onBack}><ArrowLeftIcon /></IconButton>
       <ProviderLogo providerId={session.providerId} provider={provider} size={32}/>
-      <div className="workspace-title"><div><h1>{session.title}</h1>{session.draft ? null : <Status state={session.state} />}</div><button className={`workspace-location ${session.draft ? "draft-location" : ""}`} title={session.draft ? "Choose the project folder" : session.workingDirectory || session.project} aria-label={session.draft ? `Choose project folder. Current folder: ${session.workingDirectory || "none"}` : `Open working directory: ${session.workingDirectory || session.project}`} onClick={() => { if (session.draft) onDraftDirectory(); else if (session.workingDirectory) void window.tethoqDesktop?.revealPath(session.workingDirectory); }}><FolderIcon /><span>{session.workingDirectory || "Choose a folder"}</span></button></div>
+      <div className="workspace-title"><div><h1>{session.title}</h1>{session.draft ? null : <Status state={session.state} />}</div><button className={`workspace-location ${session.draft ? "draft-location" : ""}`} title={session.draft ? "Choose the project folder" : session.workingDirectory || session.project} aria-label={session.draft ? `Choose project folder. Current folder: ${session.workingDirectory || "none"}` : `Open working directory: ${session.workingDirectory || session.project}`} onClick={() => { if (session.draft) onDraftDirectory(); else if (session.workingDirectory) void localOpen.open({ path: session.workingDirectory }); }}><FolderIcon /><span>{session.workingDirectory || "Choose a folder"}</span></button></div>
       <div className="workspace-actions">
-        {session.draft ? null : <ContextUsageControl key={session.id} session={session} notify={notify} />}
-        {working && canInterrupt ? <Button variant="danger" onClick={async () => { try { await request("session.interrupt", { sessionId: session.id }); updateSnapshot((current) => current ? { ...current, sessions: replaceSession(current.sessions, session.id, { state: "idle" }) } : current); notify("Task interrupted"); } catch (error) { notify(error instanceof Error ? error.message : String(error), "error"); } }}><StopIcon /> Interrupt</Button> : null}
+        {session.draft ? null : <ContextUsageControl key={session.id} session={session} notify={notify} onCompactionChange={updateContextCompaction} />}
+        {session.workingDirectory ? <WorkspaceLocalOpenControl path={session.workingDirectory} /> : null}
+        {session.draft ? null : <TaskDetailsControl session={session} providers={snapshot.providers} onOpenChild={onOpenChild} notify={notify} />}
       </div>
     </header>
-    <Conversation timeline={visibleTimeline} approvals={approvals} inputs={inputs} session={session} provider={provider} notify={notify} updateSnapshot={updateSnapshot} olderAvailable={olderAvailable} loadingOlder={timelineWindow?.loadingOlder === true} onLoadOlder={onLoadOlder} onLinkOpen={onLinkOpen} />
+    <Conversation timeline={visibleTimeline} approvals={approvals} inputs={inputs} session={session} provider={provider} notify={notify} updateSnapshot={updateSnapshot} olderAvailable={olderAvailable} loadingOlder={timelineWindow?.loadingOlder === true} onLoadOlder={onLoadOlder} onLinkOpen={onLinkOpen} onWorkflowOpen={onManageWorkflow} reasoningDisplay={reasoningDisplay} isCompacting={contextCompaction.isCompacting} compactionKind={contextCompaction.kind} />
     {handoffSummary ? <aside className="context-handoff-summary" aria-label="Context handoff summary"><span><ChatIcon /><strong>Context carried into this new task</strong><small>{handoffSummary.split(/\s+/u).length} words</small></span><p>{handoffSummary}</p></aside> : null}
-    <Composer key={session.id} snapshot={snapshot} session={session} request={request} selectImages={selectImages} preview={isBrowserPreview} notify={notify} updateSnapshot={updateSnapshot} onBrowser={onBrowser} onManageWorkflow={onManageWorkflow} initialDraft={initialDraft} onDraftChange={onDraftChange} onDerivedSession={onDerivedSession} onDraftSelectionChange={onDraftSelectionChange} onCreateDraftSend={onCreateDraftSend} experimental={experimental} onInstantSession={onInstantSession} queueRevision={queueRevision} />
+    <Composer key={session.id} snapshot={snapshot} session={session} request={request} selectImages={selectImages} preview={isBrowserPreview} notify={notify} updateSnapshot={updateSnapshot} onBrowser={onBrowser} onManageWorkflow={onManageWorkflow} initialDraft={initialDraft} onDraftChange={onDraftChange} initialAttachments={initialAttachments} onAttachmentsChange={onAttachmentsChange} onDerivedSession={onDerivedSession} onDraftSelectionChange={onDraftSelectionChange} onCreateDraftSend={onCreateDraftSend} experimental={experimental} onInstantSession={onInstantSession} onCreateSideChat={onCreateSideChat} queueRevision={queueRevision} queueingEnabled={queueingEnabled} onQueueingEnabledChange={onQueueingEnabledChange} agentDefaults={agentDefaults} {...(canInterrupt ? { onInterrupt: interruptSession } : {})} />
   </main>;
 }
 
@@ -1238,7 +1951,7 @@ function usageCost(context: SessionContextState): string | null {
   }
 }
 
-function ContextUsageControl({ session, notify }: { session: Session; notify: (message: string, tone?: "normal" | "error") => void }) {
+function ContextUsageControl({ session, notify, onCompactionChange }: { session: Session; notify: (message: string, tone?: "normal" | "error") => void; onCompactionChange: (compacting: boolean, kind?: "automatic" | "manual" | null) => void }) {
   const [context, setContext] = useState<SessionContextState | null>(null);
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -1252,12 +1965,14 @@ function ContextUsageControl({ session, notify }: { session: Session; notify: (m
       const next = await loadSessionContext(session.id);
       setContext(next);
       setThreshold(next.compactionThresholdTokens ?? next.contextWindowTokens);
+      onCompactionChange(next.isCompacting, next.compactionKind);
     } catch {
       setContext(null);
+      onCompactionChange(false);
     } finally {
       setLoading(false);
     }
-  }, [session.id]);
+  }, [onCompactionChange, session.id]);
 
   useEffect(() => { void refresh(); }, [refresh, session.state]);
   useEffect(() => {
@@ -1269,16 +1984,20 @@ function ContextUsageControl({ session, notify }: { session: Session; notify: (m
 
   const save = async (value: number, compactNow: boolean) => {
     setSaving(true);
+    const compactImmediately = compactNow && context?.usedTokens !== null && context?.usedTokens !== undefined && value <= context.usedTokens;
+    if (compactImmediately) onCompactionChange(true, "manual");
     try {
       const next = await setSessionContextThreshold(session.id, Math.round(value), compactNow);
       setContext(next);
       setThreshold(next.compactionThresholdTokens ?? value);
+      onCompactionChange(next.isCompacting, next.compactionKind);
       setOpen(false);
       notify("Automatic compaction updated");
     } catch (error) {
       notify(error instanceof Error ? error.message : String(error), "error");
     } finally {
       setSaving(false);
+      if (compactImmediately) onCompactionChange(false);
     }
   };
 
@@ -1297,13 +2016,16 @@ function ContextUsageControl({ session, notify }: { session: Session; notify: (m
   const willCompactNow = used !== null && safeThreshold <= used;
   const activeTurnCompaction = willCompactNow && (session.state === "working" || session.state === "needs_approval" || session.state === "needs_input");
   const cost = context ? usageCost(context) : null;
+  const appliedLimit = context?.compactionThresholdTokens ?? windowTokens;
+  const compactUsage = used !== null && appliedLimit !== null ? `${compactTokens(used)} / ${compactTokens(appliedLimit)}` : "Usage unavailable";
   const title = percent === null ? "Context usage unavailable" : `${Math.round(shownPercent)}% of context used`;
 
   return <div className={`context-usage ${open ? "context-usage-open" : ""}`} ref={root}>
-    <button className="context-usage-trigger" data-tooltip="Context" type="button" aria-label={`${title}. Open automatic compaction settings.`} aria-expanded={open} onClick={() => { const next = !open; setOpen(next); if (next) void refresh(); }}>
+    <button className="context-usage-trigger" type="button" aria-label={`${title}. ${compactUsage}. Open context window settings.`} aria-expanded={open} onClick={() => { const next = !open; setOpen(next); if (next) void refresh(); }}>
       <span className="context-usage-track" role="progressbar" aria-label="Context window used" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent === null ? undefined : Math.round(shownPercent)}><i style={{ width: `${shownPercent}%` }} /></span>
       {loading && !context ? <span className="context-usage-percent">…</span> : percent !== null ? <span className="context-usage-percent">{Math.round(shownPercent)}%</span> : null}
       <ChevronDownIcon className="context-usage-arrow" />
+      <span className="context-usage-tooltip" aria-hidden="true"><strong>Context window</strong><span>{compactUsage}</span></span>
     </button>
     {open ? <section className="context-usage-popover" aria-label="Context and compaction settings">
       <div className="context-usage-heading"><strong>Set automatic compaction</strong>{thresholdAvailable ? <b>{compactTokens(safeThreshold)}</b> : null}</div>
@@ -1318,39 +2040,97 @@ function ContextUsageControl({ session, notify }: { session: Session; notify: (m
         <Button disabled={saving || context.isCompacting || safeThreshold === context.compactionThresholdTokens} onClick={() => void save(safeThreshold, true)}>{saving ? <span className="spinner" /> : null} Apply</Button>
       </div> : <p className="context-usage-unavailable">Automatic compaction is not available for this agent.</p>}
       {context?.isCompacting ? <p className="context-compacting"><span className="spinner" /> Compacting conversation…</p> : null}
-      {context ? <details className="context-usage-details"><summary>Usage details</summary><dl className="context-usage-stats">
-        <div><dt>In use</dt><dd>{compactTokens(used)}{windowTokens ? ` / ${compactTokens(windowTokens)}` : ""}</dd></div>
-        <div><dt>Session tokens</dt><dd>{compactTokens(context.usage.totalTokens)}</dd></div>
+      {context ? <section className="context-usage-details" aria-labelledby={`context-usage-details-${session.id}`}><h3 id={`context-usage-details-${session.id}`}>Usage</h3><dl className="context-usage-stats">
+        <div><dt>Used</dt><dd>{compactTokens(used)}</dd></div>
+        {appliedLimit !== null ? <div><dt>Compacts at</dt><dd>{compactTokens(appliedLimit)}</dd></div> : null}
+        {windowTokens !== null ? <div><dt>Capacity</dt><dd>{compactTokens(windowTokens)}</dd></div> : null}
+        <div><dt>Total tokens</dt><dd>{compactTokens(context.usage.totalTokens)}</dd></div>
         {context.usage.inputTokens !== undefined || context.usage.outputTokens !== undefined ? <div><dt>Input / output</dt><dd>{compactTokens(context.usage.inputTokens)} / {compactTokens(context.usage.outputTokens)}</dd></div> : null}
-        {context.usage.cacheReadTokens !== undefined || context.usage.cacheWriteTokens !== undefined ? <div><dt>Cached read / write</dt><dd>{compactTokens(context.usage.cacheReadTokens)} / {compactTokens(context.usage.cacheWriteTokens)}</dd></div> : null}
-        {cost ? <div><dt>Session cost</dt><dd>{cost}</dd></div> : null}
-      </dl></details> : null}
+        {context.usage.cacheReadTokens !== undefined || context.usage.cacheWriteTokens !== undefined ? <div><dt>Cache read / write</dt><dd>{compactTokens(context.usage.cacheReadTokens)} / {compactTokens(context.usage.cacheWriteTokens)}</dd></div> : null}
+        {cost ? <div><dt>Cost</dt><dd>{cost}</dd></div> : null}
+      </dl></section> : null}
     </section> : null}
   </div>;
 }
 
-function Conversation({ timeline, approvals, inputs, session, provider, notify, updateSnapshot, olderAvailable, loadingOlder, onLoadOlder, onLinkOpen }: {
+const LIVE_OUTPUT_GAP_PX = 52;
+
+function Conversation({ timeline, approvals, inputs, session, provider, notify, updateSnapshot, olderAvailable, loadingOlder, onLoadOlder, onLinkOpen, onWorkflowOpen, reasoningDisplay, isCompacting, compactionKind }: {
   timeline: TimelineItem[] | undefined; approvals: ApprovalRequest[]; inputs: InputRequest[]; session: Session;
   provider?: Provider | undefined;
   notify: (message: string, tone?: "normal" | "error") => void; updateSnapshot: (value: DesktopSnapshot | ((current: DesktopSnapshot | null) => DesktopSnapshot | null) | null) => void;
   olderAvailable: boolean; loadingOlder: boolean; onLoadOlder: (() => Promise<void>) | undefined;
   onLinkOpen: (url: string) => void;
+  onWorkflowOpen: (id: string) => void;
+  reasoningDisplay: DesktopPreferencesState["reasoningDisplay"];
+  isCompacting: boolean;
+  compactionKind: "automatic" | "manual" | null;
 }) {
   const scroller = useRef<HTMLDivElement>(null);
-  const bottom = useRef<HTMLDivElement>(null);
+  const conversation = useRef<HTMLDivElement>(null);
+  const tailSpacer = useRef<HTMLDivElement>(null);
   const activeSession = useRef<string | null>(null);
-  const previousLastItem = useRef<string | null>(null);
   const pinnedToBottom = useRef(true);
+  const measuredComposerClearance = useRef(0);
+  const lastScrollTop = useRef(0);
   const loadingOlderRef = useRef(false);
-  useEffect(() => {
-    const lastItem = timeline?.at(-1)?.id ?? null;
-    const changedSession = activeSession.current !== session.id;
-    if (changedSession || (lastItem !== previousLastItem.current && pinnedToBottom.current)) {
-      window.requestAnimationFrame(() => bottom.current?.scrollIntoView({ block: "end" }));
+  const scrollToLatest = useCallback(() => {
+    const element = scroller.current;
+    if (element) {
+      pinnedToBottom.current = true;
+      element.scrollTop = element.scrollHeight;
+      lastScrollTop.current = element.scrollTop;
     }
+  }, []);
+  useLayoutEffect(() => {
+    const element = scroller.current;
+    const composer = element?.parentElement?.querySelector<HTMLElement>(".composer-wrap");
+    const spacer = tailSpacer.current;
+    if (!element || !composer || !spacer) return;
+    let followFrame: number | undefined;
+    const measure = () => {
+      const viewportBounds = element.getBoundingClientRect();
+      const composerBounds = composer.getBoundingClientRect();
+      const next = Math.max(0, Math.ceil(viewportBounds.bottom - composerBounds.top + LIVE_OUTPUT_GAP_PX));
+      if (measuredComposerClearance.current === next) return;
+      measuredComposerClearance.current = next;
+      const visuallyAtBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 72;
+      const shouldFollow = pinnedToBottom.current || visuallyAtBottom;
+      spacer.style.height = `${next}px`;
+      if (followFrame !== undefined) window.cancelAnimationFrame(followFrame);
+      if (shouldFollow) {
+        pinnedToBottom.current = true;
+        followFrame = window.requestAnimationFrame(() => {
+          followFrame = undefined;
+          if (measuredComposerClearance.current === next && pinnedToBottom.current) scrollToLatest();
+        });
+      }
+    };
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    observer?.observe(element);
+    observer?.observe(composer);
+    window.addEventListener("resize", measure);
+    measure();
+    return () => {
+      observer?.disconnect();
+      if (followFrame !== undefined) window.cancelAnimationFrame(followFrame);
+      window.removeEventListener("resize", measure);
+    };
+  }, [scrollToLatest, session.id]);
+  useLayoutEffect(() => {
+    const changedSession = activeSession.current !== session.id;
+    if (changedSession || pinnedToBottom.current) scrollToLatest();
     activeSession.current = session.id;
-    previousLastItem.current = lastItem;
-  }, [approvals.length, inputs.length, session.id, timeline]);
+  }, [approvals.length, inputs.length, scrollToLatest, session.id, timeline]);
+  useEffect(() => {
+    const element = conversation.current;
+    if (!element || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (pinnedToBottom.current) scrollToLatest();
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [scrollToLatest, session.id]);
   const loadOlder = async () => {
     const element = scroller.current;
     if (!element || !onLoadOlder || !olderAvailable || loadingOlder || loadingOlderRef.current) return;
@@ -1369,14 +2149,18 @@ function Conversation({ timeline, approvals, inputs, session, provider, notify, 
   };
   return <div className="conversation-scroll" ref={scroller} onScroll={(event) => {
     const element = event.currentTarget;
-    pinnedToBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 72;
+    const remaining = element.scrollHeight - element.scrollTop - element.clientHeight;
+    const movedUp = element.scrollTop < lastScrollTop.current - 1;
+    lastScrollTop.current = element.scrollTop;
+    if (remaining < 72) pinnedToBottom.current = true;
+    else if (movedUp) pinnedToBottom.current = false;
     if (element.scrollTop < 48) void loadOlder();
   }}>
-    <div className="conversation">
+    <div className="conversation" ref={conversation}>
       {loadingOlder ? <div className="history-loading" role="status" aria-label="Loading earlier messages"><span className="spinner" /></div> : null}
       <div className="conversation-date"><span />Today<span /></div>
       {timeline === undefined ? <LoadingState label="Loading task history" /> : timeline.length === 0 && approvals.length === 0 && inputs.length === 0 ? <EmptyState icon={<ChatIcon />} title="No messages yet" description="Send the first instruction to begin this task." /> : null}
-      {timeline ? <ChatTimeline timeline={timeline} providerId={session.providerId} provider={provider} onLinkOpen={onLinkOpen}/> : null}
+      {timeline ? <ChatTimeline timeline={timeline} providerId={session.providerId} provider={provider} onLinkOpen={onLinkOpen} onWorkflowOpen={onWorkflowOpen} reasoningDisplay={reasoningDisplay} isCompacting={isCompacting} compactionKind={compactionKind} active={session.state === "working"}/> : null}
       {approvals.map((approval) => <ApprovalCard key={approval.id} approval={approval} onRespond={async (choiceId) => {
         try {
           await request("approval.respond", { requestId: approval.id, choiceId, respondedAt: new Date().toISOString() });
@@ -1391,7 +2175,7 @@ function Conversation({ timeline, approvals, inputs, session, provider, notify, 
           notify("Answer sent");
         } catch (error) { notify(error instanceof Error ? error.message : String(error), "error"); }
       }} />)}
-      <div ref={bottom} />
+      <div className="conversation-tail-spacer" ref={tailSpacer} aria-hidden="true" />
     </div>
   </div>;
 }
@@ -1407,10 +2191,10 @@ function InputCard({ request: input, onSubmit }: { request: InputRequest; onSubm
   return <article className="request-card input-card"><div className="request-icon"><QuestionIcon /></div><div className="request-content"><p className="eyebrow">Your input is needed</p><h3>{input.title}</h3><p>{input.prompt}</p>{input.options ? <div className="input-options">{input.options.map((option) => <button key={option} className={answer === option ? "selected" : ""} onClick={() => setAnswer(option)}>{option}{answer === option ? <CheckIcon /> : null}</button>)}</div> : <textarea value={answer} onChange={(event) => setAnswer(event.target.value)} placeholder="Type your answer…" rows={3}/>}<div className="request-actions"><Button variant="primary" disabled={!answer.trim() || busy} onClick={async () => { setBusy(true); await onSubmit(answer.trim()); setBusy(false); }}>Submit answer <SendIcon /></Button></div></div></article>;
 }
 
-function Dashboard({ snapshot, onOpen, onNew, onProvider }: { snapshot: DesktopSnapshot; onOpen: (id: string) => void; onNew: () => void; onProvider: (id: ProviderFilterSelection) => void }) {
-  const working = snapshot.sessions.filter((session) => session.state === "working");
-  const attention = snapshot.sessions.filter((session) => session.state === "needs_approval" || session.state === "needs_input" || session.state === "failed");
-  const recent = [...snapshot.sessions].sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt)).slice(0, 6);
+function Dashboard({ snapshot, sessions, onOpen, onNew, onProvider }: { snapshot: DesktopSnapshot; sessions: readonly Session[]; onOpen: (id: string) => void; onNew: () => void; onProvider: (id: ProviderFilterSelection) => void }) {
+  const working = sessions.filter((session) => session.state === "working");
+  const attention = sessions.filter((session) => session.state === "needs_approval" || session.state === "needs_input" || session.state === "failed");
+  const recent = [...sessions].sort(compareOrganizedSessions).slice(0, 6);
   const active = working[0] ?? attention[0];
   return <main className="dashboard-page">
     <header className="page-heading"><div><p className="eyebrow">Local coding workspace</p><h1>Good to see you.</h1><p>Everything running across your coding tools, in one calm place.</p></div><Button variant="primary" onClick={onNew}><PlusIcon /> New task</Button></header>
@@ -1496,7 +2280,7 @@ function ConnectorReviewModal({ connector, busy, onClose, onApprove }: { connect
   </div></Modal>;
 }
 
-function SettingsPage({ snapshot, bootstrap, recorder, workflows, selectedWorkflowId, onSelectWorkflow, setWorkflows, onSaveWorkflow, onConnectorState, notify, onReconnect, preferences, onSetExperimentalFeatures }: {
+function SettingsPage({ snapshot, bootstrap, recorder, workflows, selectedWorkflowId, onSelectWorkflow, setWorkflows, onSaveWorkflow, onClose, onConnectorState, notify, onReconnect, preferences, onSetExperimentalFeatures, onSetReasoningDisplay, onSetDesktopBehavior, onSetAgentDefault }: {
   snapshot: DesktopSnapshot;
   bootstrap?: DesktopBootstrap;
   recorder: RecorderState;
@@ -1505,11 +2289,15 @@ function SettingsPage({ snapshot, bootstrap, recorder, workflows, selectedWorkfl
   onSelectWorkflow: (id: string | null) => void;
   setWorkflows: (value: readonly WorkflowDescriptor[] | ((current: readonly WorkflowDescriptor[]) => readonly WorkflowDescriptor[])) => void;
   onSaveWorkflow: () => void;
+  onClose: () => void;
   onConnectorState: (connectors: DesktopBootstrap["connectors"]) => void;
   notify: (message: string, tone?: "normal" | "error") => void;
   onReconnect: (id: string) => Promise<void>;
   preferences: DesktopPreferencesState;
   onSetExperimentalFeatures: (enabled: boolean) => Promise<void>;
+  onSetReasoningDisplay: (value: DesktopPreferencesState["reasoningDisplay"]) => Promise<void>;
+  onSetDesktopBehavior: (action: PreferencesAction) => Promise<void>;
+  onSetAgentDefault: (providerId: string, modelId: string, reasoningEffort?: string) => Promise<void>;
 }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [reviewing, setReviewing] = useState<PendingDesktopConnectorDescriptor | null>(null);
@@ -1538,11 +2326,33 @@ function SettingsPage({ snapshot, bootstrap, recorder, workflows, selectedWorkfl
     if (selectedWorkflowId === id) onSelectWorkflow(null);
     notify("Workflow deleted");
   };
-  return <main className="settings-page settings-simplified">
-    <WorkflowSettings recorder={recorder} workflows={workflows} selectedWorkflowId={selectedWorkflowId} onSelectWorkflow={onSelectWorkflow} onStart={startWorkflow} onSave={onSaveWorkflow} onReveal={revealWorkflow} onDelete={deleteWorkflow} />
-    <section className="settings-block"><header><h2>Agents</h2></header><div className="settings-list provider-settings">{snapshot.providers.map((provider) => <article key={provider.id}><ProviderLogo providerId={provider.id} provider={provider} size={34}/><span><strong>{provider.name}</strong>{provider.version ? <small>v{provider.version}</small> : null}</span><i className={`connection-dot ${provider.state}`} data-tooltip={`${provider.state === "online" ? "Connected" : provider.state === "error" ? "Connection error" : "Offline"} · ${provider.authenticated ? "Signed in" : "Sign-in unavailable"}`} />{provider.state !== "online" ? <button className="settings-icon-action" data-tooltip={`Retry ${provider.name}`} aria-label={`Retry ${provider.name}`} disabled={busy === provider.id} onClick={async () => { setBusy(provider.id); await onReconnect(provider.id); setBusy(null); }}><RefreshIcon /></button> : <span className="settings-action-space" />}</article>)}</div></section>
+  const listWorkflowScreenshots = useCallback(async (id: string): Promise<readonly WorkflowScreenshot[]> => {
+    if (isBrowserPreview) return id === previewWorkflowId ? previewWorkflowScreenshots : [];
+    const result = await window.tethoqDesktop.recorderAction({ type: "screenshots", id });
+    return Array.isArray(result) ? result as WorkflowScreenshot[] : [];
+  }, []);
+  const loadWorkflowScreenshot = useCallback(async (id: string, frameId: string, variant: "thumbnail" | "full"): Promise<WorkflowScreenshotImage> => {
+    if (isBrowserPreview) {
+      if (id !== previewWorkflowId || !previewWorkflowScreenshots.some((item) => item.frameId === frameId)) throw new Error("Screenshot not found");
+      return previewWorkflowScreenshot(frameId);
+    }
+    const result = await window.tethoqDesktop.recorderAction({ type: "screenshot-data", id, frameId, variant });
+    if (result && !Array.isArray(result) && "dataUrl" in result) return result as WorkflowScreenshotImage;
+    throw new Error("Screenshot data is unavailable");
+  }, []);
+  return <main className="settings-page settings-simplified" id="settings-page">
+    <button className="settings-close-button" type="button" aria-label="Close settings" data-tooltip="Close settings" onClick={onClose}><XIcon /></button>
+    <WorkflowSettings recorder={recorder} workflows={workflows} selectedWorkflowId={selectedWorkflowId} onSelectWorkflow={onSelectWorkflow} onStart={startWorkflow} onSave={onSaveWorkflow} onReveal={revealWorkflow} onDelete={deleteWorkflow} onListScreenshots={listWorkflowScreenshots} onLoadScreenshot={loadWorkflowScreenshot} />
+    <AgentDefaultsSettings snapshot={snapshot} preferences={preferences} onChange={onSetAgentDefault} onGlobalAgentsAction={onSetDesktopBehavior} />
+    <DictationSettings request={request} notify={notify} />
+    <section className="settings-block" id="agent-connections"><header><h2>Agents</h2></header><div className="settings-list provider-settings">{snapshot.providers.map((provider) => { const detail = providerConnectionDetail(provider, snapshot.models[provider.id] ?? []); return <article key={provider.id}><ProviderLogo providerId={provider.id} provider={provider} size={34}/><span><strong>{provider.name}</strong>{detail ? <small>{detail}</small> : null}</span><i className={`connection-dot ${provider.state}`} data-tooltip={`${provider.state === "online" ? "Connected" : provider.state === "error" ? "Connection error" : "Offline"} · ${provider.authenticated ? "Signed in" : "Sign-in unavailable"}`} />{provider.state !== "online" ? <button className="settings-icon-action" data-tooltip={`Retry ${provider.name}`} aria-label={`Retry ${provider.name}`} disabled={busy === provider.id} onClick={async () => { setBusy(provider.id); await onReconnect(provider.id); setBusy(null); }}><RefreshIcon className="refresh-icon" /></button> : <span className="settings-action-space" />}</article>; })}</div></section>
     {bootstrap?.connectors ? <section className="settings-block connector-section"><header><h2>External connectors</h2><span className="settings-info" tabIndex={0} data-tooltip="Independent connectors run local code. Use trusted sources."><InfoIcon /></span></header><div className="connector-settings"><button className="connector-directory-action" onClick={() => { if (!isBrowserPreview) void window.tethoqDesktop.revealPath(bootstrap.connectors.directory); }}><FolderIcon /><strong>Connector folder</strong>{bootstrap.connectors.loaded.length || bootstrap.connectors.pending.length ? <small>{bootstrap.connectors.loaded.length} active · {bootstrap.connectors.pending.length} to review</small> : null}</button><div className="connector-list">{bootstrap.connectors.pending.map((connector) => <PendingConnectorCard key={connector.fingerprint} connector={connector} onReview={() => setReviewing(connector)} />)}{bootstrap.connectors.loaded.map((connector) => <ConnectorCard key={connector.id} connector={connector} provider={providerFor(snapshot.providers, connector.id)} onDisable={() => void connectorAction("revoke", connector.fingerprint)} />)}</div>{rejectedConnectors.length ? <details className="settings-alert-details"><summary><AlertIcon /><strong>{rejectedConnectors.length} connector {rejectedConnectors.length === 1 ? "issue" : "issues"}</strong><ChevronDownIcon /></summary><div>{rejectedConnectors.map((diagnostic, index) => <article key={`${diagnostic.directory}-${index}`}><strong>{diagnostic.connectorId ?? "Unknown connector"}</strong><p>{diagnostic.message}</p></article>)}</div></details> : null}</div></section> : null}
-    <div className="settings-compact-grid"><details className="settings-compact-details"><summary><strong>Local runtime</strong><i className={`connection-dot ${snapshot.connected ? "online" : "offline"}`} data-tooltip={snapshot.connected ? "Runtime online" : "Runtime offline"}/><ChevronDownIcon /></summary><dl><div><dt>Computer</dt><dd>{snapshot.hostName}</dd></div><div><dt>Platform</dt><dd>{bootstrap?.host.platform ?? "Windows"}</dd></div><div><dt>Managed process</dt><dd>{bootstrap?.openCode.state ?? "Unknown"}</dd></div><div><dt>Address</dt><dd>{bootstrap?.openCode.url ?? "Local bridge"}</dd></div></dl></details><details className="settings-compact-details"><summary><strong>Desktop behavior</strong><ChevronDownIcon /></summary><dl><div><dt>Close</dt><dd>Keep running in tray</dd></div><div><dt>Alerts</dt><dd>Windows notifications</dd></div><div><dt>Startup</dt><dd>Launch manually</dd></div></dl></details></div>
+    <div className="settings-compact-grid"><details className="settings-compact-details"><summary><strong>Local runtime</strong><i className={`connection-dot ${snapshot.connected ? "online" : "offline"}`} data-tooltip={snapshot.connected ? "Runtime online" : "Runtime offline"}/><ChevronDownIcon /></summary><dl><div><dt>Computer</dt><dd>{snapshot.hostName}</dd></div><div><dt>Platform</dt><dd>{bootstrap?.host.platform ?? "Windows"}</dd></div><div><dt>Managed process</dt><dd>{bootstrap?.openCode.state ?? "Unknown"}</dd></div><div><dt>Address</dt><dd>{bootstrap?.openCode.url ?? "Local bridge"}</dd></div></dl></details><details className="settings-compact-details"><summary><strong>Desktop behavior</strong><ChevronDownIcon /></summary><dl>
+      <div><dt>Close</dt><dd><select aria-label="Close button" value={preferences.closeAction} disabled={isBrowserPreview} title="Tasks and alerts keep running while Tethoq stays in the tray." onChange={(event) => void onSetDesktopBehavior({ type: "set-close-action", value: event.target.value === "quit" ? "quit" : "tray" })}><option value="tray">Keep running in tray</option><option value="quit">Quit Tethoq</option></select></dd></div>
+      <div><dt>Alerts</dt><dd><select aria-label="Alerts" value={preferences.alerts} disabled={isBrowserPreview} title="Windows notifications while the Tethoq window is not in focus." onChange={(event) => void onSetDesktopBehavior({ type: "set-alerts", value: event.target.value === "attention" ? "attention" : event.target.value === "off" ? "off" : "all" })}><option value="all">Everything</option><option value="attention">Only when I’m needed</option><option value="off">Off</option></select></dd></div>
+      <div><dt>Startup</dt><dd><select aria-label="Startup" value={preferences.launchAtLogin} disabled={isBrowserPreview} title="Starting with Windows keeps your agents reachable after a restart." onChange={(event) => void onSetDesktopBehavior({ type: "set-launch-at-login", value: event.target.value === "window" ? "window" : event.target.value === "tray" ? "tray" : "off" })}><option value="off">Launch manually</option><option value="window">Start with Windows</option><option value="tray">Start hidden in tray</option></select></dd></div>
+      <div><dt>Reasoning display</dt><dd><select aria-label="Reasoning display" value={preferences.reasoningDisplay} disabled={isBrowserPreview} title="Controls how reasoning opens. It does not change model effort." onChange={(event) => void onSetReasoningDisplay(event.target.value === "expanded" ? "expanded" : "compact")}><option value="compact">Compact</option><option value="expanded">Expanded</option></select></dd></div>
+    </dl></details></div>
     <section className="settings-block experimental-features-block"><header><h2>Experimental features</h2><span className="settings-info" tabIndex={0} data-tooltip="Optional capabilities that may change. Disabled by default."><InfoIcon /></span></header><div className="settings-list"><article><span><strong>Enable experimental features</strong><small>Adds instant sessions: talk to a coding tool while your microphone, screen, and pointer position are captured, time-aligned, and sent with each utterance.</small></span><button type="button" className={`settings-toggle ${preferences.experimentalFeatures ? "on" : ""}`} role="switch" aria-checked={preferences.experimentalFeatures} aria-label="Enable experimental features" disabled={isBrowserPreview} onClick={() => void onSetExperimentalFeatures(!preferences.experimentalFeatures)}><i /></button></article></div></section>
     {reviewing ? <ConnectorReviewModal connector={reviewing} busy={busy === reviewing.fingerprint} onClose={() => setReviewing(null)} onApprove={() => void connectorAction("approve", reviewing.fingerprint)} /> : null}
   </main>;
@@ -1573,19 +2383,36 @@ function KeyboardShortcuts({ onClose }: { onClose: () => void }) {
   return <Modal title="Keyboard shortcuts" onClose={onClose}><div className="shortcut-cheat-sheet">{groups.map((group) => <section key={group.title}><h3>{group.title}</h3><dl>{group.shortcuts.map((shortcut) => <div key={`${group.title}:${shortcut.keys}`}><dt><kbd>{shortcut.keys}</kbd></dt><dd>{shortcut.label}</dd></div>)}</dl></section>)}<div className="modal-actions"><Button type="button" onClick={onClose}>Close</Button></div></div></Modal>;
 }
 
-function CommandPalette({ snapshot, onClose, onAction }: { snapshot: DesktopSnapshot; onClose: () => void; onAction: (action: string) => void }) {
+const settingsSearchCatalogue = [
+  { id: "settings:agent-defaults", targetId: "agent-defaults", label: "Model defaults", detail: "Default model and reasoning for each agent", keywords: "default model reasoning effort provider agent" },
+  { id: "settings:agents", targetId: "agent-connections", label: "Agents", detail: "Connections and provider availability", keywords: "agent provider connection availability" },
+  { id: "settings:dictation", targetId: "dictation-settings", label: "Dictation", detail: "Speech-to-text providers and API keys", keywords: "dictation voice microphone speech transcription openai xai grok api key" },
+  { id: "settings:workflows", targetId: "workflow-settings", label: "Recorded workflows", detail: "Saved desktop workflows", keywords: "workflow recording automation" },
+  { id: "settings:connectors", targetId: "settings-page", label: "External connectors", detail: "Trusted local integrations", keywords: "connector integration trust" },
+  { id: "settings:desktop", targetId: "settings-page", label: "Desktop behavior", detail: "Close, alerts, startup, and reasoning display", keywords: "desktop behavior close tray quit alerts notifications startup login launch windows reasoning display" },
+  { id: "settings:runtime", targetId: "settings-page", label: "Local runtime", detail: "Desktop bridge status", keywords: "runtime bridge host local" },
+  { id: "settings:experimental", targetId: "settings-page", label: "Experimental features", detail: "Optional desktop capabilities", keywords: "experimental feature instant session" },
+] as const;
+
+function settingsTargetForAction(action: string): string | undefined {
+  return settingsSearchCatalogue.find((item) => item.id === action)?.targetId;
+}
+
+function CommandPalette({ snapshot, sessions, onClose, onAction }: { snapshot: DesktopSnapshot; sessions: readonly Session[]; onClose: () => void; onAction: (action: string) => void }) {
   const [query, setQuery] = useState("");
+  const providerNames = snapshot.providers.map((provider) => provider.name).join(" ");
   const actions = [
-    { id: "new", label: "Start a new task", detail: "Ctrl N", icon: <PlusIcon /> },
-    { id: "refresh", label: "Sync coding tools", detail: "Ctrl R", icon: <RefreshIcon /> },
-    { id: "settings", label: "Open settings", detail: "", icon: <WorkflowIcon /> },
-    { id: "shortcuts", label: "Keyboard shortcuts", detail: "Reference", icon: <KeyboardIcon /> },
-    ...snapshot.providers.map((provider) => ({ id: `provider:${provider.id}`, label: `Show ${provider.name} tasks`, detail: "Coding tool", icon: <ProviderLogo providerId={provider.id} provider={provider} size={21}/> })),
-    ...snapshot.sessions.map((session) => ({ id: `session:${session.id}`, label: session.title, detail: session.project, icon: <ProviderLogo providerId={session.providerId} provider={providerFor(snapshot.providers, session.providerId)} size={21}/> })),
+    { id: "new", label: "Start a new task", detail: "Ctrl N", keywords: "new task", icon: <PlusIcon /> },
+    { id: "refresh", label: "Sync coding tools", detail: "Ctrl R", keywords: "refresh sync agents providers", icon: <RefreshIcon className="refresh-icon" /> },
+    { id: "settings", label: "Open settings", detail: "", keywords: "settings preferences", icon: <WorkflowIcon /> },
+    { id: "shortcuts", label: "Keyboard shortcuts", detail: "Reference", keywords: "keyboard shortcut keys", icon: <KeyboardIcon /> },
+    ...settingsSearchCatalogue.map((item) => ({ ...item, keywords: `${item.keywords} ${item.id === "settings:agent-defaults" || item.id === "settings:agents" ? providerNames : ""}`, icon: <WorkflowIcon /> })),
+    ...sessions.map((session) => ({ id: `session:${session.id}`, label: session.title, detail: session.project, keywords: session.preview, icon: <ProviderLogo providerId={session.providerId} provider={providerFor(snapshot.providers, session.providerId)} size={21}/> })),
   ];
-  const filtered = actions.filter((action) => `${action.label} ${action.detail}`.toLowerCase().includes(query.toLowerCase())).slice(0, 12);
+  const normalizedQuery = normalizeUiSearchQuery(query);
+  const filtered = actions.filter((action) => normalizeUiSearchQuery(`${action.label} ${action.detail} ${action.keywords}`, 2_000).includes(normalizedQuery)).slice(0, 12);
   const [index, setIndex] = useState(0);
-  return <Modal title="" onClose={onClose}><div className="palette"><label><SearchIcon /><input autoFocus value={query} onChange={(event) => { setQuery(event.target.value); setIndex(0); }} onKeyDown={(event) => { if (event.key === "ArrowDown") { event.preventDefault(); setIndex((current) => Math.min(filtered.length - 1, current + 1)); } else if (event.key === "ArrowUp") { event.preventDefault(); setIndex((current) => Math.max(0, current - 1)); } else if (event.key === "Enter" && filtered[index]) { onAction(filtered[index].id); } }} placeholder="Search tasks or type a command…"/><kbd>Esc</kbd></label><div>{filtered.length ? filtered.map((action, actionIndex) => <button key={action.id} className={actionIndex === index ? "selected" : ""} onMouseEnter={() => setIndex(actionIndex)} onClick={() => onAction(action.id)}>{action.icon}<span>{action.label}</span><small>{action.detail}</small><kbd>↵</kbd></button>) : <EmptyState icon={<SearchIcon />} title="No commands found" description="Try another search." />}</div></div></Modal>;
+  return <Modal title="" onClose={onClose}><div className="palette"><label><SearchIcon /><input autoFocus value={query} maxLength={maximumUiSearchCharacters} onChange={(event) => { setQuery(event.target.value.slice(0, maximumUiSearchCharacters)); setIndex(0); }} onKeyDown={(event) => { if (event.key === "ArrowDown") { event.preventDefault(); setIndex((current) => Math.min(Math.max(0, filtered.length - 1), current + 1)); } else if (event.key === "ArrowUp") { event.preventDefault(); setIndex((current) => Math.max(0, current - 1)); } else if (event.key === "Enter" && filtered[index]) { onAction(filtered[index].id); } }} placeholder="Search tasks or type a command…"/><kbd>Esc</kbd></label><div>{filtered.length ? filtered.map((action, actionIndex) => <button key={action.id} className={actionIndex === index ? "selected" : ""} onMouseEnter={() => setIndex(actionIndex)} onClick={() => onAction(action.id)}>{action.icon}<span>{action.label}</span><small>{action.detail}</small><kbd>↵</kbd></button>) : <EmptyState icon={<SearchIcon />} title="No commands found" description="Try another search." />}</div></div></Modal>;
 }
 
 export default App;

@@ -7,7 +7,7 @@ import { messagePage } from "./bridge.js";
 import { BridgeRequestRouter, clientMessagePage } from "./request_router.js";
 import type { BridgeConfig } from "./config.js";
 import type { CreateSessionOptions, ListSessionsOptions, PaginatedSessions, ProviderDetection, ProviderEventSink, ProviderQueuedMessage, SendMessageRequest, SendMessageResult, Subscription } from "../../../packages/provider_contract/src/index.js";
-import type { DictationTranscriber } from "./dictation.js";
+import { defaultTranscriptionSourceRegistry, type DictationTranscriber } from "./dictation.js";
 
 function config(hostId = "host-test"): BridgeConfig {
   return {
@@ -165,6 +165,7 @@ class ContextFakeProvider extends FakeProviderAdapter {
       supportsManualCompaction: true,
       supportsThreshold: true,
       isCompacting: false,
+      compactionKind: null,
       updatedAt: "2026-08-14T10:00:00.000Z",
       usage: { inputTokens: 480_000, outputTokens: 20_000, totalTokens: 500_000, cost: 1.25, currency: "USD" },
     };
@@ -247,6 +248,52 @@ class CapabilityThrowingFakeProvider extends FakeProviderAdapter {
   public override async getCapabilities(): Promise<never> {
     this.capabilityCalls += 1;
     throw new Error("capability probe failed");
+  }
+}
+
+class IdleResourceFakeProvider extends FakeProviderAdapter {
+  public releaseCalls = 0;
+  #sink: ProviderEventSink | undefined;
+  #eventCounter = 0;
+
+  public constructor(
+    hostId: string,
+    providerId: string,
+    private readonly reportedState: RemoteSession["state"],
+  ) {
+    super({ hostId, providerId, sessionCount: 1 });
+  }
+
+  public override async listSessions(options: ListSessionsOptions = {}): Promise<PaginatedSessions> {
+    const result = await super.listSessions(options);
+    return {
+      ...result,
+      sessions: result.sessions.map((session) => ({
+        ...session,
+        state: this.reportedState,
+        needsApproval: this.reportedState === "needs_approval",
+      })),
+    };
+  }
+
+  public override async subscribe(providerSessionId: string | null, sink: ProviderEventSink): Promise<Subscription> {
+    this.#sink = sink;
+    return await super.subscribe(providerSessionId, sink);
+  }
+
+  public async releaseIdleResources(): Promise<void> {
+    this.releaseCalls += 1;
+  }
+
+  public async emitState(providerSessionId: string, state: RemoteSession["state"]): Promise<void> {
+    await this.#sink?.({
+      eventId: `${this.providerId}_state_${++this.#eventCounter}`,
+      providerId: this.providerId,
+      providerSessionId,
+      type: "session.status_changed",
+      occurredAt: new Date().toISOString(),
+      payload: { state },
+    });
   }
 }
 
@@ -414,6 +461,46 @@ test("provider connections do not retry a failed capability probe for a detected
   assert.equal(provider.capabilityCalls, 1);
   assert.equal(connection?.state, "offline");
   assert.match(connection?.lastError?.message ?? "", /capability probe failed/);
+});
+
+test("bridge releases idle providers but keeps working, approval, and input providers alive", async (t) => {
+  const hostId = "host-idle-resources";
+  const idle = new IdleResourceFakeProvider(hostId, "idle-provider", "idle");
+  const working = new IdleResourceFakeProvider(hostId, "working-provider", "working");
+  const approval = new IdleResourceFakeProvider(hostId, "approval-provider", "needs_approval");
+  const input = new IdleResourceFakeProvider(hostId, "input-provider", "needs_input");
+  const providers = [idle, working, approval, input];
+  const bridge = new AgentBridge(
+    { ...config(hostId), enabledProviders: providers.map((provider) => provider.providerId) },
+    providers,
+  );
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  for (const provider of providers) provider.releaseCalls = 0;
+
+  await bridge.refresh();
+
+  assert.equal(idle.releaseCalls, 1);
+  assert.equal(working.releaseCalls, 0);
+  assert.equal(approval.releaseCalls, 0);
+  assert.equal(input.releaseCalls, 0);
+
+  await bridge.listModels("working-provider");
+  assert.equal(working.releaseCalls, 0, "read-only calls must not release a provider with a live task");
+  await bridge.listModels("idle-provider");
+  assert.equal(idle.releaseCalls, 2);
+  const idleSession = bridge.sessions().find((session) => session.providerId === "idle-provider");
+  assert.ok(idleSession);
+  await bridge.openSession(idleSession.id);
+  assert.equal(idle.releaseCalls, 3, "opening an idle task must re-arm provider release");
+  await bridge.createSession("idle-provider", { workingDirectory: process.cwd() });
+  assert.equal(idle.releaseCalls, 4, "creating an idle task must re-arm provider release");
+  await bridge.providerConnections();
+  assert.equal(idle.releaseCalls, 5);
+  assert.equal(working.releaseCalls, 0);
+
+  await working.emitState("fake_session_0001", "idle");
+  await waitFor(() => working.releaseCalls === 1, "terminal provider idle release");
 });
 
 test("subscription wallet metadata never represents an account as an API key", async (t) => {
@@ -741,12 +828,23 @@ test("agent completion finishes automatic compaction before dispatching the next
   const completion = provider.emitAgentCompleted(session.providerSessionId);
   await waitFor(() => provider.operations.includes("compact:start"), "automatic compaction start");
   await new Promise<void>((resolve) => setImmediate(resolve));
+  const activeContext = await bridge.sessionContext(session.id);
+  assert.equal(activeContext.isCompacting, true);
+  assert.equal(activeContext.compactionKind, "automatic");
   assert.equal(provider.operations.includes("send"), false, "the queued turn must remain held while compaction is active");
 
   releaseCompaction();
   await completion;
   await waitFor(() => bridge.queuedMessages(session.id).length === 0, "post-compaction queue dispatch");
   assert.deepEqual(provider.operations, ["compact:start", "compact:completed", "send"]);
+  const compactionEvents = bridge.eventsSince(0).filter((event) => event.type.startsWith("context.compaction_"));
+  assert.deepEqual(compactionEvents.map((event) => [event.type, event.payload.kind]), [
+    ["context.compaction_started", "automatic"],
+    ["context.compaction_completed", "automatic"],
+  ]);
+  const completedContext = await bridge.sessionContext(session.id);
+  assert.equal(completedContext.isCompacting, false);
+  assert.equal(completedContext.compactionKind, null);
 });
 
 test("opening a cached session fetches history without duplicating provider metadata", async (t) => {
@@ -777,9 +875,12 @@ test("simultaneous opens share one provider history load and short-lived cache h
   await bridge.openSession(session.id);
   assert.equal(fake.getMessagesCalls, 1, "a fresh snapshot should avoid another full transcript read");
 
+  await bridge.openSession(session.id, undefined, 40, true);
+  assert.equal(fake.getMessagesCalls, 2, "an explicit visible-task refresh must bypass the short-lived snapshot");
+
   await fake.emitMessageDelta(session.providerSessionId);
   await bridge.openSession(session.id);
-  assert.equal(fake.getMessagesCalls, 2, "a live message event must invalidate the fresh snapshot");
+  assert.equal(fake.getMessagesCalls, 3, "a live message event must invalidate the fresh snapshot");
   const replayedDelta = bridge.eventsSince(0).find((event) => event.type === "message.delta");
   assert.equal(replayedDelta?.nativeEvent, undefined, "raw provider events must not duplicate large payloads in replay");
 });
@@ -1251,12 +1352,44 @@ test("request router consumes uploaded dictation audio through the host transcri
     payload: {
       attachmentId: completed.attachmentId,
       sourceId: "openai-stt",
-      dictionary: ["OpenCode", "Kronos"],
+      dictionary: ["OpenCode", "PostgreSQL"],
     },
   });
   assert.equal(response.ok, true);
   assert.equal(response.payload.text, "Transcribed instruction");
-  assert.deepEqual(dictionary, ["OpenCode", "Kronos"]);
+  assert.deepEqual(dictionary, ["OpenCode", "PostgreSQL"]);
+});
+
+test("request router validates and persists a dictation API key without returning it", async (t) => {
+  const apiKey = ["sk", "test", "dictation", "value"].join("-");
+  const persisted: Array<{ readonly sourceId: string; readonly apiKey: string | undefined }> = [];
+  const bridge = new AgentBridge(config("host-dictation-configure"), [], {
+    transcriptionSources: defaultTranscriptionSourceRegistry({
+      openAiApiKey: "",
+      xAiApiKey: "",
+      fetch: async () => new Response(JSON.stringify({ data: [] }), { status: 200 }),
+    }),
+    onTranscriptionCredentialChange: (sourceId, value) => { persisted.push({ sourceId, apiKey: value }); },
+  });
+  t.after(() => bridge.dispose());
+  await bridge.start();
+
+  const response = await new BridgeRequestRouter(bridge).handle({
+    protocolVersion: 1,
+    messageId: "message-dictation-configure",
+    hostId: "host-dictation-configure",
+    sentAt: new Date().toISOString(),
+    kind: "request",
+    type: "dictation.source.configure",
+    requestId: "request-dictation-configure",
+    payload: { sourceId: "openai-stt", apiKey },
+  });
+
+  assert.equal(response.ok, true);
+  assert.deepEqual(persisted, [{ sourceId: "openai-stt", apiKey }]);
+  assert.doesNotMatch(JSON.stringify(response), new RegExp(apiKey));
+  const sources = response.payload.sources as Array<{ readonly id: string; readonly status: string }>;
+  assert.equal(sources.find((source) => source.id === "openai-stt")?.status, "ready");
 });
 
 test("failed dictation can retry the same uploaded attachment", async (t) => {

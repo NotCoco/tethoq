@@ -7,6 +7,7 @@ import {
   type RemoteSession,
   type SessionState,
 } from "../../protocol/src/index.js";
+import { providerPromptWorkflows, stripProviderPromptGuidance } from "../../provider_contract/src/index.js";
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -25,7 +26,7 @@ export function normalizeOpenCodeSession(hostId: string, value: unknown, status?
   if (!isRecord(value) || typeof value.id !== "string") throw new Error("OpenCode session response is invalid");
   const time = isRecord(value.time) ? value.time : {};
   const cwd = typeof value.directory === "string" ? value.directory : undefined;
-  const title = typeof value.title === "string" && value.title.trim() ? value.title : "OpenCode session";
+  const title = typeof value.title === "string" && value.title.trim() ? stripProviderPromptGuidance(value.title) : "OpenCode session";
   const parentProviderSessionId = typeof value.parentID === "string" && value.parentID.trim() ? value.parentID.trim() : undefined;
   const agentRole = typeof value.agent === "string" && value.agent.trim() ? value.agent.trim() : undefined;
   const modelId = openCodeModelId(value.model);
@@ -133,9 +134,14 @@ export function normalizeOpenCodeMessages(hostId: string, providerSessionId: str
     if (!isRecord(entry)) continue;
     const info = isRecord(entry.info) ? entry.info : entry;
     const partsValue = Array.isArray(entry.parts) ? entry.parts : [];
-    const parts = partsValue.map(partFromOpenCode).filter((part): part is ContentPart => part !== null);
     const id = typeof info.id === "string" ? info.id : `message_${messages.length}`;
     const role = info.role === "user" ? "user" : info.role === "assistant" ? "assistant" : "tool";
+    const parts = partsValue.map(partFromOpenCode).filter((part): part is ContentPart => part !== null).flatMap((part): readonly ContentPart[] => {
+      if (role !== "user" || part.type !== "text") return [part];
+      const workflows = providerPromptWorkflows(part.text).map((workflow): ContentPart => ({ type: "workflow", workflow }));
+      const text = stripProviderPromptGuidance(part.text);
+      return [...(text.trim() ? [{ ...part, text }] : []), ...workflows];
+    });
     const time = isRecord(info.time) ? info.time : {};
     const createdAt = milliseconds(time.created);
     messages.push({

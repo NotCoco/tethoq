@@ -64,6 +64,24 @@ test("OpenCode recognizes a healthy externally managed server without spawning",
   assert.equal(spawned, false);
 });
 
+test("OpenCode startup probe leaves an unavailable server stopped without spawning", async () => {
+  let spawned = false;
+  const supervisor = new openCode.OpenCodeSupervisor({
+    fetchHealth: async () => { throw new Error("offline"); },
+    spawnProcess: () => {
+      spawned = true;
+      throw new Error("spawn should not run");
+    },
+  });
+
+  assert.deepEqual(await supervisor.probe(), {
+    state: "stopped",
+    url: "http://127.0.0.1:4096/",
+    managed: false,
+  });
+  assert.equal(spawned, false);
+});
+
 test("OpenCode refuses to supervise a remote or custom endpoint", async () => {
   let spawned = false;
   const supervisor = new openCode.OpenCodeSupervisor({

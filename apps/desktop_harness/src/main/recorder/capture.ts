@@ -32,9 +32,10 @@ export class ElectronCaptureAdapter implements RecorderCaptureAdapter {
     const thumbnail = source.thumbnail;
     const imageSize = thumbnail.getSize();
     const localPoint = imagePoint(request, display.bounds, imageSize);
+    const marked = imageWithCursor(thumbnail, localPoint);
     const crop = boundedCrop(localPoint, imageSize, request.cursorCropSize.width, request.cursorCropSize.height);
-    const fullBytes = thumbnail.toJPEG(82);
-    const cursorBytes = thumbnail.crop(crop).toJPEG(88);
+    const fullBytes = marked.image.toJPEG(82);
+    const cursorBytes = marked.image.crop(crop).toJPEG(88);
     await Promise.all([
       mkdir(dirname(request.fullPath), { recursive: true }),
       mkdir(dirname(request.cursorPath), { recursive: true }),
@@ -51,6 +52,15 @@ export class ElectronCaptureAdapter implements RecorderCaptureAdapter {
       cursorPath: request.cursorPath,
       fullRelativePath: `screens/full/${basename(request.fullPath)}`,
       cursorRelativePath: `screens/cursor/${basename(request.cursorPath)}`,
+      cursor: {
+        screen: { x: request.x, y: request.y },
+        image: localPoint,
+        normalized: {
+          x: localPoint.x / Math.max(1, imageSize.width - 1),
+          y: localPoint.y / Math.max(1, imageSize.height - 1),
+        },
+        embeddedInImage: marked.embedded,
+      },
       bytesWritten: fullBytes.byteLength + cursorBytes.byteLength,
     };
   }
@@ -153,9 +163,61 @@ export function dragBounds(path: readonly Point[], display: Rectangle, padding: 
 
 function imagePoint(point: Point, display: Rectangle, imageSize: { readonly width: number; readonly height: number }): Point {
   return {
-    x: Math.round(((point.x - display.x) / display.width) * imageSize.width),
-    y: Math.round(((point.y - display.y) / display.height) * imageSize.height),
+    x: Math.round(clamp(((point.x - display.x) / display.width) * imageSize.width, 0, imageSize.width - 1)),
+    y: Math.round(clamp(((point.y - display.y) / display.height) * imageSize.height, 0, imageSize.height - 1)),
   };
+}
+
+function imageWithCursor(image: NativeImage, point: Point): { readonly image: NativeImage; readonly embedded: boolean } {
+  const size = image.getSize();
+  try {
+    const bitmap = drawCursorOnBitmap(image.toBitmap({ scaleFactor: 1 }), size.width, size.height, point);
+    const marked = nativeImage.createFromBitmap(bitmap, { width: size.width, height: size.height, scaleFactor: 1 });
+    return marked.isEmpty() ? { image, embedded: false } : { image: marked, embedded: true };
+  } catch {
+    return { image, embedded: false };
+  }
+}
+
+/** Draw a familiar high-contrast pointer whose tip is the captured mouse point. */
+export function drawCursorOnBitmap(bitmap: Buffer, width: number, height: number, point: Point): Buffer {
+  const output = Buffer.from(bitmap);
+  if (width < 1 || height < 1 || output.byteLength < width * height * 4) return output;
+  const scale = clamp(Math.min(width, height) / 760, 1, 2);
+  const shape = (points: readonly Point[]): Point[] => points.map(({ x, y }) => ({ x: point.x + x * scale, y: point.y + y * scale }));
+  const outer = shape([{ x: 0, y: 0 }, { x: 0, y: 20 }, { x: 5, y: 15 }, { x: 9, y: 23 }, { x: 13, y: 21 }, { x: 9, y: 13 }, { x: 17, y: 13 }]);
+  const inner = shape([{ x: 2, y: 3 }, { x: 2, y: 16 }, { x: 5, y: 12 }, { x: 10, y: 20 }, { x: 11, y: 19 }, { x: 7, y: 11 }, { x: 13, y: 11 }]);
+  fillBitmapPolygon(output, width, height, outer, 20);
+  fillBitmapPolygon(output, width, height, inner, 246);
+  return output;
+}
+
+function fillBitmapPolygon(bitmap: Buffer, width: number, height: number, points: readonly Point[], tone: number): void {
+  const left = Math.max(0, Math.floor(Math.min(...points.map((point) => point.x))));
+  const top = Math.max(0, Math.floor(Math.min(...points.map((point) => point.y))));
+  const right = Math.min(width - 1, Math.ceil(Math.max(...points.map((point) => point.x))));
+  const bottom = Math.min(height - 1, Math.ceil(Math.max(...points.map((point) => point.y))));
+  for (let y = top; y <= bottom; y += 1) {
+    for (let x = left; x <= right; x += 1) {
+      if (!insidePolygon(x + 0.5, y + 0.5, points)) continue;
+      const offset = (y * width + x) * 4;
+      bitmap[offset] = tone;
+      bitmap[offset + 1] = tone;
+      bitmap[offset + 2] = tone;
+      bitmap[offset + 3] = 255;
+    }
+  }
+}
+
+function insidePolygon(x: number, y: number, points: readonly Point[]): boolean {
+  let inside = false;
+  for (let current = 0, previous = points.length - 1; current < points.length; previous = current, current += 1) {
+    const a = points[current];
+    const b = points[previous];
+    if (a === undefined || b === undefined) continue;
+    if ((a.y > y) !== (b.y > y) && x < (b.x - a.x) * (y - a.y) / (b.y - a.y) + a.x) inside = !inside;
+  }
+  return inside;
 }
 
 function boundedCrop(point: Point, imageSize: { readonly width: number; readonly height: number }, width: number, height: number): Rectangle {

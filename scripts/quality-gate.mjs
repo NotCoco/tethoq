@@ -4,9 +4,10 @@ import { fileURLToPath } from "node:url";
 
 const root = new URL("..", import.meta.url);
 const ignoredDirectories = new Set([
-  ".dart_tool", ".git", ".next", ".playwright-cli", ".runtime", ".tmp-appserver-schema",
+  ".dart_tool", ".example-dist", ".git", ".next", ".playwright-cli", ".runtime", ".test-dist", ".tmp-appserver-schema",
   "artifacts", "build", "coverage", "dist", "node_modules", "out", "release", "tmp", "work",
 ]);
+const ignoredDirectoryPrefixes = ["qa-artifacts", "release-"];
 const sourceExtensions = new Set([".ts", ".tsx", ".cts", ".mts", ".dart", ".js", ".jsx", ".cjs", ".mjs"]);
 const suspicious = [
   /throw new Error\(["']Not implemented["']\)/i,
@@ -19,7 +20,10 @@ async function walk(directory) {
   const entries = await readdir(directory, { withFileTypes: true });
   const files = [];
   for (const entry of entries) {
-    if (entry.isDirectory() && ignoredDirectories.has(entry.name)) continue;
+    if (entry.isDirectory() && (
+      ignoredDirectories.has(entry.name)
+      || ignoredDirectoryPrefixes.some((prefix) => entry.name.startsWith(prefix))
+    )) continue;
     const path = join(directory, entry.name);
     if (entry.isDirectory()) files.push(...await walk(path));
     else files.push(path);

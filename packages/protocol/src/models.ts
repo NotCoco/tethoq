@@ -75,14 +75,22 @@ export interface TranscriptionSourceDescriptor {
   readonly label: string;
   readonly status: TranscriptionSourceStatus;
   readonly setupEnvironmentVariable: string;
+  readonly credential?: {
+    readonly kind: "api_key";
+    readonly label: string;
+    readonly setupUrl: string;
+  };
   readonly capabilities: {
     readonly batch: boolean;
     readonly maxAudioBytes: number;
   };
 }
 
-export const sessionRelationshipKinds = ["handoff", "branch", "subagent"] as const;
+export const sessionRelationshipKinds = ["handoff", "branch", "subagent", "side_chat"] as const;
 export type SessionRelationshipKind = (typeof sessionRelationshipKinds)[number];
+
+export const sessionKinds = ["task", "side_chat", "internal"] as const;
+export type SessionKind = (typeof sessionKinds)[number];
 
 export const sessionRelationshipStrategies = ["summary_bootstrap", "native", "transcript_bootstrap"] as const;
 export type SessionRelationshipStrategy = (typeof sessionRelationshipStrategies)[number];
@@ -110,6 +118,8 @@ export interface RemoteSession {
   readonly reasoningEffort?: string;
   readonly variantId?: string;
   readonly parentSessionId?: string;
+  /** Omitted by older providers and clients; omission is equivalent to `task`. */
+  readonly sessionKind?: SessionKind;
   readonly relationship?: SessionRelationship;
   readonly contextHandoffSummary?: string;
   readonly agentNickname?: string;
@@ -138,6 +148,17 @@ export interface BranchSessionResult {
 
 export type MessageRole = "user" | "assistant" | "system" | "tool";
 
+/** A local Tethoq workflow attached to a user turn. */
+export interface WorkflowReference {
+  readonly id: string;
+  readonly name: string;
+  readonly eventCount: number;
+  readonly screenshotCount: number;
+  readonly applications?: readonly string[];
+  /** Private local guidance for the coding tool. Clients should not render it as message text. */
+  readonly promptReference?: string;
+}
+
 export type ContentPart =
   | { readonly type: "text"; readonly text: string }
   | { readonly type: "reasoning"; readonly text: string; readonly redacted: boolean }
@@ -147,6 +168,7 @@ export type ContentPart =
   | { readonly type: "error"; readonly message: string; readonly code?: string }
   | { readonly type: "image"; readonly uri?: string; readonly mimeType?: string; readonly name?: string; readonly retrievalId?: string }
   | { readonly type: "file"; readonly name: string; readonly mimeType?: string }
+  | { readonly type: "workflow"; readonly workflow: WorkflowReference }
   | {
       readonly type: "subagent";
       readonly tool: string;
@@ -169,7 +191,38 @@ export interface RemoteMessage {
   readonly parts: readonly ContentPart[];
   readonly status: "streaming" | "completed" | "failed";
   readonly editable?: boolean;
+  readonly origin?: RemoteMessageOrigin;
   readonly nativeMetadata: JsonObject;
+}
+
+export interface RemoteMessageOrigin {
+  readonly kind: "cross_session";
+  readonly envelopeId: string;
+  readonly sourceSessionId: string;
+  readonly sourceTitle: string;
+}
+
+export interface CrossSessionMessageEnvelope {
+  readonly version: 1;
+  readonly id: string;
+  readonly requestId: string;
+  readonly sourceSessionId: string;
+  readonly sourceTitle: string;
+  readonly targetSessionId: string;
+  readonly content: string;
+  readonly createdAt: string;
+}
+
+export type CrossSessionMessageState = "pending" | "sending" | "delivered" | "failed";
+
+export interface CrossSessionMessage {
+  readonly envelope: CrossSessionMessageEnvelope;
+  readonly state: CrossSessionMessageState;
+  readonly attemptCount: number;
+  readonly updatedAt: string;
+  readonly deliveredAt?: string;
+  readonly providerMessageIds?: readonly string[];
+  readonly error?: string;
 }
 
 export type MessageDeliveryMode = "queue" | "steer";
@@ -204,6 +257,12 @@ export const agentEventTypes = [
   "message.queued",
   "message.queue_updated",
   "message.queue_removed",
+  "message.remote_received",
+  "context.compaction_started",
+  "context.compaction_completed",
+  "side_chat.created",
+  "side_chat.updated",
+  "side_chat.promoted",
   "tool.started",
   "tool.output",
   "tool.completed",
@@ -324,6 +383,7 @@ export interface SessionContextState {
   readonly supportsManualCompaction: boolean;
   readonly supportsThreshold: boolean;
   readonly isCompacting: boolean;
+  readonly compactionKind: "automatic" | "manual" | null;
   readonly updatedAt: string;
   readonly usage: SessionTokenUsage;
 }

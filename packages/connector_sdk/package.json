@@ -28,7 +28,7 @@
     "prepack": "npm run build",
     "typecheck": "tsc -p tsconfig.test.json --noEmit",
     "test": "node scripts/test.mjs",
-    "verify": "npm run typecheck && npm test && npm run build"
+    "verify": "npm run build && npm run typecheck && npm test"
   },
   "engines": {
     "node": ">=22.13.0"

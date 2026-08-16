@@ -3,13 +3,21 @@ import {
   CURRENT_PROTOCOL_VERSION,
   ExponentialBackoff,
   RequestLedger,
+  SecureChannel,
+  completeSecureHandshake,
+  createSecureHandshakeOffer,
   parseEnvelope,
+  parseSecureFrame,
+  parseSecureHandshakeAccept,
+  signRelayHostAttach,
+  type EphemeralKeyPair,
   type EventEnvelope,
   type AgentEvent,
   type HelloEnvelope,
   type JsonObject,
   type RequestEnvelope,
   type ResponseEnvelope,
+  type SecureHandshakeOffer,
   type SignedDeviceAction,
 } from "../../../packages/protocol/src/index.js";
 import { WebSocketServer, type WebSocketConnection } from "../../../packages/transport_ws/src/index.js";
@@ -63,6 +71,9 @@ export class BridgeMessageSession {
   #started = false;
   #eventReplayEnabled = false;
   #closed = false;
+  #handshakeKeyPair: EphemeralKeyPair | null = null;
+  #secure: SecureChannel | null = null;
+  #deviceId: string | null = null;
 
   public constructor(
     private readonly bridge: AgentBridge,
@@ -74,10 +85,25 @@ export class BridgeMessageSession {
     this.#eventPollIntervalMs = options.eventPollIntervalMs ?? 250;
   }
 
+  /** True once a paired device has agreed a key for this connection. */
+  public get encrypted(): boolean {
+    return this.#secure !== null;
+  }
+
+  /** The paired device on the other end, once it has identified itself. */
+  public get deviceId(): string | null {
+    return this.#deviceId;
+  }
+
   public start(): void {
     if (this.#closed || this.#started) return;
     this.#started = true;
-    const hello: HelloEnvelope = {
+    const { offer, keyPair } = createSecureHandshakeOffer({
+      hostId: this.bridge.config.hostId,
+      hostPrivateKeyPem: this.bridge.config.identity.privateKeyPem,
+    });
+    this.#handshakeKeyPair = keyPair;
+    const hello: HelloEnvelope & { readonly encryption: SecureHandshakeOffer } = {
       protocolVersion: CURRENT_PROTOCOL_VERSION,
       messageId: randomUUID(),
       hostId: this.bridge.config.hostId,
@@ -86,13 +112,70 @@ export class BridgeMessageSession {
       type: "protocol.hello",
       supportedVersions: [CURRENT_PROTOCOL_VERSION],
       role: "host",
+      encryption: offer,
     };
+    // The offer travels in clear text; it carries only a signed public key, and
+    // the device authenticates it against the host key it stored at pairing.
     this.send(JSON.stringify(hello));
   }
 
   public async handle(text: string): Promise<void> {
     if (this.#closed) throw new Error("Bridge message session is closed");
-    const raw = parseJson(text);
+    const outer = parseJson(text);
+
+    const accept = parseSecureHandshakeAccept(outer);
+    if (accept !== null) {
+      this.establishSecureChannel(accept);
+      return;
+    }
+
+    const frame = parseSecureFrame(outer);
+    if (frame !== null) {
+      const channel = this.#secure;
+      if (channel === null) throw new Error("An encrypted frame arrived before this connection agreed a key");
+      await this.handleDecoded(parseJson(channel.open(frame)));
+      return;
+    }
+
+    // A device announces itself so the relay path creates this session and the
+    // host offer reaches the phone before any real request is sent.
+    if (isRecord(outer) && outer.kind === "hello" && outer.role === "device") {
+      if (typeof outer.deviceId === "string" && outer.deviceId) this.#deviceId ??= outer.deviceId;
+      return;
+    }
+
+    if (this.#secure !== null) throw new Error("This connection is encrypted and no longer accepts plain messages");
+    await this.handleDecoded(outer);
+  }
+
+  private establishSecureChannel(accept: NonNullable<ReturnType<typeof parseSecureHandshakeAccept>>): void {
+    if (this.#secure !== null) throw new Error("This connection has already agreed a key");
+    const keyPair = this.#handshakeKeyPair;
+    if (keyPair === null) throw new Error("This connection did not offer encryption");
+    // Signature verification alone would accept a credential this host revoked,
+    // so the pairing manager checks registration and revocation first.
+    this.bridge.verifyDeviceCredential(accept.credential);
+    const { keys, deviceId } = completeSecureHandshake({
+      accept,
+      hostId: this.bridge.config.hostId,
+      hostPublicKeyPem: this.bridge.config.identity.publicKeyPem,
+      keyPair,
+    });
+    const channel = new SecureChannel(keys, "host");
+    this.#secure = channel;
+    this.#deviceId = deviceId;
+    this.#handshakeKeyPair = null;
+    // Sent through the new channel: the device can only read it if it derived
+    // the same key, which confirms the agreement in both directions.
+    this.emit(JSON.stringify({ kind: "secure_established", deviceId, fingerprint: channel.fingerprint() }));
+  }
+
+  private emit(text: string): void {
+    const channel = this.#secure;
+    this.send(channel === null ? text : JSON.stringify(channel.seal(text)));
+  }
+
+  private async handleDecoded(raw: unknown): Promise<void> {
     const signed = parseSignedMessage(raw);
     let envelope;
     let authenticated = false;
@@ -145,7 +228,7 @@ export class BridgeMessageSession {
   }
 
   private sendResponse(response: ResponseEnvelope): void {
-    this.send(JSON.stringify(response));
+    this.emit(JSON.stringify(response));
     this.pushEvents();
   }
 
@@ -196,7 +279,7 @@ export class BridgeMessageSession {
         omittedEventCount: bounded.omittedEventCount,
       }),
     };
-    this.send(JSON.stringify(envelope));
+    this.emit(JSON.stringify(envelope));
     this.#latestSequence = sequence;
   }
 }
@@ -245,12 +328,14 @@ export class BridgeSocketServer {
   readonly #sessions = new Map<WebSocketConnection, BridgeMessageSession>();
   readonly #heartbeatIntervalMs: number;
   readonly #heartbeatTimeoutMs: number;
+  readonly #stopWatchingRevocations: () => void;
   #heartbeat: NodeJS.Timeout | null = null;
 
   public constructor(private readonly bridge: AgentBridge, private readonly options: BridgeSocketServerOptions) {
     if (options.allowUnsignedRequests === true && !isLoopbackHost(options.host)) {
       throw new Error("Unsigned bridge mode may only bind to a loopback address");
     }
+    this.#stopWatchingRevocations = bridge.onDeviceRevoked((deviceId) => this.disconnectDevice(deviceId));
     this.#heartbeatIntervalMs = options.heartbeatIntervalMs ?? 15_000;
     this.#heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? 45_000;
     this.#server = new WebSocketServer({
@@ -283,10 +368,22 @@ export class BridgeSocketServer {
   public async close(): Promise<void> {
     if (this.#heartbeat !== null) clearInterval(this.#heartbeat);
     this.#heartbeat = null;
+    this.#stopWatchingRevocations();
     for (const session of this.#sessions.values()) session.close();
     this.#sessions.clear();
     await this.#server.close();
     this.#connections.clear();
+  }
+
+  /** Revoking a device ends its live connection instead of only refusing it. */
+  private disconnectDevice(deviceId: string): void {
+    for (const [connection, session] of this.#sessions) {
+      if (session.deviceId !== deviceId) continue;
+      session.close();
+      this.#sessions.delete(connection);
+      this.#connections.delete(connection);
+      connection.close(1008, "Device access revoked");
+    }
   }
 
   private accept(connection: WebSocketConnection): void {
@@ -346,12 +443,15 @@ export interface BridgeRelayClientOptions {
 export class BridgeRelayClient {
   readonly #backoff = new ExponentialBackoff();
   readonly #sessions = new Map<string, BridgeMessageSession>();
+  readonly #stopWatchingRevocations: () => void;
   #socket: WebSocket | null = null;
   #disposed = false;
   #reconnectTimer: NodeJS.Timeout | null = null;
+  #relaySupportsRevoke = false;
 
   public constructor(private readonly bridge: AgentBridge, private readonly options: BridgeRelayClientOptions) {
     if (options.token.length < 32) throw new Error("Relay token must contain at least 32 characters");
+    this.#stopWatchingRevocations = bridge.onDeviceRevoked((deviceId) => this.disconnectDevice(deviceId));
   }
 
   public async start(): Promise<void> {
@@ -361,6 +461,7 @@ export class BridgeRelayClient {
 
   public async dispose(): Promise<void> {
     this.#disposed = true;
+    this.#stopWatchingRevocations();
     if (this.#reconnectTimer !== null) clearTimeout(this.#reconnectTimer);
     this.#reconnectTimer = null;
     for (const session of this.#sessions.values()) session.close();
@@ -368,6 +469,23 @@ export class BridgeRelayClient {
     this.#socket?.close(1000, "Bridge shutdown");
     this.#socket = null;
     this.bridge.setRelayConnected(false);
+  }
+
+  /**
+   * The room token is shared, so the relay cannot tell a revoked device apart
+   * on its own. The host names it explicitly and the relay drops the tunnel.
+   *
+   * An older relay would treat an unknown message as a protocol error and close
+   * the tunnel, so this is only sent to a relay that announced the capability.
+   * Against such a relay the local session still closes and the device is still
+   * refused every action; only its idle tunnel survives until the relay updates.
+   */
+  private disconnectDevice(deviceId: string): void {
+    this.#sessions.get(deviceId)?.close();
+    this.#sessions.delete(deviceId);
+    if (this.#relaySupportsRevoke && this.#socket?.readyState === WebSocket.OPEN) {
+      this.#socket.send(JSON.stringify({ type: "relay.revoke", deviceId }));
+    }
   }
 
   private async connect(): Promise<void> {
@@ -395,7 +513,22 @@ export class BridgeRelayClient {
       socket.close(1000, "Bridge shutdown");
       return;
     }
-    socket.send(JSON.stringify({ type: "relay.attach", role: "host", hostId: this.bridge.config.hostId, token: this.options.token }));
+    // Signed because the room token is shared with every paired device; without
+    // proof of the host key any of them could claim the host role. The relay
+    // keeps nothing durably, so the revocation list is re-supplied every time.
+    socket.send(JSON.stringify({
+      type: "relay.attach",
+      role: "host",
+      hostId: this.bridge.config.hostId,
+      token: this.options.token,
+      revokedDeviceIds: this.bridge.revokedDeviceIds(),
+      proof: signRelayHostAttach({
+        hostId: this.bridge.config.hostId,
+        token: this.options.token,
+        hostPublicKeyPem: this.bridge.config.identity.publicKeyPem,
+        hostPrivateKeyPem: this.bridge.config.identity.privateKeyPem,
+      }),
+    }));
     socket.addEventListener("message", (event) => this.receive(String(event.data)));
     socket.addEventListener("close", () => this.disconnected(socket));
     socket.addEventListener("error", () => this.disconnected(socket));
@@ -409,6 +542,7 @@ export class BridgeRelayClient {
       return;
     }
     if (isRecord(value) && value.type === "relay.attached" && value.role === "host") {
+      this.#relaySupportsRevoke = Array.isArray(value.supports) && value.supports.includes("relay.revoke");
       this.#backoff.reset();
       this.bridge.setRelayConnected(true);
       return;
@@ -436,6 +570,7 @@ export class BridgeRelayClient {
   private disconnected(socket: WebSocket): void {
     if (this.#socket !== socket) return;
     this.#socket = null;
+    this.#relaySupportsRevoke = false;
     this.bridge.setRelayConnected(false);
     for (const session of this.#sessions.values()) session.close();
     this.#sessions.clear();

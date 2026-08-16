@@ -2,8 +2,8 @@ import { isAbsolute, join, resolve } from "node:path";
 import {
   app,
   BrowserWindow,
+  dialog,
   Menu,
-  nativeImage,
   session,
   Tray,
 } from "electron";
@@ -13,7 +13,7 @@ import { notifyForEvents } from "./notifications.js";
 import { DesktopRuntime } from "./runtime.js";
 import { BrowserWorkspaceManager, type BrowserWorkspaceNotice } from "./browser_workspace.js";
 import { RecorderManager } from "./recorder/index.js";
-import { DesktopPreferencesStore } from "./preferences.js";
+import { DesktopPreferencesStore, readGlobalAgentInstructions } from "./preferences.js";
 import { LiveSessionManager } from "./live_session/manager.js";
 import { hardenSession, hardenWindow, SECURE_WEB_PREFERENCES } from "./security.js";
 import { readWindowState, trackWindowState } from "./window_state.js";
@@ -22,6 +22,7 @@ import {
   IPC_CHANNELS,
   type BrowserNotice,
   type DesktopBootstrap,
+  type DesktopLaunchAtLogin,
   type DesktopRuntimeState,
 } from "../shared/desktop_api.js";
 
@@ -38,19 +39,45 @@ let desktopReadiness: DesktopReadinessHandle | undefined;
 let quitting = false;
 let shutdownPromise: Promise<void> | undefined;
 let shutdownComplete = false;
+let rendererRecoveryRequired = false;
+let rendererRecoveryInFlight: Promise<void> | undefined;
+let rendererCrashPromptOpen = false;
+
+app.setName("Tethoq");
+if (process.platform === "win32") app.setAppUserModelId("app.tethoq.desktop");
+
+export const HIDDEN_LAUNCH_ARGUMENT = "--hidden";
+
+/** Registration arguments for each startup choice. `tray` starts without a window. */
+export function loginItemSettingsFor(value: DesktopLaunchAtLogin): { openAtLogin: boolean; args: string[] } {
+  return { openAtLogin: value !== "off", args: value === "tray" ? [HIDDEN_LAUNCH_ARGUMENT] : [] };
+}
+
+function startedHidden(): boolean {
+  return process.argv.includes(HIDDEN_LAUNCH_ARGUMENT);
+}
+
+function applyLoginItem(value: DesktopLaunchAtLogin): void {
+  // Only a packaged build has a real executable to register. In development the
+  // preference is still stored, but pointing the Run key at electron.exe would
+  // launch a bare runtime at login.
+  if (!app.isPackaged || (process.platform !== "win32" && process.platform !== "darwin")) return;
+  try { app.setLoginItemSettings(loginItemSettingsFor(value)); }
+  catch (error: unknown) { console.error("Tethoq could not update its startup setting", error); }
+}
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.on("second-instance", () => showMainWindow());
+  app.on("second-instance", (_event, argv) => { if (!argv.includes(HIDDEN_LAUNCH_ARGUMENT)) showMainWindow(); });
   app.whenReady().then(startApplication).catch((error: unknown) => {
     console.error("Tethoq desktop failed to start", error);
+    dialog.showErrorBox("Tethoq could not start", "Tethoq could not open. Restart it and try again.");
     app.exit(1);
   });
 }
 
 async function startApplication(): Promise<void> {
-  app.setAppUserModelId("app.tethoq.desktop");
   Menu.setApplicationMenu(null);
   hardenSession(session.defaultSession);
 
@@ -94,8 +121,10 @@ async function startApplication(): Promise<void> {
   const workflowRecorder = recorder;
   preferences = await DesktopPreferencesStore.load(join(app.getPath("userData"), "preferences.json"));
   const desktopPreferences = preferences;
+  applyLoginItem(desktopPreferences.value().launchAtLogin);
   desktopPreferences.onChange((value) => {
     if (!window.isDestroyed()) window.webContents.send(IPC_CHANNELS.preferencesState, value);
+    applyLoginItem(value.launchAtLogin);
     // Turning experimental features off stops any live instant session
     // immediately; the renderer tears its microphone stream down on state.
     if (!value.experimentalFeatures) void liveSession?.end("settings-disabled");
@@ -123,10 +152,11 @@ async function startApplication(): Promise<void> {
       ? join(process.resourcesPath, "provider-tools")
       : join(app.getAppPath(), "..", "agent_bridge", "assets"),
     browserWorkspace: browser,
+    globalAgentInstructions: async () => await readGlobalAgentInstructions(desktopPreferences.value().globalAgentsPath).catch(() => undefined),
     onEvents: (batch) => {
       if (!window.isDestroyed()) {
         window.webContents.send(IPC_CHANNELS.eventBatch, batch);
-        notifyForEvents(window, batch.events);
+        notifyForEvents(window, batch.events, desktopPreferences.value().alerts);
       }
     },
     onState: (state) => sendRuntimeState(window, state),
@@ -176,7 +206,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
     titleBarOverlay: {
       color: "#0d0d0c",
       symbolColor: "#c8cbc8",
-      height: 47,
+      height: 46,
     },
     autoHideMenuBar: true,
     show: false,
@@ -196,17 +226,28 @@ async function createMainWindow(): Promise<BrowserWindow> {
       window.setIgnoreMouseEvents(true);
       window.setOpacity(0);
       window.showInactive();
-    } else {
+    } else if (!startedHidden()) {
       window.show();
     }
   });
   window.on("close", (event) => {
-    if (!quitting) {
-      event.preventDefault();
-      window.hide();
+    if (quitting) return;
+    // Closing keeps Tethoq in the tray by default so running tasks and their
+    // approval alerts survive a stray close. The user can choose to quit instead,
+    // which routes through the ordinary quit path so window state and provider
+    // processes are flushed while the window is still alive.
+    event.preventDefault();
+    if (preferences?.value().closeAction === "quit") {
+      quitting = true;
+      app.quit();
+      return;
     }
+    window.hide();
   });
-  window.on("closed", () => { mainWindow = undefined; });
+  window.on("closed", () => {
+    mainWindow = undefined;
+    rendererRecoveryRequired = false;
+  });
   window.on("show", () => {
     runtime?.setWindowVisible(true);
     void browserWorkspace?.setHostVisible(true).catch(() => undefined);
@@ -215,9 +256,13 @@ async function createMainWindow(): Promise<BrowserWindow> {
     runtime?.setWindowVisible(false);
     void browserWorkspace?.setHostVisible(false).catch(() => undefined);
   });
-  window.webContents.on("render-process-gone", () => {
+  window.webContents.on("render-process-gone", (_event, details) => {
     runtime?.setWindowVisible(false);
     void browserWorkspace?.setHostVisible(false).catch(() => undefined);
+    if (quitting || details.reason === "clean-exit") return;
+    console.error(`Tethoq renderer stopped (${details.reason}, exit ${details.exitCode})`);
+    rendererRecoveryRequired = true;
+    void promptForRendererRecovery(window);
   });
   window.webContents.on("did-finish-load", () => {
     if (window.isVisible()) {
@@ -235,8 +280,7 @@ async function loadRenderer(window: BrowserWindow): Promise<void> {
 }
 
 function createTray(window: BrowserWindow): void {
-  const icon = nativeImage.createFromPath(appIconPath());
-  tray = new Tray(icon.resize({ width: 18, height: 18 }));
+  tray = new Tray(trayIconPath());
   tray.setToolTip("Tethoq");
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: "Open Tethoq", click: () => showMainWindow() },
@@ -253,15 +297,80 @@ function createTray(window: BrowserWindow): void {
 function showMainWindow(): void {
   const window = mainWindow;
   if (window === undefined || window.isDestroyed()) return;
+  if (rendererRecoveryRequired) {
+    void recoverMainWindowRenderer(window);
+    return;
+  }
   if (window.isMinimized()) window.restore();
   window.show();
   window.focus();
 }
 
+async function promptForRendererRecovery(window: BrowserWindow): Promise<void> {
+  if (rendererCrashPromptOpen || quitting || window.isDestroyed()) return;
+  rendererCrashPromptOpen = true;
+  try {
+    const result = await dialog.showMessageBox(window, {
+      type: "error",
+      title: "Reload Tethoq",
+      message: "The Tethoq window stopped unexpectedly.",
+      detail: "Reload the window to continue.",
+      buttons: ["Reload window", "Close window"],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+    });
+    if (result.response === 0) await recoverMainWindowRenderer(window);
+    else if (!window.isDestroyed()) window.hide();
+  } catch (error: unknown) {
+    console.error("Tethoq could not show renderer recovery", error);
+  } finally {
+    rendererCrashPromptOpen = false;
+  }
+}
+
+async function recoverMainWindowRenderer(window: BrowserWindow): Promise<void> {
+  if (rendererRecoveryInFlight !== undefined) return rendererRecoveryInFlight;
+  rendererRecoveryInFlight = (async () => {
+    try {
+      await loadRenderer(window);
+      rendererRecoveryRequired = false;
+      if (window.isDestroyed() || quitting) return;
+      if (window.isMinimized()) window.restore();
+      window.show();
+      window.focus();
+    } catch (error: unknown) {
+      console.error("Tethoq renderer could not reload", error);
+      if (!window.isDestroyed() && !quitting) {
+        dialog.showErrorBox("Tethoq could not reload", "Close and reopen Tethoq, then try again.");
+      }
+    }
+  })();
+  try {
+    await rendererRecoveryInFlight;
+  } finally {
+    rendererRecoveryInFlight = undefined;
+  }
+}
+
 function appIconPath(): string {
+  if (process.platform === "win32") {
+    return app.isPackaged
+      ? join(process.resourcesPath, "assets", "tethoq-icon.ico")
+      : join(app.getAppPath(), "assets", "tethoq-icon.ico");
+  }
   return app.isPackaged
     ? join(process.resourcesPath, "assets", "tethoq-icon.png")
     : join(app.getAppPath(), "assets", "tethoq-icon.png");
+}
+
+function trayIconPath(): string {
+  if (process.platform === "win32") {
+    return app.isPackaged
+      ? join(process.resourcesPath, "assets", "tethoq-tray.ico")
+      : join(app.getAppPath(), "assets", "tethoq-tray.ico");
+  }
+  return appIconPath();
 }
 
 function packagedSmokeBrowserUrl(): string | undefined {

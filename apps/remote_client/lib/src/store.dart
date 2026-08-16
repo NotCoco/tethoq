@@ -71,6 +71,10 @@ const Set<String> _nonConversationEventTypes = <String>{
   'message.queued',
   'message.queue_updated',
   'message.queue_removed',
+  'message.remote_received',
+  'side_chat.created',
+  'side_chat.updated',
+  'side_chat.promoted',
   'agent.completed',
   'agent.interrupted',
   'approval.requested',
@@ -80,6 +84,48 @@ const Set<String> _nonConversationEventTypes = <String>{
 
 const int _maxRetainedEventsPerSession = 200;
 const Duration _liveDeltaNotificationInterval = Duration(milliseconds: 16);
+
+RemoteQueuedMessage _retainQueuedAttachmentPreviews(
+  RemoteQueuedMessage message,
+  Iterable<RemoteQueuedAttachment> localSources,
+) {
+  final sources = localSources.toList(growable: false);
+  final visibleContent = simplifyVisibleContent(message.content);
+  var changed = visibleContent != message.content;
+  final attachments = message.attachments.map((attachment) {
+    if (attachment.localImageDataUri != null) return attachment;
+    RemoteQueuedAttachment? source;
+    for (final candidate in sources) {
+      if (candidate.name == attachment.name &&
+          candidate.mimeType == attachment.mimeType &&
+          candidate.byteLength == attachment.byteLength &&
+          candidate.localImageDataUri != null) {
+        source = candidate;
+        break;
+      }
+    }
+    if (source == null) return attachment;
+    changed = true;
+    return RemoteQueuedAttachment(
+      name: attachment.name,
+      mimeType: attachment.mimeType,
+      byteLength: attachment.byteLength,
+      dataBase64: source.dataBase64,
+    );
+  }).toList(growable: false);
+  if (!changed) return message;
+  return RemoteQueuedMessage(
+    id: message.id,
+    sessionId: message.sessionId,
+    content: visibleContent,
+    state: message.state,
+    createdAt: message.createdAt,
+    attachments: attachments,
+    modelId: message.modelId,
+    reasoningEffort: message.reasoningEffort,
+    error: message.error,
+  );
+}
 
 typedef BridgeTransportFactory = BridgeTransport Function(
     BridgeEndpoint endpoint, DeviceSecurity security);
@@ -116,6 +162,8 @@ class RemoteAppStore extends ChangeNotifier {
       <String, RemoteDelegationTask>{};
   final Map<String, DelegationSelection> delegationPreferences =
       <String, DelegationSelection>{};
+  final Map<String, DelegationSelection> agentDefaults =
+      <String, DelegationSelection>{};
   final Map<String, String> _liveAssistantText = <String, String>{};
   final Map<String, String> _liveAssistantReasoning = <String, String>{};
   final Map<String, DateTime> _liveAssistantStartedAt = <String, DateTime>{};
@@ -131,6 +179,10 @@ class RemoteAppStore extends ChangeNotifier {
   final Map<String, ApprovalRequest> approvals = <String, ApprovalRequest>{};
   final Map<String, UserInputRequest> userInputs = <String, UserInputRequest>{};
   final Map<String, String> drafts = <String, String>{};
+  final Map<String, List<RemoteAttachment>> draftAttachments =
+      <String, List<RemoteAttachment>>{};
+  final Map<String, SimplifySettings> draftSimplifySettings =
+      <String, SimplifySettings>{};
   final Set<String> unreadSessionIds = <String>{};
   final List<String> dictationDictionary = <String>[];
   final List<TranscriptionSource> dictationSources = <TranscriptionSource>[];
@@ -138,6 +190,7 @@ class RemoteAppStore extends ChangeNotifier {
   final Set<String> _dismissedImageModelNoticeKeys = <String>{};
   final Map<String, DateTime> _lastReadAt = <String, DateTime>{};
   final Set<String> _preparedSessionIds = <String>{};
+  final Set<String> _queueingDisabledSessionIds = <String>{};
 
   BridgeTransport? _transport;
   StreamSubscription<AgentEvent>? _eventSubscription;
@@ -164,6 +217,8 @@ class RemoteAppStore extends ChangeNotifier {
   String selectedProviderId = 'codex';
   String query = '';
   String defaultDeliveryMode = 'queue';
+  String reasoningDisplayMode = 'compact';
+  bool showSideChats = false;
   String? preferredDictationSourceId;
 
   bool get hasHosts => hosts.isNotEmpty;
@@ -236,6 +291,10 @@ class RemoteAppStore extends ChangeNotifier {
       throw StateError('That harness cannot start a session');
     final now = DateTime.now();
     final id = 'prepared-$providerId-${now.microsecondsSinceEpoch}';
+    final availableModels = modelsByProvider[providerId];
+    final defaults = availableModels == null
+        ? null
+        : agentDefaultSelectionFor(providerId, availableModels);
     final session = RemoteSession(
       id: id,
       hostId: activeHost?.hostId ?? 'local',
@@ -247,6 +306,8 @@ class RemoteAppStore extends ChangeNotifier {
       needsApproval: false,
       stale: false,
       workingDirectory: '',
+      modelId: defaults?.modelId,
+      reasoningEffort: defaults?.reasoningEffort,
     );
     _preparedSessionIds.add(id);
     sessions.add(session);
@@ -257,8 +318,8 @@ class RemoteAppStore extends ChangeNotifier {
   }
 
   Future<RemoteSession> startPreparedSession(String providerId) async {
+    await loadModels(providerId);
     final session = prepareSession(providerId);
-    unawaited(loadModels(providerId));
     return session;
   }
 
@@ -286,6 +347,10 @@ class RemoteAppStore extends ChangeNotifier {
     if (index < 0) return;
     final current = sessions[index];
     if (current.providerId == providerId) return;
+    final availableModels = modelsByProvider[providerId];
+    final defaults = availableModels == null
+        ? null
+        : agentDefaultSelectionFor(providerId, availableModels);
     final updated = RemoteSession(
       id: current.id,
       hostId: current.hostId,
@@ -297,6 +362,8 @@ class RemoteAppStore extends ChangeNotifier {
       needsApproval: current.needsApproval,
       stale: current.stale,
       workingDirectory: current.workingDirectory,
+      modelId: defaults?.modelId,
+      reasoningEffort: defaults?.reasoningEffort,
     );
     sessions[index] = updated;
     selectedSession = updated;
@@ -310,6 +377,8 @@ class RemoteAppStore extends ChangeNotifier {
     messages.remove(sessionId);
     contextBySession.remove(sessionId);
     drafts.remove(sessionId);
+    draftAttachments.remove(sessionId);
+    draftSimplifySettings.remove(sessionId);
     if (selectedSession?.id == sessionId) selectedSession = null;
     notifyListeners();
   }
@@ -396,6 +465,7 @@ class RemoteAppStore extends ChangeNotifier {
         .toSet();
     final result = sessions.where((session) {
       if (!_isMobileProviderEnabled(session.providerId)) return false;
+      if (session.sessionKind == 'side_chat') return false;
       final hostId = activeHost?.hostId;
       if (hostId != null && session.hostId != hostId) return false;
       if (session.parentSessionId != null) return false;
@@ -433,9 +503,24 @@ class RemoteAppStore extends ChangeNotifier {
     final result = sessions
         .where((session) =>
             _isMobileProviderEnabled(session.providerId) &&
+            session.sessionKind != 'side_chat' &&
             session.parentSessionId == parentSessionId &&
             (hostId == null || session.hostId == hostId))
         .toList();
+    result.sort(
+        (left, right) => right.lastActivityAt.compareTo(left.lastActivityAt));
+    return result;
+  }
+
+  List<RemoteSession> sideChatsFor(String parentSessionId) {
+    final hostId = activeHost?.hostId;
+    final result = sessions
+        .where((session) =>
+            session.sessionKind == 'side_chat' &&
+            (session.parentSessionId == parentSessionId ||
+                session.relationship?.sourceSessionId == parentSessionId) &&
+            (hostId == null || session.hostId == hostId))
+        .toList(growable: false);
     result.sort(
         (left, right) => right.lastActivityAt.compareTo(left.lastActivityAt));
     return result;
@@ -465,9 +550,21 @@ class RemoteAppStore extends ChangeNotifier {
     return result;
   }
 
+  bool isQueueingEnabledFor(String sessionId) =>
+      !_queueingDisabledSessionIds.contains(sessionId);
+
+  void turnOffQueueingFor(String sessionId) {
+    if (_queueingDisabledSessionIds.add(sessionId)) notifyListeners();
+  }
+
+  void turnOnQueueingFor(String sessionId) {
+    if (_queueingDisabledSessionIds.remove(sessionId)) notifyListeners();
+  }
+
   Future<void> initialize() async {
     try {
       defaultDeliveryMode = await security.readDefaultDeliveryMode();
+      reasoningDisplayMode = await security.readReasoningDisplayMode();
       dictationDictionary
         ..clear()
         ..addAll(await security.readDictationDictionary());
@@ -481,6 +578,10 @@ class RemoteAppStore extends ChangeNotifier {
       delegationPreferences
         ..clear()
         ..addEntries((await security.readDelegationPreferences()).entries.where(
+            (entry) => _isMobileProviderEnabled(entry.value.providerId)));
+      agentDefaults
+        ..clear()
+        ..addEntries((await security.readAgentDefaults()).entries.where(
             (entry) => _isMobileProviderEnabled(entry.value.providerId)));
       hosts
         ..clear()
@@ -642,6 +743,7 @@ class RemoteAppStore extends ChangeNotifier {
     ]);
     await Future.wait(<Future<void>>[
       _loadQueuedMessages(),
+      _loadSideChats(),
       _loadDelegations(),
       _loadApprovals(),
       _loadUserInputs(),
@@ -654,6 +756,13 @@ class RemoteAppStore extends ChangeNotifier {
     defaultDeliveryMode = mode;
     notifyListeners();
     await security.saveDefaultDeliveryMode(mode);
+  }
+
+  Future<void> setReasoningDisplayMode(String mode) async {
+    if (mode != 'compact' && mode != 'expanded') return;
+    reasoningDisplayMode = mode;
+    notifyListeners();
+    await security.saveReasoningDisplayMode(mode);
   }
 
   Future<DesktopAppState> desktopStatus() => _desktopWakeCoordinator().status();
@@ -710,6 +819,45 @@ class RemoteAppStore extends ChangeNotifier {
     preferredDictationSourceId = source.id;
     notifyListeners();
     await security.saveDictationSourcePreferences(dictationSourcePreferences);
+  }
+
+  Future<void> configureDictationSource(String sourceId,
+      {String? apiKey, bool clear = false}) async {
+    final normalizedSourceId = sourceId.trim();
+    if (normalizedSourceId.isEmpty || normalizedSourceId.length > 80) {
+      throw ArgumentError.value(sourceId, 'sourceId', 'must be valid');
+    }
+    final normalizedKey = apiKey?.trim();
+    if (!clear &&
+        (normalizedKey == null ||
+            normalizedKey.length < 8 ||
+            normalizedKey.length > 512)) {
+      throw ArgumentError.value(
+          apiKey, 'apiKey', 'must contain 8–512 characters');
+    }
+    final result = await _requireTransport().request(
+      'dictation.source.configure',
+      <String, Object?>{
+        'sourceId': normalizedSourceId,
+        if (clear) 'clear': true else 'apiKey': normalizedKey,
+      },
+      requestId: randomId('dictation-source'),
+    );
+    dictationSources
+      ..clear()
+      ..addAll(jsonList(result['sources'])
+          .map(TranscriptionSource.fromJson)
+          .where(_isMobileDictationSourceEnabled));
+    final selected = dictationSources
+        .where((source) => source.id == normalizedSourceId && source.isReady)
+        .firstOrNull;
+    if (selected != null) {
+      preferredDictationSourceId = selected.id;
+      dictationSourcePreferences[
+          selectedSession?.providerId ?? selectedProviderId] = selected.id;
+      await security.saveDictationSourcePreferences(dictationSourcePreferences);
+    }
+    notifyListeners();
   }
 
   Future<String> transcribeDictation(List<int> waveBytes,
@@ -837,7 +985,9 @@ class RemoteAppStore extends ChangeNotifier {
   }
 
   Future<void> refresh() async {
-    await _refreshWithTransport(_requireTransport(), showProgress: true);
+    final transport = _requireTransport();
+    await _refreshWithTransport(transport, showProgress: true);
+    await _loadSideChats(expectedTransport: transport);
   }
 
   Future<bool> _refreshWithTransport(
@@ -895,6 +1045,14 @@ class RemoteAppStore extends ChangeNotifier {
     }
     selectedSession = session;
     notifyListeners();
+    await _loadSessionHistory(session);
+  }
+
+  Future<void> loadSessionHistoryFor(RemoteSession session) async {
+    if (!_isMobileProviderEnabled(session.providerId) ||
+        !_belongsToActiveHost(session)) {
+      return;
+    }
     await _loadSessionHistory(session);
   }
 
@@ -979,6 +1137,66 @@ class RemoteAppStore extends ChangeNotifier {
     _recentModelWrites = _recentModelWrites
         .then((_) => security.saveRecentModelKeys(snapshot))
         .catchError((Object _) {});
+  }
+
+  DelegationSelection? agentDefaultSelectionFor(
+    String providerId,
+    Iterable<RemoteModel> availableModels,
+  ) {
+    final models = availableModels
+        .where((model) => model.providerId == providerId)
+        .toList(growable: false);
+    if (models.isEmpty) return null;
+    final saved = agentDefaults[providerId];
+    final model = models
+            .where((candidate) => candidate.id == saved?.modelId)
+            .firstOrNull ??
+        models.where((candidate) => candidate.isDefault).firstOrNull ??
+        models.first;
+    final efforts = model.reasoningEfforts;
+    final savedEffort = saved?.modelId == model.id
+        ? efforts
+            .where((effort) => effort.id == saved?.reasoningEffort)
+            .firstOrNull
+            ?.id
+        : null;
+    final defaultEffort = efforts
+            .where((effort) => effort.id == model.defaultReasoningEffort)
+            .firstOrNull
+            ?.id ??
+        efforts.firstOrNull?.id;
+    return DelegationSelection(
+      providerId: providerId,
+      modelId: model.id,
+      reasoningEffort: savedEffort ?? defaultEffort,
+    );
+  }
+
+  Future<void> setAgentDefault(DelegationSelection selection) async {
+    final providerId = selection.providerId.trim().toLowerCase();
+    final models = modelsByProvider[providerId] ?? const <RemoteModel>[];
+    final model = models
+        .where((candidate) => candidate.id == selection.modelId)
+        .firstOrNull;
+    if (model == null) {
+      throw StateError('Choose a model currently available through this Agent');
+    }
+    final reasoningEffort = selection.reasoningEffort?.trim();
+    if (model.reasoningEfforts.isEmpty && reasoningEffort != null) {
+      throw StateError('That model does not expose a reasoning setting');
+    }
+    if (model.reasoningEfforts.isNotEmpty &&
+        !model.reasoningEfforts.any((effort) => effort.id == reasoningEffort)) {
+      throw StateError('Choose a reasoning value supported by this model');
+    }
+    final normalized = DelegationSelection(
+      providerId: providerId,
+      modelId: model.id,
+      reasoningEffort: reasoningEffort,
+    );
+    agentDefaults[providerId] = normalized;
+    notifyListeners();
+    await security.saveAgentDefault(normalized);
   }
 
   List<RemoteModel> recentModels(Iterable<RemoteModel> models) {
@@ -1239,13 +1457,15 @@ class RemoteAppStore extends ChangeNotifier {
 
   Future<void> _loadSessionHistory(RemoteSession session,
       {bool notifyOnComplete = true,
-      BridgeTransport? expectedTransport}) async {
+      BridgeTransport? expectedTransport,
+      bool refresh = false}) async {
     final transport = expectedTransport ?? _requireTransport();
     final hostId = activeHost?.hostId;
     final clearThrough = _lastEventSequenceBySession[session.id] ?? 0;
     final result = await transport.request('session.open', <String, Object?>{
       'sessionId': session.id,
       'limit': 40,
+      if (refresh) 'refresh': true,
     });
     if (_transport != transport || activeHost?.hostId != hostId) return;
     final updated = RemoteSession.fromJson(result['session']);
@@ -1378,6 +1598,7 @@ class RemoteAppStore extends ChangeNotifier {
               status: message.status,
               editable: message.editable,
               providerMessageId: message.providerMessageId,
+              origin: message.origin,
             )
           : message);
     }
@@ -1477,18 +1698,23 @@ class RemoteAppStore extends ChangeNotifier {
     String? modelId,
     String? reasoningEffort,
     List<RemoteAttachment> attachments = const <RemoteAttachment>[],
+    SimplifySettings? simplify,
   }) async {
     final trimmed = content.trim();
     if (trimmed.isEmpty) return;
+    final visibleContent = simplifyVisibleContent(trimmed);
     final requestId = randomId('send');
     drafts[sessionId] = content;
+    setDraftAttachments(sessionId, attachments);
+    if (simplify != null) draftSimplifySettings[sessionId] = simplify;
     final optimisticMessage = RemoteMessage(
       id: requestId,
       sessionId: sessionId,
       role: 'user',
       createdAt: DateTime.now(),
       parts: <ContentPart>[
-        ContentPart(type: 'text', data: <String, Object?>{'text': trimmed}),
+        ContentPart(
+            type: 'text', data: <String, Object?>{'text': visibleContent}),
         ...attachments.map((attachment) => ContentPart(
               type: 'image',
               data: <String, Object?>{
@@ -1516,10 +1742,13 @@ class RemoteAppStore extends ChangeNotifier {
             'attachments': attachments
                 .map((attachment) => attachment.toJson())
                 .toList(growable: false),
+          if (simplify != null) 'simplify': simplify.toJson(),
         },
         requestId: requestId,
       );
       drafts[sessionId] = '';
+      draftAttachments.remove(sessionId);
+      draftSimplifySettings.remove(sessionId);
       notifyListeners();
     } catch (_) {
       messages[sessionId]?.removeWhere((message) => message.id == requestId);
@@ -1535,6 +1764,7 @@ class RemoteAppStore extends ChangeNotifier {
     String? modelId,
     String? reasoningEffort,
     List<RemoteAttachment> attachments = const <RemoteAttachment>[],
+    SimplifySettings? simplify,
   }) async {
     final trimmed = content.trim();
     if (trimmed.isEmpty) return null;
@@ -1556,13 +1786,27 @@ class RemoteAppStore extends ChangeNotifier {
       messages.remove(sessionId);
       contextBySession.remove(sessionId);
       drafts.remove(sessionId);
+      draftAttachments.remove(sessionId);
+      draftSimplifySettings.remove(sessionId);
       await submitMessage(created.id, trimmed,
           deliveryMode: deliveryMode,
           modelId: modelId,
           reasoningEffort: reasoningEffort,
-          attachments: attachments);
+          attachments: attachments,
+          simplify: simplify);
       notifyListeners();
       return created.id;
+    }
+    if (deliveryMode == 'send') {
+      await sendMessage(
+        sessionId,
+        trimmed,
+        modelId: modelId,
+        reasoningEffort: reasoningEffort,
+        attachments: attachments,
+        simplify: simplify,
+      );
+      return null;
     }
     final mode = deliveryMode == 'steer' &&
             session.state == 'working' &&
@@ -1570,6 +1814,8 @@ class RemoteAppStore extends ChangeNotifier {
         ? 'steer'
         : 'queue';
     drafts[sessionId] = content;
+    setDraftAttachments(sessionId, attachments);
+    if (simplify != null) draftSimplifySettings[sessionId] = simplify;
     notifyListeners();
     final attachmentIds = await _uploadAttachments(attachments);
     try {
@@ -1582,14 +1828,25 @@ class RemoteAppStore extends ChangeNotifier {
           if (reasoningEffort != null && reasoningEffort.isNotEmpty)
             'reasoningEffort': reasoningEffort,
           if (attachmentIds.isNotEmpty) 'attachmentIds': attachmentIds,
+          if (simplify != null) 'simplify': simplify.toJson(),
         },
         requestId: randomId(mode),
       );
       if (mode == 'queue' && result['message'] != null) {
-        final queued = RemoteQueuedMessage.fromJson(result['message']);
+        final queued = _retainQueuedAttachmentPreviews(
+          RemoteQueuedMessage.fromJson(result['message']),
+          attachments.map((attachment) => RemoteQueuedAttachment(
+                name: attachment.name,
+                mimeType: attachment.mimeType,
+                byteLength: attachment.byteLength,
+                dataBase64: attachment.dataBase64,
+              )),
+        );
         queuedMessages[queued.id] = queued;
       }
       drafts[sessionId] = '';
+      draftAttachments.remove(sessionId);
+      draftSimplifySettings.remove(sessionId);
       notifyListeners();
       return null;
     } catch (_) {
@@ -1645,6 +1902,138 @@ class RemoteAppStore extends ChangeNotifier {
       queuedMessages.remove(messageId);
       notifyListeners();
     }
+  }
+
+  Future<RemoteQueuedMessage> editQueuedMessage(
+      RemoteQueuedMessage message, String content) async {
+    final trimmed = content.trim();
+    if (trimmed.isEmpty) throw StateError('Enter a message');
+    final result = await _requireTransport().request(
+      'message_queue.edit',
+      <String, Object?>{'messageId': message.id, 'content': trimmed},
+      requestId: randomId('queue-edit'),
+    );
+    final parsed = result['message'] == null
+        ? RemoteQueuedMessage(
+            id: message.id,
+            sessionId: message.sessionId,
+            content: trimmed,
+            state: message.state,
+            createdAt: message.createdAt,
+            attachments: message.attachments,
+            modelId: message.modelId,
+            reasoningEffort: message.reasoningEffort,
+            error: message.error,
+          )
+        : RemoteQueuedMessage.fromJson(result['message']);
+    final updated =
+        _retainQueuedAttachmentPreviews(parsed, message.attachments);
+    queuedMessages[updated.id] = updated;
+    notifyListeners();
+    return updated;
+  }
+
+  Future<void> deliverQueuedMessage(RemoteQueuedMessage message,
+      {required String mode}) async {
+    final deliveryMode = mode == 'steer' ? 'steer' : 'send';
+    final result = await _requireTransport().request(
+      'message_queue.deliver',
+      <String, Object?>{'messageId': message.id, 'mode': deliveryMode},
+      requestId: randomId('queue-deliver'),
+    );
+    if (result['delivered'] != false) {
+      queuedMessages.remove(message.id);
+      notifyListeners();
+    }
+  }
+
+  Future<RemoteSession> moveQueuedMessageToNewTask(
+    RemoteQueuedMessage message, {
+    required String providerId,
+    required String modelId,
+    String? reasoningEffort,
+  }) async {
+    final trimmedProviderId = providerId.trim();
+    final trimmedModelId = modelId.trim();
+    final trimmedEffort = reasoningEffort?.trim();
+    if (trimmedProviderId.isEmpty || trimmedModelId.isEmpty) {
+      throw StateError('Choose an Agent and model');
+    }
+    final result = await _requireTransport().request(
+      'message_queue.move_to_new_task',
+      <String, Object?>{
+        'messageId': message.id,
+        'providerId': trimmedProviderId,
+        'modelId': trimmedModelId,
+        if (trimmedEffort?.isNotEmpty == true) 'reasoningEffort': trimmedEffort,
+      },
+      requestId: randomId('queue-new-task'),
+    );
+    final created = RemoteSession.fromJson(result['session']);
+    _upsertSession(created);
+    queuedMessages.remove(message.id);
+    rememberModelSelection(
+        created.providerId, created.modelId ?? trimmedModelId);
+    selectedSession = sessions.where((item) => item.id == created.id).first;
+    notifyListeners();
+    return selectedSession!;
+  }
+
+  void setShowSideChats(bool value) {
+    if (showSideChats == value) return;
+    showSideChats = value;
+    notifyListeners();
+  }
+
+  Future<List<RemoteSession>> loadSideChats({String? parentSessionId}) async {
+    await _loadSideChats(parentSessionId: parentSessionId);
+    return parentSessionId == null
+        ? sessions
+            .where((session) => session.sessionKind == 'side_chat')
+            .toList(growable: false)
+        : sideChatsFor(parentSessionId);
+  }
+
+  Future<RemoteSession> createSideChat(
+    String parentSessionId, {
+    String? prompt,
+    String? queuedMessageId,
+  }) async {
+    final trimmedPrompt = prompt?.trim();
+    final result = await _requireTransport().request(
+      'side_chat.create',
+      <String, Object?>{
+        'parentSessionId': parentSessionId,
+        if (trimmedPrompt?.isNotEmpty == true) 'prompt': trimmedPrompt,
+        if (queuedMessageId?.isNotEmpty == true)
+          'queuedMessageId': queuedMessageId,
+      },
+      requestId: randomId('side-chat'),
+    );
+    final created = RemoteSession.fromJson(result['session']);
+    _upsertSession(created.copyWith(
+      parentSessionId: created.parentSessionId ?? parentSessionId,
+      sessionKind: 'side_chat',
+    ));
+    if (queuedMessageId != null) queuedMessages.remove(queuedMessageId);
+    notifyListeners();
+    return sessions.where((session) => session.id == created.id).first;
+  }
+
+  Future<RemoteSession> promoteSideChat(String sessionId) async {
+    final result = await _requireTransport().request(
+      'side_chat.promote',
+      <String, Object?>{'sessionId': sessionId},
+      requestId: randomId('side-chat-promote'),
+    );
+    final promoted =
+        RemoteSession.fromJson(result['session']).copyWith(sessionKind: 'task');
+    sessions.removeWhere((session) => session.id == promoted.id);
+    _upsertSession(promoted);
+    selectedSession =
+        sessions.where((session) => session.id == promoted.id).firstOrNull;
+    notifyListeners();
+    return selectedSession ?? promoted;
   }
 
   Future<void> editMessage(
@@ -1920,6 +2309,31 @@ class RemoteAppStore extends ChangeNotifier {
     drafts[sessionId] = value;
   }
 
+  SimplifySettings? simplifySettingsFor(String sessionId) =>
+      draftSimplifySettings[sessionId];
+
+  void setDraftSimplifySettings(String sessionId, SimplifySettings? settings) {
+    if (settings == null) {
+      draftSimplifySettings.remove(sessionId);
+      return;
+    }
+    draftSimplifySettings[sessionId] = settings;
+  }
+
+  List<RemoteAttachment> draftAttachmentsFor(String sessionId) =>
+      List<RemoteAttachment>.unmodifiable(
+          draftAttachments[sessionId] ?? const <RemoteAttachment>[]);
+
+  void setDraftAttachments(
+      String sessionId, Iterable<RemoteAttachment> attachments) {
+    final retained = List<RemoteAttachment>.of(attachments);
+    if (retained.isEmpty) {
+      draftAttachments.remove(sessionId);
+      return;
+    }
+    draftAttachments[sessionId] = List<RemoteAttachment>.unmodifiable(retained);
+  }
+
   Future<void> markSessionsRead(Iterable<RemoteSession> targetSessions) async {
     var changed = false;
     for (final session in targetSessions) {
@@ -2027,12 +2441,54 @@ class RemoteAppStore extends ChangeNotifier {
     final result = await transport
         .request('message_queue.list', const <String, Object?>{});
     if (_transport != transport || activeHost?.hostId != hostId) return;
+    final previous = Map<String, RemoteQueuedMessage>.of(queuedMessages);
+    final snapshot = jsonList(result['messages'])
+        .map(RemoteQueuedMessage.fromJson)
+        .map((message) => _retainQueuedAttachmentPreviews(
+              message,
+              previous[message.id]?.attachments ??
+                  const <RemoteQueuedAttachment>[],
+            ))
+        .toList(growable: false);
     queuedMessages
       ..clear()
-      ..addEntries(jsonList(result['messages'])
-          .map(RemoteQueuedMessage.fromJson)
-          .map((message) => MapEntry(message.id, message)));
+      ..addEntries(snapshot.map((message) => MapEntry(message.id, message)));
     notifyListeners();
+  }
+
+  Future<void> _loadSideChats({
+    BridgeTransport? expectedTransport,
+    String? parentSessionId,
+  }) async {
+    final transport = expectedTransport ?? _requireTransport();
+    final hostId = activeHost?.hostId;
+    try {
+      final result = await transport.request(
+        'side_chat.list',
+        <String, Object?>{
+          if (parentSessionId?.isNotEmpty == true)
+            'parentSessionId': parentSessionId,
+        },
+      );
+      if (_transport != transport || activeHost?.hostId != hostId) return;
+      final sideChats = jsonList(result['sessions'])
+          .map(RemoteSession.fromJson)
+          .map((session) => session.copyWith(sessionKind: 'side_chat'))
+          .where((session) => _isMobileProviderEnabled(session.providerId))
+          .toList(growable: false);
+      sessions.removeWhere((session) =>
+          session.hostId == hostId &&
+          session.sessionKind == 'side_chat' &&
+          (parentSessionId == null ||
+              session.parentSessionId == parentSessionId ||
+              session.relationship?.sourceSessionId == parentSessionId));
+      for (final sideChat in sideChats) {
+        _upsertSession(sideChat);
+      }
+      notifyListeners();
+    } on Object {
+      // Side chats are additive; older bridges keep the normal task flow.
+    }
   }
 
   Future<void> _loadDelegations([BridgeTransport? expectedTransport]) async {
@@ -2166,6 +2622,7 @@ class RemoteAppStore extends ChangeNotifier {
       if (!isCurrent()) return;
       await Future.wait(<Future<void>>[
         _loadQueuedMessages(transport),
+        _loadSideChats(expectedTransport: transport),
         _loadDelegations(transport),
         _loadApprovals(transport),
         _loadUserInputs(transport),
@@ -2205,11 +2662,28 @@ class RemoteAppStore extends ChangeNotifier {
     }
     if (event.type == 'message.queued' ||
         event.type == 'message.queue_updated') {
-      final message = RemoteQueuedMessage.fromJson(event.payload);
+      final parsed = RemoteQueuedMessage.fromJson(event.payload);
+      final message = _retainQueuedAttachmentPreviews(
+        parsed,
+        queuedMessages[parsed.id]?.attachments ??
+            const <RemoteQueuedAttachment>[],
+      );
       queuedMessages[message.id] = message;
     } else if (event.type == 'message.queue_removed') {
       final messageId = optionalString(event.payload, 'messageId');
       if (messageId != null) queuedMessages.remove(messageId);
+    }
+    if ((event.type == 'side_chat.created' ||
+            event.type == 'side_chat.updated' ||
+            event.type == 'side_chat.promoted') &&
+        event.payload['session'] is Map<Object?, Object?>) {
+      final sideChat = RemoteSession.fromJson(event.payload['session']);
+      if (event.type == 'side_chat.promoted') {
+        sessions.removeWhere((session) => session.id == sideChat.id);
+      }
+      _upsertSession(sideChat.copyWith(
+        sessionKind: event.type == 'side_chat.promoted' ? 'task' : 'side_chat',
+      ));
     }
     if (event.type == 'delegation.started' ||
         event.type == 'delegation.updated' ||
@@ -2286,7 +2760,8 @@ class RemoteAppStore extends ChangeNotifier {
           unawaited(_enqueueReadStateWrite().catchError((Object _) {}));
         }
         syncVisibleHistory = _visibleSessionId == sessionId &&
-            (event.type == 'agent.completed' ||
+            (event.type == 'message.remote_received' ||
+                event.type == 'agent.completed' ||
                 event.type == 'agent.error' ||
                 event.type == 'agent.interrupted' ||
                 (event.type == 'session.status_changed' &&
@@ -2295,6 +2770,36 @@ class RemoteAppStore extends ChangeNotifier {
       }
     }
     _notifyForEvent(event.type);
+    if (event.sessionId != null &&
+        (event.type == 'context.compaction_started' ||
+            event.type == 'context.compaction_completed')) {
+      final sessionId = event.sessionId!;
+      if (event.type == 'context.compaction_completed') {
+        final automatic = event.payload['kind'] == 'automatic';
+        final message = RemoteMessage(
+          id: 'compaction-${event.eventId}',
+          sessionId: sessionId,
+          role: 'system',
+          createdAt: event.occurredAt,
+          parts: <ContentPart>[
+            ContentPart(type: 'text', data: <String, Object?>{
+              'text': automatic
+                  ? 'Context automatically compacted'
+                  : 'Context compacted',
+            }),
+          ],
+          status: 'completed',
+        );
+        final current =
+            messages.putIfAbsent(sessionId, () => <RemoteMessage>[]);
+        if (!current.any((candidate) => candidate.id == message.id)) {
+          current.add(message);
+          current
+              .sort((left, right) => left.createdAt.compareTo(right.createdAt));
+        }
+      }
+      unawaited(_refreshSessionContextQuietly(sessionId));
+    }
     if (event.sessionId != null &&
         (event.type == 'agent.completed' ||
             event.type == 'agent.error' ||
@@ -2437,13 +2942,27 @@ class RemoteAppStore extends ChangeNotifier {
   }
 
   Future<void> _syncVisibleSessionHistory(String sessionId) async {
+    await _refreshVisibleSessionHistory(
+      sessionId,
+      delay: const Duration(milliseconds: 250),
+    );
+  }
+
+  Future<void> refreshVisibleSessionHistory(String sessionId) async {
+    await _refreshVisibleSessionHistory(sessionId);
+  }
+
+  Future<void> _refreshVisibleSessionHistory(
+    String sessionId, {
+    Duration delay = Duration.zero,
+  }) async {
     if (_visibleSessionId != sessionId || !_historySyncs.add(sessionId)) return;
     try {
-      await Future<void>.delayed(const Duration(milliseconds: 250));
+      if (delay > Duration.zero) await Future<void>.delayed(delay);
       if (_visibleSessionId != sessionId) return;
       final index =
           sessions.indexWhere((candidate) => candidate.id == sessionId);
-      if (index >= 0) await _loadSessionHistory(sessions[index]);
+      if (index >= 0) await _loadSessionHistory(sessions[index], refresh: true);
     } catch (_) {
       // Live events remain visible if the provider snapshot is briefly unavailable.
     } finally {

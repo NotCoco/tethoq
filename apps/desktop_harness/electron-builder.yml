@@ -19,6 +19,12 @@ extraResources:
       - "**/*"
   - from: build/icons/tethoq.png
     to: assets/tethoq-icon.png
+  - from: build/icons/tethoq.ico
+    to: assets/tethoq-icon.ico
+  - from: build/icons/tethoq-tray.ico
+    to: assets/tethoq-tray.ico
+  - from: node_modules/uiohook-napi/binding.gyp
+    to: app.asar.unpacked/node_modules/uiohook-napi/binding.gyp
   - from: ../agent_bridge/assets/opencode/uar_mesh.txt
     to: provider-tools/opencode/uar_mesh.txt
   - from: ../agent_bridge/assets/pi/tethoq_tools.txt

@@ -242,6 +242,19 @@ export class PairingManager {
     return true;
   }
 
+  /**
+   * Devices that hold only revoked credentials. A device that paired again has
+   * a live credential, so it is excluded and is not blocked by its own history.
+   */
+  public revokedDeviceIds(): readonly string[] {
+    const active = new Set(this.listDevices().map((device) => device.deviceId));
+    const revoked = new Set<string>();
+    for (const device of this.#devices.values()) {
+      if (this.#revoked.has(device.credentialId) && !active.has(device.deviceId)) revoked.add(device.deviceId);
+    }
+    return [...revoked];
+  }
+
   public exportState(): PairingState {
     return {
       version: 1,

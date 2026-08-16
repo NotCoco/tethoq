@@ -43,6 +43,14 @@ TETHOQ_ACCOUNT_CREDENTIALS.md
 *.keystore
 *.p12
 *.pfx
+*.pem
+*.key
+*.mobileprovision
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.dump
 
 # Local, non-repository working files belong here
 /local-artifacts/

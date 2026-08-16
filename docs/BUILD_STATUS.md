@@ -1,6 +1,6 @@
 ﻿# Build status
 
-Updated: **2026-08-14**
+Updated: **2026-08-16**
 
 Status values: `COMPLETE`, `IMPLEMENTED_UNTESTED`, `PARTIAL`, `BLOCKED_LOCAL`, `BLOCKED_CREDENTIALS`, `RESEARCH_ONLY`, `NOT_STARTED`.
 
@@ -41,8 +41,8 @@ Status values: `COMPLETE`, `IMPLEMENTED_UNTESTED`, `PARTIAL`, `BLOCKED_LOCAL`, `
 | Direct WebSocket transport | COMPLETE | Yes | Real local handshake, signed requests, heartbeat path. Production TLS external. |
 | Relay foundation | PARTIAL | Yes | Routing/auth/limits/reconnect tested; shared token, no E2E encryption, single process. |
 | Host config/pairing persistence | COMPLETE | Yes | Atomic writes and restrictive POSIX modes. |
-| Flutter application source | COMPLETE | Yes | `flutter analyze` is clean, the current Flutter suite passes, and an Android debug APK builds successfully. Physical-device installation and release QA remain outstanding. |
-| Flutter native launchers | PARTIAL | Yes | Android and Windows launchers are checked in and the Android debug build is green. iOS/macOS/Linux launchers and physical-device release QA remain outstanding. |
+| Flutter application source | COMPLETE | Yes | `flutter analyze` is clean, the current Flutter suite passes, and an Android debug APK builds, installs as an in-place update, and launches on a physical Android 16 device. Full release interaction QA remains outstanding. |
+| Flutter native launchers | PARTIAL | Yes | Android and Windows launchers are checked in; the Android debug build and physical-device launch are green. iOS/macOS/Linux launchers and full release QA remain outstanding. |
 | Flutter web transport | NOT_STARTED | No | Current client uses `dart:io`; add conditional browser WebSocket implementation first. |
 | Session list/filter UI | IMPLEMENTED_UNTESTED | No | Provider/status/search filters and recent-activity sort. Host filter is implicit in active host, not multi-host aggregation. |
 | Session timeline/composer | IMPLEMENTED_UNTESTED | Source/widget tests | History, events, drafts, send/interrupt, image previews, and transfer summaries are implemented. |
@@ -52,10 +52,14 @@ Status values: `COMPLETE`, `IMPLEMENTED_UNTESTED`, `PARTIAL`, `BLOCKED_LOCAL`, `
 | Host/provider management UI | PARTIAL | No | Pair/remove/revoke/reconnect/status. Direct API wallet/key configuration is separate; no generic remote harness-authentication UI yet. |
 | Multi-host aggregate view | PARTIAL | No | Multiple credentials stored; UI activates one host at a time. |
 | QR camera pairing | PARTIAL | Yes | The mobile scanner, validated pairing payload flow, and focused QR tests are implemented; physical-camera pairing QA remains outstanding. |
+| Website account and Google OAuth foundation | PARTIAL | Source tests | Environment-driven Supabase email/Google flows, callback handling, user/workspace bootstrap, RLS, dashboard, and revocation UI exist. The community source tree includes no hosted project or credentials; a deployer must supply public environment values and configure provider redirects before sign-in is usable. |
+| Native account sign-in | NOT_STARTED | No | Phone and Desktop do not yet authenticate to the Tethoq account service. Phone entry remains QR pairing; Desktop local use remains intentionally account-free. |
+| Account-backed no-QR enrollment | NOT_STARTED | No | Requires authenticated computer registration, device-key enrollment, explicit first-device approval, per-device relay authorization, revocation, and audit. Google login alone must not authorize Bridge actions. See `docs/ACCOUNT_ACCESS.md`. |
+| Community/hosted distribution boundary | RESEARCH_ONLY | Documentation | Product boundary is decided: community defaults to account-free local/QR use; official builds add optional account-gated cloud access without gating the local app. Build-time adapters and release configuration are not implemented yet. |
 | Durable encrypted session cache | NOT_STARTED | No | General session/event cache is in memory and provider history remains authoritative. Narrow exceptions are Direct API transcripts and restart-local `session-transfers.json`; both are restricted local JSON, not an encrypted general cache. |
 | Production relay deployment | NOT_STARTED | No | Needs TLS deployment, per-device relay auth, durable routing/audit/operations. |
 | Real Codex end-to-end vertical slice | PARTIAL | Yes | Bridge + real Codex slice green: pair/refresh/open/models/send-once/live events/idempotent retry/cleanup. Real approval, user-input, and interrupt not yet triggered live; Flutter client compiled and unit-tested but not yet connected to the real bridge. |
 | macOS/Windows/Linux provider testing | PARTIAL | Yes | Windows bridge/codex path now exercised; macOS/Linux provider processes still untested. |
-| Physical iOS/Android testing | BLOCKED_LOCAL | No | Secure storage, lifecycle, network handoff, QR/camera require devices/SDKs. |
+| Physical iOS/Android testing | PARTIAL | Yes | The debug APK was installed as an in-place update and launched without a startup crash on a physical Samsung SM-S938B running Android 16. Secure-storage migration, background lifecycle, live Bridge handoff, QR/camera pairing, and iOS remain separate release gates. |
 | Provider research | COMPLETE | N/A | Official docs/repos and dated issue-report caveats cover all twelve built-ins (eleven harnesses plus Direct API) and the Claude Code, Gemini CLI, Cursor, Aider, Crush, and Kilo Code exclusions/deferments. |
 | Security architecture documentation | COMPLETE | N/A | Includes relay/confidentiality limits, harness-process authority, credential-gated catalog discovery, session-transfer persistence/sanitization, short-lived image retrieval, browser prompt-injection risk, cross-provider screenshot disclosure, and the live send-idempotency finding. |

@@ -58,6 +58,34 @@ test("OpenCode detection explains the fixed default endpoint without starting an
   assert.match(detection.details.join(" "), /does not launch or discover/);
 });
 
+test("OpenCode lists only connected upstream models and preserves their route", async () => {
+  const fetchLike: FetchLike = async (input) => {
+    assert.equal(requestUrl(input).pathname, "/provider");
+    return jsonResponse({
+      connected: ["anthropic"],
+      default: { anthropic: "claude-sonnet-4-5" },
+      all: [
+        { id: "openai", name: "OpenAI", models: { "gpt-5.5": { id: "gpt-5.5", name: "GPT-5.5" } } },
+        { id: "anthropic", name: "Anthropic", models: { "claude-sonnet-4-5": { id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5" } } },
+      ],
+    });
+  };
+  const adapter = new OpenCodeAdapter({ hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", fetch: fetchLike, activityReader: new SequenceActivityReader(new Set()) });
+
+  const models = await adapter.listModels();
+
+  assert.deepEqual(models.map((model) => model.id), ["anthropic/claude-sonnet-4-5"]);
+  assert.equal(models[0]?.isDefault, true);
+  assert.deepEqual(models[0]?.nativeMetadata, {
+    id: "claude-sonnet-4-5",
+    name: "Claude Sonnet 4.5",
+    sourceProviderId: "anthropic",
+    sourceProviderName: "Anthropic",
+    source: "OpenCode",
+  });
+  await adapter.dispose();
+});
+
 test("OpenCode async prompts use a native message ID separate from bridge deduplication", async () => {
   let requestBody: Record<string, unknown> | undefined;
   const fetchLike: FetchLike = async (input, init) => {

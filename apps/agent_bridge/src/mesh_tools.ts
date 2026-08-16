@@ -34,6 +34,32 @@ interface GatewayResponse {
 
 export const meshToolDefinitions: readonly ClientToolDefinition[] = [
   {
+    name: "mesh_list_sessions",
+    description: "Find other indexed Tethoq tasks on this host. Results are bounded and exclude this task, side chats, and internal helper sessions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", maxLength: 200, description: "Optional title, project, folder, or provider search." },
+        limit: { type: "integer", minimum: 1, maximum: 25, default: 20 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "mesh_message_session",
+    description: "Send a message to another indexed Tethoq task through its separate inbox. It never steers active work or changes that task's user-authored queue; queued user messages always run first.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        target_session_id: { type: "string", description: "Stable task ID returned by mesh_list_sessions." },
+        message: { type: "string", maxLength: 32_000, description: "The message for the other task." },
+        request_id: { type: "string", maxLength: 256, description: "A stable unique ID for this send. Reuse it only when retrying the same target and message." },
+      },
+      required: ["target_session_id", "message", "request_id"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "mesh_list_children",
     description: "List cross-harness child sessions delegated by this parent, including their stable IDs, harnesses, and live states.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },

@@ -74,6 +74,29 @@ export const list_children = tool({
   },
 })
 
+export const list_sessions = tool({
+  description: "Find other indexed Tethoq tasks on this host without scanning folders or session databases.",
+  args: {
+    query: tool.schema.string().max(200).optional(),
+    limit: tool.schema.number().int().min(1).max(25).optional(),
+  },
+  async execute(args, context) {
+    return await call(context.sessionID, "mesh_list_sessions", args)
+  },
+})
+
+export const message_session = tool({
+  description: "Send a message to another indexed Tethoq task through its isolated inbox. This never steers or changes its user queue.",
+  args: {
+    target_session_id: tool.schema.string(),
+    message: tool.schema.string().max(32000),
+    request_id: tool.schema.string().max(256),
+  },
+  async execute(args, context) {
+    return await call(context.sessionID, "mesh_message_session", args)
+  },
+})
+
 export const message_child = tool({
   description: "Send a follow-up instruction to an existing delegated child session.",
   args: {

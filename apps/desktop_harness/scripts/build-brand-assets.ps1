@@ -14,10 +14,16 @@ try {
 
   $iconDirectory = Join-Path $OutputRoot "icons"
   $installerDirectory = Join-Path $OutputRoot "installer"
+  # Keep the notification-area mark clearer than the app icon without letting
+  # its white glyph crowd the black tile at Windows' 16 px tray size.
+  $trayContentScale = 1.25
   New-Item -ItemType Directory -Force -Path $iconDirectory, $installerDirectory | Out-Null
 
   function New-RoundedTethoqIcon {
-    param([Parameter(Mandatory = $true)][int]$Size)
+    param(
+      [Parameter(Mandatory = $true)][int]$Size,
+      [double]$ContentScale = 1.0
+    )
     $bitmap = New-Object System.Drawing.Bitmap $Size, $Size, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
     $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
     try {
@@ -40,7 +46,9 @@ try {
         $path.CloseFigure()
         $graphics.FillPath([System.Drawing.Brushes]::Black, $path)
         $graphics.SetClip($path)
-        $graphics.DrawImage($source, $inset, $inset, $diameter, $diameter)
+        $contentSize = [int][Math]::Round($diameter * $ContentScale)
+        $contentInset = [int][Math]::Round(($diameter - $contentSize) / 2)
+        $graphics.DrawImage($source, $inset + $contentInset, $inset + $contentInset, $contentSize, $contentSize)
         $graphics.ResetClip()
       } finally {
         $path.Dispose()
@@ -58,6 +66,13 @@ try {
     $runtimeIcon.Dispose()
   }
 
+  $trayIcon = New-RoundedTethoqIcon -Size 512 -ContentScale $trayContentScale
+  try {
+    $trayIcon.Save((Join-Path $iconDirectory "tethoq-tray.png"), [System.Drawing.Imaging.ImageFormat]::Png)
+  } finally {
+    $trayIcon.Dispose()
+  }
+
   $sizes = @(16, 20, 24, 32, 40, 48, 64, 128, 256)
   $iconFrames = foreach ($size in $sizes) {
     $frame = New-RoundedTethoqIcon -Size $size
@@ -71,30 +86,57 @@ try {
     }
   }
 
-  $icoPath = Join-Path $iconDirectory "tethoq.ico"
-  $file = [System.IO.File]::Create($icoPath)
-  $writer = New-Object System.IO.BinaryWriter $file
-  try {
-    $writer.Write([uint16]0)
-    $writer.Write([uint16]1)
-    $writer.Write([uint16]$iconFrames.Count)
-    $offset = 6 + (16 * $iconFrames.Count)
-    foreach ($frame in $iconFrames) {
-      $writer.Write([byte]($(if ($frame.Width -eq 256) { 0 } else { $frame.Width })))
-      $writer.Write([byte]($(if ($frame.Height -eq 256) { 0 } else { $frame.Height })))
-      $writer.Write([byte]0)
-      $writer.Write([byte]0)
-      $writer.Write([uint16]1)
-      $writer.Write([uint16]32)
-      $writer.Write([uint32]$frame.Bytes.Length)
-      $writer.Write([uint32]$offset)
-      $offset += $frame.Bytes.Length
+  $trayIconFrames = foreach ($size in $sizes) {
+    $frame = New-RoundedTethoqIcon -Size $size -ContentScale $trayContentScale
+    try {
+      $stream = New-Object System.IO.MemoryStream
+      $frame.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
+      [pscustomobject]@{ Width = $size; Height = $size; Bytes = $stream.ToArray() }
+      $stream.Dispose()
+    } finally {
+      $frame.Dispose()
     }
-    foreach ($frame in $iconFrames) { $writer.Write($frame.Bytes) }
-  } finally {
-    $writer.Dispose()
-    $file.Dispose()
   }
+
+  function Write-IconFile {
+    param(
+      [Parameter(Mandatory = $true)][string]$Path,
+      [Parameter(Mandatory = $true)][object[]]$Frames
+    )
+    $file = [System.IO.File]::Create($Path)
+    $writer = New-Object System.IO.BinaryWriter $file
+    try {
+      $writer.Write([uint16]0)
+      $writer.Write([uint16]1)
+      $writer.Write([uint16]$Frames.Count)
+      $offset = 6 + (16 * $Frames.Count)
+      foreach ($frame in $Frames) {
+        $writer.Write([byte]($(if ($frame.Width -eq 256) { 0 } else { $frame.Width })))
+        $writer.Write([byte]($(if ($frame.Height -eq 256) { 0 } else { $frame.Height })))
+        $writer.Write([byte]0)
+        $writer.Write([byte]0)
+        $writer.Write([uint16]1)
+        $writer.Write([uint16]32)
+        $writer.Write([uint32]$frame.Bytes.Length)
+        $writer.Write([uint32]$offset)
+        $offset += $frame.Bytes.Length
+      }
+      foreach ($frame in $Frames) { $writer.Write($frame.Bytes) }
+    } finally {
+      $writer.Dispose()
+      $file.Dispose()
+    }
+  }
+
+  Write-IconFile -Path (Join-Path $iconDirectory "tethoq.ico") -Frames $iconFrames
+  Write-IconFile -Path (Join-Path $iconDirectory "tethoq-tray.ico") -Frames $trayIconFrames
+
+  # Keep the development/runtime icon copies byte-identical to the resources
+  # embedded by electron-builder so Windows never falls back to Electron's
+  # executable icon while running an unpackaged window.
+  $runtimeAssetsDirectory = Join-Path $PSScriptRoot "..\assets"
+  Copy-Item -LiteralPath (Join-Path $iconDirectory "tethoq.ico") -Destination (Join-Path $runtimeAssetsDirectory "tethoq-icon.ico") -Force
+  Copy-Item -LiteralPath (Join-Path $iconDirectory "tethoq-tray.ico") -Destination (Join-Path $runtimeAssetsDirectory "tethoq-tray.ico") -Force
 
   function Write-InstallerBitmap {
     param(

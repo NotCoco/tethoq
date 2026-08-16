@@ -1,7 +1,9 @@
-import { open, stat } from "node:fs/promises";
+import { open, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import type { SessionState } from "../../protocol/src/index.js";
+import type { ContentPart, SessionState } from "../../protocol/src/index.js";
+import { stripProviderPromptGuidance } from "../../provider_contract/src/index.js";
+import { codexUserContentParts, isCodexBootstrapUserText } from "./normalize.js";
 
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
 const DEFAULT_TAIL_BYTES = 256 * 1_024;
@@ -24,6 +26,7 @@ export interface CodexObservedMessage {
   readonly role: "user" | "assistant";
   readonly text: string;
   readonly partType: "text" | "reasoning";
+  readonly parts?: readonly ContentPart[];
   readonly phase?: "commentary" | "final_answer";
   readonly createdAt?: string;
 }
@@ -31,6 +34,16 @@ export interface CodexObservedMessage {
 export interface CodexTurnMetadata {
   readonly modelId?: string;
   readonly reasoningEffort?: string;
+}
+
+export interface CodexContextObservation {
+  readonly usedTokens: number | null;
+  readonly contextWindowTokens: number | null;
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+  readonly cacheReadTokens?: number;
+  readonly totalTokens?: number;
+  readonly updatedAt?: string;
 }
 
 export interface CodexActivityReconcilerOptions {
@@ -41,6 +54,7 @@ export interface CodexActivityReconcilerOptions {
   readonly onStateChanged: (providerSessionId: string, state: SessionState) => void | Promise<void>;
   readonly onMessage?: (providerSessionId: string, message: CodexObservedMessage) => void | Promise<void>;
   readonly onTurnMetadataChanged?: (providerSessionId: string, metadata: CodexTurnMetadata) => void | Promise<void>;
+  readonly onContextChanged?: (providerSessionId: string, context: CodexContextObservation) => void | Promise<void>;
 }
 
 interface TrackedThread {
@@ -60,6 +74,7 @@ interface TrackedTurnMetadata {
 
 interface RolloutObservation {
   readonly message?: CodexObservedMessage;
+  readonly context?: CodexContextObservation;
 }
 
 /**
@@ -76,9 +91,11 @@ export class CodexActivityReconciler {
   readonly #onStateChanged: (providerSessionId: string, state: SessionState) => void | Promise<void>;
   readonly #onMessage: (providerSessionId: string, message: CodexObservedMessage) => void | Promise<void>;
   readonly #onTurnMetadataChanged: (providerSessionId: string, metadata: CodexTurnMetadata) => void | Promise<void>;
+  readonly #onContextChanged: (providerSessionId: string, context: CodexContextObservation) => void | Promise<void>;
   readonly #knownPaths = new Map<string, string>();
   readonly #trackedTurnMetadata = new Map<string, TrackedTurnMetadata>();
   readonly #turnMetadata = new Map<string, CodexTurnMetadata>();
+  readonly #context = new Map<string, CodexContextObservation>();
   readonly #tracked = new Map<string, TrackedThread>();
   #timer: ReturnType<typeof setInterval> | null = null;
   #polling = false;
@@ -92,6 +109,7 @@ export class CodexActivityReconciler {
     this.#onStateChanged = options.onStateChanged;
     this.#onMessage = options.onMessage ?? (() => undefined);
     this.#onTurnMetadataChanged = options.onTurnMetadataChanged ?? (() => undefined);
+    this.#onContextChanged = options.onContextChanged ?? (() => undefined);
   }
 
   public async reconcile(threads: readonly CodexActivityThread[]): Promise<ReadonlyMap<string, SessionState>> {
@@ -137,6 +155,22 @@ export class CodexActivityReconciler {
     return this.#turnMetadata.get(providerSessionId);
   }
 
+  public context(providerSessionId: string): CodexContextObservation | undefined {
+    return this.#context.get(providerSessionId);
+  }
+
+  public async activeThreadIds(maximum = 16): Promise<readonly string[]> {
+    try {
+      const entries = await readdir(join(this.#codexHome, "thread-writer-locks"), { withFileTypes: true });
+      return entries
+        .filter((entry) => entry.isFile() && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.lock$/iu.test(entry.name))
+        .slice(0, Math.max(1, maximum))
+        .map((entry) => entry.name.slice(0, -".lock".length));
+    } catch {
+      return [];
+    }
+  }
+
   public async recentMessages(providerSessionId: string): Promise<readonly CodexObservedMessage[]> {
     const path = this.#knownPaths.get(providerSessionId);
     return path === undefined ? [] : readRecentRolloutMessages(path);
@@ -152,6 +186,7 @@ export class CodexActivityReconciler {
         if (fingerprint === tracked.fingerprint) continue;
         tracked.fingerprint = fingerprint;
         await this.refreshTurnMetadata(providerSessionId, tracked.path, true);
+        await this.refreshContext(providerSessionId, tracked.path, true);
       }
       for (const [providerSessionId, tracked] of this.#tracked) {
         await this.readNewMessages(providerSessionId, tracked);
@@ -174,6 +209,7 @@ export class CodexActivityReconciler {
     this.#knownPaths.clear();
     this.#trackedTurnMetadata.clear();
     this.#turnMetadata.clear();
+    this.#context.clear();
   }
 
   private async resolve(providerSessionId: string, tracked: TrackedThread): Promise<SessionState> {
@@ -225,6 +261,7 @@ export class CodexActivityReconciler {
         for (const observation of observations) {
           if (this.#disposed || this.#tracked.get(providerSessionId) !== tracked) return;
           if (observation.message !== undefined) await this.#onMessage(providerSessionId, observation.message);
+          if (observation.context !== undefined) await this.applyContext(providerSessionId, observation.context, true);
         }
       }
     } catch {
@@ -240,6 +277,7 @@ export class CodexActivityReconciler {
     if (tracked !== undefined && tracked.path === path) return;
     const fingerprint = await fileFingerprint(path);
     await this.refreshTurnMetadata(providerSessionId, path, this.#turnMetadata.has(providerSessionId));
+    await this.refreshContext(providerSessionId, path, this.#context.has(providerSessionId));
     this.#trackedTurnMetadata.set(providerSessionId, { path, fingerprint });
   }
 
@@ -256,6 +294,21 @@ export class CodexActivityReconciler {
     const previous = this.#turnMetadata.get(providerSessionId);
     this.#turnMetadata.set(providerSessionId, metadata);
     if (notify && !sameTurnMetadata(previous, metadata)) await this.#onTurnMetadataChanged(providerSessionId, metadata);
+  }
+
+  private async refreshContext(providerSessionId: string, path: string, notify: boolean): Promise<void> {
+    const context = await readLatestRolloutContext(path, this.#tailBytes);
+    if (context === null) {
+      this.#context.delete(providerSessionId);
+      return;
+    }
+    await this.applyContext(providerSessionId, context, notify);
+  }
+
+  private async applyContext(providerSessionId: string, context: CodexContextObservation, notify: boolean): Promise<void> {
+    const previous = this.#context.get(providerSessionId);
+    this.#context.set(providerSessionId, context);
+    if (notify && !sameContext(previous, context)) await this.#onContextChanged(providerSessionId, context);
   }
 
   private updateTimer(): void {
@@ -310,7 +363,11 @@ function observationFromLine(line: Buffer): RolloutObservation | null {
     return null;
   }
   const message = observedMessageFromValue(value);
-  return message === null ? null : { message };
+  const context = contextFromValue(value);
+  return message === null && context === null ? null : {
+    ...(message !== null ? { message } : {}),
+    ...(context !== null ? { context } : {}),
+  };
 }
 
 function observedMessageFromValue(value: unknown): CodexObservedMessage | null {
@@ -336,11 +393,16 @@ function observedMessageFromValue(value: unknown): CodexObservedMessage | null {
   if (typeof payload.id !== "string" || payload.id.length === 0 || !Array.isArray(payload.content)) return null;
 
   const expectedPartType = payload.role === "user" ? "input_text" : "output_text";
-  const text = payload.content
-    .filter((part): part is Record<string, unknown> => isRecord(part) && part.type === expectedPartType && typeof part.text === "string")
-    .map((part) => part.text as string)
-    .join("");
-  if (text.length === 0) return null;
+  const normalizedUserParts = payload.role === "user" ? codexUserContentParts(payload.content) : undefined;
+  const rawText = payload.role === "user"
+    ? normalizedUserParts!.filter((part): part is Extract<ContentPart, { type: "text" }> => part.type === "text").map((part) => part.text).join("")
+    : payload.content
+      .filter((part): part is Record<string, unknown> => isRecord(part) && part.type === expectedPartType && typeof part.text === "string")
+      .map((part) => part.text as string)
+      .join("");
+  if (payload.role === "user" && isCodexBootstrapUserText(rawText)) return null;
+  const text = payload.role === "user" ? stripProviderPromptGuidance(rawText) : rawText;
+  if (text.length === 0 && (normalizedUserParts?.length ?? 0) === 0) return null;
 
   const phase = payload.role === "assistant" && (payload.phase === "commentary" || payload.phase === "final_answer")
     ? payload.phase
@@ -350,6 +412,7 @@ function observedMessageFromValue(value: unknown): CodexObservedMessage | null {
     role: payload.role,
     text,
     partType: "text",
+    ...(normalizedUserParts !== undefined ? { parts: normalizedUserParts } : {}),
     ...(phase !== undefined ? { phase } : {}),
     ...(typeof value.timestamp === "string" ? { createdAt: value.timestamp } : {}),
   };
@@ -414,6 +477,44 @@ function turnMetadataFromValue(value: unknown): CodexTurnMetadata | null {
 
 function sameTurnMetadata(left: CodexTurnMetadata | undefined, right: CodexTurnMetadata): boolean {
   return left?.modelId === right.modelId && left?.reasoningEffort === right.reasoningEffort;
+}
+
+function finiteToken(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function contextFromValue(value: unknown): CodexContextObservation | null {
+  if (!isRecord(value) || value.type !== "event_msg" || !isRecord(value.payload) || value.payload.type !== "token_count") return null;
+  const info = isRecord(value.payload.info) ? value.payload.info : null;
+  if (info === null) return null;
+  const last = isRecord(info.last_token_usage) ? info.last_token_usage : null;
+  const contextWindowTokens = finiteToken(info.model_context_window) ?? null;
+  const inputTokens = last === null ? undefined : finiteToken(last.input_tokens);
+  const outputTokens = last === null ? undefined : finiteToken(last.output_tokens);
+  const cacheReadTokens = last === null ? undefined : finiteToken(last.cached_input_tokens);
+  const totalTokens = last === null ? undefined : finiteToken(last.total_tokens);
+  const usedTokens = totalTokens ?? (inputTokens !== undefined || outputTokens !== undefined
+    ? (inputTokens ?? 0) + (outputTokens ?? 0)
+    : null);
+  if (usedTokens === null && contextWindowTokens === null) return null;
+  return {
+    usedTokens,
+    contextWindowTokens,
+    ...(inputTokens !== undefined ? { inputTokens } : {}),
+    ...(outputTokens !== undefined ? { outputTokens } : {}),
+    ...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
+    ...(totalTokens !== undefined ? { totalTokens } : {}),
+    ...(typeof value.timestamp === "string" ? { updatedAt: value.timestamp } : {}),
+  };
+}
+
+function sameContext(left: CodexContextObservation | undefined, right: CodexContextObservation): boolean {
+  return left?.usedTokens === right.usedTokens
+    && left?.contextWindowTokens === right.contextWindowTokens
+    && left?.inputTokens === right.inputTokens
+    && left?.outputTokens === right.outputTokens
+    && left?.cacheReadTokens === right.cacheReadTokens
+    && left?.totalTokens === right.totalTokens;
 }
 
 function validRolloutPath(value: string | null | undefined): value is string {
@@ -487,6 +588,52 @@ export async function readLatestRolloutTurnMetadata(path: string, chunkBytes = D
         }
         const result = turnMetadataFromValue(value);
         if (result !== null) return result;
+      }
+      suffix = leadingPartial.length <= MAX_ROLLOUT_LINE_BYTES ? leadingPartial : null;
+      end = start;
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+export async function readLatestRolloutContext(path: string, chunkBytes = DEFAULT_TAIL_BYTES): Promise<CodexContextObservation | null> {
+  let handle;
+  try {
+    handle = await open(path, "r");
+    const metadata = await handle.stat();
+    if (!metadata.isFile()) return null;
+    const chunkSize = Math.max(1, chunkBytes);
+    let end = metadata.size;
+    let suffix: string | null = "";
+    while (end > 0) {
+      const start = Math.max(0, end - chunkSize);
+      const buffer = Buffer.alloc(end - start);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
+      let text = buffer.subarray(0, bytesRead).toString("utf8");
+      if (suffix === null) {
+        const boundary = text.lastIndexOf("\n");
+        if (boundary < 0) {
+          end = start;
+          continue;
+        }
+        text = text.slice(0, boundary + 1);
+        suffix = "";
+      }
+      const lines: string[] = `${text}${suffix}`.split("\n");
+      const leadingPartial = start > 0 ? lines.shift() ?? "" : "";
+      for (let index = lines.length - 1; index >= 0; index -= 1) {
+        const rawLine = lines[index]?.trim();
+        if (!rawLine) continue;
+        try {
+          const result = contextFromValue(JSON.parse(rawLine));
+          if (result !== null) return result;
+        } catch {
+          // Malformed and incomplete rollout records are ignored.
+        }
       }
       suffix = leadingPartial.length <= MAX_ROLLOUT_LINE_BYTES ? leadingPartial : null;
       end = start;

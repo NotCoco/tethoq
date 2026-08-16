@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdir, readFile, readdir, rm } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,7 +27,7 @@ async function bundle(entry, name) {
         pluginBuild.onLoad({ filter: /.*/, namespace: "stub" }, ({ path }) => ({
           loader: "js",
           contents: path === "electron"
-            ? "export const globalShortcut={register(){return true},unregister(){}}; export const shell={showItemInFolder(){}}; export const desktopCapturer={getSources:async()=>[]}; export const nativeImage={createFromPath(){return {isEmpty(){return true}}}}; export const screen={getAllDisplays(){return []},getDisplayNearestPoint(){throw new Error('stub')}};"
+            ? "export const globalShortcut={register(){return true},unregister(){}}; export const shell={showItemInFolder(){}}; export const desktopCapturer={getSources:async()=>[]}; export const nativeImage={createFromPath(){return {isEmpty(){return true}}},createFromBuffer(){return {isEmpty(){return true}}},createFromBitmap(){return {isEmpty(){return true}}}}; export const screen={getAllDisplays(){return []},getDisplayNearestPoint(){throw new Error('stub')}};"
             : "export const uIOhook={on(){},off(){},start(){},stop(){}};",
         }));
       },
@@ -57,7 +57,8 @@ class FakeCapture {
   }
   async capture(request) {
     this.captures.push(request);
-    return { frameId: request.frameId, triggerEventId: request.triggerEventId, timestamp: request.timestamp, displayId: "1", displayBounds: { x: 0, y: 0, width: 1920, height: 1080 }, imageSize: { width: 1920, height: 1080 }, fullPath: request.fullPath, cursorPath: request.cursorPath, fullRelativePath: `screens/full/${request.frameId}.jpg`, cursorRelativePath: `screens/cursor/${request.frameId}.jpg`, bytesWritten: 20 };
+    await Promise.all([writeFile(request.fullPath, Buffer.from([0xff, 0xd8, 0xff, 0xd9])), writeFile(request.cursorPath, Buffer.from([0xff, 0xd8, 0xff, 0xd9]))]);
+    return { frameId: request.frameId, triggerEventId: request.triggerEventId, timestamp: request.timestamp, displayId: "1", displayBounds: { x: 0, y: 0, width: 1920, height: 1080 }, imageSize: { width: 1920, height: 1080 }, fullPath: request.fullPath, cursorPath: request.cursorPath, fullRelativePath: `screens/full/${request.frameId}.jpg`, cursorRelativePath: `screens/cursor/${request.frameId}.jpg`, cursor: { screen: { x: request.x, y: request.y }, image: { x: request.x, y: request.y }, normalized: { x: request.x / 1919, y: request.y / 1079 }, embeddedInImage: true }, bytesWritten: 8 };
   }
   async createDragSummary(request) {
     this.summaries.push(request);
@@ -181,6 +182,12 @@ test("finalize names and rebases a workflow; attachment is explicitly local-only
   assert.notEqual(saved.path, staged.path);
   assert.equal((await value.manager.list())[0].id, saved.id);
 
+  const screenshots = await value.manager.screenshots(saved.id);
+  assert.deepEqual(screenshots, [{ frameId: "frame-000001", name: "frame-000001.jpg" }]);
+  const screenshot = await value.manager.screenshot(saved.id, "frame-000001", "full");
+  assert.equal(screenshot.name, "frame-000001.jpg");
+  assert.match(screenshot.dataUrl, /^data:image\/jpeg;base64,/u);
+
   const attachment = await value.manager.attachment(saved.id);
   assert.equal(attachment.localOnly, true);
   assert.equal(attachment.neverUploadedAutomatically, true);
@@ -243,6 +250,19 @@ test("drag crop accepts virtual desktops with negative cross-display coordinates
     width: 1540,
     height: 540,
   });
+});
+
+test("captured screenshots burn in a crisp high-contrast pointer", () => {
+  const width = 64;
+  const height = 64;
+  const original = Buffer.alloc(width * height * 4, 127);
+  const marked = captureModule.drawCursorOnBitmap(original, width, height, { x: 20, y: 18 });
+  assert.notDeepEqual(marked, original);
+  const tones = new Set();
+  for (let offset = 0; offset < marked.length; offset += 4) tones.add(marked[offset]);
+  assert.ok(tones.has(20), "pointer outline is visible on light content");
+  assert.ok(tones.has(246), "pointer fill is visible on dark content");
+  assert.equal(original.every((value) => value === 127), true, "the source bitmap is not mutated");
 });
 
 test("typing keeps every key code but throttles expensive foreground context", async (t) => {
@@ -325,8 +345,9 @@ test("stop waits for an in-flight drag summary and event paths stay relative aft
   await new Promise((resolve) => setImmediate(resolve));
   let stopped = false;
   void stopping.then(() => { stopped = true; });
-  await new Promise((resolve) => setImmediate(resolve));
+  for (let attempt = 0; resolveSummary === undefined && attempt < 100; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(stopped, false, "stop must await drag postprocessing");
+  assert.equal(typeof resolveSummary, "function", "drag postprocessing started");
   resolveSummary({ cropBounds: { x: 0, y: 0, width: 800, height: 540 }, framePaths: [join(value.directory, "old", "summary.jpg")], bytesWritten: 5 });
   await stopping;
   const saved = await value.manager.finalize("Curved drag");
@@ -335,6 +356,10 @@ test("stop waits for an in-flight drag summary and event paths stay relative aft
   const drag = events.find((event) => event.type === "drag-complete");
   assert.match(screenshot.fullPath, /^screens\/full\//);
   assert.match(screenshot.cursorPath, /^screens\/cursor\//);
+  assert.equal(screenshot.cursor.embeddedInImage, true);
+  assert.deepEqual(screenshot.cursor.image, screenshot.cursor.screen);
+  assert.equal(screenshot.cursor.normalized.x, screenshot.cursor.screen.x / 1919);
+  assert.equal(screenshot.cursor.normalized.y, screenshot.cursor.screen.y / 1079);
   assert.match(drag.dragSummary.framePaths[0], /^screens\/drag-summary\//);
   assert.doesNotMatch(JSON.stringify({ screenshot, drag }), /\.recording-|\.staged-/);
 });

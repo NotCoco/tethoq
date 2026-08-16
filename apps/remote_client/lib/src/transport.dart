@@ -8,6 +8,7 @@ import 'package:flutter/foundation.dart';
 
 import 'json.dart';
 import 'models.dart';
+import 'secure_transport.dart';
 import 'security.dart';
 
 typedef BridgeDnsResolver = Future<List<InternetAddress>> Function(String host);
@@ -359,6 +360,19 @@ class BridgeTransport {
   Timer? _reconnectTimer;
   BridgeConnectionState _state = BridgeConnectionState.disconnected;
   bool _disposed = false;
+  SecureChannel? _secure;
+  /// Inbound frames are handled one at a time. Decryption is asynchronous, and
+  /// a secure channel refuses a frame that arrives out of order, so overlapping
+  /// handlers would reject perfectly good traffic.
+  Future<void> _inbound = Future<void>.value();
+  /// Set once this computer has proved it supports encryption. A later
+  /// connection that silently drops the offer is treated as an attacker
+  /// stripping it, not as an older bridge.
+  bool _encryptionExpected = false;
+  Completer<void>? _handshake;
+
+  /// True while this connection is encrypted end to end with the computer.
+  bool get encrypted => _secure != null;
   int _reconnectAttempt = 0;
   int _lastReceivedSequence = 0;
 
@@ -489,22 +503,43 @@ class BridgeTransport {
         return;
       }
       _socket = socket;
+      _secure = null;
+      final handshake = Completer<void>();
+      _handshake = handshake;
       socket.pingInterval = const Duration(seconds: 15);
       socket.listen(
-        (Object? data) => _receive(data),
+        (Object? data) {
+          _inbound = _inbound.then((_) => _receive(data)).catchError((Object _) {});
+        },
         onDone: _disconnected,
         onError: (Object error, StackTrace stackTrace) => _disconnected(),
         cancelOnError: false,
       );
-      if (endpoint.relayToken != null) {
+      final relayToken = endpoint.relayToken;
+      final pairedHost = endpoint.pairedHost;
+      if (relayToken != null) {
         socket.add(jsonEncode(<String, Object?>{
           'type': 'relay.attach',
           'role': 'device',
           'hostId': endpoint.hostId,
-          'token': endpoint.relayToken,
+          'token': relayToken,
           'deviceId': endpoint.deviceId,
+          // The shared room token cannot show which device this is, so the
+          // relay is given the host-signed credential and a fresh signature.
+          if (pairedHost != null)
+            'proof': await signRelayDeviceAttach(
+                host: pairedHost, token: relayToken),
         }));
       }
+      // Announcing the device makes the relay create the host session, so the
+      // computer's encryption offer arrives before any real request is sent.
+      // It carries no secrets.
+      socket.add(jsonEncode(<String, Object?>{
+        'kind': 'hello',
+        'role': 'device',
+        'deviceId': endpoint.deviceId,
+      }));
+      await _awaitHandshake(handshake);
       _reconnectAttempt = 0;
       _setState(BridgeConnectionState.online);
       for (final pending in _pending.values.toList(growable: false)) {
@@ -520,6 +555,24 @@ class BridgeTransport {
           Uri uri, HttpClient? customClient) =>
       WebSocket.connect(uri.toString(), customClient: customClient);
 
+  /// Waits briefly for the computer's greeting so the first real request can
+  /// already be encrypted. An older bridge that never greets falls back to the
+  /// previous behaviour instead of hanging.
+  Future<void> _awaitHandshake(Completer<void> handshake) async {
+    try {
+      await handshake.future.timeout(const Duration(seconds: 6));
+    } on TimeoutException {
+      if (_encryptionExpected) {
+        throw const BridgeRequestException(
+          'ENCRYPTION_REQUIRED',
+          'This computer previously used an encrypted connection and did not this time. '
+              'Nothing was sent.',
+          retryable: false,
+        );
+      }
+    }
+  }
+
   Future<void> _send(_PendingRequest pending) async {
     final socket = _socket;
     if (socket == null || socket.readyState != WebSocket.open) return;
@@ -531,10 +584,15 @@ class BridgeTransport {
       final signed = await security.signAction(host, pending.envelope);
       message = <String, Object?>{'kind': 'signed_action', 'signed': signed};
     }
+    final channel = _secure;
+    if (channel != null) {
+      socket.add(jsonEncode(await channel.seal(jsonEncode(message))));
+      return;
+    }
     socket.add(jsonEncode(message));
   }
 
-  void _receive(Object? raw) {
+  Future<void> _receive(Object? raw) async {
     if (raw is! String) return;
     Object? decoded;
     try {
@@ -542,7 +600,22 @@ class BridgeTransport {
     } on FormatException {
       return;
     }
-    final value = jsonMap(decoded, name: 'transport message');
+    JsonMap value = jsonMap(decoded, name: 'transport message');
+    if (value['kind'] == 'secure') {
+      final channel = _secure;
+      if (channel == null) return;
+      try {
+        value = jsonMap(jsonDecode(await channel.open(value)),
+            name: 'transport message');
+      } on Object {
+        return;
+      }
+      if (value['kind'] == 'secure_established') return;
+    } else if (_secure != null && value['kind'] != null) {
+      // The channel is live, so a readable application message did not come
+      // from the computer. Drop it rather than trusting it.
+      return;
+    }
     if (value['type'] == 'relay.attached') return;
     if (value['type'] == 'relay.host_offline') {
       _setState(BridgeConnectionState.reconnecting);
@@ -570,8 +643,70 @@ class BridgeTransport {
     } else if (kind == 'event') {
       _handleEventEnvelope(value);
     } else if (kind == 'hello') {
+      await _negotiateEncryption(value);
       _setState(BridgeConnectionState.online);
     }
+  }
+
+  /// Agrees a key with the computer using the identity stored at pairing. A
+  /// greeting without an offer is only accepted from a computer that has never
+  /// shown it can encrypt.
+  Future<void> _negotiateEncryption(JsonMap hello) async {
+    if (_secure != null) return;
+    final host = endpoint.pairedHost;
+    SecureHandshakeOffer? offer;
+    try {
+      offer = SecureHandshakeOffer.tryParse(hello['encryption']);
+    } on SecureTransportException {
+      offer = null;
+    }
+    if (offer == null || host == null) {
+      if (offer == null && _encryptionExpected) {
+        // Refusing to continue is the point: this is what a relay stripping
+        // the offer looks like, and falling back hands it the plain text.
+        await _failHandshake(const BridgeRequestException(
+          'ENCRYPTION_REQUIRED',
+          'This computer previously used an encrypted connection and did not '
+              'this time. Nothing was sent.',
+          retryable: false,
+        ));
+        return;
+      }
+      _finishHandshake();
+      return;
+    }
+    try {
+      final result = await acceptSecureHandshake(offer: offer, host: host);
+      _socket?.add(jsonEncode(result.accept));
+      _secure = result.channel;
+      _encryptionExpected = true;
+    } on Object catch (error) {
+      await _failHandshake(BridgeRequestException(
+        'ENCRYPTION_FAILED',
+        error is SecureTransportException
+            ? error.message
+            : 'This computer could not prove its encryption key. '
+                'Nothing was sent.',
+        retryable: false,
+      ));
+      return;
+    }
+    _finishHandshake();
+  }
+
+  void _finishHandshake() {
+    final handshake = _handshake;
+    _handshake = null;
+    if (handshake != null && !handshake.isCompleted) handshake.complete();
+  }
+
+  Future<void> _failHandshake(BridgeRequestException reason) async {
+    final handshake = _handshake;
+    _handshake = null;
+    if (handshake != null && !handshake.isCompleted) {
+      handshake.completeError(reason);
+    }
+    await _socket?.close(WebSocketStatus.policyViolation, 'Encryption refused');
   }
 
   void _handleResponse(JsonMap response) {
@@ -632,6 +767,10 @@ class BridgeTransport {
   void _disconnected() {
     if (_disposed) return;
     _socket = null;
+    // Session keys belong to one socket. The next connection agrees fresh ones,
+    // which is what keeps past traffic unreadable if a key ever leaks.
+    _secure = null;
+    _finishHandshake();
     _scheduleReconnect();
   }
 

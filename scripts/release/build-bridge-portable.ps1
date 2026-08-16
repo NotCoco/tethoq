@@ -40,6 +40,17 @@ function Reset-Directory([string]$Path, [string]$Parent) {
   New-Item -ItemType Directory -Path $Path -Force | Out-Null
 }
 
+function Get-Sha256([string]$Path) {
+  $hasher = [System.Security.Cryptography.SHA256]::Create()
+  $stream = [System.IO.File]::OpenRead($Path)
+  try {
+    return ([System.BitConverter]::ToString($hasher.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
+  } finally {
+    $stream.Dispose()
+    $hasher.Dispose()
+  }
+}
+
 function Get-RelativePath([string]$BasePath, [string]$TargetPath) {
   $baseFull = [System.IO.Path]::GetFullPath($BasePath).TrimEnd('\') + '\'
   $targetFull = [System.IO.Path]::GetFullPath($TargetPath)
@@ -128,11 +139,11 @@ Write-DeterministicZip $portableRoot $portableArchive
 
 $checksums = @()
 if (-not $PortableOnly) {
-  $installerSha256 = (Get-FileHash -LiteralPath (Join-Path $artifactsRoot $installerName) -Algorithm SHA256).Hash.ToLowerInvariant()
+  $installerSha256 = Get-Sha256 (Join-Path $artifactsRoot $installerName)
   $checksums += "$installerSha256  $installerName"
 }
 $portableFile = Get-Item -LiteralPath $portableArchive
-$portableSha256 = (Get-FileHash -LiteralPath $portableArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+$portableSha256 = Get-Sha256 $portableArchive
 $checksums += "$portableSha256  $($portableFile.Name)"
 $checksums | Set-Content -LiteralPath (Join-Path $artifactsRoot 'SHA256SUMS.txt') -Encoding ascii
 

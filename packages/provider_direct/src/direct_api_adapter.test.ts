@@ -141,6 +141,44 @@ test("direct API key is encrypted and Responses usage updates the local wallet",
   }
 });
 
+test("direct API errors do not expose upstream response content", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tethoq-direct-error-"));
+  const upstreamSecret = ["provider", "credential", "fixture"].join("-");
+  const upstreamPrompt = "confidential provider prompt fixture";
+  try {
+    const fakeFetch: typeof fetch = async (input) => {
+      const url = String(input);
+      if (url.endsWith("/models")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      if (url.endsWith("/responses")) {
+        return new Response(JSON.stringify({ error: { message: `${upstreamSecret}: ${upstreamPrompt}` } }), { status: 429 });
+      }
+      throw new Error(`Unexpected URL ${url}`);
+    };
+    const adapter = new DirectApiProviderAdapter({ hostId: "host-test", statePath: join(root, "wallet.json"), encryptionSecret: "test-secret", environment: {}, fetch: fakeFetch });
+    await adapter.configureWallet({ endpointId: "openai", apiKey: ["sk-test", "error-fixture"].join("-") });
+    const session = await adapter.createSession({ workingDirectory: "C:\\workspace", modelId: "openai::gpt-5.6-sol" });
+    let errorMessage: string | undefined;
+    let resolveError!: () => void;
+    const errored = new Promise<void>((resolve) => { resolveError = resolve; });
+    await adapter.subscribe(session.providerSessionId, (event) => {
+      if (event.type === "agent.error") {
+        errorMessage = typeof event.payload.message === "string" ? event.payload.message : undefined;
+        resolveError();
+      }
+    });
+
+    await adapter.sendMessage(session.providerSessionId, { requestId: "error-request", content: "Trigger a safe error" });
+    await errored;
+
+    assert.equal(errorMessage, "API request failed (429)");
+    assert.doesNotMatch(errorMessage ?? "", new RegExp(upstreamSecret, "u"));
+    assert.doesNotMatch(errorMessage ?? "", new RegExp(upstreamPrompt, "u"));
+    await adapter.dispose();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("CrofAI wallet uses the documented provider credit endpoint", async () => {
   const root = await mkdtemp(join(tmpdir(), "tethoq-direct-crof-"));
   try {

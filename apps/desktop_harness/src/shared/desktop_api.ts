@@ -40,6 +40,9 @@ export const IPC_CHANNELS = Object.freeze({
   selectFiles: "tethoq:select-files",
   captureScreens: "tethoq:capture-screens",
   revealPath: "tethoq:reveal-path",
+  localOpenHandlers: "tethoq:local-open-handlers",
+  openLocalTarget: "tethoq:open-local-target",
+  openDictationSetupPage: "tethoq:open-dictation-setup-page",
   showWindow: "tethoq:show-window",
   hideWindow: "tethoq:hide-window",
   openCodeStatus: "tethoq:opencode-status",
@@ -235,6 +238,15 @@ export interface WorkflowDescriptor {
   readonly startedAt: string; readonly stoppedAt: string; readonly durationMs: number; readonly stopReason: "user" | "panic-shortcut" | "duration-limit" | "app-shutdown" | "error";
   readonly summary: WorkflowCaptureSummary; readonly privacy: RecorderPrivacy;
 }
+export interface WorkflowScreenshot {
+  readonly frameId: string;
+  readonly name: string;
+}
+export interface WorkflowScreenshotImage extends WorkflowScreenshot {
+  readonly dataUrl: string;
+  readonly width: number;
+  readonly height: number;
+}
 export interface StagedWorkflow extends WorkflowDescriptor { readonly status: "staged"; readonly name: null }
 export interface WorkflowAttachment { readonly kind: "tethoq-workflow"; readonly id: string; readonly name: string; readonly path: string; readonly manifestPath: string; readonly eventsPath: string; readonly promptReference: string; readonly summary: WorkflowCaptureSummary; readonly localOnly: true; readonly neverUploadedAutomatically: true; readonly sensitiveDataPossible: true }
 export interface RecorderState {
@@ -246,7 +258,8 @@ export type RecorderAction =
   | { readonly type: "stop"; readonly reason?: "user" | "panic-shortcut" | "app-shutdown" }
   | { readonly type: "finalize"; readonly name: string }
   | { readonly type: "discard" | "list" }
-  | { readonly type: "delete" | "reveal" | "attachment"; readonly id: string };
+  | { readonly type: "delete" | "reveal" | "attachment" | "screenshots"; readonly id: string }
+  | { readonly type: "screenshot-data"; readonly id: string; readonly frameId: string; readonly variant: "thumbnail" | "full" };
 
 /**
  * Desktop preferences. Every gated experimental capability must verify
@@ -256,8 +269,69 @@ export type RecorderAction =
 export interface DesktopPreferencesState {
   readonly version: 1;
   readonly experimentalFeatures: boolean;
+  readonly reasoningDisplay: "compact" | "expanded";
+  readonly localOpenHandlerId: LocalOpenHandlerId;
+  /** What the window close button does. Tray keeps active tasks and alerts alive. */
+  readonly closeAction: DesktopCloseAction;
+  /** Whether Windows starts Tethoq for the user, and whether it opens a window. */
+  readonly launchAtLogin: DesktopLaunchAtLogin;
+  /** Which unfocused events are allowed to raise an operating-system notification. */
+  readonly alerts: DesktopAlertLevel;
+  /** Concrete model/reasoning defaults used when a task has no recorded selection yet. */
+  readonly agentDefaults: Readonly<Record<string, AgentModelDefault>>;
+  /** Optional user-selected AGENTS.md applied privately to every Tethoq task turn. */
+  readonly globalAgentsPath: string | null;
+  /** Local, user-owned task organisation keyed by session ID. Provider titles are never overwritten upstream. */
+  readonly taskOverrides: Readonly<Record<string, TaskOverride>>;
 }
-export type PreferencesAction = { readonly type: "set-experimental-features"; readonly enabled: boolean };
+export type DesktopCloseAction = "tray" | "quit";
+export type DesktopLaunchAtLogin = "off" | "window" | "tray";
+export type DesktopAlertLevel = "all" | "attention" | "off";
+export interface AgentModelDefault {
+  readonly modelId: string;
+  readonly reasoningEffort?: string;
+}
+/** A user's own name, priority, and put-away state for one task. Absent fields mean "unchanged". */
+export interface TaskOverride {
+  readonly title?: string;
+  readonly pinned?: boolean;
+  readonly archived?: boolean;
+}
+export const MAX_TASK_OVERRIDES = 500;
+export const MAX_TASK_TITLE_CHARACTERS = 120;
+export type PreferencesAction =
+  | { readonly type: "set-experimental-features"; readonly enabled: boolean }
+  | { readonly type: "set-reasoning-display"; readonly value: "compact" | "expanded" }
+  | { readonly type: "set-close-action"; readonly value: DesktopCloseAction }
+  | { readonly type: "set-launch-at-login"; readonly value: DesktopLaunchAtLogin }
+  | { readonly type: "set-alerts"; readonly value: DesktopAlertLevel }
+  | { readonly type: "choose-global-agents" | "clear-global-agents" }
+  | { readonly type: "set-task-override"; readonly sessionId: string; readonly override: TaskOverride }
+  | { readonly type: "set-agent-default"; readonly providerId: string; readonly modelId: string; readonly reasoningEffort?: string };
+
+export type LocalOpenHandlerId = "system" | "vscode" | "cursor" | "windsurf" | "sublime" | "notepadpp" | "zed";
+export type LocalOpenHandlerIcon = "explorer" | "vscode" | "cursor" | "windsurf" | "sublime" | "notepadpp" | "zed";
+export interface LocalOpenHandler {
+  readonly id: LocalOpenHandlerId;
+  readonly label: string;
+  readonly icon: LocalOpenHandlerIcon;
+}
+export interface LocalOpenState {
+  readonly defaultHandlerId: LocalOpenHandlerId;
+  readonly handlers: readonly LocalOpenHandler[];
+}
+export interface LocalOpenTarget {
+  readonly path: string;
+  readonly line?: number;
+  readonly column?: number;
+  readonly handlerId?: LocalOpenHandlerId;
+  readonly rememberAsDefault?: boolean;
+}
+export interface LocalOpenResult {
+  readonly opened: true;
+  readonly handlerId: LocalOpenHandlerId;
+  readonly state: LocalOpenState;
+}
 
 export interface LiveSessionPrivacy {
   readonly localOnly: true;
@@ -353,6 +427,9 @@ export interface DesktopHarnessApi {
   selectFiles(providerId: DesktopProviderId): Promise<readonly SelectedFile[]>;
   captureScreens(): Promise<readonly ScreenCaptureSource[]>;
   revealPath(path: string): Promise<boolean>;
+  localOpenHandlers(): Promise<LocalOpenState>;
+  openLocalTarget(target: LocalOpenTarget): Promise<LocalOpenResult>;
+  openDictationSetupPage(sourceId: "openai-stt" | "xai-stt"): Promise<void>;
   showWindow(): Promise<void>;
   hideWindow(): Promise<void>;
   openCodeStatus(): Promise<OpenCodeProcessStatus>;
@@ -361,7 +438,7 @@ export interface DesktopHarnessApi {
   browserState(): Promise<BrowserWorkspaceState>;
   browserAction(action: BrowserAction): Promise<BrowserWorkspaceState>;
   recorderState(): Promise<RecorderState>;
-  recorderAction(action: RecorderAction): Promise<RecorderState | WorkflowDescriptor | readonly WorkflowDescriptor[] | WorkflowAttachment | null>;
+  recorderAction(action: RecorderAction): Promise<RecorderState | WorkflowDescriptor | readonly WorkflowDescriptor[] | readonly WorkflowScreenshot[] | WorkflowScreenshotImage | WorkflowAttachment | null>;
   preferencesState(): Promise<DesktopPreferencesState>;
   preferencesAction(action: PreferencesAction): Promise<DesktopPreferencesState>;
   liveSessionState(): Promise<LiveSessionState>;

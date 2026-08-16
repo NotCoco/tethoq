@@ -2,6 +2,15 @@ import assert from "node:assert/strict";
 import { createConnection } from "node:net";
 import test from "node:test";
 import { callMeshToolGateway, MeshToolGateway } from "./mesh_tools.js";
+import { meshToolDefinitions } from "./mesh_tools.js";
+
+test("mesh tools expose bounded task discovery and isolated cross-task messaging", () => {
+  const discovery = meshToolDefinitions.find((tool) => tool.name === "mesh_list_sessions");
+  const messaging = meshToolDefinitions.find((tool) => tool.name === "mesh_message_session");
+  assert.equal(discovery?.inputSchema.additionalProperties, false);
+  assert.deepEqual(messaging?.inputSchema.required, ["target_session_id", "message", "request_id"]);
+  assert.match(messaging?.description ?? "", /never steers/i);
+});
 
 test("mesh gateway authenticates and carries scoped parent context", async (t) => {
   const calls: unknown[] = [];

@@ -11,6 +11,85 @@ import 'package:universal_agent_remote/src/store.dart';
 import 'package:universal_agent_remote/src/transport.dart';
 
 void main() {
+  test('per-Agent defaults persist and seed a new prepared task', () async {
+    FlutterSecureStorage.setMockInitialValues(<String, String>{});
+    final security = DeviceSecurity();
+    await security.saveAgentDefault(const DelegationSelection(
+      providerId: 'codex',
+      modelId: 'gpt-5.6-sol',
+      reasoningEffort: 'ultra',
+    ));
+    final store = RemoteAppStore(security: security);
+    addTearDown(store.dispose);
+    await store.initialize();
+    store.providers.add(const ProviderConnection(
+      providerId: 'codex',
+      displayName: 'Codex',
+      state: 'online',
+      detected: true,
+      authenticated: true,
+      capabilities: ProviderCapabilities(
+        createSession: true,
+        modelEnumeration: true,
+      ),
+    ));
+    store.modelsByProvider['codex'] = const <RemoteModel>[
+      RemoteModel(
+        id: 'gpt-5.6-sol',
+        providerId: 'codex',
+        displayName: 'GPT-5.6 Sol',
+        isDefault: true,
+        nativeMetadata: <String, Object?>{
+          'supportedReasoningEfforts': <Object?>[
+            <String, Object?>{'reasoningEffort': 'light'},
+            <String, Object?>{'reasoningEffort': 'ultra'},
+          ],
+          'defaultReasoningEffort': 'light',
+        },
+      ),
+    ];
+
+    final resolved = store.agentDefaultSelectionFor(
+        'codex', store.modelsByProvider['codex']!);
+    expect(resolved?.modelId, 'gpt-5.6-sol');
+    expect(resolved?.reasoningEffort, 'ultra');
+
+    final prepared = store.prepareSession('codex');
+    expect(prepared.modelId, 'gpt-5.6-sol');
+    expect(prepared.reasoningEffort, 'ultra');
+
+    await store.setAgentDefault(const DelegationSelection(
+      providerId: 'codex',
+      modelId: 'gpt-5.6-sol',
+      reasoningEffort: 'light',
+    ));
+    final reopened = RemoteAppStore(security: security);
+    addTearDown(reopened.dispose);
+    await reopened.initialize();
+    expect(reopened.agentDefaults['codex']?.modelId, 'gpt-5.6-sol');
+    expect(reopened.agentDefaults['codex']?.reasoningEffort, 'light');
+  });
+
+  test('reasoning display preference persists without changing model effort',
+      () async {
+    FlutterSecureStorage.setMockInitialValues(<String, String>{});
+    final security = DeviceSecurity();
+    await security.saveReasoningDisplayMode('expanded');
+    final store = RemoteAppStore(security: security);
+    addTearDown(store.dispose);
+
+    await store.initialize();
+    expect(store.reasoningDisplayMode, 'expanded');
+
+    await store.setReasoningDisplayMode('compact');
+    expect(store.reasoningDisplayMode, 'compact');
+    expect(await security.readReasoningDisplayMode(), 'compact');
+    await expectLater(
+      security.saveReasoningDisplayMode('verbose'),
+      throwsArgumentError,
+    );
+  });
+
   test('pairing hides network details and can be retried', () async {
     FlutterSecureStorage.setMockInitialValues(<String, String>{});
     final security = DeviceSecurity();
@@ -652,6 +731,30 @@ void main() {
     expect(store.sessions.single.state, 'working');
   });
 
+  test('automatic compaction completion becomes one quiet system record', () {
+    final store = RemoteAppStore();
+    addTearDown(store.dispose);
+    store.messages[_sessionId] = <RemoteMessage>[];
+
+    final event = AgentEvent(
+      eventId: 'compact-complete',
+      sequence: 3,
+      type: 'context.compaction_completed',
+      occurredAt: DateTime.utc(2026, 8, 10, 11),
+      payload: const <String, Object?>{'kind': 'automatic'},
+      sessionId: _sessionId,
+      providerId: 'fake',
+    );
+    store.applyEventForTesting(event);
+    store.applyEventForTesting(event);
+
+    final records = store.messages[_sessionId]!;
+    expect(records, hasLength(1));
+    expect(records.single.role, 'system');
+    expect(
+        records.single.parts.single.summary, 'Context automatically compacted');
+  });
+
   test('session metadata events update live truth without dropping relations',
       () {
     final store = RemoteAppStore();
@@ -1109,6 +1212,67 @@ void main() {
     expect(store.messages[_sessionId]!.single.parts.last.type, 'image');
   });
 
+  test('simplify settings stay attached to send, queue, and steer requests',
+      () async {
+    FlutterSecureStorage.setMockInitialValues(<String, String>{});
+    final security = DeviceSecurity();
+    final transport = _FakeTransport(security: security)
+      ..sessionState = 'working';
+    final store = RemoteAppStore(
+      security: security,
+      transportFactory: (_, __) => transport,
+    );
+    addTearDown(store.dispose);
+    await store.connectHost(_host);
+
+    await store.sendMessage(
+      _sessionId,
+      '/simplify',
+      simplify: SimplifySettings(
+        maxWords: 100,
+        guidance: 'Keep the decision.',
+      ),
+    );
+    expect(transport.lastSendPayload?['content'], '/simplify');
+    expect(transport.lastSendPayload?['simplify'], <String, Object?>{
+      'maxWords': 100,
+      'guidance': 'Keep the decision.',
+    });
+    expect(store.messages[_sessionId]!.last.parts.single.summary,
+        'Simplify the previous answer.');
+    expect(store.messages[_sessionId]!.last.parts.single.summary,
+        isNot(contains('/simplify')));
+
+    await store.submitMessage(
+      _sessionId,
+      '/simplify Explain the result',
+      deliveryMode: 'queue',
+      simplify: SimplifySettings(maxWords: 200),
+    );
+    expect(
+        transport.lastQueuePayload?['content'], '/simplify Explain the result');
+    expect(transport.lastQueuePayload?['simplify'], <String, Object?>{
+      'maxWords': 200,
+    });
+    expect(
+        store.queuedMessagesFor(_sessionId).last.content, 'Explain the result');
+    expect(store.queuedMessagesFor(_sessionId).last.content,
+        isNot(contains('/simplify')));
+
+    await store.submitMessage(
+      _sessionId,
+      'Please /simplify explain the log',
+      deliveryMode: 'steer',
+      simplify: SimplifySettings(maxWords: 300),
+    );
+    expect(transport.lastSteerPayload?['content'],
+        'Please /simplify explain the log');
+    expect(transport.lastSteerPayload?['simplify'], <String, Object?>{
+      'maxWords': 300,
+    });
+    expect(store.simplifySettingsFor(_sessionId), isNull);
+  });
+
   test('prepared first turn creates the session before sending the message',
       () async {
     FlutterSecureStorage.setMockInitialValues(<String, String>{});
@@ -1187,6 +1351,180 @@ void main() {
     expect(store.queuedMessagesFor(_sessionId), isEmpty);
   });
 
+  test('a locally queued image retains only its safe local preview data',
+      () async {
+    FlutterSecureStorage.setMockInitialValues(<String, String>{});
+    final security = DeviceSecurity();
+    final transport = _FakeTransport(security: security);
+    final store = RemoteAppStore(
+      security: security,
+      transportFactory: (_, __) => transport,
+    );
+    addTearDown(store.dispose);
+    await store.connectHost(_host);
+    const encoded =
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+    final bytes = base64Decode(encoded);
+
+    await store.submitMessage(
+      _sessionId,
+      'Look at this next',
+      attachments: <RemoteAttachment>[
+        RemoteAttachment(
+          name: 'local-preview.png',
+          mimeType: 'image/png',
+          dataBase64: encoded,
+          byteLength: bytes.length,
+        ),
+      ],
+    );
+
+    final attachment =
+        store.queuedMessagesFor(_sessionId).single.attachments.single;
+    expect(attachment.dataBase64, encoded);
+    expect(attachment.localImageDataUri, 'data:image/png;base64,$encoded');
+  });
+
+  test('queue actions and side chats use isolated bridge operations', () async {
+    FlutterSecureStorage.setMockInitialValues(<String, String>{});
+    final security = DeviceSecurity();
+    final transport = _FakeTransport(security: security)
+      ..queueSnapshot = <Object?>[_queuedJson('queue-actions')]
+      ..sideChatSnapshot = <Object?>[_sideChatJson('existing-side-chat')];
+    final store = RemoteAppStore(
+      security: security,
+      transportFactory: (_, __) => transport,
+    );
+    addTearDown(store.dispose);
+    await store.connectHost(_host);
+
+    expect(store.sideChatsFor(_sessionId).single.id, 'existing-side-chat');
+    expect(store.visibleSessions.map((session) => session.id),
+        isNot(contains('existing-side-chat')));
+
+    final queued = store.queuedMessagesFor(_sessionId).single;
+    final edited = await store.editQueuedMessage(queued, 'Edited in place');
+    expect(edited.content, 'Edited in place');
+    expect(transport.lastQueueEditPayload?['messageId'], queued.id);
+
+    await store.deliverQueuedMessage(edited, mode: 'steer');
+    expect(transport.lastQueueDeliverPayload, <String, Object?>{
+      'messageId': queued.id,
+      'mode': 'steer',
+    });
+    expect(store.queuedMessagesFor(_sessionId), isEmpty);
+
+    final sideChat = await store.createSideChat(
+      _sessionId,
+      prompt: 'Check the current approach',
+    );
+    expect(sideChat.sessionKind, 'side_chat');
+    expect(store.visibleSessions.map((session) => session.id),
+        isNot(contains(sideChat.id)));
+    final promoted = await store.promoteSideChat(sideChat.id);
+    expect(promoted.sessionKind, 'task');
+    expect(store.visibleSessions.map((session) => session.id),
+        contains(promoted.id));
+
+    await store.createSideChat(
+      _sessionId,
+      queuedMessageId: 'queued-for-side-chat',
+    );
+    expect(transport.lastSideChatCreatePayload, <String, Object?>{
+      'parentSessionId': _sessionId,
+      'queuedMessageId': 'queued-for-side-chat',
+    });
+  });
+
+  test(
+      'moving a queued instruction records the chosen model and removes only that item',
+      () async {
+    FlutterSecureStorage.setMockInitialValues(<String, String>{});
+    final security = DeviceSecurity();
+    final transport = _FakeTransport(security: security)
+      ..queueSnapshot = <Object?>[
+        _queuedJson('move-this'),
+        <String, Object?>{
+          ..._queuedJson('keep-this'),
+          'content': 'Keep this queued',
+        },
+      ];
+    final store = RemoteAppStore(
+      security: security,
+      transportFactory: (_, __) => transport,
+    );
+    addTearDown(store.dispose);
+    await store.connectHost(_host);
+    final selected = store.queuedMessages['move-this']!;
+
+    final created = await store.moveQueuedMessageToNewTask(
+      selected,
+      providerId: 'fake',
+      modelId: 'fake-model',
+      reasoningEffort: 'high',
+    );
+
+    expect(transport.lastQueueNewTaskPayload, <String, Object?>{
+      'messageId': 'move-this',
+      'providerId': 'fake',
+      'modelId': 'fake-model',
+      'reasoningEffort': 'high',
+    });
+    expect(store.queuedMessages.keys, contains('keep-this'));
+    expect(store.queuedMessages.keys, isNot(contains('move-this')));
+    expect(store.selectedSession?.id, created.id);
+    expect(created.modelId, 'fake-model');
+    expect(created.reasoningEffort, 'high');
+  });
+
+  test('a received cross-task message refreshes visible history with origin',
+      () async {
+    FlutterSecureStorage.setMockInitialValues(<String, String>{});
+    final security = DeviceSecurity();
+    final transport = _FakeTransport(security: security)
+      ..openMessages = <Object?>[
+        <String, Object?>{
+          'id': 'remote-message',
+          'sessionId': _sessionId,
+          'role': 'user',
+          'createdAt': DateTime.utc(2026, 8, 15, 12).toIso8601String(),
+          'parts': <Object?>[
+            <String, Object?>{'type': 'text', 'text': 'Review this handoff'}
+          ],
+          'status': 'completed',
+          'origin': <String, Object?>{
+            'kind': 'cross_session',
+            'envelopeId': 'envelope-1',
+            'sourceSessionId': 'source-session',
+            'sourceTitle': 'Source task',
+          },
+        },
+      ];
+    final store = RemoteAppStore(
+      security: security,
+      transportFactory: (_, __) => transport,
+    );
+    addTearDown(store.dispose);
+    await store.connectHost(_host);
+    store.setVisibleSession(_sessionId);
+
+    store.applyEventForTesting(_eventWithPayload(
+      'message.remote_received',
+      1,
+      const <String, Object?>{
+        'state': 'delivered',
+        'envelope': <String, Object?>{'id': 'envelope-1'},
+      },
+    ));
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+
+    expect(transport.openCalls, 1);
+    expect(store.events[_sessionId], isNull);
+    expect(store.messages[_sessionId]!.single.origin?.kind, 'cross_session');
+    expect(
+        store.messages[_sessionId]!.single.origin?.sourceTitle, 'Source task');
+  });
+
   test('dictation sends the selected persisted source and saved dictionary',
       () async {
     FlutterSecureStorage.setMockInitialValues(<String, String>{});
@@ -1199,7 +1537,7 @@ void main() {
     addTearDown(store.dispose);
     await store.connectHost(_host);
     await store.setDictationDictionary(
-        <String>[' OpenCode ', 'Kronos', 'opencode', '']);
+        <String>[' OpenCode ', 'PostgreSQL', 'opencode', '']);
     await store.setDictationSource('xai-stt');
 
     final transcript =
@@ -1207,7 +1545,7 @@ void main() {
 
     expect(transcript, 'Transcribed phone instruction');
     expect(transport.lastDictationPayload?['dictionary'],
-        <String>['OpenCode', 'Kronos']);
+        <String>['OpenCode', 'PostgreSQL']);
     expect(transport.lastDictationPayload?['sourceId'], 'xai-stt');
     expect(await security.readDictationSourceId(), 'xai-stt');
     expect(transport.uploadChunkSizes.reduce((a, b) => a + b), 9000);
@@ -1238,6 +1576,36 @@ void main() {
       'opencode': 'xai-stt',
       'grok': 'openai-stt',
     });
+  });
+
+  test(
+      'dictation provider key setup returns a ready source without echoing the key',
+      () async {
+    FlutterSecureStorage.setMockInitialValues(<String, String>{});
+    final security = DeviceSecurity();
+    final transport = _FakeTransport(security: security)
+      ..dictationSourcesReady = false;
+    final store = RemoteAppStore(
+      security: security,
+      transportFactory: (_, __) => transport,
+    );
+    addTearDown(store.dispose);
+    await store.connectHost(_host);
+
+    await store.configureDictationSource('openai-stt',
+        apiKey: 'sk-test-secret');
+
+    expect(transport.lastDictationConfigurePayload, <String, Object?>{
+      'sourceId': 'openai-stt',
+      'apiKey': 'sk-test-secret',
+    });
+    expect(
+        store.dictationSources
+            .singleWhere((source) => source.id == 'openai-stt')
+            .isReady,
+        isTrue);
+    expect(
+        store.dictationSources.toString(), isNot(contains('sk-test-secret')));
   });
 
   test('harness login does not make an unavailable dictation service ready',
@@ -1336,6 +1704,43 @@ void main() {
     expect(store.liveAssistantMessageFor(_sessionId), isNull);
     expect(store.messages[_sessionId]!.single.parts.single.summary,
         'Canonical answer');
+  });
+
+  test('a visible working task can reconcile missed provider reasoning quietly',
+      () async {
+    FlutterSecureStorage.setMockInitialValues(<String, String>{});
+    final security = DeviceSecurity();
+    final transport = _FakeTransport(security: security)
+      ..sessionState = 'working'
+      ..openMessages = <Object?>[
+        <String, Object?>{
+          'id': 'missed-reasoning',
+          'sessionId': _sessionId,
+          'role': 'assistant',
+          'createdAt': DateTime.utc(2026, 8, 16, 12).toIso8601String(),
+          'parts': <Object?>[
+            <String, Object?>{
+              'type': 'reasoning',
+              'text': 'Inspecting the current provider state',
+            }
+          ],
+          'status': 'streaming',
+        }
+      ];
+    final store = RemoteAppStore(
+      security: security,
+      transportFactory: (_, __) => transport,
+    );
+    addTearDown(store.dispose);
+    await store.connectHost(_host);
+    store.setVisibleSession(_sessionId);
+
+    await store.refreshVisibleSessionHistory(_sessionId);
+
+    expect(transport.openCalls, 1);
+    expect(transport.openRefreshes, <bool>[true]);
+    expect(store.messages[_sessionId]!.single.parts.single.summary,
+        'Inspecting the current provider state');
   });
 
   test('history refresh preserves a newer local thinking artifact', () async {
@@ -1703,6 +2108,16 @@ Map<String, Object?> _queuedJson(String id) => <String, Object?>{
       'attachments': const <Object?>[],
     };
 
+Map<String, Object?> _sideChatJson(String id) => <String, Object?>{
+      ..._sessionJson('idle', DateTime.utc(2026, 8, 15, 12)),
+      'id': id,
+      'providerSessionId': id,
+      'title': 'Side chat prompt',
+      'preview': 'Side chat prompt',
+      'sessionKind': 'side_chat',
+      'parentSessionId': _sessionId,
+    };
+
 Map<String, Object?> _delegationJson(String id) => <String, Object?>{
       'id': id,
       'parentSessionId': _sessionId,
@@ -1796,13 +2211,20 @@ class _FakeTransport extends BridgeTransport {
   Map<String, Object?>? lastSendPayload;
   Map<String, Object?>? lastCreatePayload;
   Map<String, Object?>? lastQueuePayload;
+  Map<String, Object?>? lastSteerPayload;
   Map<String, Object?>? lastDictationPayload;
+  Map<String, Object?>? lastDictationConfigurePayload;
   Map<String, Object?>? lastVisionConfigurePayload;
   Map<String, Object?>? lastContextThresholdPayload;
   Map<String, Object?>? lastHandoffPayload;
   Map<String, Object?>? lastBranchPayload;
   Map<String, Object?>? lastWalletGetPayload;
   Map<String, Object?>? lastWalletConfigurePayload;
+  Map<String, Object?>? lastQueueEditPayload;
+  Map<String, Object?>? lastQueueDeliverPayload;
+  Map<String, Object?>? lastQueueNewTaskPayload;
+  Map<String, Object?>? lastSideChatCreatePayload;
+  Map<String, Object?>? lastAttachmentUploadPayload;
   final List<int> uploadChunkSizes = <int>[];
   List<int>? retrievalImageBytes;
   final List<int> imageGetOffsets = <int>[];
@@ -1825,11 +2247,13 @@ class _FakeTransport extends BridgeTransport {
   String? openNextCursor;
   bool expireNextHistoryCursor = false;
   final List<String?> openCursors = <String?>[];
+  final List<bool> openRefreshes = <bool>[];
   List<Object?> childSessions = <Object?>[];
   List<Object?> extraProviders = <Object?>[];
   List<Object?> extraSessions = <Object?>[];
   List<Object?> extraDictationSources = <Object?>[];
   List<Object?> queueSnapshot = <Object?>[];
+  List<Object?> sideChatSnapshot = <Object?>[];
   List<Object?> delegationSnapshot = <Object?>[];
   List<Object?> approvalSnapshot = <Object?>[];
   List<Object?> userInputSnapshot = <Object?>[];
@@ -1913,6 +2337,7 @@ class _FakeTransport extends BridgeTransport {
         openCalls += 1;
         final cursor = payload['cursor'] as String?;
         openCursors.add(cursor);
+        openRefreshes.add(payload['refresh'] == true);
         await openGate?.future;
         if (failOpen) throw StateError('open failed');
         if (expireNextHistoryCursor && cursor != null) {
@@ -2087,6 +2512,28 @@ class _FakeTransport extends BridgeTransport {
       case 'message_queue.list':
         queueListedAfterRefresh = refreshCompleted;
         return <String, Object?>{'messages': queueSnapshot};
+      case 'side_chat.list':
+        return <String, Object?>{'sessions': sideChatSnapshot};
+      case 'side_chat.create':
+        lastSideChatCreatePayload = payload;
+        return <String, Object?>{
+          'session': <String, Object?>{
+            ..._sideChatJson('created-side-chat'),
+            'parentSessionId': payload['parentSessionId'],
+            'title': payload['prompt'] ?? 'Side chat',
+            'preview': payload['prompt'] ?? '',
+          },
+        };
+      case 'side_chat.promote':
+        return <String, Object?>{
+          'session': <String, Object?>{
+            ..._sessionJson('idle', DateTime.utc(2026, 8, 15, 13)),
+            'id': payload['sessionId'],
+            'providerSessionId': 'promoted-side-chat',
+            'title': 'Promoted side chat',
+            'sessionKind': 'task',
+          },
+        };
       case 'delegation.list':
         return <String, Object?>{'delegations': delegationSnapshot};
       case 'approval.list':
@@ -2101,6 +2548,11 @@ class _FakeTransport extends BridgeTransport {
               'label': 'OpenAI speech-to-text',
               'status': dictationSourcesReady ? 'ready' : 'needs_credential',
               'setupEnvironmentVariable': 'TETHOQ_OPENAI_API_KEY',
+              'credential': <String, Object?>{
+                'kind': 'api_key',
+                'label': 'OpenAI API key',
+                'setupUrl': 'https://platform.openai.com/api-keys',
+              },
               'capabilities': <String, Object?>{
                 'batch': true,
                 'maxAudioBytes': 4 * 1024 * 1024,
@@ -2111,12 +2563,54 @@ class _FakeTransport extends BridgeTransport {
               'label': 'xAI speech-to-text',
               'status': dictationSourcesReady ? 'ready' : 'needs_credential',
               'setupEnvironmentVariable': 'XAI_API_KEY',
+              'credential': <String, Object?>{
+                'kind': 'api_key',
+                'label': 'xAI API key',
+                'setupUrl': 'https://console.x.ai/',
+              },
               'capabilities': <String, Object?>{
                 'batch': true,
                 'maxAudioBytes': 25 * 1024 * 1024,
               },
             },
             ...extraDictationSources,
+          ],
+        };
+      case 'dictation.source.configure':
+        lastDictationConfigurePayload = Map<String, Object?>.from(payload);
+        dictationSourcesReady = payload['clear'] != true;
+        return <String, Object?>{
+          'sources': <Object?>[
+            <String, Object?>{
+              'id': 'openai-stt',
+              'label': 'OpenAI speech-to-text',
+              'status': dictationSourcesReady ? 'ready' : 'needs_credential',
+              'setupEnvironmentVariable': 'TETHOQ_OPENAI_API_KEY',
+              'credential': <String, Object?>{
+                'kind': 'api_key',
+                'label': 'OpenAI API key',
+                'setupUrl': 'https://platform.openai.com/api-keys',
+              },
+              'capabilities': <String, Object?>{
+                'batch': true,
+                'maxAudioBytes': 4 * 1024 * 1024,
+              },
+            },
+            <String, Object?>{
+              'id': 'xai-stt',
+              'label': 'xAI speech-to-text',
+              'status': dictationSourcesReady ? 'ready' : 'needs_credential',
+              'setupEnvironmentVariable': 'XAI_API_KEY',
+              'credential': <String, Object?>{
+                'kind': 'api_key',
+                'label': 'xAI API key',
+                'setupUrl': 'https://console.x.ai/',
+              },
+              'capabilities': <String, Object?>{
+                'batch': true,
+                'maxAudioBytes': 25 * 1024 * 1024,
+              },
+            },
           ],
         };
       case 'sync.since':
@@ -2142,6 +2636,7 @@ class _FakeTransport extends BridgeTransport {
           concurrentSyncs -= 1;
         }
       case 'attachment.upload.begin':
+        lastAttachmentUploadPayload = payload;
         return <String, Object?>{
           'uploadId': 'upload-1',
           'chunkBytes': 64 * 1024,
@@ -2161,6 +2656,7 @@ class _FakeTransport extends BridgeTransport {
         return <String, Object?>{'text': 'Transcribed phone instruction'};
       case 'message_queue.enqueue':
         lastQueuePayload = payload;
+        final uploaded = lastAttachmentUploadPayload;
         return <String, Object?>{
           'message': <String, Object?>{
             'id': 'queued-1',
@@ -2168,18 +2664,46 @@ class _FakeTransport extends BridgeTransport {
             'content': payload['content'],
             'state': 'queued',
             'createdAt': '2026-08-10T12:00:00.000Z',
-            'attachments': <Object?>[
-              <String, Object?>{
-                'name': 'phone-large.bin',
-                'mimeType': 'application/octet-stream',
-                'byteLength': 1024 * 1024 + 13,
-              }
-            ],
+            'attachments': uploaded == null
+                ? const <Object?>[]
+                : <Object?>[
+                    <String, Object?>{
+                      'name': uploaded['name'],
+                      'mimeType': uploaded['mimeType'],
+                      'byteLength': uploaded['byteLength'],
+                    }
+                  ],
           },
         };
       case 'message_queue.cancel':
         return <String, Object?>{'cancelled': true};
+      case 'message_queue.edit':
+        lastQueueEditPayload = payload;
+        return <String, Object?>{
+          'message': <String, Object?>{
+            ..._queuedJson(payload['messageId']! as String),
+            'content': payload['content'],
+          },
+        };
+      case 'message_queue.deliver':
+        lastQueueDeliverPayload = payload;
+        return <String, Object?>{'delivered': true};
+      case 'message_queue.move_to_new_task':
+        lastQueueNewTaskPayload = payload;
+        return <String, Object?>{
+          'session': <String, Object?>{
+            ..._sessionJson('working', DateTime.utc(2026, 8, 16, 12)),
+            'id': 'queue-new-task',
+            'providerSessionId': 'queue-new-task-provider',
+            'providerId': payload['providerId'],
+            'title': 'Moved queued instruction',
+            'modelId': payload['modelId'],
+            if (payload['reasoningEffort'] != null)
+              'reasoningEffort': payload['reasoningEffort'],
+          },
+        };
       case 'session.steer_message':
+        lastSteerPayload = payload;
         return <String, Object?>{'accepted': true};
       case 'session.send_message':
         if (failSend) throw StateError('send failed');

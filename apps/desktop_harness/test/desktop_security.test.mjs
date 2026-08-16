@@ -21,6 +21,9 @@ test("desktop built-in provider allowlist stays explicit at every privileged bou
   assert.match(runtime, /new CodexAdapter\s*\(/);
   assert.match(runtime, /new OpenCodeAdapter\s*\(/);
   assert.match(runtime, /new GrokProviderAdapter\s*\(/);
+  assert.match(runtime, /new CodexAdapter\([\s\S]*?localActivity:\s*\{\}/);
+  assert.match(runtime, /new OpenCodeAdapter\([\s\S]*?localActivity:\s*openCodeDatabasePath === undefined \? \{\} : \{ databasePath: openCodeDatabasePath \}/);
+  assert.match(runtime, /new CodexAdapter\([\s\S]*?localActivity:\s*\{\},[\s\S]*?desktopQueue:\s*\{\}/);
 });
 
 test("preload exposes a narrow frozen API without Node or raw IPC access", async () => {
@@ -41,6 +44,9 @@ test("preload exposes a narrow frozen API without Node or raw IPC access", async
     "selectFiles",
     "captureScreens",
     "revealPath",
+    "localOpenHandlers",
+    "openLocalTarget",
+    "openDictationSetupPage",
     "showWindow",
     "hideWindow",
     "openCodeStatus",
@@ -58,6 +64,23 @@ test("preload exposes a narrow frozen API without Node or raw IPC access", async
   ]));
   assert.match(preload, /process\.env\.TETHOQ_PACKAGED_SMOKE\s*===\s*"1"[\s\S]*?quitForSmoke[\s\S]*?IPC_CHANNELS\.smokeQuit/);
   assert.doesNotMatch(preload, /desktopCapturer|screen\.getAllDisplays/);
+});
+
+test("local file opening stays main-validated and never accepts renderer commands", async () => {
+  const [api, preload, ipc, localOpen] = await Promise.all([
+    source("../src/shared/desktop_api.ts"),
+    source("../src/preload/index.ts"),
+    source("../src/main/ipc.ts"),
+    source("../src/main/local_open.ts"),
+  ]);
+  assert.match(api, /localOpenHandlers:\s*"tethoq:local-open-handlers"/);
+  assert.match(preload, /openLocalTarget:[\s\S]*?IPC_CHANNELS\.openLocalTarget/);
+  assert.match(ipc, /handle\(IPC_CHANNELS\.openLocalTarget[\s\S]*?existingLocalTarget\(path, line, column\)[\s\S]*?openExistingLocalTarget/);
+  assert.match(localOpen, /realpath\(normalize\(resolve\(path\)\)\)/);
+  assert.match(localOpen, /Network and Win32 device namespaces/);
+  assert.match(localOpen, /spawnProcess\(executable, \[\.\.\.args\], \{ detached: true, shell: false/);
+  assert.match(localOpen, /target\.kind === "file"\) options\.shell\.showItemInFolder/);
+  assert.doesNotMatch(preload, /executable|command|shell/);
 });
 
 test("generic desktop files stay OpenCode-only, bounded, and non-executable", async () => {
@@ -109,6 +132,9 @@ test("provider requests stay in the main process and event replay is bounded", a
   const ensureOpenCode = runtime.match(/public async ensureOpenCode\([\s\S]*?\n  }/)?.[0] ?? "";
   assert.match(ensureOpenCode, /#openCode\.ensureRunning\(\)/);
   assert.doesNotMatch(ensureOpenCode, /reconnectProvider/);
+  const startOnce = runtime.match(/private async startOnce\([\s\S]*?\n  }/)?.[0] ?? "";
+  assert.match(startOnce, /#openCode\.probe\(\)/);
+  assert.doesNotMatch(startOnce, /#openCode\.ensureRunning\(\)/);
   assert.match(runtime, /new MeshToolGateway\(/);
   assert.match(runtime, /bridge\.configureClientTooling\(clientTools\)/);
   assert.match(runtime, /catch \(error\) \{[\s\S]*?#bridge\?\.dispose\(\)[\s\S]*?#clientTools\?\.close\(\)[\s\S]*?#connectorRegistry\?\.dispose\(\)[\s\S]*?#openCode\.dispose\(\)/);
@@ -170,12 +196,12 @@ test("the Electron window keeps renderer privileges disabled", async () => {
   assert.match(main, /hardenSession\(session\.defaultSession\)/);
   assert.match(main, /hardenWindow\(window\)/);
   assert.match(main, /titleBarStyle:\s*"hidden"/);
-  assert.match(main, /titleBarOverlay:\s*\{[\s\S]*?height:\s*47/);
+  assert.match(main, /titleBarOverlay:\s*\{[\s\S]*?color:\s*"#0d0d0c"[\s\S]*?height:\s*46/);
   assert.match(main, /minWidth:\s*760/);
   assert.match(main, /minHeight:\s*480/);
   assert.match(main, /backgroundThrottling:\s*true/);
   assert.match(main, /window\.on\("hide"[\s\S]*?setWindowVisible\(false\)[\s\S]*?setHostVisible\(false\)/);
-  assert.match(main, /ready-to-show[\s\S]*?TETHOQ_PACKAGED_SMOKE\s*===\s*"1"[\s\S]*?else\s*\{\s*window\.show\(\)/);
+  assert.match(main, /ready-to-show[\s\S]*?TETHOQ_PACKAGED_SMOKE\s*===\s*"1"[\s\S]*?else if \(!startedHidden\(\)\) \{\s*window\.show\(\)/);
   assert.match(security, /contextIsolation:\s*true/);
   assert.match(security, /nodeIntegration:\s*false/);
   assert.match(security, /sandbox:\s*true/);
@@ -201,7 +227,8 @@ test("packaged smoke compositor priming stays invisible and environment-guarded"
   assert.match(main, /window\.setIgnoreMouseEvents\(true\)/);
   assert.match(main, /window\.setOpacity\(0\)/);
   assert.match(main, /window\.showInactive\(\)/);
-  assert.match(main, /else\s*\{\s*window\.show\(\)/);
+  // Outside smoke, the window shows unless the user asked Windows to start Tethoq in the tray.
+  assert.match(main, /else if \(!startedHidden\(\)\) \{\s*window\.show\(\)/);
 });
 
 test("the packaged preload is emitted as sandbox-compatible CommonJS", async () => {

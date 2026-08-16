@@ -9,6 +9,10 @@ const bridgeNativeMetadataKeys = [
   "tethoqHandoffPending",
   "tethoqBranchBootstrap",
   "tethoqBranchPending",
+  "tethoqSessionKind",
+  "tethoqClientTitle",
+  "tethoqClientPreview",
+  "tethoqInitialProviderTitle",
 ] as const;
 
 export class SessionCache {
@@ -73,7 +77,7 @@ export class SessionCache {
 
   public updateMetadata(
     globalSessionId: string,
-    metadata: Partial<Pick<RemoteSession, "modelId" | "reasoningEffort" | "variantId" | "parentSessionId" | "relationship" | "contextHandoffSummary" | "agentNickname" | "agentRole">>,
+    metadata: Partial<Pick<RemoteSession, "modelId" | "reasoningEffort" | "variantId" | "parentSessionId" | "relationship" | "sessionKind" | "contextHandoffSummary" | "agentNickname" | "agentRole">>,
   ): void {
     const session = this.#sessions.get(globalSessionId);
     if (session === undefined) return;
@@ -96,8 +100,14 @@ export class SessionCache {
     const state = session.state === "unknown" && existing !== undefined && existing.state !== "unknown"
       ? existing.state
       : session.state;
+    const clientTitle = typeof existing?.nativeMetadata.tethoqClientTitle === "string" ? existing.nativeMetadata.tethoqClientTitle : undefined;
+    const clientPreview = typeof existing?.nativeMetadata.tethoqClientPreview === "string" ? existing.nativeMetadata.tethoqClientPreview : undefined;
+    const initialProviderTitle = typeof existing?.nativeMetadata.tethoqInitialProviderTitle === "string" ? existing.nativeMetadata.tethoqInitialProviderTitle : undefined;
+    const keepClientTitle = clientTitle !== undefined && initialProviderTitle !== undefined && session.title === initialProviderTitle;
     this.#sessions.set(session.id, withInferredSubagentRelationship({
       ...session,
+      ...(keepClientTitle ? { title: clientTitle } : {}),
+      ...((session.preview === undefined || session.preview.trim() === "") && clientPreview !== undefined ? { preview: clientPreview } : {}),
       state,
       stale: false,
       nativeMetadata: { ...session.nativeMetadata, ...bridgeNativeMetadata(existing?.nativeMetadata) },
@@ -106,6 +116,7 @@ export class SessionCache {
       ...(session.variantId === undefined && existing?.variantId !== undefined ? { variantId: existing.variantId } : {}),
       ...(session.parentSessionId === undefined && existing?.parentSessionId !== undefined ? { parentSessionId: existing.parentSessionId } : {}),
       ...(session.relationship === undefined && existing?.relationship !== undefined ? { relationship: existing.relationship } : {}),
+      ...(session.sessionKind === undefined && existing?.sessionKind !== undefined ? { sessionKind: existing.sessionKind } : {}),
       ...(session.contextHandoffSummary === undefined && existing?.contextHandoffSummary !== undefined ? { contextHandoffSummary: existing.contextHandoffSummary } : {}),
       ...(session.agentNickname === undefined && existing?.agentNickname !== undefined ? { agentNickname: existing.agentNickname } : {}),
       ...(session.agentRole === undefined && existing?.agentRole !== undefined ? { agentRole: existing.agentRole } : {}),

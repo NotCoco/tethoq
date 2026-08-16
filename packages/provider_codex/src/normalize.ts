@@ -9,6 +9,7 @@ import {
   type SessionState,
 } from "../../protocol/src/index.js";
 import type { CodexThread } from "./wire.js";
+import { providerPromptWorkflows, stripProviderPromptGuidance } from "../../provider_contract/src/index.js";
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -41,7 +42,7 @@ export function normalizeCodexThread(hostId: string, thread: CodexThread): Remot
   const agentRole = typeof thread.agentRole === "string" && thread.agentRole.trim() ? thread.agentRole.trim() : undefined;
   const modelId = typeof thread.model === "string" && thread.model.trim() ? thread.model.trim() : undefined;
   const reasoningEffort = typeof thread.effort === "string" && thread.effort.trim() ? thread.effort.trim() : undefined;
-  const preview = typeof thread.preview === "string" ? thread.preview : "";
+  const preview = typeof thread.preview === "string" ? stripProviderPromptGuidance(thread.preview) : "";
   const title = name ?? preview.split(/\r?\n/, 1)[0]?.trim().slice(0, 96) ?? "Codex thread";
   const updated = secondsToIso(thread.recencyAt ?? thread.updatedAt ?? thread.createdAt);
   return {
@@ -111,6 +112,7 @@ function isClosingImageWrapper(text: string): boolean {
 }
 
 function stripSyntheticFileHeader(text: string): string {
+  text = stripProviderPromptGuidance(text);
   const trimmedStart = text.trimStart();
   if (!/^# Files mentioned by the user:\s*\r?\n/.test(trimmedStart)) return text;
   const requestMarker = /^## My request:\s*\r?\n/m.exec(trimmedStart);
@@ -118,14 +120,24 @@ function stripSyntheticFileHeader(text: string): string {
   return trimmedStart.slice(requestMarker.index + requestMarker[0].length).trim();
 }
 
-function codexUserContentParts(value: unknown): readonly ContentPart[] {
+/** Codex Desktop records its launch/bootstrap envelope as a user item before the real turn. */
+export function isCodexBootstrapUserText(value: string): boolean {
+  const text = value.trimStart();
+  return text.startsWith("<recommended_plugins>")
+    && text.includes("# AGENTS.md instructions for ")
+    && text.includes("<environment_context>");
+}
+
+export function codexUserContentParts(value: unknown): readonly ContentPart[] {
   const values = Array.isArray(value) ? value : [value];
   const parts: ContentPart[] = [];
   let pendingFilename: string | undefined;
   for (const value of values) {
     if (typeof value === "string") {
+      const workflows = providerPromptWorkflows(value);
       const text = stripSyntheticFileHeader(value);
       if (text.trim()) parts.push({ type: "text", text });
+      for (const workflow of workflows) parts.push({ type: "workflow", workflow });
       continue;
     }
     if (!isRecord(value)) continue;
@@ -140,8 +152,10 @@ function codexUserContentParts(value: unknown): readonly ContentPart[] {
         pendingFilename = undefined;
         continue;
       }
+      const workflows = providerPromptWorkflows(value.text);
       const text = stripSyntheticFileHeader(value.text);
       if (text.trim()) parts.push({ type: "text", text });
+      for (const workflow of workflows) parts.push({ type: "workflow", workflow });
       continue;
     }
     if (type === "image" || type === "input_image") {
@@ -267,7 +281,11 @@ function subagentPart(hostId: string, item: Record<string, unknown>): ContentPar
 
 function contentParts(hostId: string, item: Record<string, unknown>): readonly ContentPart[] {
   const type = typeof item.type === "string" ? item.type : "unknown";
-  if (type === "userMessage") return codexUserContentParts(item.content ?? item.text);
+  if (type === "userMessage") {
+    const parts = codexUserContentParts(item.content ?? item.text);
+    const text = parts.filter((part): part is Extract<ContentPart, { type: "text" }> => part.type === "text").map((part) => part.text).join("\n");
+    return isCodexBootstrapUserText(text) ? [] : parts;
+  }
   if (type === "agentMessage" || type === "plan") {
     const text = textFromUnknown(item.content ?? item.text);
     return text ? [{ type: "text", text }] : [];

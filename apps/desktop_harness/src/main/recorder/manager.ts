@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { globalShortcut, shell } from "electron";
+import { globalShortcut, nativeImage, shell } from "electron";
 import { ElectronCaptureAdapter } from "./capture.js";
 import { WindowsInputHook } from "./input_hook.js";
 import { directorySize, emptySummary, recoverInterruptedWorkflows, WorkflowStore, type WorkflowWriteSession } from "./store.js";
@@ -25,6 +25,8 @@ import {
   type WorkflowAttachment,
   type WorkflowDescriptor,
   type WorkflowManifest,
+  type WorkflowScreenshot,
+  type WorkflowScreenshotImage,
 } from "./types.js";
 import { createWindowsContextProvider, mergeForegroundContext } from "./windows_context.js";
 
@@ -344,6 +346,28 @@ export class RecorderManager {
     return await this.#store.list();
   }
 
+  public async screenshots(id: string): Promise<WorkflowScreenshot[]> {
+    await this.initialize();
+    return await this.#store.screenshots(id);
+  }
+
+  public async screenshot(id: string, frameId: string, variant: "thumbnail" | "full"): Promise<WorkflowScreenshotImage> {
+    await this.initialize();
+    const stored = await this.#store.screenshotBytes(id, frameId);
+    const source = nativeImage.createFromBuffer(stored.bytes);
+    const image = variant === "thumbnail" && !source.isEmpty() && source.getSize().width > 260
+      ? source.resize({ width: 260, quality: "good" })
+      : source;
+    const imageSize = image.isEmpty() ? { width: 0, height: 0 } : image.getSize();
+    const bytes = variant === "thumbnail" && !image.isEmpty() ? image.toJPEG(78) : stored.bytes;
+    return {
+      frameId,
+      name: stored.name,
+      dataUrl: `data:image/jpeg;base64,${bytes.toString("base64")}`,
+      ...imageSize,
+    };
+  }
+
   public async delete(id: string): Promise<void> {
     await this.exclusive(async () => {
       if (this.#staged?.id === id) {
@@ -372,7 +396,7 @@ export class RecorderManager {
       path: workflow.path,
       manifestPath: workflow.manifestPath,
       eventsPath: workflow.eventsPath,
-      promptReference: `Review the local Tethoq workflow “${workflow.name}” at ${workflow.manifestPath}. Its chronological input/context records are at ${workflow.eventsPath}; screenshot paths referenced there are local files.`,
+      promptReference: `Review the local Tethoq workflow “${workflow.name}” at ${workflow.manifestPath}. Its chronological input/context records are at ${workflow.eventsPath}; screenshot paths referenced there are local files. New screenshots include a visible pointer, and their screenshot events retain the exact screen and image coordinates.`,
       summary: workflow.summary,
       localOnly: true,
       neverUploadedAutomatically: true,
@@ -563,6 +587,7 @@ export class RecorderManager {
         imageSize: frame.imageSize,
         fullPath: frame.fullRelativePath,
         cursorPath: frame.cursorRelativePath,
+        ...(frame.cursor ? { cursor: frame.cursor } : {}),
       }, timestamp);
     }).catch((error: unknown) => {
       session.counts.droppedFrames += 1;

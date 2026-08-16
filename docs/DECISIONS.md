@@ -164,3 +164,19 @@ wallet status.
 **Reason:** Tethoq does not process payments, hold funds, or control the
 provider's billing ledger. Clear provenance prevents a local estimate from
 being mistaken for money, provider credit, or a guaranteed billing stop.
+
+## D-021 — Accounts unlock hosted access, not the local app
+
+**Decision:** Keep desktop and local-agent use account-free in every edition.
+The official build requests an account only when a user chooses hosted
+discovery, enrollment, relay, or synchronization. The open-source community
+build defaults to no Tethoq account dependency and retains direct/LAN and QR
+pairing. Account-backed discovery may remove the QR scan, but every phone still
+uses a device key and a revocable Bridge-issued credential.
+
+**Reason:** A mandatory login would weaken the local-first and open-source
+product while creating an unnecessary outage/privacy dependency. Conversely,
+equating a Google session with remote-control authority would collapse two
+important trust boundaries. Separating account membership from device
+authorization gives the official service a low-friction phone experience
+without making the hosted control plane the final authority over local tools.

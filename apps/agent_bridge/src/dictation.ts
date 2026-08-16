@@ -4,6 +4,8 @@ import { tethoqEnvironmentValue } from "./environment.js";
 
 const openAiTranscriptionUrl = "https://api.openai.com/v1/audio/transcriptions";
 const xAiTranscriptionUrl = "https://api.x.ai/v1/stt";
+const openAiCredentialCheckUrl = "https://api.openai.com/v1/models";
+const xAiCredentialCheckUrl = "https://api.x.ai/v1/models";
 const openAiMaximumAudioBytes = 4 * 1024 * 1024;
 const bridgeMaximumAudioBytes = 25 * 1024 * 1024;
 const openAiAudioTypes = new Set([
@@ -50,6 +52,12 @@ export interface TranscriptionSource {
   readonly setupEnvironmentVariable: string;
   readonly maxAudioBytes: number;
   readonly transcriber: DictationTranscriber;
+  readonly credential?: {
+    readonly label: string;
+    readonly setupUrl: string;
+    validate(apiKey: string): Promise<void>;
+    set(apiKey: string | undefined): void;
+  };
   isReady(): boolean;
 }
 
@@ -71,11 +79,28 @@ export class TranscriptionSourceRegistry {
       label: source.label,
       status: source.isReady() ? "ready" : "needs_credential",
       setupEnvironmentVariable: source.setupEnvironmentVariable,
+      ...(source.credential !== undefined ? { credential: {
+        kind: "api_key" as const,
+        label: source.credential.label,
+        setupUrl: source.credential.setupUrl,
+      } } : {}),
       capabilities: {
         batch: true,
         maxAudioBytes: source.maxAudioBytes,
       },
     }));
+  }
+
+  public async validateCredential(sourceId: string, apiKey: string): Promise<void> {
+    const source = this.#sources.get(sourceId);
+    if (source?.credential === undefined) throw new Error("Dictation source is not configurable");
+    await source.credential.validate(apiKey);
+  }
+
+  public setCredential(sourceId: string, apiKey: string | undefined): void {
+    const source = this.#sources.get(sourceId);
+    if (source?.credential === undefined) throw new Error("Dictation source is not configurable");
+    source.credential.set(apiKey);
   }
 
   public async transcribe(
@@ -86,9 +111,7 @@ export class TranscriptionSourceRegistry {
     const source = this.#sources.get(sourceId);
     if (source === undefined) throw new Error("Dictation source is not supported");
     if (!source.isReady()) {
-      throw new Error(
-        `Dictation source is not configured on this computer; set ${source.setupEnvironmentVariable} for Tethoq Bridge`,
-      );
+      throw new Error(`${source.label} needs an API key. Open its setup from the dictation source menu.`);
     }
     if (audio.byteLength > source.maxAudioBytes) {
       throw new Error(`Dictation audio exceeds the ${source.label} upload limit`);
@@ -117,6 +140,12 @@ export function defaultTranscriptionSourceRegistry(options: {
       setupEnvironmentVariable: "TETHOQ_OPENAI_API_KEY",
       maxAudioBytes: openAiMaximumAudioBytes,
       transcriber: openAi,
+      credential: {
+        label: "OpenAI API key",
+        setupUrl: "https://platform.openai.com/api-keys",
+        validate: (apiKey) => openAi.validateCredential(apiKey),
+        set: (apiKey) => openAi.setCredential(apiKey),
+      },
       isReady: () => openAi.isConfigured,
     },
     {
@@ -125,6 +154,12 @@ export function defaultTranscriptionSourceRegistry(options: {
       setupEnvironmentVariable: "XAI_API_KEY",
       maxAudioBytes: bridgeMaximumAudioBytes,
       transcriber: xAi,
+      credential: {
+        label: "xAI API key",
+        setupUrl: "https://console.x.ai/",
+        validate: (apiKey) => xAi.validateCredential(apiKey),
+        set: (apiKey) => xAi.setCredential(apiKey),
+      },
       isReady: () => xAi.isConfigured,
     },
   ]);
@@ -144,7 +179,7 @@ export function singleTranscriptionSourceRegistry(
 }
 
 export class OpenAiDictationTranscriber implements DictationTranscriber {
-  readonly #apiKey: string | undefined;
+  #apiKey: string | undefined;
   readonly #fetch: typeof fetch;
 
   public constructor(options: { readonly apiKey?: string; readonly fetch?: typeof fetch } = {}) {
@@ -156,6 +191,14 @@ export class OpenAiDictationTranscriber implements DictationTranscriber {
     return configured(this.#apiKey);
   }
 
+  public setCredential(apiKey: string | undefined): void {
+    this.#apiKey = apiKey;
+  }
+
+  public async validateCredential(apiKey: string): Promise<void> {
+    await validateProviderCredential(this.#fetch, openAiCredentialCheckUrl, apiKey, "OpenAI");
+  }
+
   public async transcribe(
     audio: MessageAttachment,
     options: DictationOptions = {},
@@ -163,7 +206,7 @@ export class OpenAiDictationTranscriber implements DictationTranscriber {
     validateAudio(audio, openAiAudioTypes, openAiMaximumAudioBytes);
     if (!this.isConfigured) {
       throw new Error(
-        "Dictation is not configured on this computer; set TETHOQ_OPENAI_API_KEY for Tethoq Bridge",
+        "OpenAI speech-to-text needs an API key. Open its setup from the dictation source menu.",
       );
     }
     const bytes = Uint8Array.from(Buffer.from(audio.dataBase64, "base64"));
@@ -182,12 +225,12 @@ export class OpenAiDictationTranscriber implements DictationTranscriber {
       body,
       signal: AbortSignal.timeout(60_000),
     });
-    return transcriptFromResponse(response, "TETHOQ_OPENAI_API_KEY");
+    return transcriptFromResponse(response, "OpenAI API key");
   }
 }
 
 export class XAiDictationTranscriber implements DictationTranscriber {
-  readonly #apiKey: string | undefined;
+  #apiKey: string | undefined;
   readonly #fetch: typeof fetch;
 
   public constructor(options: { readonly apiKey?: string; readonly fetch?: typeof fetch } = {}) {
@@ -199,6 +242,14 @@ export class XAiDictationTranscriber implements DictationTranscriber {
     return configured(this.#apiKey);
   }
 
+  public setCredential(apiKey: string | undefined): void {
+    this.#apiKey = apiKey;
+  }
+
+  public async validateCredential(apiKey: string): Promise<void> {
+    await validateProviderCredential(this.#fetch, xAiCredentialCheckUrl, apiKey, "xAI");
+  }
+
   public async transcribe(
     audio: MessageAttachment,
     options: DictationOptions = {},
@@ -206,7 +257,7 @@ export class XAiDictationTranscriber implements DictationTranscriber {
     validateAudio(audio, xAiAudioTypes, bridgeMaximumAudioBytes);
     if (!this.isConfigured) {
       throw new Error(
-        "Dictation is not configured on this computer; set XAI_API_KEY for Tethoq Bridge",
+        "xAI speech-to-text needs an API key. Open its setup from the dictation source menu.",
       );
     }
     const bytes = Uint8Array.from(Buffer.from(audio.dataBase64, "base64"));
@@ -224,7 +275,7 @@ export class XAiDictationTranscriber implements DictationTranscriber {
       body,
       signal: AbortSignal.timeout(60_000),
     });
-    return transcriptFromResponse(response, "XAI_API_KEY");
+    return transcriptFromResponse(response, "xAI API key");
   }
 }
 
@@ -232,13 +283,35 @@ function configured(apiKey: string | undefined): boolean {
   return apiKey !== undefined && apiKey.trim().length > 0;
 }
 
+async function validateProviderCredential(
+  request: typeof fetch,
+  url: string,
+  apiKey: string,
+  provider: string,
+): Promise<void> {
+  const trimmed = apiKey.trim();
+  if (trimmed.length < 8 || trimmed.length > 512) throw new Error(`${provider} API key is not valid`);
+  let response: Response;
+  try {
+    response = await request(url, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${trimmed}` },
+      signal: AbortSignal.timeout(12_000),
+    });
+  } catch {
+    throw new Error(`${provider} could not be reached to check this API key`);
+  }
+  if (response.status === 401 || response.status === 403) throw new Error(`${provider} rejected this API key`);
+  if (!response.ok) throw new Error(`${provider} could not check this API key (${response.status})`);
+}
+
 async function transcriptFromResponse(
   response: Response,
-  environmentVariable: string,
+  credentialLabel: string,
 ): Promise<{ readonly text: string }> {
   if (!response.ok) {
     if (response.status === 401 || response.status === 403) {
-      throw new Error(`Tethoq Bridge could not authorize dictation; check ${environmentVariable}`);
+      throw new Error(`Tethoq could not authorize dictation; check the saved ${credentialLabel}`);
     }
     throw new Error(`Dictation transcription failed (${response.status})`);
   }

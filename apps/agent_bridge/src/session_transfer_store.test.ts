@@ -32,13 +32,22 @@ test("session transfer state persists restart-safe handoff and branch data", asy
         status: "completed",
         nativeMetadata: {},
       }],
+    }, {
+      sessionId: "host/provider/side-chat",
+      relationship: { kind: "side_chat", sourceSessionId: "host/provider/source", strategy: "transcript_bootstrap" },
+      pending: true,
+      bootstrap: "[[TETHOQ_BRANCH_TRANSCRIPT_BOOTSTRAP_V1]]",
+      copiedMessages: [],
+      sideChatPreview: "Why did this task choose that architecture?",
     }]);
     await store.flush();
 
     const restored = await new SessionTransferStateStore(path).read();
-    assert.equal(restored.transfers.length, 2);
+    assert.equal(restored.transfers.length, 3);
     assert.equal(restored.transfers[0]?.summary, "A bounded handoff summary.");
     assert.equal(restored.transfers[1]?.copiedMessages?.[0]?.parts[0]?.type, "text");
+    assert.equal(restored.transfers[2]?.relationship.kind, "side_chat");
+    assert.equal(restored.transfers[2]?.sideChatPreview, "Why did this task choose that architecture?");
     assert.match(await readFile(path, "utf8"), /TETHOQ_BRANCH_TRANSCRIPT_BOOTSTRAP_V1/);
   } finally {
     await rm(root, { recursive: true, force: true });

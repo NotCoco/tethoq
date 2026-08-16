@@ -8,10 +8,15 @@ import {
   isSessionState,
   makeGlobalSessionId,
   parseGlobalSessionId,
+  normalizeSimplifySettings,
+  parseSimplifyCommand,
+  simplifyDeveloperInstructions,
   type AgentEvent,
   type EventReplaySlice,
   type ApprovalResponse,
   type ConfigureWalletRequest,
+  type CrossSessionMessage,
+  type CrossSessionMessageEnvelope,
   type BranchSessionResult,
   type ContextHandoffResult,
   type DelegationChild,
@@ -28,6 +33,7 @@ import {
   type RemoteSession,
   type SessionContextState,
   type SessionRelationship,
+  type SignedCredential,
   type SignedDeviceAction,
   type UserInputResponse,
     type PairingState,
@@ -76,6 +82,12 @@ import {
   persistableBranchMessages,
 } from "./context_transfer.js";
 import type { SessionTransferRecord } from "./session_transfer_store.js";
+import {
+  maxCrossSessionContentLength,
+  maxCrossSessionMessages,
+  maxPendingCrossSessionMessagesPerTarget,
+} from "./cross_session_store.js";
+import { sideChatBootstrap, sideChatDeveloperInstructions } from "./side_chat.js";
 
 export interface OpenSessionResult {
   readonly session: RemoteSession;
@@ -85,9 +97,20 @@ export interface OpenSessionResult {
 
 interface QueuedMessageRecord {
   view: QueuedMessage;
-  readonly request?: SendMessageRequest;
+  request?: SendMessageRequest;
   readonly providerOwned: boolean;
   readonly providerMessageId?: string;
+}
+
+export interface SideChatResult {
+  readonly session: RemoteSession;
+  readonly copiedMessageCount: number;
+}
+
+export interface QueuedTaskSelection {
+  readonly providerId: string;
+  readonly modelId: string;
+  readonly reasoningEffort?: string;
 }
 
 interface DelegationRuntime {
@@ -184,6 +207,7 @@ export class AgentBridge {
   readonly #approvals = new ApprovalRegistry();
   readonly #userInputs = new UserInputRegistry();
   readonly #pairing: PairingManager;
+  readonly #deviceRevokedListeners = new Set<(deviceId: string) => void>();
   readonly #deviceVerifier: DeviceActionVerifier;
   readonly #sendLedger = new RequestLedger<SendMessageResult>();
   readonly #pendingContextHandoffs = new Map<string, PendingContextHandoff>();
@@ -193,18 +217,25 @@ export class AgentBridge {
   readonly #pendingHandoffSends = new Map<string, Promise<void>>();
   readonly #attachmentUploads: AttachmentUploadManager;
   readonly #transcriptionSources: TranscriptionSourceRegistry;
+  readonly #onTranscriptionCredentialChange: ((sourceId: string, apiKey: string | undefined) => void | Promise<void>) | undefined;
   readonly #queuedMessages = new Map<string, QueuedMessageRecord>();
   readonly #queuePumps = new Set<string>();
+  readonly #queueMutations = new Set<string>();
+  readonly #crossSessionMessages = new Map<string, CrossSessionMessage>();
+  readonly #crossSessionPumps = new Set<string>();
   readonly #delegations = new Map<string, DelegationRuntime>();
   readonly #visionProxies = new Map<string, VisionProxyRuntime>();
   readonly #compactionThresholds = new Map<string, number>();
   readonly #compactingSessions = new Set<string>();
+  readonly #compactionKinds = new Map<string, "automatic" | "manual">();
   readonly #lastCompactionUsage = new Map<string, number>();
   readonly #internalSessionIds = new Set<string>();
   readonly #internalSessionCreations = new Map<string, { depth: number; readonly events: ProviderEvent[] }>();
   readonly #delegationPumps = new Set<string>();
   readonly #onDelegationsChange: ((tasks: readonly DelegationTask[]) => void) | undefined;
   readonly #onSessionTransfersChange: ((transfers: readonly SessionTransferRecord[]) => void) | undefined;
+  readonly #onCrossSessionMessagesChange: ((messages: readonly CrossSessionMessage[]) => void | Promise<void>) | undefined;
+  readonly #globalAgentInstructions: (() => Promise<string | undefined>) | undefined;
   readonly #onPairingConfirmed: (() => void) | undefined;
   #delegationTimer: NodeJS.Timeout | undefined;
   #refresh: RefreshCoordinator;
@@ -223,10 +254,14 @@ export class AgentBridge {
       readonly attachmentUploads?: AttachmentUploadManager;
       readonly dictationTranscriber?: DictationTranscriber;
       readonly transcriptionSources?: TranscriptionSourceRegistry;
+      readonly onTranscriptionCredentialChange?: (sourceId: string, apiKey: string | undefined) => void | Promise<void>;
       readonly delegations?: readonly DelegationTask[];
       readonly onDelegationsChange?: (tasks: readonly DelegationTask[]) => void;
       readonly sessionTransfers?: readonly SessionTransferRecord[];
       readonly onSessionTransfersChange?: (transfers: readonly SessionTransferRecord[]) => void;
+      readonly crossSessionMessages?: readonly CrossSessionMessage[];
+      readonly onCrossSessionMessagesChange?: (messages: readonly CrossSessionMessage[]) => void | Promise<void>;
+      readonly globalAgentInstructions?: () => Promise<string | undefined>;
     } = {},
   ) {
     this.#events = new EventReplayBuffer(config.hostId);
@@ -238,8 +273,11 @@ export class AgentBridge {
       ?? (pairingOptions.dictationTranscriber === undefined
         ? defaultTranscriptionSourceRegistry()
         : singleTranscriptionSourceRegistry(pairingOptions.dictationTranscriber));
+    this.#onTranscriptionCredentialChange = pairingOptions.onTranscriptionCredentialChange;
     this.#onDelegationsChange = pairingOptions.onDelegationsChange;
     this.#onSessionTransfersChange = pairingOptions.onSessionTransfersChange;
+    this.#onCrossSessionMessagesChange = pairingOptions.onCrossSessionMessagesChange;
+    this.#globalAgentInstructions = pairingOptions.globalAgentInstructions;
     for (const task of pairingOptions.delegations ?? []) {
       this.#delegations.set(task.id, {
         task,
@@ -251,6 +289,9 @@ export class AgentBridge {
       });
     }
     for (const transfer of pairingOptions.sessionTransfers ?? []) this.restoreSessionTransferRuntime(transfer);
+    for (const message of pairingOptions.crossSessionMessages ?? []) {
+      this.#crossSessionMessages.set(message.envelope.id, message);
+    }
     for (const adapter of adapters) this.registerAdapter(adapter);
     this.#refresh = new RefreshCoordinator(this.#adapters, this.#cache);
   }
@@ -307,7 +348,7 @@ export class AgentBridge {
     this.assertActive();
     const adapter = this.requireAdapter(providerId);
     if (adapter.listModels === undefined) throw new Error(`${providerId} does not expose model enumeration`);
-    return await adapter.listModels();
+    return await this.withIdleRelease(adapter, () => adapter.listModels!());
   }
 
   public async walletStatus(providerId: string, modelId?: string, endpointId?: string): Promise<ProviderWalletStatus> {
@@ -365,6 +406,7 @@ export class AgentBridge {
       supportsManualCompaction,
       supportsThreshold: supportsManualCompaction && contextWindowTokens !== null,
       isCompacting: this.#compactingSessions.has(globalSessionId),
+      compactionKind: this.#compactionKinds.get(globalSessionId) ?? null,
       updatedAt: reported?.updatedAt ?? new Date().toISOString(),
       usage: reported?.usage ?? {},
     };
@@ -394,7 +436,7 @@ export class AgentBridge {
     this.#compactionThresholds.set(globalSessionId, thresholdTokens);
     this.#lastCompactionUsage.delete(globalSessionId);
     try {
-      if (context.usedTokens !== null && thresholdTokens <= context.usedTokens) await this.compactSession(globalSessionId);
+      if (context.usedTokens !== null && thresholdTokens <= context.usedTokens) await this.compactSession(globalSessionId, "manual");
     } catch (error) {
       if (previousThreshold === undefined) this.#compactionThresholds.delete(globalSessionId);
       else this.#compactionThresholds.set(globalSessionId, previousThreshold);
@@ -405,28 +447,78 @@ export class AgentBridge {
     return await this.sessionContext(globalSessionId);
   }
 
-  public async compactSession(globalSessionId: string): Promise<void> {
+  public async compactSession(globalSessionId: string, kind: "automatic" | "manual" = "manual"): Promise<void> {
     this.assertActive();
     if (this.#compactingSessions.has(globalSessionId)) return;
     const { providerId, providerSessionId } = this.assertSessionHost(globalSessionId);
     const adapter = this.requireAdapter(providerId);
     if (adapter.compactSession === undefined) throw new Error(`${adapter.displayName} does not expose context compaction`);
     this.#compactingSessions.add(globalSessionId);
+    this.#compactionKinds.set(globalSessionId, kind);
+    this.#events.append({
+      type: "context.compaction_started",
+      providerId,
+      sessionId: globalSessionId,
+      payload: { kind },
+    });
+    let completed = false;
     try {
       const before = await this.sessionContext(globalSessionId).catch(() => undefined);
       if (before?.usedTokens !== null && before?.usedTokens !== undefined) this.#lastCompactionUsage.set(globalSessionId, before.usedTokens);
       await adapter.compactSession(providerSessionId);
+      completed = true;
     } finally {
       this.#compactingSessions.delete(globalSessionId);
+      this.#compactionKinds.delete(globalSessionId);
+    }
+    if (completed) {
+      this.#events.append({
+        type: "context.compaction_completed",
+        providerId,
+        sessionId: globalSessionId,
+        payload: { kind },
+      });
     }
   }
 
   public async providerConnections(): Promise<readonly ProviderConnection[]> {
     return await Promise.all([...this.#adapters.values()].map(async (adapter): Promise<ProviderConnection> => {
-      try {
-        const detection = await adapter.detect();
-        if (!detection.available) {
-          const error = this.providerUnavailableError(adapter, detection);
+      return await this.withIdleRelease(adapter, async () => {
+        try {
+          const detection = await adapter.detect();
+          if (!detection.available) {
+            const error = this.providerUnavailableError(adapter, detection);
+            return {
+              providerId: adapter.providerId,
+              displayName: adapter.displayName,
+              state: "offline",
+              detected: false,
+              authenticated: null,
+              capabilities: this.unavailableProviderCapabilities(),
+              lastError: providerErrorFromUnknown(adapter.providerId, error),
+            };
+          }
+          const [auth, capabilities] = await Promise.all([adapter.getAuthStatus(), adapter.getCapabilities()]);
+          const connected = this.#subscribedProviders.has(adapter.providerId);
+          const connectionError = this.#providerConnectionErrors.get(adapter.providerId);
+          return {
+            providerId: adapter.providerId,
+            displayName: adapter.displayName,
+            state: connected ? "online" : "offline",
+            detected: true,
+            authenticated: auth.authenticated,
+            capabilities,
+            ...(detection.version !== undefined ? { nativeVersion: detection.version } : {}),
+            ...(!connected ? {
+              lastError: connectionError ?? providerErrorFromUnknown(adapter.providerId, new ProviderAdapterError(
+                adapter.providerId,
+                "PROVIDER_DISCONNECTED",
+                `${adapter.displayName} is detected but its bridge event subscription is not connected.`,
+                true,
+              )),
+            } : {}),
+          };
+        } catch (error) {
           return {
             providerId: adapter.providerId,
             displayName: adapter.displayName,
@@ -437,37 +529,7 @@ export class AgentBridge {
             lastError: providerErrorFromUnknown(adapter.providerId, error),
           };
         }
-        const [auth, capabilities] = await Promise.all([adapter.getAuthStatus(), adapter.getCapabilities()]);
-        const connected = this.#subscribedProviders.has(adapter.providerId);
-        const connectionError = this.#providerConnectionErrors.get(adapter.providerId);
-        return {
-          providerId: adapter.providerId,
-          displayName: adapter.displayName,
-          state: connected ? "online" : "offline",
-          detected: true,
-          authenticated: auth.authenticated,
-          capabilities,
-          ...(detection.version !== undefined ? { nativeVersion: detection.version } : {}),
-          ...(!connected ? {
-            lastError: connectionError ?? providerErrorFromUnknown(adapter.providerId, new ProviderAdapterError(
-              adapter.providerId,
-              "PROVIDER_DISCONNECTED",
-              `${adapter.displayName} is detected but its bridge event subscription is not connected.`,
-              true,
-            )),
-          } : {}),
-        };
-      } catch (error) {
-        return {
-          providerId: adapter.providerId,
-          displayName: adapter.displayName,
-          state: "offline",
-          detected: false,
-          authenticated: null,
-          capabilities: this.unavailableProviderCapabilities(),
-          lastError: providerErrorFromUnknown(adapter.providerId, error),
-        };
-      }
+      });
     }));
   }
 
@@ -478,6 +540,13 @@ export class AgentBridge {
     this.restoreDelegationLinks();
     this.restoreSessionTransferLinks();
     this.reconcileDelegationTimer();
+    await this.reconcileCrossSessionDeliveries();
+    for (const targetSessionId of new Set([...this.#crossSessionMessages.values()]
+      .filter((message) => message.state === "pending")
+      .map((message) => message.envelope.targetSessionId))) {
+      void this.pumpCrossSessionInbox(targetSessionId);
+    }
+    await Promise.all([...this.#adapters.values()].map((adapter) => this.releaseProviderIfIdle(adapter)));
     return { ...result, sessions: this.sessions() };
   }
 
@@ -488,15 +557,17 @@ export class AgentBridge {
   public async visionProxyTargets(): Promise<readonly VisionProxyTarget[]> {
     this.assertActive();
     const targets = await Promise.all([...this.#adapters.values()].map(async (adapter): Promise<VisionProxyTarget | null> => {
-      try {
-        if (adapter.sessionCreationFeatures?.hiddenDeveloperInstructions !== true || adapter.listModels === undefined) return null;
-        const capabilities = await adapter.getCapabilities();
-        if (!capabilities.createSession || !capabilities.sendMessage || !capabilities.modelEnumeration) return null;
-        const models = (await adapter.listModels()).filter((model) => model.inputModalities?.includes("image") === true);
-        return models.length === 0 ? null : { providerId: adapter.providerId, displayName: adapter.displayName, models };
-      } catch {
-        return null;
-      }
+      return await this.withIdleRelease(adapter, async () => {
+        try {
+          if (adapter.sessionCreationFeatures?.hiddenDeveloperInstructions !== true || adapter.listModels === undefined) return null;
+          const capabilities = await adapter.getCapabilities();
+          if (!capabilities.createSession || !capabilities.sendMessage || !capabilities.modelEnumeration) return null;
+          const models = (await adapter.listModels()).filter((model) => model.inputModalities?.includes("image") === true);
+          return models.length === 0 ? null : { providerId: adapter.providerId, displayName: adapter.displayName, models };
+        } catch {
+          return null;
+        }
+      });
     }));
     return targets.filter((target): target is VisionProxyTarget => target !== null);
   }
@@ -557,41 +628,43 @@ export class AgentBridge {
     return { observation, helperSessionId: helper.id };
   }
 
-  public async openSession(globalSessionId: string, cursor?: string, limit = 40): Promise<OpenSessionResult> {
+  public async openSession(globalSessionId: string, cursor?: string, limit = 40, refresh = false): Promise<OpenSessionResult> {
     this.assertActive();
     const { providerId, providerSessionId, hostId } = parseGlobalSessionId(globalSessionId);
     if (hostId !== this.config.hostId) throw new Error("Session belongs to a different host");
     const adapter = this.requireAdapter(providerId);
-    const cached = this.#cache.get(globalSessionId);
-    const boundedLimit = Math.max(1, Math.min(limit, 80));
-    if (cursor !== undefined) {
+    return await this.withIdleRelease(adapter, async () => {
+      const cached = this.#cache.get(globalSessionId);
+      const boundedLimit = Math.max(1, Math.min(limit, 80));
+      if (cursor !== undefined) {
+        const snapshot = this.#messageSnapshots.get(globalSessionId);
+        if (snapshot === undefined) throw new Error("Message history page expired; reopen the session");
+        this.touchMessageSnapshot(globalSessionId, snapshot);
+        const page = messagePage(snapshot.messages, cursor, boundedLimit);
+        return { session: cached ?? await adapter.getSession(providerSessionId), ...page };
+      }
+
+      const generation = this.#messageSnapshotGenerations.get(globalSessionId) ?? 0;
       const snapshot = this.#messageSnapshots.get(globalSessionId);
-      if (snapshot === undefined) throw new Error("Message history page expired; reopen the session");
-      this.touchMessageSnapshot(globalSessionId, snapshot);
-      const page = messagePage(snapshot.messages, cursor, boundedLimit);
-      return { session: cached ?? await adapter.getSession(providerSessionId), ...page };
-    }
+      if (!refresh && cached !== undefined && snapshot !== undefined && snapshot.generation === generation && snapshot.freshUntil > Date.now()) {
+        this.touchMessageSnapshot(globalSessionId, snapshot);
+        return { session: cached, ...messagePage(snapshot.messages, undefined, boundedLimit) };
+      }
 
-    const generation = this.#messageSnapshotGenerations.get(globalSessionId) ?? 0;
-    const snapshot = this.#messageSnapshots.get(globalSessionId);
-    if (cached !== undefined && snapshot !== undefined && snapshot.generation === generation && snapshot.freshUntil > Date.now()) {
-      this.touchMessageSnapshot(globalSessionId, snapshot);
-      return { session: cached, ...messagePage(snapshot.messages, undefined, boundedLimit) };
-    }
-
-    const existingLoad = this.#openSessionLoads.get(globalSessionId);
-    const load = existingLoad?.generation === generation
-      ? existingLoad.promise
-      : this.loadOpenSession(globalSessionId, providerSessionId, adapter, cached, generation);
-    if (existingLoad?.generation !== generation) {
-      const record: OpenSessionLoad = { generation, promise: load };
-      this.#openSessionLoads.set(globalSessionId, record);
-      void load.finally(() => {
-        if (this.#openSessionLoads.get(globalSessionId) === record) this.#openSessionLoads.delete(globalSessionId);
-      }).catch(() => undefined);
-    }
-    const opened = await load;
-    return { session: opened.session, ...messagePage(opened.messages, undefined, boundedLimit) };
+      const existingLoad = this.#openSessionLoads.get(globalSessionId);
+      const load = existingLoad?.generation === generation
+        ? existingLoad.promise
+        : this.loadOpenSession(globalSessionId, providerSessionId, adapter, cached, generation);
+      if (existingLoad?.generation !== generation) {
+        const record: OpenSessionLoad = { generation, promise: load };
+        this.#openSessionLoads.set(globalSessionId, record);
+        void load.finally(() => {
+          if (this.#openSessionLoads.get(globalSessionId) === record) this.#openSessionLoads.delete(globalSessionId);
+        }).catch(() => undefined);
+      }
+      const opened = await load;
+      return { session: opened.session, ...messagePage(opened.messages, undefined, boundedLimit) };
+    });
   }
 
   private async loadOpenSession(
@@ -609,14 +682,15 @@ export class AgentBridge {
     this.restoreSessionTransferLinks();
     const resolvedSession = this.#cache.get(globalSessionId) ?? session;
     const providerVisible = clientVisibleBranchMessages(clientVisibleHandoffMessages(providerMessages));
-    const copied = resolvedSession.relationship?.kind === "branch" && resolvedSession.relationship.strategy === "transcript_bootstrap"
+    const copied = (resolvedSession.relationship?.kind === "branch" || resolvedSession.relationship?.kind === "side_chat") && resolvedSession.relationship.strategy === "transcript_bootstrap"
       ? this.#branchCopies.get(globalSessionId)
       : undefined;
     const messages = copied === undefined
       ? providerVisible
       : [...copyBranchMessages(copied, globalSessionId), ...providerVisible];
-    this.cacheMessageSnapshot(globalSessionId, messages, generation);
-    return { session: resolvedSession, messages };
+    const decoratedMessages = this.decorateCrossSessionMessages(globalSessionId, messages);
+    this.cacheMessageSnapshot(globalSessionId, decoratedMessages, generation);
+    return { session: resolvedSession, messages: decoratedMessages };
   }
 
   private cacheMessageSnapshot(sessionId: string, messages: readonly RemoteMessage[], generation: number): void {
@@ -804,6 +878,25 @@ export class AgentBridge {
     this.assertActive();
     this.assertSessionHost(parentSessionId);
     if (this.#cache.get(parentSessionId) === undefined) throw new Error("Parent session is not loaded on this bridge");
+    if (tool === "mesh_list_sessions") {
+      const query = optionalMeshString(input, "query", 200) ?? "";
+      const limit = optionalMeshInteger(input.limit, 20, 1, 25);
+      return { sessions: this.crossSessionTargets(parentSessionId, query, limit).map((session) => ({
+        sessionId: session.id,
+        title: session.title.slice(0, 240),
+        providerId: session.providerId,
+        state: session.state,
+        project: session.project?.slice(0, 240) ?? null,
+        workingDirectory: session.workingDirectory?.slice(0, 2_000) ?? null,
+        lastActivityAt: session.lastActivityAt,
+      })) };
+    }
+    if (tool === "mesh_message_session") {
+      const targetSessionId = requiredMeshString(input, "target_session_id", 16_384);
+      const message = requiredMeshString(input, "message", maxCrossSessionContentLength);
+      const requestId = requiredMeshString(input, "request_id", 256);
+      return { message: await this.sendCrossSessionMessage(parentSessionId, targetSessionId, requestId, message) as unknown as JsonObject };
+    }
     if (tool === "mesh_list_children") return { children: this.meshChildren(parentSessionId) };
     if (tool === "mesh_message_child") {
       const childSessionId = requiredMeshString(input, "child_session_id");
@@ -907,12 +1000,56 @@ export class AgentBridge {
 
   public async createSession(providerId: string, options: CreateSessionOptions): Promise<RemoteSession> {
     this.assertActive();
-    const session = await this.requireAdapter(providerId).createSession({
-      ...options,
-      workingDirectory: options.workingDirectory.trim() || process.cwd(),
+    const adapter = this.requireAdapter(providerId);
+    return await this.withIdleRelease(adapter, async () => {
+      const globalInstructions = await this.#globalAgentInstructions?.();
+      const separatedFirstTurn = options.firstInstruction !== undefined
+        && (options.firstInstructionDeveloperInstructions !== undefined || globalInstructions !== undefined);
+      const {
+        firstInstructionDeveloperInstructions: _firstTurnGuidance,
+        firstInstruction,
+        ...providerOptions
+      } = options;
+      const providerSession = await adapter.createSession({
+        ...providerOptions,
+        ...(!separatedFirstTurn && firstInstruction !== undefined ? { firstInstruction } : {}),
+        ...(separatedFirstTurn && providerOptions.title === undefined
+          ? { title: options.firstInstruction!.split(/\r?\n/u)[0]?.trim().slice(0, 96) || "New task" }
+          : {}),
+        workingDirectory: options.workingDirectory.trim() || process.cwd(),
+      });
+      const clientTitle = options.title?.trim() || options.firstInstruction?.split(/\r?\n/u)[0]?.trim().slice(0, 96);
+      const clientPreview = options.firstInstruction?.trim().slice(0, 240);
+      const session: RemoteSession = {
+        ...providerSession,
+        ...(clientTitle ? { title: clientTitle } : {}),
+        ...(clientPreview ? { preview: clientPreview, state: "working" as const, lastActivityAt: new Date().toISOString() } : {}),
+        ...(options.modelId !== undefined ? { modelId: options.modelId } : {}),
+        ...(options.reasoningEffort !== undefined ? { reasoningEffort: options.reasoningEffort } : {}),
+        nativeMetadata: {
+          ...providerSession.nativeMetadata,
+          ...(clientTitle ? { tethoqClientTitle: clientTitle, tethoqInitialProviderTitle: providerSession.title } : {}),
+          ...(clientPreview ? { tethoqClientPreview: clientPreview } : {}),
+        },
+      };
+      this.#cache.upsert(session);
+      if (separatedFirstTurn) {
+        const result = await this.sendMessage(session.id, {
+          requestId: `first_turn_${randomUUID()}`,
+          content: options.firstInstruction!,
+          ...(options.firstInstructionDeveloperInstructions !== undefined
+            ? { developerInstructions: options.firstInstructionDeveloperInstructions }
+            : {}),
+          ...(options.modelId !== undefined ? { modelId: options.modelId } : {}),
+          ...(options.reasoningEffort !== undefined ? { reasoningEffort: options.reasoningEffort } : {}),
+        });
+        if (!result.accepted) throw new Error(result.details.join(" ") || "The harness did not accept the first instruction");
+        const active = { ...session, state: "working" as const, preview: options.firstInstruction!.slice(0, 240), lastActivityAt: new Date().toISOString() };
+        this.#cache.upsert(active);
+        return active;
+      }
+      return session;
     });
-    this.#cache.upsert(session);
-    return session;
   }
 
   private restoreSessionTransferRuntime(record: SessionTransferRecord): void {
@@ -924,7 +1061,7 @@ export class AgentBridge {
         ...(record.prompt !== undefined ? { prompt: record.prompt } : {}),
       });
     }
-    if (record.relationship.kind === "branch") {
+    if (record.relationship.kind === "branch" || record.relationship.kind === "side_chat") {
       if (record.copiedMessages !== undefined) this.#branchCopies.set(record.sessionId, record.copiedMessages);
       if (record.pending && record.bootstrap !== undefined) {
         this.#pendingBranchBootstraps.set(record.sessionId, { bootstrap: record.bootstrap, relationship: record.relationship });
@@ -954,6 +1091,7 @@ export class AgentBridge {
       pending: false,
       ...(record.summary !== undefined ? { summary: record.summary } : {}),
       ...(record.copiedMessages !== undefined ? { copiedMessages: record.copiedMessages } : {}),
+      ...(record.sideChatPreview !== undefined ? { sideChatPreview: record.sideChatPreview } : {}),
     };
     this.#sessionTransfers.set(sessionId, completed);
     this.#onSessionTransfersChange?.([...this.#sessionTransfers.values()]);
@@ -981,8 +1119,18 @@ export class AgentBridge {
       this.#cache.upsert({
         ...session,
         relationship: record.relationship,
+        ...(record.relationship.kind === "side_chat" ? {
+          sessionKind: "side_chat" as const,
+          parentSessionId: record.relationship.sourceSessionId,
+          ...(record.sideChatPreview !== undefined ? { preview: record.sideChatPreview } : {}),
+        } : {}),
         ...(record.summary !== undefined ? { contextHandoffSummary: record.summary } : {}),
-        nativeMetadata: { ...session.nativeMetadata, ...transferMetadata(record.relationship), ...nativeMetadata },
+        nativeMetadata: {
+          ...session.nativeMetadata,
+          ...transferMetadata(record.relationship),
+          ...nativeMetadata,
+          ...(record.relationship.kind === "side_chat" ? { tethoqSessionKind: "side_chat" } : {}),
+        },
       });
     }
   }
@@ -1082,6 +1230,118 @@ export class AgentBridge {
     return { session, strategy, copiedMessageCount: messages.length };
   }
 
+  public sideChats(parentSessionId?: string): readonly RemoteSession[] {
+    if (parentSessionId !== undefined) this.assertSessionHost(parentSessionId);
+    return this.sessions()
+      .filter((session) => session.sessionKind === "side_chat")
+      .filter((session) => parentSessionId === undefined || session.parentSessionId === parentSessionId)
+      .sort((left, right) => right.lastActivityAt.localeCompare(left.lastActivityAt));
+  }
+
+  public async createSideChat(parentSessionId: string, prompt?: string, queuedMessageId?: string): Promise<SideChatResult> {
+    if (queuedMessageId !== undefined) {
+      return await this.withQueueMutation(queuedMessageId, async () =>
+        await this.createSideChatInternal(parentSessionId, prompt, queuedMessageId));
+    }
+    return await this.createSideChatInternal(parentSessionId, prompt);
+  }
+
+  private async createSideChatInternal(parentSessionId: string, prompt?: string, queuedMessageId?: string): Promise<SideChatResult> {
+    this.assertActive();
+    const normalizedPrompt = prompt?.trim();
+    if (prompt !== undefined && (!normalizedPrompt || normalizedPrompt.length > 100_000)) {
+      throw new Error("A side-chat message must contain between 1 and 100000 characters");
+    }
+    const queued = queuedMessageId === undefined ? undefined : this.#queuedMessages.get(queuedMessageId);
+    if (queuedMessageId !== undefined && (queued === undefined || queued.view.sessionId !== parentSessionId || queued.view.state === "sending")) {
+      throw new Error("That queued instruction is no longer available for this task");
+    }
+    if (normalizedPrompt !== undefined && queued !== undefined) throw new Error("Choose either a new side-chat message or a queued instruction, not both");
+
+    const { adapter, source, messages } = await this.transferSource(parentSessionId);
+    if (source.sessionKind === "internal") throw new Error("Internal helper sessions cannot create side chats");
+    const capabilities = await adapter.getCapabilities();
+    if (!capabilities.createSession || !capabilities.sendMessage) {
+      throw new Error(`${adapter.displayName} cannot create a side chat`);
+    }
+    const relationship: SessionRelationship = { kind: "side_chat", sourceSessionId: parentSessionId, strategy: "transcript_bootstrap" };
+    const fallback = branchBootstrap(source, messages);
+    const bootstrap = sideChatBootstrap(fallback.content);
+    const created = await adapter.createSession({
+      workingDirectory: transferWorkingDirectory(source),
+      title: `Side chat: ${source.title}`.slice(0, 120),
+      ...(source.modelId !== undefined ? { modelId: source.modelId } : {}),
+      ...(source.reasoningEffort !== undefined ? { reasoningEffort: source.reasoningEffort } : {}),
+      ...(adapter.sessionCreationFeatures?.hiddenDeveloperInstructions === true
+        ? { developerInstructions: sideChatDeveloperInstructions }
+        : {}),
+      metadata: { ...transferMetadata(relationship), tethoqSessionKind: "side_chat", parentSessionId },
+    });
+    const session: RemoteSession = {
+      ...transferredSession(created, source, relationship, {
+        tethoqBranchBootstrap: bootstrap,
+        tethoqBranchPending: true,
+        tethoqSessionKind: "side_chat",
+      }),
+      sessionKind: "side_chat",
+      parentSessionId,
+    };
+    assertFreshTransferSession(source, session);
+    this.#cache.upsert(session);
+    this.#pendingBranchBootstraps.set(session.id, { bootstrap, relationship });
+    this.#branchCopies.set(session.id, messages);
+    this.rememberSessionTransfer({
+      sessionId: session.id,
+      relationship,
+      pending: true,
+      bootstrap,
+      copiedMessages: persistableBranchMessages(messages),
+    });
+    this.appendSideChatEvent("side_chat.created", session, { sourceSessionId: parentSessionId });
+
+    const initialRequest = queued?.request ?? (queued === undefined
+      ? normalizedPrompt === undefined ? undefined : {
+          requestId: `side_chat_${randomUUID()}`,
+          content: normalizedPrompt,
+          ...(source.modelId !== undefined ? { modelId: source.modelId } : {}),
+          ...(source.reasoningEffort !== undefined ? { reasoningEffort: source.reasoningEffort } : {}),
+        }
+      : {
+          requestId: `side_chat_${randomUUID()}`,
+          content: queued.view.content,
+          ...(queued.view.modelId !== undefined ? { modelId: queued.view.modelId } : {}),
+          ...(queued.view.reasoningEffort !== undefined ? { reasoningEffort: queued.view.reasoningEffort } : {}),
+        });
+    if (initialRequest !== undefined) {
+      await this.sendMessage(session.id, { ...initialRequest, requestId: `side_chat_${randomUUID()}` });
+      this.#cache.updateState(session.id, "working", false);
+      this.rememberSideChatPreview(session.id, initialRequest.content);
+      if (queuedMessageId !== undefined) {
+        const removed = await this.cancelQueuedMessageInternal(queuedMessageId, "moved_to_side_chat");
+        if (!removed) throw new Error("The side chat was created, but its queued instruction could not be removed from the parent task");
+      }
+    }
+    return { session: this.#cache.get(session.id) ?? session, copiedMessageCount: messages.length };
+  }
+
+  public async promoteSideChat(sessionId: string): Promise<BranchSessionResult> {
+    const session = this.#cache.get(sessionId);
+    if (session?.sessionKind !== "side_chat") throw new Error("Only a side chat can be promoted to a full task");
+    const result = await this.branchSession(sessionId);
+    const { parentSessionId: _parentSessionId, ...withoutParent } = result.session;
+    const promoted: RemoteSession = {
+      ...withoutParent,
+      sessionKind: "task",
+      nativeMetadata: { ...withoutParent.nativeMetadata, tethoqSessionKind: "task" },
+    };
+    this.#cache.upsert(promoted);
+    this.appendSideChatEvent("side_chat.promoted", promoted, {
+      sourceSideChatId: sessionId,
+      promotionMode: "copy",
+    });
+    return { ...result, session: promoted };
+  }
+
   private async transferSource(sourceSessionId: string): Promise<{
     readonly adapter: AgentProviderAdapter;
     readonly source: RemoteSession;
@@ -1098,7 +1358,7 @@ export class AgentBridge {
     this.restoreSessionTransferLinks();
     const source = this.#cache.get(sourceSessionId) ?? providerSession;
     const providerVisible = clientVisibleBranchMessages(clientVisibleHandoffMessages(providerMessages));
-    const copied = source.relationship?.kind === "branch" && source.relationship.strategy === "transcript_bootstrap"
+    const copied = (source.relationship?.kind === "branch" || source.relationship?.kind === "side_chat") && source.relationship.strategy === "transcript_bootstrap"
       ? this.#branchCopies.get(sourceSessionId)
       : undefined;
     const messages = copied === undefined ? providerVisible : [...copyBranchMessages(copied, sourceSessionId), ...providerVisible];
@@ -1107,11 +1367,26 @@ export class AgentBridge {
 
   public async sendMessage(globalSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
     this.assertActive();
+    const prepared = withSimplifyResponseGuidance(await this.withGlobalAgentInstructions(request));
     if (this.pendingContextHandoff(globalSessionId) !== undefined || this.pendingBranchBootstrap(globalSessionId) !== undefined) {
       return await this.withPendingHandoffSendLock(globalSessionId, async () =>
-        await this.dispatchMessage(globalSessionId, request));
+        await this.dispatchMessage(globalSessionId, prepared));
     }
-    return await this.dispatchMessage(globalSessionId, request);
+    return await this.dispatchMessage(globalSessionId, prepared);
+  }
+
+  private async withGlobalAgentInstructions(request: SendMessageRequest): Promise<SendMessageRequest> {
+    const selected = await this.#globalAgentInstructions?.();
+    if (selected === undefined) return request;
+    const globalHeader = "Use these user-selected global AGENTS.md instructions for this Tethoq turn:";
+    if (request.developerInstructions?.startsWith(`${globalHeader}\n\n`) === true) return request;
+    const globalInstructions = `${globalHeader}\n\n${selected}`;
+    return {
+      ...request,
+      developerInstructions: request.developerInstructions === undefined
+        ? globalInstructions
+        : `${globalInstructions}\n\n${request.developerInstructions}`,
+    };
   }
 
   public async sendUploadedMessage(
@@ -1175,8 +1450,38 @@ export class AgentBridge {
       this.#cache.updateNativeMetadata(globalSessionId, { tethoqBranchPending: false });
       this.completeSessionTransferBootstrap(globalSessionId);
     }
+    if (result.accepted) this.rememberSideChatPreview(globalSessionId, request.content);
     this.invalidateMessageSnapshot(globalSessionId);
     return result;
+  }
+
+  private rememberSideChatPreview(sessionId: string, content: string): void {
+    const record = this.#sessionTransfers.get(sessionId);
+    if (record?.relationship.kind !== "side_chat" || record.sideChatPreview !== undefined) return;
+    const preview = content.trim().replace(/\s+/gu, " ").slice(0, 1_000);
+    if (preview.length === 0) return;
+    const updated: SessionTransferRecord = { ...record, sideChatPreview: preview };
+    this.#sessionTransfers.set(sessionId, updated);
+    const session = this.#cache.get(sessionId);
+    if (session !== undefined) {
+      const withPreview = { ...session, preview };
+      this.#cache.upsert(withPreview);
+      this.appendSideChatEvent("side_chat.updated", withPreview);
+    }
+    this.#onSessionTransfersChange?.([...this.#sessionTransfers.values()]);
+  }
+
+  private appendSideChatEvent(
+    type: "side_chat.created" | "side_chat.updated" | "side_chat.promoted",
+    session: RemoteSession,
+    details: JsonObject = {},
+  ): void {
+    this.#events.append({
+      type,
+      providerId: session.providerId,
+      sessionId: session.id,
+      payload: { ...details, session: session as unknown as JsonObject },
+    });
   }
 
   private pendingContextHandoff(globalSessionId: string): PendingContextHandoff | undefined {
@@ -1201,7 +1506,7 @@ export class AgentBridge {
     const current = this.#pendingBranchBootstraps.get(globalSessionId);
     if (current !== undefined) return current;
     const session = this.#cache.get(globalSessionId);
-    if (session?.relationship?.kind !== "branch"
+    if ((session?.relationship?.kind !== "branch" && session?.relationship?.kind !== "side_chat")
       || session.relationship.strategy !== "transcript_bootstrap"
       || session.nativeMetadata.tethoqBranchPending !== true
       || typeof session.nativeMetadata.tethoqBranchBootstrap !== "string") return undefined;
@@ -1270,6 +1575,20 @@ export class AgentBridge {
     return this.#transcriptionSources.list();
   }
 
+  public async configureTranscriptionSource(
+    sourceId: string,
+    apiKey: string | undefined,
+  ) {
+    this.assertActive();
+    if (apiKey !== undefined) await this.#transcriptionSources.validateCredential(sourceId, apiKey);
+    if (this.#onTranscriptionCredentialChange === undefined) {
+      throw new Error("Dictation credential storage is unavailable");
+    }
+    await this.#onTranscriptionCredentialChange(sourceId, apiKey);
+    this.#transcriptionSources.setCredential(sourceId, apiKey);
+    return this.#transcriptionSources.list();
+  }
+
   public queuedMessages(sessionId?: string): readonly QueuedMessage[] {
     return [...this.#queuedMessages.values()]
       .map((record) => record.view)
@@ -1277,26 +1596,116 @@ export class AgentBridge {
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   }
 
+  public crossSessionTargets(sourceSessionId: string, query = "", limit = 20): readonly RemoteSession[] {
+    this.assertActive();
+    this.requireCrossSessionTask(sourceSessionId, "Source");
+    const normalizedQuery = query.trim().toLocaleLowerCase();
+    if (query.length > 200) throw new Error("Task search must contain at most 200 characters");
+    if (!Number.isInteger(limit) || limit < 1 || limit > 25) throw new Error("Task search limit must be an integer from 1 to 25");
+    return this.#cache.all()
+      .filter((session) => session.id !== sourceSessionId && this.isCrossSessionTask(session))
+      .filter((session) => normalizedQuery.length === 0 || [
+        session.title,
+        session.project,
+        session.workingDirectory,
+        session.providerId,
+      ].some((value) => value?.toLocaleLowerCase().includes(normalizedQuery) === true))
+      .sort((left, right) => right.lastActivityAt.localeCompare(left.lastActivityAt) || left.id.localeCompare(right.id))
+      .slice(0, limit);
+  }
+
+  public crossSessionInbox(targetSessionId: string, limit = 100): readonly CrossSessionMessage[] {
+    this.assertSessionHost(targetSessionId);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) throw new Error("Inbox limit must be an integer from 1 to 200");
+    return [...this.#crossSessionMessages.values()]
+      .filter((message) => message.envelope.targetSessionId === targetSessionId)
+      .sort((left, right) => right.envelope.createdAt.localeCompare(left.envelope.createdAt) || right.envelope.id.localeCompare(left.envelope.id))
+      .slice(0, limit);
+  }
+
+  public async sendCrossSessionMessage(
+    sourceSessionId: string,
+    targetSessionId: string,
+    requestId: string,
+    content: string,
+  ): Promise<CrossSessionMessage> {
+    this.assertActive();
+    const source = this.requireCrossSessionTask(sourceSessionId, "Source");
+    const target = this.requireCrossSessionTask(targetSessionId, "Target");
+    if (source.id === target.id) throw new Error("A task cannot send a message to itself");
+    const normalizedRequestId = requestId.trim();
+    if (normalizedRequestId.length === 0 || normalizedRequestId.length > 256) {
+      throw new Error("Cross-task request ID must contain between 1 and 256 characters");
+    }
+    if (content.trim().length === 0 || content.length > maxCrossSessionContentLength) {
+      throw new Error(`Cross-task message must contain between 1 and ${maxCrossSessionContentLength} characters`);
+    }
+    const existing = [...this.#crossSessionMessages.values()].find((message) =>
+      message.envelope.sourceSessionId === sourceSessionId && message.envelope.requestId === normalizedRequestId);
+    if (existing !== undefined) {
+      if (existing.envelope.targetSessionId !== targetSessionId || existing.envelope.content !== content) {
+        throw new Error("That cross-task request ID was already used for a different message");
+      }
+      if (existing.state === "pending") await this.pumpCrossSessionInbox(targetSessionId);
+      return this.#crossSessionMessages.get(existing.envelope.id) ?? existing;
+    }
+    this.pruneCrossSessionMessages(1);
+    const pendingForTarget = [...this.#crossSessionMessages.values()].filter((message) =>
+      message.envelope.targetSessionId === targetSessionId && (message.state === "pending" || message.state === "sending"));
+    if (pendingForTarget.length >= maxPendingCrossSessionMessagesPerTarget) {
+      throw new Error("That task already has too many pending cross-task messages");
+    }
+    const now = new Date().toISOString();
+    const envelope: CrossSessionMessageEnvelope = {
+      version: 1,
+      id: `remote_${randomUUID()}`,
+      requestId: normalizedRequestId,
+      sourceSessionId,
+      sourceTitle: source.title.trim().slice(0, 240) || "Tethoq task",
+      targetSessionId,
+      content,
+      createdAt: now,
+    };
+    const record: CrossSessionMessage = { envelope, state: "pending", attemptCount: 0, updatedAt: now };
+    this.#crossSessionMessages.set(envelope.id, record);
+    try {
+      await this.persistCrossSessionMessages();
+    } catch (error) {
+      this.#crossSessionMessages.delete(envelope.id);
+      throw error;
+    }
+    await this.pumpCrossSessionInbox(targetSessionId);
+    return this.#crossSessionMessages.get(envelope.id) ?? record;
+  }
+
   public async enqueueMessage(
     globalSessionId: string,
     input: Omit<SendMessageRequest, "attachments"> & { readonly attachmentIds?: readonly string[] },
   ): Promise<QueuedMessage> {
+    const prepared = withSimplifyResponseGuidance(input);
     const { providerId, providerSessionId } = this.assertSessionHost(globalSessionId);
     const session = this.#cache.get(globalSessionId);
     if (session === undefined) throw new Error("Session is not loaded on this bridge");
     const adapter = this.requireAdapter(providerId);
-    if (adapter.enqueueQueuedMessage !== undefined && (input.attachmentIds?.length ?? 0) === 0) {
+    if (adapter.enqueueQueuedMessage !== undefined && (input.attachmentIds?.length ?? 0) === 0 && (prepared.workflows?.length ?? 0) === 0) {
+      const providerPrepared = await this.withGlobalAgentInstructions(prepared);
       if (session.workingDirectory === undefined) throw new Error("This session does not expose a working directory for its desktop queue");
       const message = await adapter.enqueueQueuedMessage(providerSessionId, {
-        requestId: input.requestId,
-        content: input.content,
+        requestId: providerPrepared.requestId,
+        content: providerPrepared.content,
+        ...(providerPrepared.developerInstructions !== undefined ? { developerInstructions: providerPrepared.developerInstructions } : {}),
         workingDirectory: session.workingDirectory,
-        ...(input.modelId !== undefined ? { modelId: input.modelId } : {}),
-        ...(input.reasoningEffort !== undefined ? { reasoningEffort: input.reasoningEffort } : {}),
+        ...(prepared.modelId !== undefined ? { modelId: prepared.modelId } : {}),
+        ...(prepared.reasoningEffort !== undefined ? { reasoningEffort: prepared.reasoningEffort } : {}),
       });
       const view = this.providerQueuedMessage(providerId, message);
       const previous = this.#queuedMessages.get(view.id)?.view;
-      this.#queuedMessages.set(view.id, { view, providerOwned: true, providerMessageId: message.id });
+      this.#queuedMessages.set(view.id, {
+        view,
+        providerOwned: true,
+        providerMessageId: message.id,
+        ...(message.developerInstructions !== undefined ? { request: { requestId: `provider_queue_${message.id}`, content: message.content, developerInstructions: message.developerInstructions } } : {}),
+      });
       if (previous === undefined) this.appendQueueEvent("message.queued", view);
       else if (JSON.stringify(previous) !== JSON.stringify(view)) this.appendQueueEvent("message.queue_updated", view);
       return view;
@@ -1311,16 +1720,18 @@ export class AgentBridge {
     }
     const id = `queued_${randomUUID()}`;
     const request: SendMessageRequest = {
-      requestId: input.requestId,
-      content: input.content,
+      requestId: prepared.requestId,
+      content: prepared.content,
+      ...(prepared.developerInstructions !== undefined ? { developerInstructions: prepared.developerInstructions } : {}),
       ...(input.modelId !== undefined ? { modelId: input.modelId } : {}),
       ...(input.reasoningEffort !== undefined ? { reasoningEffort: input.reasoningEffort } : {}),
       ...(attachments.length > 0 ? { attachments } : {}),
+      ...(prepared.workflows?.length ? { workflows: prepared.workflows } : {}),
     };
     const view: QueuedMessage = {
       id,
       sessionId: globalSessionId,
-      content: input.content,
+      content: prepared.content,
       mode: "queue",
       state: "queued",
       createdAt: new Date().toISOString(),
@@ -1336,6 +1747,11 @@ export class AgentBridge {
   }
 
   public async cancelQueuedMessage(messageId: string): Promise<boolean> {
+    return await this.withQueueMutation(messageId, async () =>
+      await this.cancelQueuedMessageInternal(messageId, "cancelled"));
+  }
+
+  private async cancelQueuedMessageInternal(messageId: string, reason: string): Promise<boolean> {
     const record = this.#queuedMessages.get(messageId);
     if (record === undefined || record.view.state === "sending") return false;
     if (record.providerOwned) {
@@ -1350,15 +1766,336 @@ export class AgentBridge {
     this.#events.append({
       type: "message.queue_removed",
       sessionId: record.view.sessionId,
-      payload: { messageId, reason: "cancelled" },
+      payload: { messageId, reason },
     });
+    void this.pumpCrossSessionInbox(record.view.sessionId);
     return true;
+  }
+
+  public async editQueuedMessage(messageId: string, content: string): Promise<QueuedMessage> {
+    const normalized = content.trim();
+    if (normalized.length === 0 || normalized.length > 100_000) {
+      throw new Error("Queued instructions must contain between 1 and 100000 characters");
+    }
+    return await this.withQueueMutation(messageId, async () => {
+      const record = this.#queuedMessages.get(messageId);
+      if (record === undefined || record.view.state === "sending") {
+        throw new Error("That queued instruction is no longer available to edit");
+      }
+      if (record.providerOwned) {
+        const { providerId, providerSessionId } = this.assertSessionHost(record.view.sessionId);
+        const adapter = this.requireAdapter(providerId);
+        if (adapter.updateQueuedMessage === undefined) {
+          throw new Error(`${adapter.displayName} cannot edit this queued instruction in place`);
+        }
+        const updated = await adapter.updateQueuedMessage(providerSessionId, record.providerMessageId ?? messageId, normalized);
+        if (updated === null) {
+          this.#queuedMessages.delete(messageId);
+          this.#events.append({
+            type: "message.queue_removed",
+            providerId,
+            sessionId: record.view.sessionId,
+            payload: { messageId, reason: "provider_removed" },
+          });
+          throw new Error("That queued instruction is no longer available to edit");
+        }
+        const view = this.providerQueuedMessage(providerId, updated);
+        const previous = this.#queuedMessages.get(messageId)?.view;
+        this.#queuedMessages.set(view.id, {
+          view,
+          providerOwned: true,
+          providerMessageId: updated.id,
+          ...(updated.developerInstructions !== undefined ? { request: { requestId: `provider_queue_${updated.id}`, content: updated.content, developerInstructions: updated.developerInstructions } } : {}),
+        });
+        if (view.id !== messageId) this.#queuedMessages.delete(messageId);
+        if (previous === undefined || JSON.stringify(previous) !== JSON.stringify(view)) {
+          this.appendQueueEvent("message.queue_updated", view);
+        }
+        return view;
+      }
+      if (record.request === undefined) throw new Error("That queued instruction cannot be edited");
+      const { error: _error, ...viewWithoutError } = record.view;
+      record.view = { ...viewWithoutError, content: normalized, state: "queued" };
+      record.request = { ...record.request, content: normalized };
+      this.appendQueueEvent("message.queue_updated", record.view);
+      return record.view;
+    });
+  }
+
+  public async deliverQueuedMessage(messageId: string, mode: "send" | "steer"): Promise<boolean> {
+    return await this.withQueueMutation(messageId, async () => {
+      const record = this.#queuedMessages.get(messageId);
+      if (record === undefined || record.view.state === "sending") {
+        throw new Error("That queued instruction is no longer available");
+      }
+      const { providerId, providerSessionId } = this.assertSessionHost(record.view.sessionId);
+      const adapter = this.requireAdapter(providerId);
+      const session = this.#cache.get(record.view.sessionId);
+      if (session === undefined) throw new Error("The target task is not loaded on this bridge");
+      const active = session.state === "working" || session.state === "needs_approval" || session.state === "needs_input";
+      if (mode === "steer" && session.state !== "working") throw new Error("This task is not currently working, so there is nothing to steer");
+      if (mode === "send" && active) throw new Error("Wait for the active turn to finish, or steer this instruction instead");
+      if (mode === "steer" && adapter.steerMessage === undefined) {
+        throw new Error(`${adapter.displayName} does not support steering active work`);
+      }
+      if (record.providerOwned && (adapter.cancelQueuedMessage === undefined || adapter.restoreQueuedMessage === undefined)) {
+        throw new Error(`${adapter.displayName} cannot safely move this queued instruction`);
+      }
+
+      const providerQueueSiblings = record.providerOwned
+        ? [...this.#queuedMessages.values()]
+            .filter((candidate) => candidate.providerOwned && candidate.view.sessionId === record.view.sessionId)
+            .sort((left, right) => left.view.createdAt.localeCompare(right.view.createdAt) || left.view.id.localeCompare(right.view.id))
+        : [];
+      const providerQueueIndex = providerQueueSiblings.findIndex((candidate) => candidate === record);
+      const beforeProviderMessageId = providerQueueIndex >= 0
+        ? providerQueueSiblings[providerQueueIndex + 1]?.providerMessageId
+        : undefined;
+      const originalProviderMessage: ProviderQueuedMessage | undefined = record.providerOwned
+        ? {
+            id: record.providerMessageId ?? messageId,
+            providerSessionId,
+            content: record.view.content,
+            state: "queued",
+            createdAt: record.view.createdAt,
+            ...(record.request?.developerInstructions !== undefined ? { developerInstructions: record.request.developerInstructions } : {}),
+          }
+        : undefined;
+
+      const request: SendMessageRequest = {
+        ...(record.request ?? {}),
+        requestId: `queue_delivery_${randomUUID()}`,
+        content: record.view.content,
+        ...(record.view.modelId !== undefined ? { modelId: record.view.modelId } : {}),
+        ...(record.view.reasoningEffort !== undefined ? { reasoningEffort: record.view.reasoningEffort } : {}),
+      };
+      let providerQueueRemoved = false;
+      if (record.providerOwned) {
+        providerQueueRemoved = await adapter.cancelQueuedMessage!(providerSessionId, record.providerMessageId ?? messageId);
+        if (!providerQueueRemoved) throw new Error("That queued instruction is no longer available");
+        if (this.#queuedMessages.has(messageId)) {
+          this.#queuedMessages.delete(messageId);
+          this.#events.append({
+            type: "message.queue_removed",
+            providerId,
+            sessionId: record.view.sessionId,
+            payload: { messageId, reason: "delivering" },
+          });
+        }
+      } else {
+        record.view = { ...record.view, state: "sending" };
+        this.appendQueueEvent("message.queue_updated", record.view);
+      }
+
+      try {
+        const result = mode === "steer"
+          ? await adapter.steerMessage!(providerSessionId, request)
+          : await this.sendMessage(record.view.sessionId, request);
+        if (!result.accepted) throw new Error(result.details.join(" ") || "The harness did not accept the queued instruction");
+        if (this.#queuedMessages.has(messageId)) {
+          this.#queuedMessages.delete(messageId);
+          this.#events.append({
+            type: "message.queue_removed",
+            providerId,
+            sessionId: record.view.sessionId,
+            payload: { messageId, reason: mode === "steer" ? "steered" : "dispatched" },
+          });
+        }
+        this.invalidateMessageSnapshot(record.view.sessionId);
+        this.#cache.updateState(record.view.sessionId, "working", false);
+        return true;
+      } catch (error) {
+        if (record.providerOwned && providerQueueRemoved) {
+          try {
+            const restored = await adapter.restoreQueuedMessage!(providerSessionId, {
+              requestId: `queue_restore_${randomUUID()}`,
+              content: record.view.content,
+              workingDirectory: session.workingDirectory ?? session.project ?? process.cwd(),
+              originalMessage: originalProviderMessage!,
+              ...(beforeProviderMessageId !== undefined ? { beforeMessageId: beforeProviderMessageId } : {}),
+              ...(record.view.modelId !== undefined ? { modelId: record.view.modelId } : {}),
+              ...(record.view.reasoningEffort !== undefined ? { reasoningEffort: record.view.reasoningEffort } : {}),
+              ...(record.request?.developerInstructions !== undefined ? { developerInstructions: record.request.developerInstructions } : {}),
+            });
+            const restoredView = this.providerQueuedMessage(providerId, restored);
+            const previous = this.#queuedMessages.get(restoredView.id)?.view;
+            this.#queuedMessages.set(restoredView.id, {
+              view: restoredView,
+              providerOwned: true,
+              providerMessageId: restored.id,
+              ...(restored.developerInstructions !== undefined ? { request: { requestId: `provider_queue_${restored.id}`, content: restored.content, developerInstructions: restored.developerInstructions } } : {}),
+            });
+            if (previous === undefined) this.appendQueueEvent("message.queued", restoredView);
+            else if (JSON.stringify(previous) !== JSON.stringify(restoredView)) {
+              this.appendQueueEvent("message.queue_updated", restoredView);
+            }
+          } catch (restoreError) {
+            throw new Error(`${error instanceof Error ? error.message : String(error)} The queued instruction could not be restored: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`);
+          }
+        } else if (!record.providerOwned) {
+          record.view = {
+            ...record.view,
+            state: "failed",
+            error: error instanceof Error ? error.message : String(error),
+          };
+          this.appendQueueEvent("message.queue_updated", record.view);
+        }
+        throw error;
+      } finally {
+        void this.pumpCrossSessionInbox(record.view.sessionId);
+      }
+    });
+  }
+
+  public async moveQueuedMessageToNewTask(messageId: string, selection: QueuedTaskSelection): Promise<RemoteSession> {
+    return await this.withQueueMutation(messageId, async () => {
+      const record = this.#queuedMessages.get(messageId);
+      if (record === undefined || record.view.state === "sending") {
+        throw new Error("That queued instruction is no longer available");
+      }
+      const sourceSession = this.#cache.get(record.view.sessionId);
+      if (sourceSession === undefined || sourceSession.sessionKind === "internal") {
+        throw new Error("The queued instruction does not belong to an available task");
+      }
+      const providerId = selection.providerId.trim();
+      const modelId = selection.modelId.trim();
+      const reasoningEffort = selection.reasoningEffort?.trim();
+      if (!providerId || !modelId) throw new Error("Choose an Agent and model for the new task");
+      if (isAmbiguousQueueSelection(modelId) || (reasoningEffort !== undefined && isAmbiguousQueueSelection(reasoningEffort))) {
+        throw new Error("Choose a concrete model and reasoning level for the new task");
+      }
+      const targetAdapter = this.requireAdapter(providerId);
+      const capabilities = await targetAdapter.getCapabilities();
+      if (!capabilities.createSession || !capabilities.sendMessage || targetAdapter.listModels === undefined) {
+        throw new Error(`${targetAdapter.displayName} cannot start this as a new task`);
+      }
+      const selectedModel = (await this.listModels(providerId)).find((model) => model.id === modelId);
+      if (selectedModel === undefined) throw new Error("The selected model is no longer available");
+      const supportedEfforts = modelReasoningEfforts(selectedModel);
+      if (reasoningEffort !== undefined && !supportedEfforts.includes(reasoningEffort)) {
+        throw new Error("The selected reasoning level is not available for this model");
+      }
+      this.assertAttachmentProvider(providerId, record.request?.attachments);
+
+      const { providerId: sourceProviderId, providerSessionId } = this.assertSessionHost(record.view.sessionId);
+      const sourceAdapter = this.requireAdapter(sourceProviderId);
+      const providerQueueSiblings = record.providerOwned
+        ? [...this.#queuedMessages.values()]
+            .filter((candidate) => candidate.providerOwned && candidate.view.sessionId === record.view.sessionId)
+            .sort((left, right) => left.view.createdAt.localeCompare(right.view.createdAt) || left.view.id.localeCompare(right.view.id))
+        : [];
+      const providerQueueIndex = providerQueueSiblings.findIndex((candidate) => candidate === record);
+      const beforeProviderMessageId = providerQueueIndex >= 0
+        ? providerQueueSiblings[providerQueueIndex + 1]?.providerMessageId
+        : undefined;
+      const originalProviderMessage: ProviderQueuedMessage | undefined = record.providerOwned
+        ? {
+            id: record.providerMessageId ?? messageId,
+            providerSessionId,
+            content: record.view.content,
+            state: "queued",
+            createdAt: record.view.createdAt,
+            ...(record.request?.developerInstructions !== undefined ? { developerInstructions: record.request.developerInstructions } : {}),
+          }
+        : undefined;
+      if (record.providerOwned && (sourceAdapter.cancelQueuedMessage === undefined || sourceAdapter.restoreQueuedMessage === undefined)) {
+        throw new Error(`${sourceAdapter.displayName} cannot safely move this queued instruction`);
+      }
+
+      const previousView = record.view;
+      let providerQueueRemoved = false;
+      if (record.providerOwned) {
+        providerQueueRemoved = await sourceAdapter.cancelQueuedMessage!(providerSessionId, record.providerMessageId ?? messageId);
+        if (!providerQueueRemoved) throw new Error("That queued instruction is no longer available");
+      }
+      record.view = { ...record.view, state: "sending" };
+      this.appendQueueEvent("message.queue_updated", record.view);
+
+      try {
+        const title = record.view.content.split(/\r?\n/u).map((line) => line.trim()).find(Boolean)?.slice(0, 96) || "New task";
+        const richRequest = (record.request?.attachments?.length ?? 0) > 0 || (record.request?.workflows?.length ?? 0) > 0;
+        let session = await this.createSession(providerId, {
+          workingDirectory: sourceSession.workingDirectory ?? sourceSession.project ?? process.cwd(),
+          title,
+          modelId,
+          ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+          ...(!richRequest ? {
+            firstInstruction: record.view.content,
+            ...(record.request?.developerInstructions !== undefined
+              ? { firstInstructionDeveloperInstructions: record.request.developerInstructions }
+              : {}),
+          } : {}),
+        });
+        if (richRequest) {
+          const result = await this.sendMessage(session.id, {
+            ...(record.request ?? {}),
+            requestId: `queue_new_task_${randomUUID()}`,
+            content: record.view.content,
+            modelId,
+            ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+          });
+          if (!result.accepted) throw new Error(result.details.join(" ") || "The new task did not accept the queued instruction");
+          session = {
+            ...session,
+            title,
+            preview: record.view.content.trim().slice(0, 240),
+            state: "working",
+            modelId,
+            ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+            lastActivityAt: new Date().toISOString(),
+          };
+          this.#cache.upsert(session);
+        }
+        this.#queuedMessages.delete(messageId);
+        this.#events.append({
+          type: "message.queue_removed",
+          providerId: sourceProviderId,
+          sessionId: previousView.sessionId,
+          payload: { messageId, reason: "moved_to_new_task", targetSessionId: session.id },
+        });
+        void this.pumpCrossSessionInbox(previousView.sessionId);
+        return this.#cache.get(session.id) ?? session;
+      } catch (error) {
+        if (record.providerOwned && providerQueueRemoved) {
+          try {
+            const restored = await sourceAdapter.restoreQueuedMessage!(providerSessionId, {
+              requestId: `queue_restore_${randomUUID()}`,
+              content: previousView.content,
+              workingDirectory: sourceSession.workingDirectory ?? sourceSession.project ?? process.cwd(),
+              originalMessage: originalProviderMessage!,
+              ...(beforeProviderMessageId !== undefined ? { beforeMessageId: beforeProviderMessageId } : {}),
+              ...(previousView.modelId !== undefined ? { modelId: previousView.modelId } : {}),
+              ...(previousView.reasoningEffort !== undefined ? { reasoningEffort: previousView.reasoningEffort } : {}),
+              ...(record.request?.developerInstructions !== undefined ? { developerInstructions: record.request.developerInstructions } : {}),
+            });
+            const restoredView = this.providerQueuedMessage(sourceProviderId, restored);
+            this.#queuedMessages.delete(messageId);
+            this.#queuedMessages.set(restoredView.id, {
+              view: restoredView,
+              providerOwned: true,
+              providerMessageId: restored.id,
+              ...(restored.developerInstructions !== undefined
+                ? { request: { requestId: `provider_queue_${restored.id}`, content: restored.content, developerInstructions: restored.developerInstructions } }
+                : {}),
+            });
+            this.appendQueueEvent("message.queue_updated", restoredView);
+          } catch (restoreError) {
+            throw new Error(`${error instanceof Error ? error.message : String(error)} The queued instruction could not be restored: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`);
+          }
+        } else {
+          record.view = previousView;
+          this.appendQueueEvent("message.queue_updated", record.view);
+        }
+        throw error;
+      }
+    });
   }
 
   public async steerMessage(
     globalSessionId: string,
     input: Omit<SendMessageRequest, "attachments"> & { readonly attachmentIds?: readonly string[] },
   ): Promise<SendMessageResult> {
+    const prepared = withSimplifyResponseGuidance(input);
     const { providerId, providerSessionId } = this.assertSessionHost(globalSessionId);
     const consumption = this.#attachmentUploads.consume(input.attachmentIds ?? []);
     const attachments = consumption.attachments;
@@ -1369,11 +2106,13 @@ export class AgentBridge {
       throw error;
     }
     const request: SendMessageRequest = {
-      requestId: input.requestId,
-      content: input.content,
+      requestId: prepared.requestId,
+      content: prepared.content,
+      ...(prepared.developerInstructions !== undefined ? { developerInstructions: prepared.developerInstructions } : {}),
       ...(input.modelId !== undefined ? { modelId: input.modelId } : {}),
       ...(input.reasoningEffort !== undefined ? { reasoningEffort: input.reasoningEffort } : {}),
       ...(attachments.length > 0 ? { attachments } : {}),
+      ...(prepared.workflows?.length ? { workflows: prepared.workflows } : {}),
     };
     const session = this.#cache.get(globalSessionId);
     if (session?.state !== "working") {
@@ -1392,7 +2131,7 @@ export class AgentBridge {
       throw new Error(`${providerId} does not support steering active work`);
     }
     try {
-      const result = await adapter.steerMessage(providerSessionId, request);
+      const result = await adapter.steerMessage(providerSessionId, await this.withGlobalAgentInstructions(request));
       this.invalidateMessageSnapshot(globalSessionId);
       consumption.commit();
       return result;
@@ -1477,11 +2216,38 @@ export class AgentBridge {
   }
 
   public revokeDevice(credentialId: string): boolean {
-    return this.#pairing.revoke(credentialId);
+    const device = this.#pairing.listDevices().find((entry) => entry.credentialId === credentialId);
+    const revoked = this.#pairing.revoke(credentialId);
+    // Revoking must also disconnect. Without this the device keeps a live
+    // tunnel and simply has every action refused, which is not what the user
+    // asked for when they removed it.
+    if (revoked && device !== undefined && !this.#pairing.listDevices().some((entry) => entry.deviceId === device.deviceId)) {
+      for (const listener of this.#deviceRevokedListeners) listener(device.deviceId);
+    }
+    return revoked;
+  }
+
+  /** Device IDs whose access has been withdrawn and which must not reconnect. */
+  public revokedDeviceIds(): readonly string[] {
+    return this.#pairing.revokedDeviceIds();
+  }
+
+  public onDeviceRevoked(listener: (deviceId: string) => void): () => void {
+    this.#deviceRevokedListeners.add(listener);
+    return () => this.#deviceRevokedListeners.delete(listener);
   }
 
   public verifyDeviceAction<T extends JsonObject>(signed: SignedDeviceAction<T>): T {
     return this.#deviceVerifier.verify(signed).action;
+  }
+
+  /**
+   * Confirms a credential is one this host issued and has not revoked. The
+   * secure transport handshake needs this before it will agree a key with the
+   * device that presented it.
+   */
+  public verifyDeviceCredential(credential: SignedCredential) {
+    return this.#pairing.verifyCredential(credential);
   }
 
   public eventsSince(sequence: number): readonly AgentEvent[] {
@@ -1515,6 +2281,9 @@ export class AgentBridge {
     this.#providerConnectionErrors.clear();
     this.#queuedMessages.clear();
     this.#queuePumps.clear();
+    this.#queueMutations.clear();
+    this.#crossSessionMessages.clear();
+    this.#crossSessionPumps.clear();
     this.#delegations.clear();
     this.#visionProxies.clear();
     this.#internalSessionIds.clear();
@@ -1588,7 +2357,9 @@ export class AgentBridge {
     )) {
       if (event.type === "agent.completed") await this.maybeAutoCompact(globalSessionId);
       void this.pumpQueue(globalSessionId);
+      void this.pumpCrossSessionInbox(globalSessionId);
       void this.pumpDelegationsForSession(globalSessionId);
+      void this.releaseProviderIfIdle(this.requireAdapter(event.providerId));
     }
   }
 
@@ -1756,6 +2527,7 @@ export class AgentBridge {
       this.#subscribedProviders.add(adapter.providerId);
       this.#providerConnectionErrors.delete(adapter.providerId);
       this.#events.append({ type: "provider.connected", providerId: adapter.providerId, payload: {} });
+      await this.releaseProviderIfIdle(adapter);
     } catch (error) {
       const providerError = providerErrorFromUnknown(adapter.providerId, error);
       this.#providerConnectionErrors.set(adapter.providerId, providerError);
@@ -1771,6 +2543,23 @@ export class AgentBridge {
   private providerUnavailableError(adapter: AgentProviderAdapter, detection: ProviderDetection): ProviderAdapterError {
     const message = detection.details.map((detail) => detail.trim()).filter(Boolean).join(" ") || `${adapter.displayName} is not available on this host.`;
     return new ProviderAdapterError(adapter.providerId, "PROVIDER_UNAVAILABLE", message, true);
+  }
+
+  private async withIdleRelease<T>(adapter: AgentProviderAdapter, operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } finally {
+      await this.releaseProviderIfIdle(adapter);
+    }
+  }
+
+  private async releaseProviderIfIdle(adapter: AgentProviderAdapter): Promise<void> {
+    if (this.#disposed || adapter.releaseIdleResources === undefined) return;
+    const hasLiveSession = this.#cache.all().some((session) =>
+      session.providerId === adapter.providerId &&
+      (session.state === "working" || session.state === "needs_approval" || session.state === "needs_input"));
+    if (hasLiveSession) return;
+    await adapter.releaseIdleResources().catch(() => undefined);
   }
 
   private unavailableProviderCapabilities() {
@@ -1807,7 +2596,7 @@ export class AgentBridge {
         return;
       }
       if (this.#lastCompactionUsage.get(globalSessionId) === context.usedTokens) return;
-      await this.compactSession(globalSessionId);
+      await this.compactSession(globalSessionId, "automatic");
     } catch {
       // Context telemetry and compaction are optional provider features. A
       // failed automatic attempt must never fail an otherwise completed turn.
@@ -1840,7 +2629,12 @@ export class AgentBridge {
     }
     for (const { message, view } of views) {
       const previous = this.#queuedMessages.get(view.id)?.view;
-      this.#queuedMessages.set(view.id, { view, providerOwned: true, providerMessageId: message.id });
+      this.#queuedMessages.set(view.id, {
+        view,
+        providerOwned: true,
+        providerMessageId: message.id,
+        ...(message.developerInstructions !== undefined ? { request: { requestId: `provider_queue_${message.id}`, content: message.content, developerInstructions: message.developerInstructions } } : {}),
+      });
       if (previous === undefined) this.appendQueueEvent("message.queued", view);
       else if (JSON.stringify(previous) !== JSON.stringify(view)) this.appendQueueEvent("message.queue_updated", view);
     }
@@ -1864,7 +2658,10 @@ export class AgentBridge {
     const state = this.#cache.get(globalSessionId)?.state;
     if (state === "working" || state === "needs_approval" || state === "needs_input" || state === "disconnected" || state === "unknown") return;
     const next = [...this.#queuedMessages.values()]
-      .filter((record) => !record.providerOwned && record.view.sessionId === globalSessionId && record.view.state === "queued")
+      .filter((record) => !record.providerOwned
+        && !this.#queueMutations.has(record.view.id)
+        && record.view.sessionId === globalSessionId
+        && record.view.state === "queued")
       .sort((left, right) => left.view.createdAt.localeCompare(right.view.createdAt))[0];
     if (next === undefined) return;
     if (next.request === undefined) return;
@@ -1889,7 +2686,221 @@ export class AgentBridge {
       this.appendQueueEvent("message.queue_updated", next.view);
     } finally {
       this.#queuePumps.delete(globalSessionId);
+      void this.pumpCrossSessionInbox(globalSessionId);
     }
+  }
+
+  private async reconcileCrossSessionDeliveries(): Promise<void> {
+    const recovering = [...this.#crossSessionMessages.values()]
+      .filter((message) => message.state === "sending");
+    if (recovering.length === 0) return;
+
+    const previous = new Map(recovering.map((message) => [message.envelope.id, message]));
+    const recoveredEvents: CrossSessionMessage[] = [];
+    let changed = false;
+    for (const targetSessionId of new Set(recovering.map((message) => message.envelope.targetSessionId))) {
+      const target = this.#cache.get(targetSessionId);
+      if (target === undefined || !this.isCrossSessionTask(target)) continue;
+      try {
+        const { providerId, providerSessionId } = this.assertSessionHost(targetSessionId);
+        const messages = await this.requireAdapter(providerId).getMessages(providerSessionId);
+        for (const record of recovering.filter((message) => message.envelope.targetSessionId === targetSessionId)) {
+          const match = messages.find((message) => isCrossSessionDeliveryMessage(message, record.envelope));
+          const now = new Date().toISOString();
+          const { error: _error, ...withoutError } = record;
+          if (match === undefined) {
+            this.#crossSessionMessages.set(record.envelope.id, {
+              ...withoutError,
+              state: "pending",
+              updatedAt: now,
+            });
+          } else {
+            const deliveryRequestId = crossSessionDeliveryRequestId(record.envelope.id);
+            const delivered: CrossSessionMessage = {
+              ...withoutError,
+              state: "delivered",
+              updatedAt: now,
+              deliveredAt: now,
+              providerMessageIds: [...new Set([
+                deliveryRequestId,
+                record.envelope.id,
+                match.id,
+                match.providerMessageId,
+              ])],
+            };
+            this.#crossSessionMessages.set(record.envelope.id, delivered);
+            recoveredEvents.push(delivered);
+          }
+          changed = true;
+        }
+      } catch {
+        // Keep an unknown in-flight delivery durable until its provider can be inspected.
+      }
+    }
+    if (!changed) return;
+    try {
+      await this.persistCrossSessionMessages();
+    } catch {
+      for (const [envelopeId, record] of previous) this.#crossSessionMessages.set(envelopeId, record);
+      return;
+    }
+    for (const delivered of recoveredEvents) {
+      this.invalidateMessageSnapshot(delivered.envelope.targetSessionId);
+      this.#events.append({
+        type: "message.remote_received",
+        sessionId: delivered.envelope.targetSessionId,
+        payload: delivered as unknown as JsonObject,
+      });
+    }
+  }
+
+  private async pumpCrossSessionInbox(targetSessionId: string): Promise<void> {
+    if (this.#crossSessionPumps.has(targetSessionId) || this.#disposed) return;
+    const target = this.#cache.get(targetSessionId);
+    if (target === undefined || !this.isCrossSessionTask(target)) return;
+    if (target.state === "working" || target.state === "needs_approval" || target.state === "needs_input"
+      || target.state === "disconnected" || target.state === "unknown") return;
+    if (this.hasPendingUserQueue(targetSessionId) || this.#queuePumps.has(targetSessionId)) return;
+    const next = [...this.#crossSessionMessages.values()]
+      .filter((message) => message.envelope.targetSessionId === targetSessionId && message.state === "pending")
+      .sort((left, right) => left.envelope.createdAt.localeCompare(right.envelope.createdAt) || left.envelope.id.localeCompare(right.envelope.id))[0];
+    if (next === undefined) return;
+    this.#crossSessionPumps.add(targetSessionId);
+    const sending: CrossSessionMessage = {
+      ...next,
+      state: "sending",
+      attemptCount: next.attemptCount + 1,
+      updatedAt: new Date().toISOString(),
+    };
+    this.#crossSessionMessages.set(next.envelope.id, sending);
+    try {
+      await this.persistCrossSessionMessages();
+      // A user can enqueue while the durable state write is in flight. Recheck
+      // immediately before provider dispatch so user-authored work stays first.
+      if (this.hasPendingUserQueue(targetSessionId) || this.#queuePumps.has(targetSessionId)) {
+        this.#crossSessionMessages.set(next.envelope.id, { ...sending, state: "pending", updatedAt: new Date().toISOString() });
+        await this.persistCrossSessionMessages();
+        return;
+      }
+      const persisted = this.#crossSessionMessages.get(next.envelope.id);
+      if (persisted?.state !== "sending" || !sameCrossSessionEnvelope(persisted.envelope, next.envelope)) {
+        throw new Error("Cross-task delivery envelope no longer matches its persisted inbox record");
+      }
+      const deliveryRequestId = crossSessionDeliveryRequestId(next.envelope.id);
+      const result = await this.sendMessage(targetSessionId, {
+        requestId: deliveryRequestId,
+        content: crossSessionDispatchContent(next.envelope),
+        metadata: {
+          tethoqMessageKind: "cross_session",
+          tethoqEnvelopeVersion: 1,
+          tethoqEnvelopeId: next.envelope.id,
+          tethoqSourceSessionId: next.envelope.sourceSessionId,
+        },
+      });
+      if (!result.accepted) throw new Error(result.details.join(" ") || "The target harness did not accept the cross-task message");
+      const deliveredAt = new Date().toISOString();
+      const delivered: CrossSessionMessage = {
+        ...sending,
+        state: "delivered",
+        updatedAt: deliveredAt,
+        deliveredAt,
+        providerMessageIds: [...new Set([deliveryRequestId, next.envelope.id, ...(result.providerTurnId === undefined ? [] : [result.providerTurnId])])],
+      };
+      this.#crossSessionMessages.set(next.envelope.id, delivered);
+      this.#cache.updateState(targetSessionId, "working", false);
+      this.invalidateMessageSnapshot(targetSessionId);
+      await this.persistCrossSessionMessages();
+      this.#events.append({
+        type: "message.remote_received",
+        sessionId: targetSessionId,
+        payload: delivered as unknown as JsonObject,
+      });
+    } catch (error) {
+      const current = this.#crossSessionMessages.get(next.envelope.id);
+      if (current?.state !== "delivered") {
+        const failed: CrossSessionMessage = {
+          ...(current ?? sending),
+          state: "failed",
+          updatedAt: new Date().toISOString(),
+          error: error instanceof Error ? error.message.slice(0, 2_000) : String(error).slice(0, 2_000),
+        };
+        this.#crossSessionMessages.set(next.envelope.id, failed);
+        await this.persistCrossSessionMessages().catch(() => undefined);
+      }
+    } finally {
+      this.#crossSessionPumps.delete(targetSessionId);
+    }
+  }
+
+  private hasPendingUserQueue(sessionId: string): boolean {
+    return [...this.#queuedMessages.values()].some((record) =>
+      record.view.sessionId === sessionId && (record.view.state === "queued" || record.view.state === "sending"));
+  }
+
+  private async withQueueMutation<T>(messageId: string, operation: () => Promise<T>): Promise<T> {
+    if (this.#queueMutations.has(messageId)) throw new Error("That queued instruction is already being changed");
+    this.#queueMutations.add(messageId);
+    try {
+      return await operation();
+    } finally {
+      this.#queueMutations.delete(messageId);
+    }
+  }
+
+  private isCrossSessionTask(session: RemoteSession): boolean {
+    return !this.#internalSessionIds.has(session.id) && (session.sessionKind === undefined || session.sessionKind === "task");
+  }
+
+  private requireCrossSessionTask(sessionId: string, label: string): RemoteSession {
+    this.assertSessionHost(sessionId);
+    const session = this.#cache.get(sessionId);
+    if (session === undefined) throw new Error(`${label} task is not loaded on this bridge`);
+    if (this.#internalSessionIds.has(sessionId) || session.sessionKind === "internal") {
+      throw new Error(`${label} task is an internal helper session`);
+    }
+    if (session.sessionKind === "side_chat") throw new Error(`${label} task is a side chat`);
+    return session;
+  }
+
+  private decorateCrossSessionMessages(sessionId: string, messages: readonly RemoteMessage[]): readonly RemoteMessage[] {
+    const inbox = new Map([...this.#crossSessionMessages.values()]
+      .filter((message) => message.state === "delivered" && message.envelope.targetSessionId === sessionId)
+      .map((message) => [message.envelope.id, message]));
+    if (inbox.size === 0) return messages;
+    return messages.map((message) => {
+      if (message.role !== "user") return message;
+      const markerId = message.parts.flatMap((part) => part.type === "text" ? [crossSessionMarkerId(part.text)] : []).find((id) => id !== undefined);
+      if (markerId === undefined) return message;
+      const persisted = inbox.get(markerId);
+      if (persisted === undefined || crossSessionDispatchContent(persisted.envelope) !== message.parts.find((part) => part.type === "text")?.text) return message;
+      return {
+        ...message,
+        parts: message.parts.map((part) => part.type === "text" && part.text === crossSessionDispatchContent(persisted.envelope)
+          ? { ...part, text: persisted.envelope.content }
+          : part),
+        origin: {
+          kind: "cross_session",
+          envelopeId: persisted.envelope.id,
+          sourceSessionId: persisted.envelope.sourceSessionId,
+          sourceTitle: persisted.envelope.sourceTitle,
+        },
+      };
+    });
+  }
+
+  private pruneCrossSessionMessages(incoming: number): void {
+    const removeCount = Math.max(0, this.#crossSessionMessages.size + incoming - maxCrossSessionMessages);
+    if (removeCount === 0) return;
+    const removable = [...this.#crossSessionMessages.values()]
+      .filter((message) => message.state === "delivered" || message.state === "failed")
+      .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt) || left.envelope.id.localeCompare(right.envelope.id));
+    if (removable.length < removeCount) throw new Error("Cross-task inbox is full of pending messages");
+    for (const message of removable.slice(0, removeCount)) this.#crossSessionMessages.delete(message.envelope.id);
+  }
+
+  private async persistCrossSessionMessages(): Promise<void> {
+    await this.#onCrossSessionMessagesChange?.([...this.#crossSessionMessages.values()]
+      .sort((left, right) => left.envelope.createdAt.localeCompare(right.envelope.createdAt) || left.envelope.id.localeCompare(right.envelope.id)));
   }
 
   private requirePrimarySession(sessionId: string): RemoteSession {
@@ -2137,10 +3148,19 @@ function normalizedMetadataValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-function requiredMeshString(input: JsonObject, key: string): string {
+function requiredMeshString(input: JsonObject, key: string, maximum = 32_000): string {
   const value = input[key];
-  if (typeof value !== "string" || value.trim().length === 0) throw new Error(`${key} must be a non-empty string`);
+  if (typeof value !== "string" || value.trim().length === 0 || value.length > maximum) {
+    throw new Error(`${key} must contain between 1 and ${maximum} characters`);
+  }
   return value.trim();
+}
+
+function optionalMeshString(input: JsonObject, key: string, maximum: number): string | undefined {
+  const value = input[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || value.length > maximum) throw new Error(`${key} must contain at most ${maximum} characters`);
+  return value;
 }
 
 function optionalMeshInteger(value: unknown, fallback: number, minimum: number, maximum: number): number {
@@ -2149,6 +3169,45 @@ function optionalMeshInteger(value: unknown, fallback: number, minimum: number, 
     throw new Error(`timeout_seconds must be an integer from ${minimum} to ${maximum}`);
   }
   return value;
+}
+
+function crossSessionDeliveryRequestId(envelopeId: string): string {
+  return `cross_session_${envelopeId}`;
+}
+
+function crossSessionDispatchContent(envelope: CrossSessionMessageEnvelope): string {
+  return [
+    `[[TETHOQ_REMOTE_MESSAGE_V1:${envelope.id}]]`,
+    `This message was sent by another Tethoq task: ${envelope.sourceTitle} (${envelope.sourceSessionId}).`,
+    "Treat the text below as that task's message. Do not repeat this routing envelope in your response.",
+    "",
+    envelope.content,
+  ].join("\n");
+}
+
+function crossSessionMarkerId(content: string): string | undefined {
+  return /^\[\[TETHOQ_REMOTE_MESSAGE_V1:([a-zA-Z0-9_-]{1,128})\]\]\n/u.exec(content)?.[1];
+}
+
+function isCrossSessionDeliveryMessage(message: RemoteMessage, envelope: CrossSessionMessageEnvelope): boolean {
+  if (message.role !== "user") return false;
+  const deliveryRequestId = crossSessionDeliveryRequestId(envelope.id);
+  if (message.providerMessageId === deliveryRequestId || message.id === deliveryRequestId) return true;
+  if (message.nativeMetadata.tethoqEnvelopeId === envelope.id
+    || message.nativeMetadata.clientUserMessageId === deliveryRequestId
+    || message.nativeMetadata.requestId === deliveryRequestId) return true;
+  return message.parts.some((part) => part.type === "text" && crossSessionMarkerId(part.text) === envelope.id);
+}
+
+function sameCrossSessionEnvelope(left: CrossSessionMessageEnvelope, right: CrossSessionMessageEnvelope): boolean {
+  return left.version === right.version
+    && left.id === right.id
+    && left.requestId === right.requestId
+    && left.sourceSessionId === right.sourceSessionId
+    && left.sourceTitle === right.sourceTitle
+    && left.targetSessionId === right.targetSessionId
+    && left.content === right.content
+    && left.createdAt === right.createdAt;
 }
 
 function clearDelegationError(task: DelegationTask): DelegationTask {
@@ -2235,6 +3294,28 @@ function delegationSynthesisInstruction(
   ].join("\n");
 }
 
+function withSimplifyResponseGuidance<T extends SendMessageRequest>(request: T): T {
+  const parsed = parseSimplifyCommand(request.content);
+  const rawSettings = request.metadata?.simplify;
+  const explicit = typeof rawSettings === "object" && rawSettings !== null && !Array.isArray(rawSettings)
+    && (rawSettings.target === "previous" || rawSettings.target === "upcoming")
+      ? rawSettings.target
+      : undefined;
+  if (!parsed.active && explicit === undefined) return request;
+  const settings = normalizeSimplifySettings(request.metadata?.simplify);
+  const simplifyInstructions = simplifyDeveloperInstructions(settings, explicit ?? parsed.target);
+  const metadata = { ...(request.metadata ?? {}) };
+  delete metadata.simplify;
+  return {
+    ...request,
+    content: parsed.active ? parsed.content : request.content,
+    developerInstructions: request.developerInstructions === undefined
+      ? simplifyInstructions
+      : `${request.developerInstructions}\n\n${simplifyInstructions}`,
+    ...(Object.keys(metadata).length > 0 ? { metadata } : { metadata: undefined }),
+  };
+}
+
 function isProviderQueuedMessage(value: unknown): value is ProviderQueuedMessage {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const message = value as Partial<ProviderQueuedMessage>;
@@ -2243,4 +3324,25 @@ function isProviderQueuedMessage(value: unknown): value is ProviderQueuedMessage
     typeof message.content === "string" &&
     (message.state === "queued" || message.state === "sending" || message.state === "failed") &&
     typeof message.createdAt === "string";
+}
+
+function isAmbiguousQueueSelection(value: string): boolean {
+  return ["", "auto", "default", "cli default", "session default"].includes(value.trim().toLowerCase());
+}
+
+function modelReasoningEfforts(model: RemoteModel): readonly string[] {
+  const metadata = model.nativeMetadata;
+  const source = metadata.supportedReasoningEfforts ?? metadata.reasoningEfforts ?? metadata.supported_reasoning_efforts;
+  if (!Array.isArray(source)) return [];
+  return [...new Set(source.flatMap((entry) => {
+    if (typeof entry === "string") return isAmbiguousQueueSelection(entry) ? [] : [entry.trim()];
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return [];
+    const record = entry as JsonObject;
+    const value = typeof record.reasoningEffort === "string"
+      ? record.reasoningEffort
+      : typeof record.id === "string"
+        ? record.id
+        : undefined;
+    return value === undefined || isAmbiguousQueueSelection(value) ? [] : [value.trim()];
+  }))];
 }

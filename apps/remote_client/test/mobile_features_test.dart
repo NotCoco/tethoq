@@ -162,8 +162,8 @@ void main() {
     ));
     await tester.pump();
 
-    final bubble =
-        find.byKey(const ValueKey<String>('message-bubble-copy-assistant'));
+    final bubble = find.byKey(
+        const ValueKey<String>('message-bubble-copy-assistant-visible-1'));
     await tester.longPress(bubble);
     await tester.pumpAndSettle();
     final copyAction =
@@ -205,6 +205,10 @@ void main() {
     ));
     await tester.pump();
 
+    final collapsedContext = find.byKey(const Key('session-context-button'));
+    expect(
+        find.descendant(of: collapsedContext, matching: find.text('70k / 80k')),
+        findsOneWidget);
     await tester.tap(find.byKey(const Key('session-context-button')));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 350));
@@ -216,11 +220,11 @@ void main() {
         find.text(
             'Compacts this task automatically when its context reaches this point.'),
         findsOneWidget);
-    expect(find.text('In use'), findsNothing);
-    await tester.tap(find.text('Usage details'));
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 350));
-    expect(find.text('In use'), findsOneWidget);
+    expect(find.text('Usage details'), findsOneWidget);
+    expect(find.text('Context used'), findsOneWidget);
+    expect(find.text('Automatic compaction'), findsOneWidget);
+    expect(find.text('Model capacity'), findsOneWidget);
+    expect(find.text('Session cost'), findsOneWidget);
 
     var slider = tester.widget<Slider>(
         find.byKey(const Key('session-context-threshold-slider')));
@@ -249,6 +253,190 @@ void main() {
     expect(find.text('Automatic compaction updated'), findsOneWidget);
   });
 
+  testWidgets('active compaction appears once as a quiet temporary status',
+      (tester) async {
+    final store = _FeatureStore()
+      ..connectionState = BridgeConnectionState.online;
+    final source = _session('compacting', providerId: 'future-harness');
+    final compacting = _contextState(source.id,
+        isCompacting: true, compactionKind: 'automatic');
+    store
+      ..sessions.add(source)
+      ..providers.add(_provider('future-harness'))
+      ..contextFixture = compacting
+      ..contextBySession[source.id] = compacting;
+    addTearDown(store.dispose);
+
+    await tester.pumpWidget(StoreScope(
+      store: store,
+      child: MaterialApp(home: SessionScreen(sessionId: source.id)),
+    ));
+    await tester.pump();
+
+    expect(find.byKey(const Key('compaction-progress-row')), findsOneWidget);
+    expect(find.text('Automatically compacting context…'), findsOneWidget);
+
+    final finished = _contextState(source.id);
+    store
+      ..contextFixture = finished
+      ..contextBySession[source.id] = finished
+      ..notifyListeners();
+    await tester.pump();
+
+    expect(find.byKey(const Key('compaction-progress-row')), findsNothing);
+    expect(find.text('Automatically compacting context…'), findsNothing);
+  });
+
+  testWidgets('user turn boundaries have the same expanded spacing',
+      (tester) async {
+    tester.view.physicalSize = const Size(430, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final store = _FeatureStore()
+      ..connectionState = BridgeConnectionState.online;
+    final source = _session('spacing', providerId: 'future-harness');
+    store
+      ..sessions.add(source)
+      ..providers.add(_provider('future-harness'))
+      ..messages[source.id] = <RemoteMessage>[
+        RemoteMessage(
+          id: 'spacing-before',
+          sessionId: source.id,
+          role: 'assistant',
+          createdAt: DateTime.utc(2026, 8, 15, 10),
+          status: 'completed',
+          parts: const <ContentPart>[
+            ContentPart(type: 'text', data: <String, Object?>{
+              'text': 'Assistant response before the user turn.',
+            }),
+          ],
+        ),
+        RemoteMessage(
+          id: 'spacing-user',
+          sessionId: source.id,
+          role: 'user',
+          createdAt: DateTime.utc(2026, 8, 15, 10, 1),
+          status: 'completed',
+          parts: const <ContentPart>[
+            ContentPart(type: 'text', data: <String, Object?>{
+              'text': 'A distinct user instruction.',
+            }),
+          ],
+        ),
+        RemoteMessage(
+          id: 'spacing-reasoning',
+          sessionId: source.id,
+          role: 'assistant',
+          createdAt: DateTime.utc(2026, 8, 15, 10, 2),
+          status: 'completed',
+          parts: const <ContentPart>[
+            ContentPart(type: 'reasoning', data: <String, Object?>{
+              'text': 'Inspecting the requested spacing.',
+            }),
+          ],
+        ),
+      ];
+    addTearDown(store.dispose);
+
+    await tester.pumpWidget(StoreScope(
+      store: store,
+      child: MaterialApp(home: SessionScreen(sessionId: source.id)),
+    ));
+    await tester.pump();
+
+    final beforeUser = tester.widget<Padding>(
+        find.byKey(const ValueKey<String>('turn-boundary-spacing-user')));
+    final afterUser = tester.widget<Padding>(find.byKey(const ValueKey<String>(
+        'turn-boundary-spacing-reasoning-part-0-thinking-0')));
+    expect(beforeUser.padding, const EdgeInsets.only(top: 21));
+    expect(afterUser.padding, beforeUser.padding);
+  });
+
+  testWidgets('automatic effort resolves to the model concrete default',
+      (tester) async {
+    final store = _FeatureStore()
+      ..connectionState = BridgeConnectionState.online;
+    final source = _session(
+      'resolved-effort',
+      providerId: 'codex',
+      modelId: 'gpt-5.6-sol',
+      reasoningEffort: 'auto',
+    );
+    store
+      ..sessions.add(source)
+      ..providers.add(_provider('codex', modelEnumeration: true))
+      ..modelsByProvider['codex'] = <RemoteModel>[
+        RemoteModel(
+          id: 'gpt-5.6-sol',
+          providerId: 'codex',
+          displayName: 'GPT-5.6 Sol',
+          isDefault: true,
+          nativeMetadata: const <String, Object?>{
+            'supportedReasoningEfforts': <Object?>[
+              <String, Object?>{'reasoningEffort': 'auto'},
+              <String, Object?>{'reasoningEffort': 'low'},
+              <String, Object?>{'reasoningEffort': 'high'},
+            ],
+            'defaultReasoningEffort': 'low',
+          },
+        ),
+      ];
+    addTearDown(store.dispose);
+
+    await tester.pumpWidget(StoreScope(
+      store: store,
+      child: MaterialApp(home: SessionScreen(sessionId: source.id)),
+    ));
+    await tester.pump();
+
+    expect(find.text('Light'), findsOneWidget);
+    expect(find.text('Auto'), findsNothing);
+    expect(find.text('Effort unknown'), findsNothing);
+  });
+
+  testWidgets('reasoning control stays hidden when no effort is truthful',
+      (tester) async {
+    final store = _FeatureStore()
+      ..connectionState = BridgeConnectionState.online;
+    final source = _session(
+      'unknown-effort',
+      providerId: 'codex',
+      modelId: 'ambiguous-model',
+      reasoningEffort: 'auto',
+    );
+    store
+      ..sessions.add(source)
+      ..providers.add(_provider('codex', modelEnumeration: true))
+      ..modelsByProvider['codex'] = <RemoteModel>[
+        RemoteModel(
+          id: 'ambiguous-model',
+          providerId: 'codex',
+          displayName: 'Ambiguous model',
+          isDefault: true,
+          nativeMetadata: const <String, Object?>{
+            'supportedReasoningEfforts': <Object?>[
+              <String, Object?>{'reasoningEffort': 'auto'},
+              <String, Object?>{'reasoningEffort': 'low'},
+              <String, Object?>{'reasoningEffort': 'high'},
+            ],
+            'defaultReasoningEffort': 'auto',
+          },
+        ),
+      ];
+    addTearDown(store.dispose);
+
+    await tester.pumpWidget(StoreScope(
+      store: store,
+      child: MaterialApp(home: SessionScreen(sessionId: source.id)),
+    ));
+    await tester.pump();
+
+    expect(find.byKey(const Key('reasoning-control')), findsNothing);
+    expect(find.text('Auto'), findsNothing);
+    expect(find.text('Effort unknown'), findsNothing);
+  });
+
   testWidgets('collapsed context control does not show a dash without usage',
       (tester) async {
     final store = _FeatureStore()
@@ -271,6 +459,194 @@ void main() {
     expect(control, findsOneWidget);
     expect(
         find.descendant(of: control, matching: find.text('—')), findsNothing);
+  });
+
+  testWidgets(
+      'task drafts keep text and local attachments when switching away and back',
+      (tester) async {
+    tester.view.physicalSize = const Size(430, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final store = _FeatureStore()
+      ..connectionState = BridgeConnectionState.online;
+    final first = _session('draft-one', providerId: 'codex');
+    final second = _session('draft-two', providerId: 'codex');
+    const attachment = RemoteAttachment(
+      name: 'phone-shot.png',
+      mimeType: 'image/png',
+      dataBase64:
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      byteLength: 68,
+    );
+    store
+      ..sessions.addAll(<RemoteSession>[first, second])
+      ..providers.add(_provider('codex'))
+      ..modelsByProvider['codex'] = <RemoteModel>[
+        _model('codex', 'test-model', 'Test model', isDefault: true),
+      ];
+    addTearDown(store.dispose);
+
+    Widget task(String sessionId) => StoreScope(
+          store: store,
+          child: MaterialApp(
+            home: SessionScreen(
+              key: ValueKey<String>('screen-$sessionId'),
+              sessionId: sessionId,
+              imageAttachmentPicker: () async => attachment,
+              dictationRecorder: _NoopRecorder(),
+            ),
+          ),
+        );
+
+    await tester.pumpWidget(task(first.id));
+    await tester.pump();
+    await tester.enterText(find.byKey(const Key('session-composer')),
+        'Keep this unsent instruction.');
+    await tester.tap(find.byKey(const Key('add-attachment')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Photo or image'));
+    await tester.pumpAndSettle();
+
+    expect(store.drafts[first.id], 'Keep this unsent instruction.');
+    expect(store.draftAttachmentsFor(first.id), hasLength(1));
+
+    await tester.pumpWidget(task(second.id));
+    await tester.pump();
+    expect(find.text('Continue this task…'), findsOneWidget);
+    await tester.enterText(
+        find.byKey(const Key('session-composer')), 'A separate draft.');
+
+    await tester.pumpWidget(task(first.id));
+    await tester.pump();
+    final composer =
+        tester.widget<TextField>(find.byKey(const Key('session-composer')));
+    expect(composer.controller?.text, 'Keep this unsent instruction.');
+    expect(find.byKey(const ValueKey<String>('pending-image-phone-shot.png')),
+        findsOneWidget);
+    expect(store.drafts[second.id], 'A separate draft.');
+    expect(store.draftAttachmentsFor(first.id), hasLength(1));
+    expect(
+        tester.getSize(find.byKey(const Key('session-composer-shell'))).height,
+        lessThanOrEqualTo(360));
+  });
+
+  testWidgets(
+      'simplify chip keeps settings, text, and attachments with the task draft',
+      (tester) async {
+    tester.view.physicalSize = const Size(430, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final store = _FeatureStore()
+      ..connectionState = BridgeConnectionState.online;
+    final first = _session('simplify-one', providerId: 'codex');
+    final second = _session('simplify-two', providerId: 'codex');
+    const attachment = RemoteAttachment(
+      name: 'diagram.png',
+      mimeType: 'image/png',
+      dataBase64:
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      byteLength: 68,
+    );
+    store
+      ..sessions.addAll(<RemoteSession>[first, second])
+      ..providers.add(_provider('codex'))
+      ..modelsByProvider['codex'] = <RemoteModel>[
+        _model('codex', 'test-model', 'Test model', isDefault: true),
+      ];
+    addTearDown(store.dispose);
+
+    Widget task(String sessionId) => StoreScope(
+          store: store,
+          child: MaterialApp(
+            home: SessionScreen(
+              key: ValueKey<String>('simplify-screen-$sessionId'),
+              sessionId: sessionId,
+              imageAttachmentPicker: () async => attachment,
+              dictationRecorder: _NoopRecorder(),
+            ),
+          ),
+        );
+
+    await tester.pumpWidget(task(first.id));
+    await tester.pump();
+    await tester.enterText(find.byKey(const Key('session-composer')), '/sim');
+    await tester.pump();
+    expect(
+        find.byKey(const Key('simplify-command-suggestion')), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('simplify-command-suggestion')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('simplify-composer-chip')), findsOneWidget);
+    expect(
+        tester
+            .widget<TextField>(find.byKey(const Key('session-composer')))
+            .controller
+            ?.text,
+        '/simplify ');
+
+    await tester.tap(find.byKey(const Key('simplify-composer-chip')));
+    await tester.pumpAndSettle();
+    expect(find.text('Simplify response'), findsOneWidget);
+    expect(find.textContaining('shortens the previous answer'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('simplify-preset-200')));
+    await tester.enterText(
+        find.byKey(const Key('simplify-guidance')), 'Keep the example.');
+    await tester
+        .ensureVisible(find.byKey(const Key('apply-simplify-settings')));
+    await tester.tap(find.byKey(const Key('apply-simplify-settings')));
+    await tester.pumpAndSettle();
+    expect(find.text('Simplify · 200 words'), findsOneWidget);
+
+    await tester.enterText(find.byKey(const Key('session-composer')),
+        '/simplify Explain this result.');
+    await tester.tap(find.byKey(const Key('add-attachment')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Photo or image'));
+    await tester.pumpAndSettle();
+    expect(store.simplifySettingsFor(first.id)?.maxWords, 200);
+    expect(store.simplifySettingsFor(first.id)?.guidance, 'Keep the example.');
+    expect(store.draftAttachmentsFor(first.id), hasLength(1));
+
+    await tester.pumpWidget(task(second.id));
+    await tester.pump();
+    await tester.enterText(
+        find.byKey(const Key('session-composer')), 'A different draft.');
+    await tester.pumpWidget(task(first.id));
+    await tester.pump();
+
+    expect(find.text('Simplify · 200 words'), findsOneWidget);
+    expect(
+        tester
+            .widget<TextField>(find.byKey(const Key('session-composer')))
+            .controller
+            ?.text,
+        '/simplify Explain this result.');
+    expect(find.byKey(const ValueKey<String>('pending-image-diagram.png')),
+        findsOneWidget);
+  });
+
+  testWidgets('new task composer uses a task-aware placeholder',
+      (tester) async {
+    final store = _FeatureStore()
+      ..connectionState = BridgeConnectionState.online
+      ..providers.add(_provider('codex'));
+    final prepared = store.prepareSession('codex');
+    addTearDown(store.dispose);
+
+    await tester.pumpWidget(StoreScope(
+      store: store,
+      child: MaterialApp(
+        home: SessionScreen(
+          sessionId: prepared.id,
+          dictationRecorder: _NoopRecorder(),
+        ),
+      ),
+    ));
+    await tester.pump();
+
+    expect(find.text('Describe a task…'), findsOneWidget);
   });
 
   testWidgets('model picker is large, searchable, grouped, and shows recents',
@@ -560,7 +936,8 @@ void main() {
 
     expect(find.text('Reasoning'), findsOneWidget);
     expect(find.textContaining('Inspecting the project'), findsNothing);
-    final reasoningToggle = find.byKey(const Key('reasoning-activity-toggle'));
+    final reasoningToggle =
+        find.byKey(const Key('reasoning-toggle-activity-tool-event'));
     await tester.ensureVisible(reasoningToggle);
     await tester.pump(const Duration(milliseconds: 100));
     tester.widget<InkWell>(reasoningToggle).onTap!();
@@ -571,14 +948,21 @@ void main() {
           matching: find.byIcon(Icons.keyboard_arrow_up_rounded),
         ),
         findsOneWidget);
-    expect(find.byKey(const ValueKey<String>('activity-disclosure-tool-event')),
-        findsOneWidget);
-    expect(find.text('Read'), findsOneWidget);
+    expect(find.textContaining('Read'), findsOneWidget);
     expect(find.textContaining('Inspecting the project'), findsNothing);
+    final toolBulkToggle = find.byKey(const Key('expand-reasoning-tools'));
+    expect(tester.getSize(toolBulkToggle).height, greaterThanOrEqualTo(44));
+    expect(
+        tester
+            .widget<TextButton>(
+                find.byKey(const Key('expand-reasoning-thinking')))
+            .onPressed,
+        isNull);
+    tester.widget<TextButton>(toolBulkToggle).onPressed!();
+    await tester.pump(const Duration(milliseconds: 200));
     final readDisclosure =
         find.byKey(const ValueKey<String>('activity-disclosure-tool-event'));
-    tester.widget<InkWell>(readDisclosure).onTap!();
-    await tester.pump(const Duration(milliseconds: 200));
+    expect(readDisclosure, findsOneWidget);
     expect(find.textContaining('Inspecting the project'), findsOneWidget);
     expect(find.byKey(const Key('activity-collapse-top')), findsOneWidget);
     expect(find.byKey(const Key('activity-collapse-bottom')), findsOneWidget);
@@ -586,10 +970,222 @@ void main() {
     expect(find.text('tool started'), findsNothing);
     expect(find.text('Provider request details'), findsNothing);
     expect(find.text('Answers JSON'), findsNothing);
+    tester.widget<InkWell>(readDisclosure).onTap!();
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(find.textContaining('Inspecting the project'), findsNothing);
+    tester.widget<InkWell>(reasoningToggle).onTap!();
+    await tester.pump(const Duration(milliseconds: 200));
+    await tester.drag(find.byType(ListView), const Offset(0, -320));
+    await tester.pump();
     expect(find.text('Choose the pace for this task.'), findsOneWidget);
     await tester.tap(find.text('Careful'));
     await tester.pump();
     expect(store.lastInputAnswers, <String, Object?>{'pace': 'Careful'});
+  });
+
+  testWidgets(
+      'mixed assistant parts form chronological reasoning spans without raw trace leakage',
+      (tester) async {
+    tester.view.physicalSize = const Size(430, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final store = _FeatureStore();
+    final source = _session('mixed-reasoning', providerId: 'future-harness');
+    store
+      ..sessions.add(source)
+      ..providers.add(_provider('future-harness'))
+      ..messages[source.id] = <RemoteMessage>[
+        RemoteMessage(
+          id: 'mixed',
+          sessionId: source.id,
+          role: 'assistant',
+          createdAt: DateTime.utc(2026, 8, 15, 10),
+          status: 'completed',
+          parts: const <ContentPart>[
+            ContentPart(type: 'reasoning', data: <String, Object?>{
+              'text':
+                  'First private thought with verbose implementation notes.',
+            }),
+            ContentPart(type: 'text', data: <String, Object?>{
+              'phase': 'commentary',
+              'text': 'Visible progress update.',
+            }),
+            ContentPart(type: 'tool', data: <String, Object?>{
+              'name': 'read_file',
+              'text': 'raw tool body one',
+            }),
+            ContentPart(type: 'file_change', data: <String, Object?>{
+              'path': 'lib/example.dart',
+              'diff': 'raw tool body two',
+            }),
+            ContentPart(type: 'reasoning', data: <String, Object?>{
+              'summary': 'Checked the resulting state',
+              'text': '''Second private thought with verbose state details.
+Detail 02
+Detail 03
+Detail 04
+Detail 05
+Detail 06
+Detail 07
+Detail 08
+Detail 09
+Detail 10
+Detail 11
+Detail 12
+Detail 13
+Detail 14
+Detail 15
+Detail 16''',
+            }),
+            ContentPart(type: 'text', data: <String, Object?>{
+              'text': 'Final visible answer.',
+            }),
+          ],
+        ),
+      ];
+    addTearDown(store.dispose);
+
+    await tester.pumpWidget(StoreScope(
+      store: store,
+      child: MaterialApp(home: SessionScreen(sessionId: source.id)),
+    ));
+    await tester.pump();
+
+    expect(find.text('Reasoning'), findsNWidgets(2));
+    expect(find.text('Visible progress update.'), findsOneWidget);
+    expect(find.text('Final visible answer.'), findsOneWidget);
+    expect(find.textContaining('First private thought'), findsNothing);
+    expect(find.textContaining('Second private thought'), findsNothing);
+    expect(find.textContaining('raw tool body'), findsNothing);
+
+    final secondReasoning =
+        find.byKey(const Key('reasoning-toggle-mixed-part-2-toolCall-0'));
+    await tester.ensureVisible(secondReasoning);
+    tester.widget<InkWell>(secondReasoning).onTap!();
+    await tester.pump(const Duration(milliseconds: 200));
+
+    expect(find.text('read file + 1 more'), findsOneWidget);
+    expect(find.text('Checked the resulting state'), findsOneWidget);
+    expect(find.textContaining('Second private thought'), findsNothing);
+    expect(find.textContaining('raw tool body'), findsNothing);
+
+    final expandThinking = find.byKey(const Key('expand-reasoning-thinking'));
+    tester.widget<TextButton>(expandThinking).onPressed!();
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(find.textContaining('Second private thought'), findsOneWidget);
+    expect(
+        find.byKey(
+            const Key('reasoning-thinking-scroll-mixed-part-4-thinking-0')),
+        findsOneWidget);
+    expect(find.textContaining('raw tool body'), findsNothing);
+
+    final expandTools = find.byKey(const Key('expand-reasoning-tools'));
+    tester.widget<TextButton>(expandTools).onPressed!();
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(find.textContaining('raw tool body one'), findsOneWidget);
+    expect(find.textContaining('raw tool body two'), findsOneWidget);
+    expect(
+        tester.getTopLeft(find.text('read file + 1 more')).dy,
+        lessThan(
+            tester.getTopLeft(find.text('Checked the resulting state')).dy));
+  });
+
+  testWidgets(
+      'a working task shows one live reasoning state before provider detail arrives',
+      (tester) async {
+    final store = _FeatureStore();
+    final source = _session(
+      'waiting-for-reasoning',
+      providerId: 'future-harness',
+      state: 'working',
+    );
+    store
+      ..sessions.add(source)
+      ..providers.add(_provider('future-harness'));
+    addTearDown(store.dispose);
+
+    await tester.pumpWidget(StoreScope(
+      store: store,
+      child: MaterialApp(home: SessionScreen(sessionId: source.id)),
+    ));
+    await tester.pump();
+
+    expect(find.text('Reasoning'), findsOneWidget);
+    final toggle = find.byKey(
+        const Key('reasoning-toggle-tethoq-live-reasoning'));
+    tester.widget<InkWell>(toggle).onTap!();
+    await tester.pump();
+    expect(find.text('Working…'), findsOneWidget);
+
+    store.sessions[0] = source.copyWith(state: 'completed');
+    store.notifyListeners();
+    await tester.pump();
+    expect(find.byKey(
+        const Key('reasoning-toggle-tethoq-live-reasoning')), findsNothing);
+  });
+
+  testWidgets('expanded reasoning display opens thinking but not tool bodies',
+      (tester) async {
+    final store = _FeatureStore()..reasoningDisplayMode = 'expanded';
+    final source = _session('expanded-reasoning', providerId: 'future-harness');
+    store
+      ..sessions.add(source)
+      ..providers.add(_provider('future-harness'))
+      ..messages[source.id] = <RemoteMessage>[
+        RemoteMessage(
+          id: 'expanded-message',
+          sessionId: source.id,
+          role: 'assistant',
+          createdAt: DateTime.utc(2026, 8, 15, 11),
+          status: 'completed',
+          parts: const <ContentPart>[
+            ContentPart(type: 'reasoning', data: <String, Object?>{
+              'summary': 'Checked the approach',
+              'text': 'Expanded thinking body.',
+            }),
+            ContentPart(type: 'tool', data: <String, Object?>{
+              'name': 'read_file',
+              'text': 'Hidden tool body.',
+            }),
+          ],
+        ),
+      ];
+    addTearDown(store.dispose);
+
+    await tester.pumpWidget(StoreScope(
+      store: store,
+      child: MaterialApp(home: SessionScreen(sessionId: source.id)),
+    ));
+    await tester.pump();
+    expect(find.text('Expanded thinking body.'), findsNothing);
+    final toggle = find.byKey(
+        const Key('reasoning-toggle-expanded-message-part-0-thinking-0'));
+    tester.widget<InkWell>(toggle).onTap!();
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(find.text('Expanded thinking body.'), findsOneWidget);
+    expect(find.text('Hidden tool body.'), findsNothing);
+  });
+
+  testWidgets('settings labels reasoning display separately from model effort',
+      (tester) async {
+    final store = _FeatureStore();
+    addTearDown(store.dispose);
+    await tester.pumpWidget(StoreScope(
+      store: store,
+      child: const MaterialApp(home: HostsScreen()),
+    ));
+    await tester.pump();
+
+    expect(find.text('Reasoning display'), findsOneWidget);
+    expect(find.text('Only changes what opens here, not model effort.'),
+        findsOneWidget);
+    final picker = tester.widget<DropdownButton<String>>(
+        find.byKey(const Key('reasoning-display-mode')));
+    expect(picker.value, 'compact');
+    picker.onChanged!('expanded');
+    await tester.pump();
+    expect(store.lastReasoningDisplayMode, 'expanded');
   });
 }
 
@@ -597,11 +1193,19 @@ class _FeatureStore extends RemoteAppStore {
   String? lastHandoffPrompt;
   String? lastBranchSessionId;
   String? lastWalletEndpointId;
+  String? lastReasoningDisplayMode;
   Map<String, Object?>? lastInputAnswers;
   SessionContextState? contextFixture;
   int thresholdSetCalls = 0;
   int? lastThresholdTokens;
   bool? lastCompactNow;
+
+  @override
+  Future<void> setReasoningDisplayMode(String mode) async {
+    reasoningDisplayMode = mode;
+    lastReasoningDisplayMode = mode;
+    notifyListeners();
+  }
 
   @override
   Future<void> respondToUserInput(
@@ -703,6 +1307,7 @@ class _FeatureStore extends RemoteAppStore {
       supportsManualCompaction: current.supportsManualCompaction,
       supportsThreshold: current.supportsThreshold,
       isCompacting: current.isCompacting,
+      compactionKind: current.compactionKind,
       updatedAt: current.updatedAt,
       usage: current.usage,
     );
@@ -775,6 +1380,8 @@ RemoteSession _session(
   String id, {
   required String providerId,
   String? modelId,
+  String? reasoningEffort,
+  String? variantId,
   SessionRelationship? relationship,
   String state = 'idle',
 }) =>
@@ -789,10 +1396,14 @@ RemoteSession _session(
       needsApproval: false,
       stale: false,
       modelId: modelId,
+      reasoningEffort: reasoningEffort,
+      variantId: variantId,
       relationship: relationship,
     );
 
-SessionContextState _contextState(String sessionId) => SessionContextState(
+SessionContextState _contextState(String sessionId,
+        {bool isCompacting = false, String? compactionKind}) =>
+    SessionContextState(
       sessionId: sessionId,
       modelId: 'test-model',
       usedTokens: 70000,
@@ -802,7 +1413,8 @@ SessionContextState _contextState(String sessionId) => SessionContextState(
       minimumThresholdTokens: 20000,
       supportsManualCompaction: true,
       supportsThreshold: true,
-      isCompacting: false,
+      isCompacting: isCompacting,
+      compactionKind: compactionKind,
       updatedAt: DateTime.utc(2026, 8, 14),
       usage: const SessionUsageTotals(
         inputTokens: 60000,

@@ -250,8 +250,10 @@ standalone Bridge changes Codex/OpenCode tool configuration only when
 OpenCode tool module and Pi extension so browser/visual/mesh tools work without
 manual setup. ACP providers receive the same tools in each ACP session, and
 OMP receives them through its host-tool RPC command. These Tethoq-owned files
-do not contain provider credentials or artwork. Codex rollout/Desktop queue
-observation and OpenCode SQLite activity observation require the separate
+do not contain provider credentials or artwork. The installed Desktop app reads
+Codex rollout/activity and Desktop queue state plus OpenCode SQLite activity so
+its one visible task can stay current. The standalone Bridge keeps those
+undocumented local-state readers behind the separate
 `TETHOQ_ENABLE_CODEX_LOCAL_STATE=1` and
 `TETHOQ_ENABLE_OPENCODE_LOCAL_STATE=1` opt-ins. Legacy `UAR_*` setting names
 remain accepted as fallbacks, but new configuration should use `TETHOQ_*`.

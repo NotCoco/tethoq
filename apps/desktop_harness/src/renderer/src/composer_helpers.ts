@@ -14,6 +14,11 @@ export interface TranscriptionSource {
   readonly label: string;
   readonly status: "ready" | "needs_credential";
   readonly setupEnvironmentVariable: string;
+  readonly credential?: {
+    readonly kind: "api_key";
+    readonly label: string;
+    readonly setupUrl: string;
+  };
   readonly capabilities: {
     readonly batch: boolean;
     readonly maxAudioBytes: number;
@@ -21,6 +26,34 @@ export interface TranscriptionSource {
 }
 
 export const maximumMessageAttachmentBytes = 50 * 1024 * 1024;
+
+export interface ComposerSlashCommand {
+  readonly id: string;
+  readonly command: string;
+  readonly description: string;
+}
+
+export const composerSlashCommands: readonly ComposerSlashCommand[] = [
+  {
+    id: "simplify",
+    command: "/simplify",
+    description: "Shorten the previous or upcoming answer",
+  },
+];
+
+export function slashCommandSuggestions(
+  value: string,
+  commands: readonly ComposerSlashCommand[] = composerSlashCommands,
+): readonly ComposerSlashCommand[] | null {
+  const match = /^\/([a-z0-9_-]*)$/iu.exec(value);
+  if (!match) return null;
+  const query = match[1]?.toLowerCase() ?? "";
+  return commands.filter((item) => item.command.slice(1).toLowerCase().startsWith(query));
+}
+
+export function insertedSlashCommand(command: ComposerSlashCommand): string {
+  return `${command.command} `;
+}
 
 export function appendAttachmentsWithinLimits<T extends { readonly path: string; readonly byteLength: number }>(
   current: readonly T[],
@@ -55,6 +88,42 @@ export function resolveComposerModelId(
   sessionModel: string,
 ): string {
   return models.find((model) => model.id === sessionModel || model.name === sessionModel)?.id ?? "default";
+}
+
+const ambiguousSelectionValues = new Set(["", "auto", "default", "cli default", "session default"]);
+
+export function isAmbiguousSelectionValue(value: string | null | undefined): boolean {
+  return ambiguousSelectionValues.has(value?.trim().toLowerCase() ?? "");
+}
+
+export interface ConcreteModelSelection {
+  readonly modelId: string;
+  readonly reasoningEffort?: string;
+}
+
+export function resolveConcreteModelSelection(
+  models: readonly { readonly id: string; readonly name: string; readonly isDefault?: boolean; readonly efforts: readonly string[]; readonly defaultEffort?: string }[],
+  current: { readonly modelId?: string; readonly reasoningEffort?: string } = {},
+  preferred?: { readonly modelId: string; readonly reasoningEffort?: string },
+): ConcreteModelSelection | null {
+  const concreteModel = !isAmbiguousSelectionValue(current.modelId)
+    ? models.find((model) => model.id === current.modelId || model.name === current.modelId)
+    : undefined;
+  const preferredModel = preferred && !isAmbiguousSelectionValue(preferred.modelId)
+    ? models.find((model) => model.id === preferred.modelId || model.name === preferred.modelId)
+    : undefined;
+  const model = concreteModel ?? preferredModel ?? models.find((item) => item.isDefault) ?? models[0];
+  if (!model) return null;
+  const supportedEfforts = model.efforts.filter((effort) => !isAmbiguousSelectionValue(effort));
+  const supported = (value: string | undefined): string | undefined => {
+    const concrete = !isAmbiguousSelectionValue(value) ? value?.trim() : undefined;
+    return concrete && supportedEfforts.includes(concrete) ? concrete : undefined;
+  };
+  const currentEffort = supported(current.reasoningEffort);
+  const preferredEffort = preferredModel?.id === model.id ? supported(preferred?.reasoningEffort) : undefined;
+  const nativeDefault = supported(model.defaultEffort);
+  const reasoningEffort = currentEffort ?? preferredEffort ?? nativeDefault ?? supportedEfforts[0];
+  return { modelId: model.id, ...(reasoningEffort ? { reasoningEffort } : {}) };
 }
 
 export async function uploadAttachments(

@@ -48,7 +48,13 @@ simultaneous adapter owners.
 
 `services/relay` accepts outbound host and device WebSockets. A room is keyed by `hostId` and a high-entropy token. The relay routes device payloads to the host and host payloads to the addressed device, enforces heartbeat/size/rate limits, and notifies devices when a host tunnel disappears.
 
-The relay is not an approval authority. Host-side verification still requires a valid host-signed device credential, an unexpired Ed25519 action signature, and a fresh action ID. Payloads are not application-layer encrypted; use TLS for confidentiality.
+The relay is not an approval authority. Host-side verification still requires a valid host-signed device credential, an unexpired Ed25519 action signature, and a fresh action ID.
+
+Both roles authenticate at attachment. The room token is shared with every paired device, so it is a routing hint rather than a credential: a host signs with its Ed25519 identity and the relay pins that key for the room, and a device presents its host-signed credential and signs with the key inside it. The relay therefore learns the device ID the host issued rather than the one the client claimed, which stops a paired phone claiming the host role or a sibling's identity.
+
+Revocation closes connections rather than only refusing actions. The host names revoked devices when it attaches and whenever a revocation happens; the relay drops any live tunnel for them and refuses their reattachment even though the room token is shared. The relay stores nothing durably, so the host re-publishes that list on every attach.
+
+Payloads are encrypted end to end between the host and the paired device, so a relay operator routes ciphertext it cannot read. Each connection agrees a fresh key by signed ephemeral X25519 exchange: the host signs its ephemeral key with the host identity, the device signs its own with the key inside its host-signed credential, and both signatures cover the full transcript so a substituted key cannot go unnoticed. Keys are derived per direction with HKDF-SHA256 and used with AES-256-GCM under a monotonic frame counter, which also rejects a replayed or reordered frame. Because the keys are ephemeral, recorded traffic stays unreadable even if a device key later leaks. Only relay routing fields stay in clear text. TLS remains required in any non-local deployment.
 
 ## Provider boundary
 

@@ -50,8 +50,8 @@ export class OpenCodeHttpClient {
         ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
       });
       if (!response.ok) {
-        const text = await response.text();
-        throw new ProviderAdapterError("opencode", `HTTP_${response.status}`, `OpenCode returned ${response.status}: ${text.slice(0, 500)}`, response.status >= 500 || response.status === 429);
+        await response.body?.cancel().catch(() => undefined);
+        throw new ProviderAdapterError("opencode", `HTTP_${response.status}`, `OpenCode returned ${response.status}`, response.status >= 500 || response.status === 429);
       }
       if (response.status === 204) return undefined as T;
       const text = await response.text();

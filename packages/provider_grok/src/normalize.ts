@@ -8,6 +8,7 @@ import {
   type RemoteSession,
   type SessionState,
 } from "../../protocol/src/index.js";
+import { providerPromptWorkflows, stripProviderPromptGuidance } from "../../provider_contract/src/index.js";
 
 export interface AcpProviderIdentity {
   readonly providerId: string;
@@ -62,7 +63,7 @@ export function normalizeAcpSession(
   if (providerSessionId === undefined) throw new Error("ACP session payload has no sessionId");
   const cwd = typeof value.cwd === "string" ? value.cwd : typeof value.workingDirectory === "string" ? value.workingDirectory : undefined;
   const title = typeof value.title === "string" && value.title.trim().length > 0
-    ? value.title
+    ? stripProviderPromptGuidance(value.title)
     : `Untitled ${identity.sessionLabel ?? identity.displayName} session`;
   const updatedAt = parseTimestamp(value.updatedAt ?? value.lastActivityAt, now);
   return {
@@ -74,7 +75,7 @@ export function normalizeAcpSession(
     ...(cwd !== undefined ? { workingDirectory: cwd, project: basename(cwd) || cwd } : {}),
     state: sessionState(value),
     lastActivityAt: updatedAt,
-    preview: typeof value.preview === "string" ? value.preview : title,
+    preview: typeof value.preview === "string" ? stripProviderPromptGuidance(value.preview) : title,
     needsApproval: false,
     stale: false,
     nativeMetadata: asJsonObject(value),
@@ -215,18 +216,24 @@ export function appendAcpContentChunk(
     ? update.messageId
     : fallbackMessageId ?? `${role}_${accumulator.orderedIds.length}`;
   const existing = accumulator.messages.get(nativeId);
+  const incomingWorkflows = role === "user" ? providerPromptWorkflows(content.text) : [];
+  const incomingText = role === "user" ? stripProviderPromptGuidance(content.text) : content.text;
   const incomingPart = content.part.type === "text"
-    ? { type: partType, text: content.text, ...(partType === "reasoning" ? { redacted: false } : {}) } as ContentPart
+    ? { type: partType, text: incomingText, ...(partType === "reasoning" ? { redacted: false } : {}) } as ContentPart
     : content.part;
   const existingParts = retainAccumulatedText ? existing?.parts ?? [] : [];
-  const matchingPartIndex = existingParts.findIndex((entry) => entry.type === incomingPart.type);
   const parts = [...existingParts];
-  if ((incomingPart.type === "text" || incomingPart.type === "reasoning") && matchingPartIndex >= 0) {
-    const prior = existingParts[matchingPartIndex];
+  const lastPartIndex = existingParts.length - 1;
+  const prior = existingParts[lastPartIndex];
+  if ((incomingPart.type === "text" || incomingPart.type === "reasoning") && prior?.type === incomingPart.type) {
     const priorText = prior?.type === incomingPart.type ? prior.text : "";
-    parts[matchingPartIndex] = { ...incomingPart, text: priorText + incomingPart.text };
+    const separator = /[a-z0-9][.!?:;]$/u.test(priorText) && /^[A-Z]/u.test(incomingPart.text) ? " " : "";
+    parts[lastPartIndex] = { ...incomingPart, text: priorText + separator + incomingPart.text };
   } else {
     parts.push(incomingPart);
+  }
+  for (const workflow of incomingWorkflows) {
+    if (!parts.some((part) => part.type === "workflow" && part.workflow.id === workflow.id)) parts.push({ type: "workflow", workflow });
   }
   const message: RemoteMessage = {
     id: makeProviderMessageId(identity.providerId, nativeId),

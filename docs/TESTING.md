@@ -11,10 +11,8 @@ Windows for native Desktop/companion packaging
 Current deterministic checks:
 
 ```bash
-npm test
-# exit 0: 202 total, 200 passed, 2 expected opt-in Codex integration skips
-npm run quality      # exit 0
-npm run publication  # exit 0
+npm run verify
+# root typecheck, deterministic tests, quality gate, and publication boundary
 
 cd apps/remote_client
 flutter analyze      # exit 0, no issues
@@ -28,8 +26,9 @@ cd ../..
 ```
 
 The root suite uses fake providers, protocol peers, fixtures, and injected HTTP.
-The two opt-in Codex tests remain skipped unless explicitly enabled; default
-verification does not invoke a live model.
+Opt-in live-provider tests remain skipped unless explicitly enabled; default
+verification does not invoke a live model. Avoid recording a fixed test count
+here because provider and client coverage changes frequently.
 
 ## Cross-platform coverage
 
@@ -187,8 +186,9 @@ connect host
   restored top-level summaries, editable handoff drafts, searchable grouped
   model results and recents, endpoint-aware wallet setup, inline image expansion,
   and chunked image hydration.
-- These checks validate deterministic state and UI wiring. A packaged Desktop
-  interaction pass and physical phone testing remain separate release gates.
+- These checks validate deterministic state and UI wiring. Packaged Desktop interaction and
+  an Android debug install/launch have also been exercised; full phone interaction remains a
+  separate release gate.
 
 ### Codex adapter (deterministic, added this run)
 
@@ -232,10 +232,12 @@ every request.
   local sandbox config did not produce a permission boundary crossing). The response mapping
   is covered by deterministic adapter tests against the generated schema.
 - Building/running the native Windows Flutter app (requires Developer Mode for plugin
-  symlinks, unavailable in this non-elevated session) and any iOS/Android/macOS/Linux build.
+  symlinks, unavailable in this non-elevated session) and any iOS/macOS/Linux build.
 - `opencode` and `grok` executables were not installed.
 - No live Direct API model turn, key validation, or billable request was run.
-- TLS relay, QR pairing, multi-device/multi-host UI, iOS/Android/macOS behavior.
+- TLS relay, QR camera pairing, multi-device/multi-host UI, iOS/macOS behavior, and extended
+  Android lifecycle/network-handoff interaction. The Android debug APK was installed in place
+  and launched successfully on a physical Android 16 device.
 
 ## Test honesty rule
 

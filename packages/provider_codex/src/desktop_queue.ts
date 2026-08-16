@@ -5,7 +5,11 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { connect, type Socket } from "node:net";
 
-import type { EnqueueProviderMessageRequest, ProviderQueuedMessage } from "../../provider_contract/src/index.js";
+import type {
+  EnqueueProviderMessageRequest,
+  ProviderQueuedMessage,
+  RestoreProviderMessageRequest,
+} from "../../provider_contract/src/index.js";
 
 interface DesktopQueuedMessage {
   readonly id: string;
@@ -13,7 +17,7 @@ interface DesktopQueuedMessage {
   readonly context: Record<string, unknown>;
   readonly cwd: string;
   readonly createdAt: number;
-  readonly mentionedBrowserFamilies: readonly string[];
+  readonly mentionedBrowserFamilies?: readonly string[];
   readonly pausedReason?: string | null;
 }
 
@@ -83,13 +87,48 @@ export class CodexDesktopQueue {
     const desktopMessage: DesktopQueuedMessage = {
       id: randomUUID(),
       text: request.content,
-      context: emptyComposerContext(request.content, request.workingDirectory),
+      context: emptyComposerContext(request.content, request.workingDirectory, request.developerInstructions),
       cwd: request.workingDirectory,
       createdAt: Date.now(),
       mentionedBrowserFamilies: [],
       pausedReason: null,
     };
     await this.replaceConversationQueue(providerSessionId, state, [...(state[providerSessionId] ?? []), desktopMessage]);
+    return normalizeQueuedMessage(providerSessionId, desktopMessage);
+  }
+
+  public async restore(providerSessionId: string, request: RestoreProviderMessageRequest): Promise<ProviderQueuedMessage> {
+    if ((request.attachments?.length ?? 0) > 0) throw new Error("Codex Desktop queue synchronization does not yet support attachments");
+    if (request.originalMessage.providerSessionId !== providerSessionId) {
+      throw new Error("The queued instruction belongs to a different Codex task");
+    }
+    const createdAt = Date.parse(request.originalMessage.createdAt);
+    if (!Number.isFinite(createdAt)) throw new Error("The original queued instruction time is invalid");
+    const state = await this.readState();
+    const current = [...(state[providerSessionId] ?? [])];
+    const existing = current.find((message) => message.id === request.originalMessage.id);
+    if (existing !== undefined) {
+      if (existing.text !== request.content) throw new Error("The original Codex queue ID is already in use");
+      return normalizeQueuedMessage(providerSessionId, existing);
+    }
+    const desktopMessage: DesktopQueuedMessage = {
+      id: request.originalMessage.id,
+      text: request.content,
+      context: emptyComposerContext(request.content, request.workingDirectory, request.developerInstructions),
+      cwd: request.workingDirectory,
+      createdAt,
+      mentionedBrowserFamilies: [],
+      pausedReason: null,
+    };
+    const requestedIndex = request.beforeMessageId === undefined
+      ? -1
+      : current.findIndex((message) => message.id === request.beforeMessageId);
+    const chronologicalIndex = current.findIndex((message) => message.createdAt > createdAt);
+    const insertAt = requestedIndex >= 0
+      ? requestedIndex
+      : chronologicalIndex >= 0 ? chronologicalIndex : current.length;
+    current.splice(insertAt, 0, desktopMessage);
+    await this.replaceConversationQueue(providerSessionId, state, current);
     return normalizeQueuedMessage(providerSessionId, desktopMessage);
   }
 
@@ -100,6 +139,25 @@ export class CodexDesktopQueue {
     if (next.length === current.length) return false;
     await this.replaceConversationQueue(providerSessionId, state, next);
     return true;
+  }
+
+  public async update(providerSessionId: string, messageId: string, content: string): Promise<ProviderQueuedMessage | null> {
+    const trimmed = content.trim();
+    if (trimmed.length === 0 || trimmed.length > 100_000) throw new Error("Queued instructions must contain between 1 and 100000 characters");
+    const state = await this.readState();
+    const current = state[providerSessionId] ?? [];
+    const index = current.findIndex((message) => message.id === messageId);
+    if (index < 0) return null;
+    const existing = current[index]!;
+    const updated: DesktopQueuedMessage = {
+      ...existing,
+      text: trimmed,
+      context: { ...existing.context, prompt: trimmed },
+    };
+    const next = [...current];
+    next[index] = updated;
+    await this.replaceConversationQueue(providerSessionId, state, next);
+    return normalizeQueuedMessage(providerSessionId, updated);
   }
 
   public dispose(): void {
@@ -234,7 +292,7 @@ class CodexIpcClient {
   }
 }
 
-function emptyComposerContext(prompt: string, workingDirectory: string): Record<string, unknown> {
+function emptyComposerContext(prompt: string, workingDirectory: string, developerInstructions?: string): Record<string, unknown> {
   return {
     addedFiles: [],
     chatGptConversationContexts: [],
@@ -256,6 +314,7 @@ function emptyComposerContext(prompt: string, workingDirectory: string): Record<
     localProjectId: null,
     workspaceRoots: [workingDirectory],
     threadReferences: [],
+    ...(developerInstructions !== undefined ? { tethoqDeveloperInstructions: developerInstructions } : {}),
   };
 }
 
@@ -284,6 +343,9 @@ function normalizeQueuedMessage(providerSessionId: string, message: DesktopQueue
     content: message.text,
     state: error === undefined ? "queued" : "failed",
     createdAt: new Date(message.createdAt).toISOString(),
+    ...(typeof message.context.tethoqDeveloperInstructions === "string" && message.context.tethoqDeveloperInstructions.trim()
+      ? { developerInstructions: message.context.tethoqDeveloperInstructions }
+      : {}),
     ...(error !== undefined ? { error } : {}),
   };
 }
@@ -296,7 +358,7 @@ function isDesktopQueuedMessage(value: unknown): value is DesktopQueuedMessage {
     typeof value.createdAt === "number" &&
     Number.isFinite(value.createdAt) &&
     isRecord(value.context) &&
-    Array.isArray(value.mentionedBrowserFamilies);
+    (value.mentionedBrowserFamilies === undefined || (Array.isArray(value.mentionedBrowserFamilies) && value.mentionedBrowserFamilies.every((item) => typeof item === "string")));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

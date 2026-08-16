@@ -230,7 +230,19 @@ app. Desktop packaging also writes `release\release-manifest.json` and
 
 ## Desktop behavior
 
-- Closing the window hides it to the tray so active work and notifications continue.
+- Closing the window hides it to the tray by default so active work and
+  notifications continue. **Settings > Desktop behavior > Close** can change the
+  close button to quit Tethoq instead.
+- **Settings > Desktop behavior > Startup** registers Tethoq as a Windows login
+  item, either opening its window or starting straight to the tray (`--hidden`).
+  Only a packaged build registers the login item; a development run stores the
+  preference without writing to the Run key.
+- **Settings > Desktop behavior > Alerts** chooses which unfocused events raise a
+  Windows notification: everything, only the events that need a decision
+  (approvals, questions, failures), or nothing.
+- Task names, pins, and archived state are stored locally per task in the desktop
+  preferences file. A local name is display-only and never rewrites the
+  provider's own session title.
 - Desktop does not silently auto-start the separately bundled Bridge in this
   release. Until Desktop's connector/runtime state is migrated to one local
   Bridge client, explicit Bridge startup avoids duplicate provider owners.
@@ -242,7 +254,7 @@ app. Desktop packaging also writes `release\release-manifest.json` and
 - Active chat events are checked at 100 ms while the window is visible and at
   1 second while it is hidden, returning to the faster cadence immediately on
   show.
-- Provider connectivity, working sessions, approvals, requested input, completion, and failures surface in the task list and Windows notifications.
+- Provider connectivity, working sessions, approvals, requested input, completion, and failures surface in the task list and, subject to the Alerts setting, Windows notifications.
 - Images are selected through a native dialog and checked for type, count, and size before crossing the IPC boundary.
 
 ## Security boundary

@@ -83,6 +83,8 @@ class DemoRemoteAppStore extends RemoteAppStore {
           setupEnvironmentVariable: 'TETHOQ_OPENAI_API_KEY',
           supportsBatch: true,
           maxAudioBytes: 4194304,
+          credentialLabel: 'OpenAI API key',
+          credentialSetupUrl: 'https://platform.openai.com/api-keys',
         ),
         TranscriptionSource(
           id: 'xai-stt',
@@ -91,6 +93,8 @@ class DemoRemoteAppStore extends RemoteAppStore {
           setupEnvironmentVariable: 'XAI_API_KEY',
           supportsBatch: true,
           maxAudioBytes: 26214400,
+          credentialLabel: 'xAI API key',
+          credentialSetupUrl: 'https://console.x.ai/',
         ),
       ]);
     preferredDictationSourceId = 'openai-stt';
@@ -514,6 +518,9 @@ class DemoRemoteAppStore extends RemoteAppStore {
   }
 
   @override
+  Future<void> loadSessionHistoryFor(RemoteSession session) async {}
+
+  @override
   void openSessionForView(RemoteSession session) {
     unawaited(openSession(session));
   }
@@ -525,13 +532,17 @@ class DemoRemoteAppStore extends RemoteAppStore {
     String? modelId,
     String? reasoningEffort,
     List<RemoteAttachment> attachments = const <RemoteAttachment>[],
+    SimplifySettings? simplify,
   }) async {
     final trimmed = content.trim();
     if (trimmed.isEmpty) return;
+    final visibleContent = simplifyVisibleContent(trimmed);
     drafts[sessionId] = '';
+    draftAttachments.remove(sessionId);
+    draftSimplifySettings.remove(sessionId);
     messages.putIfAbsent(sessionId, () => <RemoteMessage>[]).add(
           _message('demo-user-${DateTime.now().microsecondsSinceEpoch}',
-              sessionId, 'user', DateTime.now(), trimmed),
+              sessionId, 'user', DateTime.now(), visibleContent),
         );
     _setSessionState(sessionId, 'working');
     notifyListeners();
@@ -557,6 +568,7 @@ class DemoRemoteAppStore extends RemoteAppStore {
     String? modelId,
     String? reasoningEffort,
     List<RemoteAttachment> attachments = const <RemoteAttachment>[],
+    SimplifySettings? simplify,
   }) async {
     if (isPreparedSession(sessionId)) {
       return await super.submitMessage(
@@ -566,16 +578,17 @@ class DemoRemoteAppStore extends RemoteAppStore {
         modelId: modelId,
         reasoningEffort: reasoningEffort,
         attachments: attachments,
+        simplify: simplify,
       );
     }
     final session = sessions.where((item) => item.id == sessionId).firstOrNull;
-    if (session?.state == 'working' && deliveryMode != 'steer') {
+    if (session?.state == 'working' && deliveryMode == 'queue') {
       final now = DateTime.now();
       final id = 'demo-queue-${now.microsecondsSinceEpoch}';
       queuedMessages[id] = RemoteQueuedMessage(
         id: id,
         sessionId: sessionId,
-        content: content.trim(),
+        content: simplifyVisibleContent(content),
         state: 'queued',
         createdAt: now,
         modelId: modelId,
@@ -585,10 +598,13 @@ class DemoRemoteAppStore extends RemoteAppStore {
                   name: attachment.name,
                   mimeType: attachment.mimeType,
                   byteLength: attachment.byteLength,
+                  dataBase64: attachment.dataBase64,
                 ))
             .toList(growable: false),
       );
       drafts[sessionId] = '';
+      draftAttachments.remove(sessionId);
+      draftSimplifySettings.remove(sessionId);
       notifyListeners();
       return null;
     }
@@ -598,6 +614,7 @@ class DemoRemoteAppStore extends RemoteAppStore {
       modelId: modelId,
       reasoningEffort: reasoningEffort,
       attachments: attachments,
+      simplify: simplify,
     );
     return null;
   }
@@ -606,6 +623,109 @@ class DemoRemoteAppStore extends RemoteAppStore {
   Future<void> cancelQueuedMessage(String messageId) async {
     queuedMessages.remove(messageId);
     notifyListeners();
+  }
+
+  @override
+  Future<RemoteQueuedMessage> editQueuedMessage(
+      RemoteQueuedMessage message, String content) async {
+    final updated = RemoteQueuedMessage(
+      id: message.id,
+      sessionId: message.sessionId,
+      content: content.trim(),
+      state: message.state,
+      createdAt: message.createdAt,
+      attachments: message.attachments,
+      modelId: message.modelId,
+      reasoningEffort: message.reasoningEffort,
+      error: message.error,
+    );
+    queuedMessages[message.id] = updated;
+    notifyListeners();
+    return updated;
+  }
+
+  @override
+  Future<void> deliverQueuedMessage(RemoteQueuedMessage message,
+      {required String mode}) async {
+    queuedMessages.remove(message.id);
+    await sendMessage(message.sessionId, message.content,
+        modelId: message.modelId, reasoningEffort: message.reasoningEffort);
+  }
+
+  @override
+  Future<List<RemoteSession>> loadSideChats({String? parentSessionId}) async =>
+      parentSessionId == null
+          ? sessions
+              .where((session) => session.sessionKind == 'side_chat')
+              .toList(growable: false)
+          : sideChatsFor(parentSessionId);
+
+  @override
+  Future<RemoteSession> createSideChat(
+    String parentSessionId, {
+    String? prompt,
+    String? queuedMessageId,
+  }) async {
+    final parent =
+        sessions.where((session) => session.id == parentSessionId).firstOrNull;
+    if (parent == null) throw StateError('Task is no longer available');
+    final now = DateTime.now();
+    final id = 'demo-side-chat-${now.microsecondsSinceEpoch}';
+    final initial = prompt?.trim() ?? '';
+    final sideChat = _session(
+      id: id,
+      providerId: parent.providerId,
+      title: initial.isEmpty ? 'Side chat' : initial,
+      state: 'idle',
+      activity: now,
+      project: parent.project ?? 'Side chat',
+      directory: parent.workingDirectory ?? '',
+      preview: initial,
+      modelId: parent.modelId,
+      reasoningEffort: parent.reasoningEffort,
+      parentSessionId: parent.id,
+      sessionKind: 'side_chat',
+    );
+    sessions.add(sideChat);
+    messages[id] = <RemoteMessage>[
+      if (initial.isNotEmpty)
+        _message('demo-side-chat-user', id, 'user', now, initial),
+    ];
+    if (queuedMessageId != null) queuedMessages.remove(queuedMessageId);
+    notifyListeners();
+    return sideChat;
+  }
+
+  @override
+  Future<RemoteSession> promoteSideChat(String sessionId) async {
+    final current =
+        sessions.where((session) => session.id == sessionId).firstOrNull;
+    if (current == null || current.sessionKind != 'side_chat') {
+      throw StateError('Side chat is no longer available');
+    }
+    final promoted = RemoteSession(
+      id: current.id,
+      hostId: current.hostId,
+      providerId: current.providerId,
+      providerSessionId: current.providerSessionId,
+      title: current.title,
+      state: current.state,
+      lastActivityAt: DateTime.now(),
+      needsApproval: current.needsApproval,
+      stale: current.stale,
+      project: current.project,
+      workingDirectory: current.workingDirectory,
+      preview: current.preview,
+      modelId: current.modelId,
+      reasoningEffort: current.reasoningEffort,
+      variantId: current.variantId,
+      sessionKind: 'task',
+    );
+    final index = sessions.indexWhere((session) => session.id == sessionId);
+    sessions[index] = promoted;
+    selectedSession = promoted;
+    notifyListeners();
+    return promoted;
   }
 
   @override
@@ -797,6 +917,7 @@ class DemoRemoteAppStore extends RemoteAppStore {
     String? parentSessionId,
     String? agentNickname,
     String? agentRole,
+    String sessionKind = 'task',
   }) {
     return RemoteSession(
       id: id,
@@ -817,6 +938,7 @@ class DemoRemoteAppStore extends RemoteAppStore {
       parentSessionId: parentSessionId,
       agentNickname: agentNickname,
       agentRole: agentRole,
+      sessionKind: sessionKind,
     );
   }
 

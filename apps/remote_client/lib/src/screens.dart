@@ -575,6 +575,17 @@ class _SessionsScreenState extends State<SessionsScreen> {
                     onToggle: () => toggleProvider(provider.providerId),
                   );
                 }),
+                SwitchListTile(
+                  key: const Key('task-filter-show-side-chats'),
+                  secondary:
+                      const Icon(Icons.chat_bubble_outline_rounded, size: 22),
+                  title: const Text('Show side chats'),
+                  value: store.showSideChats,
+                  onChanged: (value) {
+                    store.setShowSideChats(value);
+                    setSheetState(() {});
+                  },
+                ),
                 const Divider(height: 18),
                 Padding(
                   padding: const EdgeInsets.fromLTRB(20, 4, 20, 4),
@@ -830,7 +841,7 @@ class _SessionTileState extends State<_SessionTile> {
             session.preview == displayTitle
         ? session.project
         : session.preview;
-    return Material(
+    final taskRow = Material(
       color:
           _pressed ? visual.accent.withValues(alpha: 0.10) : Colors.transparent,
       child: GestureDetector(
@@ -865,72 +876,84 @@ class _SessionTileState extends State<_SessionTile> {
                   unawaited(_showTaskActions(store, session));
                 },
           child: Padding(
-            padding: const EdgeInsets.fromLTRB(14, 10, 13, 10),
+            padding: const EdgeInsets.fromLTRB(14, 7, 13, 7),
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
-                _ProviderBadge(
-                  key: ValueKey<String>('session-provider-${session.id}'),
-                  providerId: session.providerId,
+                Padding(
+                  padding: const EdgeInsets.only(top: 1),
+                  child: _ProviderBadge(
+                    key: ValueKey<String>('session-provider-${session.id}'),
+                    providerId: session.providerId,
+                  ),
                 ),
                 const SizedBox(width: 10),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: <Widget>[
-                      Row(
-                        children: <Widget>[
-                          Expanded(
-                            child: Text(displayTitle,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: Theme.of(context)
-                                    .textTheme
-                                    .bodyMedium
-                                    ?.copyWith(
-                                      fontSize: 15,
-                                      fontWeight: FontWeight.w600,
-                                    )),
-                          ),
-                          SizedBox(
-                            key: ValueKey<String>('session-time-${session.id}'),
-                            width: 44,
-                            child: Text(
-                              _relativeTime(session.lastActivityAt.toLocal()),
-                              textAlign: TextAlign.right,
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodySmall
-                                  ?.copyWith(
-                                    fontSize: 12.5,
-                                    fontFeatures: const <FontFeature>[
-                                      FontFeature.tabularFigures(),
-                                    ],
-                                    color: Theme.of(context)
-                                        .colorScheme
-                                        .onSurface
-                                        .withValues(alpha: .62),
-                                  ),
+                      SizedBox(
+                        height: 26,
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.center,
+                          children: <Widget>[
+                            Expanded(
+                              child: Text(displayTitle,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: Theme.of(context)
+                                      .textTheme
+                                      .bodyMedium
+                                      ?.copyWith(
+                                        fontSize: 15,
+                                        fontWeight: FontWeight.w600,
+                                      )),
                             ),
-                          ),
-                          const SizedBox(width: 4),
-                          SizedBox.square(
-                            dimension: 24,
-                            child: session.state == 'offline' ||
-                                    session.state == 'disconnected'
-                                ? null
-                                : _InlineStateIndicator(
-                                    key: ValueKey<String>(
-                                        'session-state-${session.id}'),
-                                    state: session.state,
-                                    visual: visual,
-                                  ),
-                          ),
-                        ],
+                            Transform.translate(
+                              offset: const Offset(0, 2),
+                              child: SizedBox(
+                                key: ValueKey<String>(
+                                    'session-time-${session.id}'),
+                                width: 42,
+                                child: Text(
+                                  _relativeTime(
+                                      session.lastActivityAt.toLocal()),
+                                  textAlign: TextAlign.right,
+                                  style: Theme.of(context)
+                                      .textTheme
+                                      .bodySmall
+                                      ?.copyWith(
+                                        fontSize: 11,
+                                        fontFeatures: const <FontFeature>[
+                                          FontFeature.tabularFigures(),
+                                        ],
+                                        color: Theme.of(context)
+                                            .colorScheme
+                                            .onSurface
+                                            .withValues(alpha: .62),
+                                      ),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 3),
+                            SizedBox.square(
+                              dimension: 24,
+                              child: session.state == 'offline' ||
+                                      session.state == 'disconnected'
+                                  ? null
+                                  : _InlineStateIndicator(
+                                      key: ValueKey<String>(
+                                          'session-state-${session.id}'),
+                                      state: session.state,
+                                      visual: visual,
+                                    ),
+                            ),
+                          ],
+                        ),
                       ),
                       if (preview != null &&
                           preview.trim().isNotEmpty) ...<Widget>[
-                        const SizedBox(height: 4),
+                        const SizedBox(height: 2),
                         Text(preview,
                             maxLines: 2,
                             overflow: TextOverflow.ellipsis,
@@ -948,6 +971,567 @@ class _SessionTileState extends State<_SessionTile> {
                 ),
               ],
             ),
+          ),
+        ),
+      ),
+    );
+    final sideChats = store.showSideChats
+        ? store.sideChatsFor(session.id)
+        : const <RemoteSession>[];
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        taskRow,
+        if (sideChats.isNotEmpty)
+          _MobileSideChatPreview(
+            parent: session,
+            sideChats: sideChats,
+            onOpen: (sideChat) =>
+                unawaited(_showSideChatSheet(context, sideChat)),
+            onCreate: () async {
+              try {
+                final created = await store.createSideChat(session.id);
+                if (context.mounted) {
+                  await _showSideChatSheet(context, created);
+                }
+              } on Object catch (caught) {
+                if (!context.mounted) return;
+                _showCompactError(context, 'Could not open side chat', caught);
+              }
+            },
+          ),
+      ],
+    );
+  }
+}
+
+class _MobileSideChatPreview extends StatelessWidget {
+  const _MobileSideChatPreview({
+    required this.parent,
+    required this.sideChats,
+    required this.onOpen,
+    required this.onCreate,
+  });
+
+  final RemoteSession parent;
+  final List<RemoteSession> sideChats;
+  final ValueChanged<RemoteSession> onOpen;
+  final VoidCallback onCreate;
+
+  Future<void> _showAll(BuildContext context) async {
+    final selected = await showModalBottomSheet<RemoteSession>(
+      context: context,
+      useSafeArea: true,
+      showDragHandle: true,
+      constraints: const BoxConstraints(maxWidth: 640),
+      builder: (sheetContext) => SafeArea(
+        top: false,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxHeight: MediaQuery.sizeOf(sheetContext).height * .62,
+          ),
+          child: ListView.builder(
+            shrinkWrap: true,
+            padding: const EdgeInsets.only(bottom: 8),
+            itemCount: sideChats.length,
+            itemBuilder: (context, index) {
+              final sideChat = sideChats[index];
+              return SizedBox(
+                height: 52,
+                child: ListTile(
+                  key: ValueKey<String>('side-chat-list-${sideChat.id}'),
+                  leading:
+                      const Icon(Icons.chat_bubble_outline_rounded, size: 20),
+                  title: Text(
+                    _sideChatPreviewText(sideChat),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  onTap: () => Navigator.pop(sheetContext, sideChat),
+                ),
+              );
+            },
+          ),
+        ),
+      ),
+    );
+    if (selected != null) onOpen(selected);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final recent = sideChats.first;
+    final colors = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(54, 0, 12, 5),
+      child: Material(
+        color: colors.surfaceContainerHighest.withValues(alpha: .42),
+        borderRadius: const BorderRadius.only(
+          bottomLeft: Radius.circular(8),
+          bottomRight: Radius.circular(8),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: SizedBox(
+          height: 48,
+          child: Row(
+            children: <Widget>[
+              const SizedBox(width: 8),
+              const Icon(Icons.subdirectory_arrow_right_rounded, size: 18),
+              const SizedBox(width: 5),
+              Expanded(
+                child: InkWell(
+                  key: ValueKey<String>('side-chat-preview-${recent.id}'),
+                  onTap: () => onOpen(recent),
+                  child: Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      _sideChatPreviewText(recent),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context)
+                          .textTheme
+                          .bodySmall
+                          ?.copyWith(fontSize: 13),
+                    ),
+                  ),
+                ),
+              ),
+              if (sideChats.length > 1)
+                TextButton(
+                  key: ValueKey<String>('view-side-chats-${parent.id}'),
+                  onPressed: () => unawaited(_showAll(context)),
+                  style: TextButton.styleFrom(
+                    minimumSize: const Size(58, 44),
+                    padding: const EdgeInsets.symmetric(horizontal: 7),
+                  ),
+                  child: const Text('View all'),
+                ),
+              SizedBox.square(
+                dimension: 44,
+                child: IconButton(
+                  key: ValueKey<String>('new-side-chat-${parent.id}'),
+                  tooltip: 'New side chat',
+                  onPressed: onCreate,
+                  icon: const Icon(Icons.add_rounded, size: 21),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+String _sideChatPreviewText(RemoteSession session) {
+  final preview = session.preview?.trim();
+  if (preview?.isNotEmpty == true) return preview!;
+  final title = session.title.trim();
+  return title.isEmpty || title.toLowerCase() == 'side chat'
+      ? 'New side chat'
+      : title;
+}
+
+void _showCompactError(BuildContext context, String label, Object error) {
+  final detail =
+      error.toString().replaceFirst(RegExp(r'^(Exception|StateError):\s*'), '');
+  ScaffoldMessenger.of(context)
+      .showSnackBar(SnackBar(content: Text('$label: $detail')));
+}
+
+Future<void> _showSideChatSheet(
+    BuildContext context, RemoteSession sideChat) async {
+  final promoted = await showModalBottomSheet<RemoteSession>(
+    context: context,
+    useSafeArea: true,
+    isScrollControlled: true,
+    backgroundColor: Colors.transparent,
+    builder: (sheetContext) => DraggableScrollableSheet(
+      expand: false,
+      minChildSize: .42,
+      initialChildSize: .64,
+      maxChildSize: .94,
+      builder: (context, scrollController) => _SideChatSheet(
+        sideChat: sideChat,
+        scrollController: scrollController,
+      ),
+    ),
+  );
+  if (promoted == null || !context.mounted) return;
+  final store = StoreScope.read(context);
+  store.openSessionForView(promoted);
+  await Navigator.of(context).push(sessionScreenRoute(promoted.id));
+}
+
+class _SideChatSheet extends StatefulWidget {
+  const _SideChatSheet({
+    required this.sideChat,
+    required this.scrollController,
+  });
+
+  final RemoteSession sideChat;
+  final ScrollController scrollController;
+
+  @override
+  State<_SideChatSheet> createState() => _SideChatSheetState();
+}
+
+class _SideChatSheetState extends State<_SideChatSheet> {
+  final TextEditingController _composer = TextEditingController();
+  final List<RemoteAttachment> _attachments = <RemoteAttachment>[];
+  late final DictationRecorder _recorder = MicrophoneDictationRecorder();
+  RemoteAppStore? _store;
+  bool _loaded = false;
+  bool _sending = false;
+  bool _recording = false;
+  bool _transcribing = false;
+  bool _promoting = false;
+  SimplifySettings? _simplifySettings;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_loaded) return;
+    _loaded = true;
+    final store = StoreScope.read(context);
+    _store = store;
+    _composer.text = store.drafts[widget.sideChat.id] ?? '';
+    _attachments
+      ..clear()
+      ..addAll(store.draftAttachmentsFor(widget.sideChat.id));
+    if (_containsSimplifyCommand(_composer.text)) {
+      _simplifySettings =
+          store.simplifySettingsFor(widget.sideChat.id) ?? SimplifySettings();
+      store.setDraftSimplifySettings(widget.sideChat.id, _simplifySettings);
+    }
+    unawaited(store.loadSessionHistoryFor(widget.sideChat).catchError((_) {}));
+  }
+
+  @override
+  void dispose() {
+    if (_recording) unawaited(_recorder.cancel());
+    unawaited(_recorder.dispose());
+    _store?.setDraft(widget.sideChat.id, _composer.text);
+    _store?.setDraftAttachments(widget.sideChat.id, _attachments);
+    _store?.setDraftSimplifySettings(
+      widget.sideChat.id,
+      _containsSimplifyCommand(_composer.text) ? _simplifySettings : null,
+    );
+    _composer.dispose();
+    super.dispose();
+  }
+
+  Future<void> _pickAttachment() async {
+    final file = await openFile();
+    if (!mounted || file == null) return;
+    try {
+      final bytes = await file.readAsBytes();
+      if (!_isValidPhoneAttachmentLength(bytes.length)) {
+        throw StateError('Files must be between 1 byte and 25 MiB');
+      }
+      final encoded = await compute(_encodeBase64, bytes);
+      if (!mounted) return;
+      setState(() {
+        _attachments.add(RemoteAttachment(
+          name: file.name,
+          mimeType: _genericMimeType(file.name),
+          dataBase64: encoded,
+          byteLength: bytes.length,
+        ));
+        StoreScope.read(context)
+            .setDraftAttachments(widget.sideChat.id, _attachments);
+      });
+    } on Object catch (caught) {
+      if (mounted) _showCompactError(context, 'Could not attach file', caught);
+    }
+  }
+
+  Future<void> _toggleDictation() async {
+    if (_transcribing) return;
+    final store = StoreScope.read(context);
+    if (_recording) {
+      setState(() {
+        _recording = false;
+        _transcribing = true;
+      });
+      try {
+        final wave = await _recorder.stop();
+        final source =
+            store.dictationSourceForHarness(widget.sideChat.providerId);
+        final transcript = await store.transcribeDictation(
+          wave,
+          sourceId: source?.id,
+        );
+        if (!mounted) return;
+        final before = _composer.text.trimRight();
+        _composer.text = before.isEmpty ? transcript : '$before $transcript';
+        _composer.selection =
+            TextSelection.collapsed(offset: _composer.text.length);
+        store.setDraft(widget.sideChat.id, _composer.text);
+      } on Object catch (caught) {
+        if (mounted) _showCompactError(context, 'Dictation stopped', caught);
+      } finally {
+        if (mounted) setState(() => _transcribing = false);
+      }
+      return;
+    }
+    try {
+      final permitted = await _recorder.start();
+      if (!mounted) return;
+      if (!permitted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Microphone permission is needed for dictation.'),
+        ));
+        return;
+      }
+      setState(() => _recording = true);
+    } on Object catch (caught) {
+      if (mounted)
+        _showCompactError(context, 'Could not start dictation', caught);
+    }
+  }
+
+  Future<void> _send() async {
+    final text = _composer.text.trim();
+    if (_sending || text.isEmpty) return;
+    final store = StoreScope.read(context);
+    setState(() => _sending = true);
+    try {
+      await store.sendMessage(widget.sideChat.id, text,
+          attachments: List<RemoteAttachment>.of(_attachments),
+          simplify: _containsSimplifyCommand(text) ? _simplifySettings : null);
+      if (!mounted) return;
+      _composer.clear();
+      setState(() {
+        _attachments.clear();
+        _simplifySettings = null;
+      });
+    } on Object catch (caught) {
+      if (mounted) _showCompactError(context, 'Could not send message', caught);
+    } finally {
+      if (mounted) setState(() => _sending = false);
+    }
+  }
+
+  void _composerChanged(String value) {
+    final store = StoreScope.read(context);
+    store.setDraft(widget.sideChat.id, value);
+    final settings = _containsSimplifyCommand(value)
+        ? _simplifySettings ??
+            store.simplifySettingsFor(widget.sideChat.id) ??
+            SimplifySettings()
+        : null;
+    store.setDraftSimplifySettings(widget.sideChat.id, settings);
+    if (!identical(settings, _simplifySettings)) {
+      setState(() => _simplifySettings = settings);
+    }
+  }
+
+  Future<void> _editSimplifySettings() async {
+    final selected = await showModalBottomSheet<SimplifySettings>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      constraints: const BoxConstraints(maxWidth: 640),
+      builder: (sheetContext) => _SimplifySettingsSheet(
+          initial: _simplifySettings ?? SimplifySettings()),
+    );
+    if (!mounted || selected == null) return;
+    setState(() => _simplifySettings = selected);
+    StoreScope.read(context)
+        .setDraftSimplifySettings(widget.sideChat.id, selected);
+  }
+
+  void _removeSimplify() {
+    final text = _withoutSimplifyCommand(_composer.text);
+    _composer.value = TextEditingValue(
+      text: text,
+      selection: TextSelection.collapsed(offset: text.length),
+    );
+    _composerChanged(text);
+  }
+
+  Future<void> _promote() async {
+    if (_promoting) return;
+    setState(() => _promoting = true);
+    try {
+      final promoted =
+          await StoreScope.read(context).promoteSideChat(widget.sideChat.id);
+      if (mounted) Navigator.pop(context, promoted);
+    } on Object catch (caught) {
+      if (mounted)
+        _showCompactError(context, 'Could not promote side chat', caught);
+      if (mounted) setState(() => _promoting = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final store = StoreScope.of(context);
+    final visual = providerVisualThemeFor(widget.sideChat.providerId);
+    final history =
+        store.messages[widget.sideChat.id] ?? const <RemoteMessage>[];
+    final live = store.liveAssistantMessageFor(widget.sideChat.id);
+    final displayMessages = <RemoteMessage>[
+      ...history,
+      if (live != null) live,
+    ];
+    return Material(
+      color: visual.surface,
+      borderRadius: const BorderRadius.vertical(top: Radius.circular(16)),
+      clipBehavior: Clip.antiAlias,
+      child: SafeArea(
+        top: false,
+        child: Padding(
+          padding:
+              EdgeInsets.only(bottom: MediaQuery.viewInsetsOf(context).bottom),
+          child: Column(
+            children: <Widget>[
+              SizedBox(
+                height: 52,
+                child: Row(
+                  children: <Widget>[
+                    const SizedBox(width: 16),
+                    Expanded(
+                      child: Text('Side chat',
+                          style: Theme.of(context).textTheme.titleMedium),
+                    ),
+                    TextButton(
+                      key: const Key('promote-side-chat'),
+                      onPressed: _promoting ? null : _promote,
+                      style:
+                          TextButton.styleFrom(minimumSize: const Size(44, 44)),
+                      child:
+                          Text(_promoting ? 'Promoting…' : 'Promote to task'),
+                    ),
+                    IconButton(
+                      tooltip: 'Close side chat',
+                      onPressed: () => Navigator.pop(context),
+                      icon: const Icon(Icons.close_rounded),
+                    ),
+                  ],
+                ),
+              ),
+              Divider(height: 1, color: visual.border.withValues(alpha: .52)),
+              Expanded(
+                child: displayMessages.isEmpty
+                    ? Center(
+                        child: Text('Ask about this task',
+                            style: TextStyle(
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .onSurface
+                                  .withValues(alpha: .54),
+                            )),
+                      )
+                    : ListView.builder(
+                        controller: widget.scrollController,
+                        padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+                        itemCount: displayMessages.length,
+                        itemBuilder: (context, index) {
+                          final message = displayMessages[index];
+                          return _MessageCard(
+                            message: message,
+                            visual: visual,
+                            providerId: widget.sideChat.providerId,
+                            showIdentity:
+                                message.role.toLowerCase() == 'assistant',
+                            streaming: message.status == 'streaming',
+                          );
+                        },
+                      ),
+              ),
+              if (_attachments.isNotEmpty)
+                SizedBox(
+                  height: 42,
+                  child: ListView.separated(
+                    scrollDirection: Axis.horizontal,
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    itemCount: _attachments.length,
+                    separatorBuilder: (_, __) => const SizedBox(width: 6),
+                    itemBuilder: (context, index) => InputChip(
+                      label: Text(_attachments[index].name,
+                          overflow: TextOverflow.ellipsis),
+                      onDeleted: () => setState(() {
+                        _attachments.removeAt(index);
+                        store.setDraftAttachments(
+                            widget.sideChat.id, _attachments);
+                      }),
+                    ),
+                  ),
+                ),
+              if (_simplifySettings != null &&
+                  _containsSimplifyCommand(_composer.text))
+                _SimplifyComposerChip(
+                  settings: _simplifySettings!,
+                  visual: visual,
+                  onPressed: () => unawaited(_editSimplifySettings()),
+                  onDeleted: _removeSimplify,
+                ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: <Widget>[
+                    SizedBox.square(
+                      dimension: 44,
+                      child: IconButton(
+                        key: const Key('side-chat-attachment'),
+                        tooltip: 'Attach file',
+                        onPressed: _sending ? null : _pickAttachment,
+                        icon: const Icon(Icons.add_rounded),
+                      ),
+                    ),
+                    Expanded(
+                      child: TextField(
+                        key: const Key('side-chat-composer'),
+                        controller: _composer,
+                        autofocus: true,
+                        minLines: 1,
+                        maxLines: 5,
+                        onChanged: _composerChanged,
+                        decoration: const InputDecoration(
+                          hintText: 'Ask about this task…',
+                          border: InputBorder.none,
+                        ),
+                      ),
+                    ),
+                    SizedBox.square(
+                      dimension: 44,
+                      child: IconButton(
+                        key: const Key('side-chat-dictation'),
+                        tooltip: _recording ? 'Stop dictation' : 'Dictate',
+                        onPressed: _sending ? null : _toggleDictation,
+                        icon: _transcribing
+                            ? const SizedBox.square(
+                                dimension: 18,
+                                child:
+                                    CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : Icon(_recording
+                                ? Icons.stop_circle_outlined
+                                : Icons.mic_none_rounded),
+                      ),
+                    ),
+                    SizedBox.square(
+                      dimension: 44,
+                      child: IconButton(
+                        key: const Key('side-chat-send'),
+                        tooltip: 'Send',
+                        onPressed: _sending ? null : _send,
+                        icon: _sending
+                            ? const SizedBox.square(
+                                dimension: 18,
+                                child:
+                                    CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Icon(Icons.send_rounded),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ),
         ),
       ),
@@ -974,6 +1558,7 @@ class SessionScreen extends StatefulWidget {
 class _SessionScreenState extends State<SessionScreen>
     with WidgetsBindingObserver {
   final TextEditingController _composer = TextEditingController();
+  final FocusNode _composerFocus = FocusNode();
   final TextEditingController _preparedDirectory = TextEditingController();
   final ScrollController _scrollController = ScrollController();
   final Map<String, GlobalKey> _messageKeys = <String, GlobalKey>{};
@@ -984,7 +1569,9 @@ class _SessionScreenState extends State<SessionScreen>
   bool _scrollScheduled = false;
   bool _loadingOlderHistory = false;
   String? _historyLoadError;
-  bool _meshSuggestionVisible = false;
+  int _slashCommandSelection = 0;
+  bool _slashCommandPaletteDismissed = false;
+  SimplifySettings? _simplifySettings;
   String? _modelProviderId;
   String? _selectedModelId;
   String? _selectedReasoningEffort;
@@ -996,6 +1583,8 @@ class _SessionScreenState extends State<SessionScreen>
   String? _walletLoadedFor;
   bool _sourceActionRunning = false;
   Timer? _childSessionPollTimer;
+  Timer? _liveSessionPollTimer;
+  bool _liveSessionPollInFlight = false;
   Timer? _dictationTimer;
   late final DictationRecorder _dictationRecorder;
   DateTime? _dictationStartedAt;
@@ -1025,7 +1614,15 @@ class _SessionScreenState extends State<SessionScreen>
     }
     if (!_draftLoaded) {
       _composer.text = store.drafts[widget.sessionId] ?? '';
-      _meshSuggestionVisible = _shouldShowMeshSuggestion(_composer.text);
+      _attachments
+        ..clear()
+        ..addAll(store.draftAttachmentsFor(widget.sessionId));
+      if (_containsSimplifyCommand(_composer.text) &&
+          _filteredSlashCommands(_composer.text) == null) {
+        _simplifySettings =
+            store.simplifySettingsFor(widget.sessionId) ?? SimplifySettings();
+        store.setDraftSimplifySettings(widget.sessionId, _simplifySettings);
+      }
       _deliveryMode = store.defaultDeliveryMode;
       _draftLoaded = true;
     }
@@ -1054,16 +1651,29 @@ class _SessionScreenState extends State<SessionScreen>
             final configured = models
                 .where((model) => model.id == _selectedModelId)
                 .firstOrNull;
+            final prepared = store.isPreparedSession(session.id);
+            final defaults = prepared
+                ? store.agentDefaultSelectionFor(session.providerId, models)
+                : null;
             final initialModel = configured ??
+                models
+                    .where((model) => model.id == defaults?.modelId)
+                    .firstOrNull ??
                 models.where((model) => model.isDefault).firstOrNull ??
                 models.firstOrNull;
-            if (store.isPreparedSession(session.id) && initialModel != null) {
-              _selectedModelId ??= initialModel.id;
-              _selectedReasoningEffort ??= initialModel.defaultReasoningEffort;
+            if (prepared &&
+                initialModel != null &&
+                _selectedModelId == session.modelId) {
+              setState(() {
+                _selectedModelId = initialModel.id;
+                _selectedReasoningEffort = defaults?.modelId == initialModel.id
+                    ? defaults?.reasoningEffort
+                    : _defaultConcreteReasoningEffort(initialModel);
+              });
             }
             if (_attachments.isNotEmpty) {
               _maybeShowImageModelNotice(initialModel);
-            } else {
+            } else if (!prepared || _selectedModelId != session.modelId) {
               setState(() {});
             }
           }));
@@ -1089,22 +1699,37 @@ class _SessionScreenState extends State<SessionScreen>
         }());
       });
     }
-    if (session != null) _configureChildSessionMonitoring(store, session);
+    if (session != null) {
+      _configureChildSessionMonitoring(store, session);
+      _configureLiveSessionMonitoring(store, session);
+    }
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _childSessionPollTimer?.cancel();
+    _liveSessionPollTimer?.cancel();
     _dictationTimer?.cancel();
     if (_recordingDictation) unawaited(_dictationRecorder.cancel());
     unawaited(_dictationRecorder.dispose());
     _store?.setVisibleSession(null);
-    _store?.discardPreparedSession(widget.sessionId);
+    _store?.setDraft(widget.sessionId, _composer.text);
+    _store?.setDraftAttachments(widget.sessionId, _attachments);
+    _store?.setDraftSimplifySettings(
+      widget.sessionId,
+      _containsSimplifyCommand(_composer.text) ? _simplifySettings : null,
+    );
+    if (_composer.text.trim().isEmpty &&
+        _attachments.isEmpty &&
+        _preparedDirectory.text.trim().isEmpty) {
+      _store?.discardPreparedSession(widget.sessionId);
+    }
     _scrollController
       ..removeListener(_updateStickToBottom)
       ..dispose();
     _composer.dispose();
+    _composerFocus.dispose();
     _preparedDirectory.dispose();
     super.dispose();
   }
@@ -1114,13 +1739,54 @@ class _SessionScreenState extends State<SessionScreen>
     if (state != AppLifecycleState.resumed) {
       _childSessionPollTimer?.cancel();
       _childSessionPollTimer = null;
+      _liveSessionPollTimer?.cancel();
+      _liveSessionPollTimer = null;
       return;
     }
     final store = _store;
     if (!mounted || store == null) return;
     final session =
         store.sessions.where((item) => item.id == widget.sessionId).firstOrNull;
-    if (session != null) _configureChildSessionMonitoring(store, session);
+    if (session != null) {
+      _configureChildSessionMonitoring(store, session);
+      _configureLiveSessionMonitoring(store, session);
+    }
+  }
+
+  void _configureLiveSessionMonitoring(
+      RemoteAppStore store, RemoteSession session) {
+    final lifecycleState = WidgetsBinding.instance.lifecycleState;
+    final visible = (lifecycleState == null ||
+            lifecycleState == AppLifecycleState.resumed) &&
+        ModalRoute.of(context)?.isCurrent != false;
+    if (!visible || session.state != 'working') {
+      _liveSessionPollTimer?.cancel();
+      _liveSessionPollTimer = null;
+      return;
+    }
+    _liveSessionPollTimer ??=
+        Timer.periodic(const Duration(milliseconds: 900), (_) async {
+      if (!mounted ||
+          _liveSessionPollInFlight ||
+          WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed ||
+          ModalRoute.of(context)?.isCurrent == false) {
+        return;
+      }
+      final current = store.sessions
+          .where((item) => item.id == widget.sessionId)
+          .firstOrNull;
+      if (current?.state != 'working') {
+        _liveSessionPollTimer?.cancel();
+        _liveSessionPollTimer = null;
+        return;
+      }
+      _liveSessionPollInFlight = true;
+      try {
+        await store.refreshVisibleSessionHistory(widget.sessionId);
+      } finally {
+        _liveSessionPollInFlight = false;
+      }
+    });
   }
 
   Future<void> _toggleDictation() async {
@@ -1195,150 +1861,164 @@ class _SessionScreenState extends State<SessionScreen>
     final preferredId = store.preferredDictationSourceIdForHarness(harnessId) ??
         store.dictationSourceForHarness(harnessId)?.id;
     final harnessName = providerVisualThemeFor(harnessId).displayName;
+    final hasReadySource =
+        store.dictationSources.any(store.isDictationSourceReady);
     final sourceId = await showModalBottomSheet<String>(
       context: context,
       showDragHandle: true,
       isScrollControlled: true,
       builder: (sheetContext) => SafeArea(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: <Widget>[
-              Text(
-                'Dictation source',
-                style: Theme.of(sheetContext).textTheme.titleMedium,
-              ),
-              const SizedBox(height: 3),
-              Text(
-                'Choose the service $harnessName uses for voice input.',
-                style: Theme.of(sheetContext).textTheme.bodySmall,
-              ),
-              const SizedBox(height: 12),
-              if (store.dictationSources.isEmpty)
-                Container(
-                  key: const Key('dictation-source-empty'),
-                  width: double.infinity,
-                  padding: const EdgeInsets.all(14),
-                  decoration: BoxDecoration(
-                    color: Theme.of(sheetContext)
-                        .colorScheme
-                        .surfaceContainerHighest
-                        .withValues(alpha: 0.45),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: const Text(
-                    'No dictation services were reported by this computer. '
-                    'Add an OpenAI or xAI API credential in Tethoq Bridge.',
-                  ),
-                )
-              else
-                ...store.dictationSources.map((source) {
-                  final ready = store.isDictationSourceReady(source);
-                  final selected = preferredId == source.id;
-                  return Padding(
-                    padding: const EdgeInsets.only(bottom: 8),
-                    child: Material(
-                      color: selected
-                          ? Theme.of(sheetContext)
-                              .colorScheme
-                              .primary
-                              .withValues(alpha: 0.1)
-                          : Theme.of(sheetContext)
-                              .colorScheme
-                              .surfaceContainerHighest
-                              .withValues(alpha: 0.35),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxHeight: MediaQuery.sizeOf(sheetContext).height * .78,
+          ),
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  'Dictation source',
+                  style: Theme.of(sheetContext).textTheme.titleMedium,
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  'Choose the service $harnessName uses for voice input.',
+                  style: Theme.of(sheetContext).textTheme.bodySmall,
+                ),
+                const SizedBox(height: 12),
+                if (!hasReadySource)
+                  Container(
+                    key: const Key('dictation-source-empty'),
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: Theme.of(sheetContext)
+                          .colorScheme
+                          .surfaceContainerHighest
+                          .withValues(alpha: 0.45),
                       borderRadius: BorderRadius.circular(12),
-                      child: InkWell(
-                        key: Key('dictation-source-option-${source.id}'),
+                    ),
+                    child: Text(
+                      store.dictationSources.isEmpty
+                          ? 'No dictation source is enabled. No compatible source is available on this computer.'
+                          : 'No dictation source is enabled. Set one up in Settings to start speaking here.',
+                    ),
+                  ),
+                if (store.dictationSources.isNotEmpty) ...<Widget>[
+                  const SizedBox(height: 8),
+                  ...store.dictationSources.map((source) {
+                    final ready = store.isDictationSourceReady(source);
+                    final selected = preferredId == source.id;
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Material(
+                        color: selected
+                            ? Theme.of(sheetContext)
+                                .colorScheme
+                                .primary
+                                .withValues(alpha: 0.1)
+                            : Theme.of(sheetContext)
+                                .colorScheme
+                                .surfaceContainerHighest
+                                .withValues(alpha: 0.35),
                         borderRadius: BorderRadius.circular(12),
-                        onTap: ready
-                            ? () => Navigator.pop(sheetContext, source.id)
-                            : null,
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 12, vertical: 10),
-                          child: Row(
-                            children: <Widget>[
-                              ClipOval(
-                                child: Container(
-                                  width: 38,
-                                  height: 38,
-                                  alignment: Alignment.center,
-                                  color: Theme.of(sheetContext)
-                                      .colorScheme
-                                      .surface,
-                                  child: ProviderLogo(
-                                    providerId:
-                                        _dictationLogoProviderId(source),
-                                    size: 24,
-                                    semanticLabel: '${source.label} logo',
+                        child: InkWell(
+                          key: Key('dictation-source-option-${source.id}'),
+                          borderRadius: BorderRadius.circular(12),
+                          onTap: ready
+                              ? () => Navigator.pop(sheetContext, source.id)
+                              : null,
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 12, vertical: 10),
+                            child: Row(
+                              children: <Widget>[
+                                ClipOval(
+                                  child: Container(
+                                    width: 38,
+                                    height: 38,
+                                    alignment: Alignment.center,
+                                    color: Theme.of(sheetContext)
+                                        .colorScheme
+                                        .surface,
+                                    child: ProviderLogo(
+                                      providerId:
+                                          _dictationLogoProviderId(source),
+                                      size: 24,
+                                      semanticLabel: '${source.label} logo',
+                                    ),
                                   ),
                                 ),
-                              ),
-                              const SizedBox(width: 11),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: <Widget>[
-                                    Text(
-                                      source.label,
-                                      style: Theme.of(sheetContext)
-                                          .textTheme
-                                          .bodyLarge
-                                          ?.copyWith(
-                                            fontWeight: FontWeight.w600,
-                                            color: ready
-                                                ? null
-                                                : Theme.of(sheetContext)
-                                                    .disabledColor,
-                                          ),
-                                    ),
-                                    const SizedBox(height: 2),
-                                    Text(
-                                      ready
-                                          ? 'Ready on Tethoq Bridge'
-                                          : 'API credential needed in Tethoq Bridge · ${source.setupEnvironmentVariable}',
-                                      style: Theme.of(sheetContext)
-                                          .textTheme
-                                          .bodySmall
-                                          ?.copyWith(
-                                            color: ready
-                                                ? Theme.of(sheetContext)
-                                                    .colorScheme
-                                                    .onSurfaceVariant
-                                                : Theme.of(sheetContext)
-                                                    .disabledColor,
-                                          ),
-                                    ),
-                                  ],
+                                const SizedBox(width: 11),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: <Widget>[
+                                      Text(
+                                        source.label,
+                                        style: Theme.of(sheetContext)
+                                            .textTheme
+                                            .bodyLarge
+                                            ?.copyWith(
+                                              fontWeight: FontWeight.w600,
+                                              color: ready
+                                                  ? null
+                                                  : Theme.of(sheetContext)
+                                                      .disabledColor,
+                                            ),
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        ready
+                                            ? 'Ready on Tethoq Bridge'
+                                            : '${source.credentialLabel ?? 'API key'} required · set up in Settings',
+                                        style: Theme.of(sheetContext)
+                                            .textTheme
+                                            .bodySmall
+                                            ?.copyWith(
+                                              color: ready
+                                                  ? Theme.of(sheetContext)
+                                                      .colorScheme
+                                                      .onSurfaceVariant
+                                                  : Theme.of(sheetContext)
+                                                      .disabledColor,
+                                            ),
+                                      ),
+                                    ],
+                                  ),
                                 ),
-                              ),
-                              const SizedBox(width: 8),
-                              Icon(
-                                selected
-                                    ? Icons.check_circle_rounded
-                                    : ready
-                                        ? Icons.circle_outlined
-                                        : Icons.lock_outline_rounded,
-                                size: 21,
-                                color: selected
-                                    ? Theme.of(sheetContext).colorScheme.primary
-                                    : ready
-                                        ? Theme.of(sheetContext)
-                                            .colorScheme
-                                            .onSurfaceVariant
-                                        : Theme.of(sheetContext).disabledColor,
-                              ),
-                            ],
+                                const SizedBox(width: 8),
+                                Icon(
+                                  selected
+                                      ? Icons.check_circle_rounded
+                                      : ready
+                                          ? Icons.circle_outlined
+                                          : Icons.lock_outline_rounded,
+                                  size: 21,
+                                  color: selected
+                                      ? Theme.of(sheetContext)
+                                          .colorScheme
+                                          .primary
+                                      : ready
+                                          ? Theme.of(sheetContext)
+                                              .colorScheme
+                                              .onSurfaceVariant
+                                          : Theme.of(sheetContext)
+                                              .disabledColor,
+                                ),
+                              ],
+                            ),
                           ),
                         ),
                       ),
-                    ),
-                  );
-                }),
-            ],
+                    );
+                  }),
+                ],
+              ],
+            ),
           ),
         ),
       ),
@@ -1412,10 +2092,7 @@ class _SessionScreenState extends State<SessionScreen>
       selection:
           TextSelection.collapsed(offset: before.length + inserted.length),
     );
-    StoreScope.of(context).setDraft(widget.sessionId, text);
-    setState(() {
-      _meshSuggestionVisible = _shouldShowMeshSuggestion(text);
-    });
+    _onComposerChanged(StoreScope.of(context), text);
   }
 
   void _showDictationError(Object caught) {
@@ -1426,11 +2103,114 @@ class _SessionScreenState extends State<SessionScreen>
         .showSnackBar(SnackBar(content: Text(message)));
   }
 
-  String get _dictationHint {
+  String _composerHint(RemoteAppStore store) {
     if (_transcribingDictation) return 'Transcribing…';
-    if (!_recordingDictation) return 'Continue the session…';
+    if (!_recordingDictation) {
+      return store.isPreparedSession(widget.sessionId)
+          ? 'Describe a task…'
+          : 'Continue this task…';
+    }
     final seconds = _dictationElapsed.inSeconds;
     return 'Listening… 0:${seconds.toString().padLeft(2, '0')}';
+  }
+
+  void _onComposerChanged(RemoteAppStore store, String value) {
+    store.setDraft(widget.sessionId, value);
+    final simplifyActive = _containsSimplifyCommand(value) &&
+        _filteredSlashCommands(value) == null;
+    final nextSimplifySettings = simplifyActive
+        ? _simplifySettings ??
+            store.simplifySettingsFor(widget.sessionId) ??
+            SimplifySettings()
+        : null;
+    store.setDraftSimplifySettings(widget.sessionId, nextSimplifySettings);
+    setState(() {
+      _slashCommandPaletteDismissed = false;
+      _slashCommandSelection = 0;
+      _simplifySettings = nextSimplifySettings;
+    });
+    if (_meshTargets.isEmpty && value.toLowerCase() == '/mesh ') {
+      unawaited(_activateMesh());
+    }
+  }
+
+  List<_SlashCommandDefinition>? get _slashCommandSuggestions =>
+      _meshTargets.isEmpty ? _filteredSlashCommands(_composer.text) : null;
+
+  bool get _slashCommandPaletteVisible =>
+      !_slashCommandPaletteDismissed && _slashCommandSuggestions != null;
+
+  void _activateSlashCommand(_SlashCommandDefinition command) {
+    if (command.id == 'mesh') {
+      unawaited(_activateMesh());
+      return;
+    }
+    _activateSimplify();
+  }
+
+  KeyEventResult _handleComposerKey(FocusNode _, KeyEvent event) {
+    if (event is! KeyDownEvent || !_slashCommandPaletteVisible) {
+      return KeyEventResult.ignored;
+    }
+    final suggestions = _slashCommandSuggestions ?? const [];
+    if (event.logicalKey == LogicalKeyboardKey.escape) {
+      setState(() => _slashCommandPaletteDismissed = true);
+      return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.arrowDown ||
+        event.logicalKey == LogicalKeyboardKey.arrowUp) {
+      if (suggestions.isNotEmpty) {
+        final direction =
+            event.logicalKey == LogicalKeyboardKey.arrowDown ? 1 : -1;
+        setState(() => _slashCommandSelection =
+            (_slashCommandSelection + direction + suggestions.length) %
+                suggestions.length);
+      }
+      return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.enter ||
+        event.logicalKey == LogicalKeyboardKey.numpadEnter ||
+        event.logicalKey == LogicalKeyboardKey.tab) {
+      if (suggestions.isNotEmpty) {
+        _activateSlashCommand(suggestions[
+            _slashCommandSelection.clamp(0, suggestions.length - 1)]);
+      }
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  void _activateSimplify() {
+    const command = '/simplify ';
+    _composer.value = const TextEditingValue(
+      text: command,
+      selection: TextSelection.collapsed(offset: command.length),
+    );
+    _onComposerChanged(StoreScope.of(context), command);
+    _composerFocus.requestFocus();
+  }
+
+  void _removeSimplify() {
+    final text = _withoutSimplifyCommand(_composer.text);
+    _composer.value = TextEditingValue(
+      text: text,
+      selection: TextSelection.collapsed(offset: text.length),
+    );
+    _onComposerChanged(StoreScope.of(context), text);
+  }
+
+  Future<void> _openSimplifySettings() async {
+    final current = _simplifySettings ?? SimplifySettings();
+    final selected = await showModalBottomSheet<SimplifySettings>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      constraints: const BoxConstraints(maxWidth: 640),
+      builder: (sheetContext) => _SimplifySettingsSheet(initial: current),
+    );
+    if (!mounted || selected == null) return;
+    setState(() => _simplifySettings = selected);
+    StoreScope.of(context).setDraftSimplifySettings(widget.sessionId, selected);
   }
 
   void _configureChildSessionMonitoring(
@@ -1491,17 +2271,10 @@ class _SessionScreenState extends State<SessionScreen>
     }
   }
 
-  bool _shouldShowMeshSuggestion(String value) {
-    if (_meshTargets.isNotEmpty) return false;
-    final text = value.trim();
-    if (text.contains(RegExp(r'\s'))) return false;
-    return text.length >= 4 && '/mesh'.startsWith(text.toLowerCase());
-  }
-
   Future<void> _activateMesh() async {
     _composer.clear();
     StoreScope.of(context).setDraft(widget.sessionId, '');
-    setState(() => _meshSuggestionVisible = false);
+    setState(() => _slashCommandPaletteDismissed = true);
     await _addMeshTarget();
   }
 
@@ -1565,10 +2338,12 @@ class _SessionScreenState extends State<SessionScreen>
             models.firstOrNull;
     final efforts = model?.reasoningEfforts ?? const <ReasoningEffortOption>[];
     final rememberedEffort = efforts
-            .where((item) => item.id == remembered?.reasoningEffort)
+            .where((item) =>
+                item.id ==
+                _concreteReasoningEffort(remembered?.reasoningEffort))
             .firstOrNull
             ?.id ??
-        model?.defaultReasoningEffort ??
+        _defaultConcreteReasoningEffort(model) ??
         efforts.firstOrNull?.id;
     setState(() => _meshTargets.add(DelegationSelection(
           providerId: provider.providerId,
@@ -1630,7 +2405,7 @@ class _SessionScreenState extends State<SessionScreen>
     final model =
         models.where((item) => item.id == selectedModelId).firstOrNull;
     final efforts = model?.reasoningEfforts ?? const <ReasoningEffortOption>[];
-    String? effort = model?.defaultReasoningEffort;
+    String? effort = _defaultConcreteReasoningEffort(model);
     if (efforts.isNotEmpty) {
       effort = await showModalBottomSheet<String>(
         context: context,
@@ -1820,11 +2595,10 @@ class _SessionScreenState extends State<SessionScreen>
 
   void _setPendingAttachment(RemoteAttachment attachment) {
     setState(() {
-      _attachments
-        ..clear()
-        ..add(attachment);
+      _attachments.add(attachment);
     });
     final store = StoreScope.of(context);
+    store.setDraftAttachments(widget.sessionId, _attachments);
     final session =
         store.sessions.where((item) => item.id == widget.sessionId).firstOrNull;
     final model = session == null
@@ -2022,7 +2796,7 @@ class _SessionScreenState extends State<SessionScreen>
     setState(() {
       _modelProviderId = model.providerId;
       _selectedModelId = model.id;
-      _selectedReasoningEffort = null;
+      _selectedReasoningEffort = _defaultConcreteReasoningEffort(model);
       _imageModelNoticeId = null;
     });
     store.rememberModelSelection(model.providerId, model.id);
@@ -2175,7 +2949,8 @@ class _SessionScreenState extends State<SessionScreen>
                       VisionProxySelection(
                         providerId: choice.target.providerId,
                         modelId: choice.model.id,
-                        reasoningEffort: choice.model.defaultReasoningEffort,
+                        reasoningEffort:
+                            _defaultConcreteReasoningEffort(choice.model),
                       )),
                 )),
           ],
@@ -2198,7 +2973,7 @@ class _SessionScreenState extends State<SessionScreen>
             _visionProxySelection?.providerId == configured.providerId &&
                     _visionProxySelection?.modelId == configured.modelId
                 ? _visionProxySelection?.reasoningEffort
-                : choice.model.defaultReasoningEffort;
+                : _defaultConcreteReasoningEffort(choice.model);
         final effort = await showModalBottomSheet<String>(
           context: context,
           constraints: const BoxConstraints(maxWidth: 640),
@@ -2282,6 +3057,8 @@ class _SessionScreenState extends State<SessionScreen>
       ),
     );
     if (!mounted || selected == null) return;
+    final store = StoreScope.read(context);
+    store.turnOnQueueingFor(widget.sessionId);
     setState(() => _deliveryMode = selected);
   }
 
@@ -2431,6 +3208,201 @@ class _SessionScreenState extends State<SessionScreen>
     }
   }
 
+  Future<void> _editQueuedInstruction(
+      RemoteAppStore store, RemoteQueuedMessage message) async {
+    final controller = TextEditingController(text: message.content);
+    try {
+      final replacement = await showModalBottomSheet<String>(
+        context: context,
+        useSafeArea: true,
+        isScrollControlled: true,
+        showDragHandle: true,
+        constraints: const BoxConstraints(maxWidth: 640),
+        builder: (sheetContext) => Padding(
+          padding: EdgeInsets.fromLTRB(
+              16, 0, 16, MediaQuery.viewInsetsOf(sheetContext).bottom + 12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              Text('Edit queued message',
+                  style: Theme.of(sheetContext).textTheme.titleMedium),
+              const SizedBox(height: 10),
+              TextField(
+                key: const Key('edit-queued-message-field'),
+                controller: controller,
+                autofocus: true,
+                minLines: 2,
+                maxLines: 7,
+              ),
+              const SizedBox(height: 10),
+              FilledButton(
+                key: const Key('save-queued-message'),
+                onPressed: () {
+                  final value = controller.text.trim();
+                  if (value.isNotEmpty) Navigator.pop(sheetContext, value);
+                },
+                child: const Text('Save'),
+              ),
+            ],
+          ),
+        ),
+      );
+      if (!mounted ||
+          replacement == null ||
+          replacement == message.content.trim()) {
+        return;
+      }
+      await store.editQueuedMessage(message, replacement);
+    } on Object catch (caught) {
+      if (mounted) _showCompactError(context, 'Could not edit message', caught);
+    } finally {
+      controller.dispose();
+    }
+  }
+
+  Future<void> _openQueuedInstructionActions(
+    RemoteAppStore store,
+    RemoteSession session,
+    RemoteQueuedMessage message,
+  ) async {
+    final canSteer = session.state == 'working' &&
+        store.providerSupportsSteering(session.providerId);
+    final action = await showModalBottomSheet<_QueuedMessageAction>(
+      context: context,
+      useSafeArea: true,
+      showDragHandle: true,
+      constraints: const BoxConstraints(maxWidth: 640),
+      builder: (sheetContext) => SafeArea(
+        top: false,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            _QueueActionTile(
+              key: const Key('queued-action-edit'),
+              icon: Icons.edit_outlined,
+              label: 'Edit message',
+              onTap: () =>
+                  Navigator.pop(sheetContext, _QueuedMessageAction.edit),
+            ),
+            _QueueActionTile(
+              key: const Key('queued-action-deliver'),
+              icon: canSteer ? Icons.alt_route_rounded : Icons.send_outlined,
+              label: canSteer ? 'Steer now' : 'Send now',
+              onTap: () =>
+                  Navigator.pop(sheetContext, _QueuedMessageAction.deliver),
+            ),
+            _QueueActionTile(
+              key: const Key('queued-action-side-chat'),
+              icon: Icons.add_comment_outlined,
+              label: 'Open in side chat',
+              onTap: () =>
+                  Navigator.pop(sheetContext, _QueuedMessageAction.sideChat),
+            ),
+            _QueueActionTile(
+              key: const Key('queued-action-new-task'),
+              icon: Icons.call_split_rounded,
+              label: 'Send to new task',
+              onTap: () =>
+                  Navigator.pop(sheetContext, _QueuedMessageAction.newTask),
+            ),
+            _QueueActionTile(
+              key: const Key('queued-action-disable-queue'),
+              icon: Icons.next_plan_outlined,
+              label: 'Turn off queuing',
+              onTap: () => Navigator.pop(
+                  sheetContext, _QueuedMessageAction.disableQueue),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (!mounted || action == null) return;
+    try {
+      switch (action) {
+        case _QueuedMessageAction.edit:
+          await _editQueuedInstruction(store, message);
+          return;
+        case _QueuedMessageAction.deliver:
+          await store.deliverQueuedMessage(message,
+              mode: canSteer ? 'steer' : 'send');
+          return;
+        case _QueuedMessageAction.sideChat:
+          final created = await store.createSideChat(
+            session.id,
+            queuedMessageId: message.id,
+          );
+          if (mounted) await _showSideChatSheet(context, created);
+          return;
+        case _QueuedMessageAction.newTask:
+          final catalog = await store.loadModelCatalog();
+          if (!mounted) return;
+          final usableProviderIds = store.providers
+              .where((provider) =>
+                  provider.detected &&
+                  provider.state == 'online' &&
+                  provider.authenticated != false &&
+                  provider.capabilities.createSession &&
+                  provider.capabilities.modelEnumeration)
+              .map((provider) => provider.providerId)
+              .toSet();
+          final models = catalog
+              .where((model) => usableProviderIds.contains(model.providerId))
+              .toList(growable: false);
+          if (models.isEmpty) {
+            throw StateError('No connected Agent is ready to start a task');
+          }
+          final choice = await showModalBottomSheet<_QueuedTaskChoice>(
+            context: context,
+            useSafeArea: true,
+            showDragHandle: true,
+            isScrollControlled: true,
+            constraints: const BoxConstraints(maxWidth: 720),
+            builder: (sheetContext) => FractionallySizedBox(
+              heightFactor: .86,
+              child: _QueuedNewTaskSheet(
+                models: models,
+                sessions: store.sessions,
+                recentModels: store.recentModels(models),
+                sourceSession: session,
+                message: message,
+              ),
+            ),
+          );
+          if (!mounted || choice == null) return;
+          final created = await store.moveQueuedMessageToNewTask(
+            message,
+            providerId: choice.providerId,
+            modelId: choice.modelId,
+            reasoningEffort: choice.reasoningEffort,
+          );
+          if (!mounted) return;
+          await Navigator.of(context).push(MaterialPageRoute<void>(
+            builder: (_) => SessionScreen(sessionId: created.id),
+          ));
+          return;
+        case _QueuedMessageAction.disableQueue:
+          store.turnOffQueueingFor(session.id);
+          setState(() => _deliveryMode = canSteer ? 'steer' : 'send');
+          return;
+      }
+    } on Object catch (caught) {
+      if (mounted)
+        _showCompactError(context, 'Could not update message', caught);
+    }
+  }
+
+  Future<void> _createSideChat(RemoteAppStore store) async {
+    try {
+      final created = await store.createSideChat(widget.sessionId);
+      if (mounted) await _showSideChatSheet(context, created);
+    } on Object catch (caught) {
+      if (mounted)
+        _showCompactError(context, 'Could not open side chat', caught);
+    }
+  }
+
   Future<void> _openContextControls(RemoteAppStore store, RemoteSession session,
       ProviderVisualTheme visual) async {
     var usage = store.contextBySession[session.id];
@@ -2490,7 +3462,7 @@ class _SessionScreenState extends State<SessionScreen>
               Row(
                 children: <Widget>[
                   Expanded(
-                    child: Text('Context used',
+                    child: Text('Current use',
                         style: Theme.of(sheetContext).textTheme.bodyMedium),
                   ),
                   if (_contextFraction(initial) != null)
@@ -2601,42 +3573,47 @@ class _SessionScreenState extends State<SessionScreen>
                       height: 1.4),
                 ),
               ],
-              const SizedBox(height: 8),
-              Theme(
-                data: Theme.of(sheetContext)
-                    .copyWith(dividerColor: Colors.transparent),
-                child: ExpansionTile(
-                  key: const Key('session-context-usage-details'),
-                  tilePadding: EdgeInsets.zero,
-                  childrenPadding: const EdgeInsets.only(bottom: 4),
-                  visualDensity: VisualDensity.compact,
-                  title: const Text('Usage details',
-                      style:
-                          TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
-                  children: <Widget>[
-                    _ContextStatRow(
-                        label: 'In use',
-                        value: initial.usedTokens == null
-                            ? 'Not reported'
-                            : initial.contextWindowTokens == null
-                                ? _compactTokenCount(initial.usedTokens)
-                                : '${_compactTokenCount(initial.usedTokens)} / ${_compactTokenCount(initial.contextWindowTokens)}'),
-                    _ContextStatRow(
-                        label: 'Input / output',
-                        value:
-                            '${initial.usage.inputTokens == null ? 'Not reported' : _compactTokenCount(initial.usage.inputTokens)} / ${initial.usage.outputTokens == null ? 'Not reported' : _compactTokenCount(initial.usage.outputTokens)}'),
-                    if (initial.usage.cacheReadTokens != null ||
-                        initial.usage.cacheWriteTokens != null)
-                      _ContextStatRow(
-                          label: 'Cached read / write',
-                          value:
-                              '${initial.usage.cacheReadTokens == null ? 'Not reported' : _compactTokenCount(initial.usage.cacheReadTokens)} / ${initial.usage.cacheWriteTokens == null ? 'Not reported' : _compactTokenCount(initial.usage.cacheWriteTokens)}'),
-                    if (_contextCost(initial) != null)
-                      _ContextStatRow(
-                          label: 'Session cost', value: _contextCost(initial)!),
-                  ],
+              const SizedBox(height: 16),
+              Text(
+                'Usage details',
+                key: const Key('session-context-usage-details'),
+                style: const TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w700,
+                  decoration: TextDecoration.underline,
+                  decorationThickness: 1,
                 ),
               ),
+              const SizedBox(height: 4),
+              _ContextStatRow(
+                  label: 'Context used',
+                  value: initial.usedTokens == null
+                      ? 'Not reported'
+                      : _compactTokenCount(initial.usedTokens)),
+              if (initial.compactionThresholdTokens != null)
+                _ContextStatRow(
+                    label: 'Automatic compaction',
+                    value:
+                        _compactTokenCount(initial.compactionThresholdTokens)),
+              _ContextStatRow(
+                  label: 'Model capacity',
+                  value: initial.contextWindowTokens == null
+                      ? 'Not reported'
+                      : _compactTokenCount(initial.contextWindowTokens)),
+              _ContextStatRow(
+                  label: 'Input / output',
+                  value:
+                      '${initial.usage.inputTokens == null ? 'Not reported' : _compactTokenCount(initial.usage.inputTokens)} / ${initial.usage.outputTokens == null ? 'Not reported' : _compactTokenCount(initial.usage.outputTokens)}'),
+              if (initial.usage.cacheReadTokens != null ||
+                  initial.usage.cacheWriteTokens != null)
+                _ContextStatRow(
+                    label: 'Cached read / write',
+                    value:
+                        '${initial.usage.cacheReadTokens == null ? 'Not reported' : _compactTokenCount(initial.usage.cacheReadTokens)} / ${initial.usage.cacheWriteTokens == null ? 'Not reported' : _compactTokenCount(initial.usage.cacheWriteTokens)}'),
+              if (_contextCost(initial) != null)
+                _ContextStatRow(
+                    label: 'Session cost', value: _contextCost(initial)!),
+              const SizedBox(height: 8),
               if (initial.supportsThreshold &&
                   windowTokens != null) ...<Widget>[
                 if ((session.state == 'working' ||
@@ -2825,12 +3802,17 @@ class _SessionScreenState extends State<SessionScreen>
             metadataModel?.displayName ??
             session?.modelId ??
             'Model';
-    final displayedReasoningEffort = sessionWorking
-        ? session?.reasoningEffort
-        : _selectedReasoningEffort ?? session?.reasoningEffort;
+    final displayedReasoningEffort = _resolveReasoningEffort(
+      session: session,
+      selectedEffort: _selectedReasoningEffort,
+      displayedModelId: displayedModelId,
+      model: metadataModel,
+      sessionWorking: sessionWorking,
+    );
     final displayedReasoningLabel = displayedReasoningEffort == null
-        ? 'Effort unknown'
+        ? ''
         : _effortDisplayLabel(displayedReasoningEffort, displayedModelId);
+    final contextCompacting = sessionContext?.isCompacting == true;
     final wallet = session == null
         ? null
         : store.walletDisplayFor(session.providerId, displayedModelId);
@@ -2851,8 +3833,13 @@ class _SessionScreenState extends State<SessionScreen>
     final steeringSupported =
         session != null && store.providerSupportsSteering(session.providerId);
     final steeringAvailable = sessionWorking && steeringSupported;
-    final deliveryMode =
-        _deliveryMode == 'steer' && steeringAvailable ? 'steer' : 'queue';
+    final deliveryMode = !store.isQueueingEnabledFor(widget.sessionId)
+        ? steeringAvailable
+            ? 'steer'
+            : 'send'
+        : _deliveryMode == 'steer' && steeringAvailable
+            ? 'steer'
+            : 'queue';
     final queuedMessages = store.queuedMessagesFor(widget.sessionId);
     final delegationTasks = store.delegationsFor(widget.sessionId);
     final messageEditingAvailable = session != null &&
@@ -2867,37 +3854,42 @@ class _SessionScreenState extends State<SessionScreen>
       ...history,
       if (liveAssistant != null) liveAssistant,
     ];
-    final shimmeringReasoningMessage = <RemoteMessage>[
-      ...history,
-      if (liveAssistant != null) liveAssistant,
-    ]
-        .reversed
-        .where((message) =>
-            message.status == 'streaming' &&
-            message.role.toLowerCase() == 'assistant' &&
-            message.parts.any((part) =>
-                _assistantTextTone(part, false) ==
-                _AssistantTextTone.privateReasoning))
-        .firstOrNull;
+    final shimmeringReasoningMessage = sessionWorking
+        ? <RemoteMessage>[
+            ...history,
+            if (liveAssistant != null) liveAssistant,
+          ]
+            .reversed
+            .where((message) =>
+                message.status == 'streaming' &&
+                message.role.toLowerCase() == 'assistant' &&
+                message.parts.any((part) =>
+                    _assistantTextTone(part, false) ==
+                    _AssistantTextTone.privateReasoning))
+            .firstOrNull
+        : null;
     final liveEvents = (store.events[widget.sessionId] ?? const <AgentEvent>[])
         .where((event) =>
             _showsConversationEvent(event.type) &&
             !_eventHasStructuredSubagent(event))
         .toList(growable: false);
     final activityGroups = _groupConversationActivity(liveEvents);
+    final conversationItems = _conversationTimelineItems(
+      identityMessages,
+      activityGroups,
+      sessionWorking,
+    );
     final sessionApprovals = store.approvals.values
         .where((approval) => approval.sessionId == widget.sessionId)
         .toList();
     final inputRequests = store.userInputs.values
         .where((request) => request.sessionId == widget.sessionId)
         .toList();
-    final itemCount = history.length +
-        (liveAssistant == null ? 0 : 1) +
-        (activityGroups.isEmpty ? 0 : 1) +
+    final itemCount = conversationItems.length +
         sessionApprovals.length +
         inputRequests.length +
-        queuedMessages.length +
-        delegationTasks.length;
+        delegationTasks.length +
+        (contextCompacting ? 1 : 0);
     final sessionHistoryLoading =
         store.isSessionHistoryLoading(widget.sessionId);
     final emptyHistoryError = itemCount == 0 && !sessionHistoryLoading
@@ -3189,75 +4181,74 @@ class _SessionScreenState extends State<SessionScreen>
                                 );
                               }
                               if (hasHistoryLoader) index -= 1;
-                              if (index < history.length) {
-                                final message = history[index];
-                                final canEdit =
-                                    messageEditingAvailable && message.editable;
+                              if (index < conversationItems.length) {
+                                final item = conversationItems[index];
+                                if (item.reasoningSegments.isNotEmpty) {
+                                  final firstMessageIndex =
+                                      item.firstMessageIndex;
+                                  return _withTurnBoundarySpacing(
+                                    items: conversationItems,
+                                    index: index,
+                                    child: _MessageReasoningSpan(
+                                      key: ValueKey<String>(
+                                          'reasoning-span-${item.id}'),
+                                      id: item.id,
+                                      segments: item.reasoningSegments,
+                                      visual: visual,
+                                      providerId: session?.providerId ??
+                                          visual.providerId,
+                                      showIdentity: firstMessageIndex != null &&
+                                          _shouldShowAssistantIdentity(
+                                              identityMessages,
+                                              firstMessageIndex),
+                                      working: item.working,
+                                      displayMode: store.reasoningDisplayMode ==
+                                              'expanded'
+                                          ? _ReasoningDisplayMode.expanded
+                                          : _ReasoningDisplayMode.compact,
+                                    ),
+                                  );
+                                }
+                                final message = item.message!;
+                                final messageIndex = item.firstMessageIndex!;
+                                final sourceMessage =
+                                    identityMessages[messageIndex];
+                                final isLiveMessage = item.working;
+                                final canEdit = !isLiveMessage &&
+                                    messageEditingAvailable &&
+                                    sourceMessage.editable;
                                 final hasMessageActions = canEdit ||
-                                    _copyableMessageText(message).isNotEmpty;
-                                return _MessageCard(
-                                  key: _messageKeys.putIfAbsent(
-                                      message.id, GlobalKey.new),
-                                  message: message,
-                                  visual: visual,
-                                  providerId:
-                                      session?.providerId ?? visual.providerId,
-                                  showIdentity: _shouldShowAssistantIdentity(
-                                      identityMessages, index),
-                                  streaming: message.status == 'streaming',
-                                  shimmerPrivateReasoning: message.id ==
-                                      shimmeringReasoningMessage?.id,
-                                  showFinalBoundary:
-                                      _finalFollowsAssistantArtifacts(
-                                          identityMessages, index),
-                                  editEnabled: canEdit,
-                                  onLongPress: hasMessageActions
-                                      ? () => unawaited(_openMessageActions(
-                                          message, visual,
-                                          editEnabled: canEdit))
-                                      : null,
-                                );
-                              }
-                              var cursor = index - history.length;
-                              if (liveAssistant != null) {
-                                if (cursor == 0) {
-                                  return _MessageCard(
+                                    _copyableMessageText(sourceMessage)
+                                        .isNotEmpty;
+                                return _withTurnBoundarySpacing(
+                                  items: conversationItems,
+                                  index: index,
+                                  child: _MessageCard(
                                     key: _messageKeys.putIfAbsent(
-                                        liveAssistant.id, GlobalKey.new),
-                                    message: liveAssistant,
+                                        message.id, GlobalKey.new),
+                                    message: message,
                                     visual: visual,
                                     providerId: session?.providerId ??
                                         visual.providerId,
                                     showIdentity: _shouldShowAssistantIdentity(
-                                        identityMessages, history.length),
-                                    streaming: true,
-                                    shimmerPrivateReasoning: liveAssistant.id ==
+                                        identityMessages, messageIndex),
+                                    streaming: isLiveMessage ||
+                                        message.status == 'streaming',
+                                    shimmerPrivateReasoning: message.id ==
                                         shimmeringReasoningMessage?.id,
-                                    showFinalBoundary:
+                                    showFinalBoundary: item.showFinalBoundary ||
                                         _finalFollowsAssistantArtifacts(
-                                            identityMessages, history.length),
-                                    onLongPress:
-                                        _copyableMessageText(liveAssistant)
-                                                .isNotEmpty
-                                            ? () => unawaited(
-                                                _openMessageActions(
-                                                    liveAssistant, visual,
-                                                    editEnabled: false))
-                                            : null,
-                                  );
-                                }
-                                cursor -= 1;
+                                            identityMessages, messageIndex),
+                                    editEnabled: canEdit,
+                                    onLongPress: hasMessageActions
+                                        ? () => unawaited(_openMessageActions(
+                                            sourceMessage, visual,
+                                            editEnabled: canEdit))
+                                        : null,
+                                  ),
+                                );
                               }
-                              if (activityGroups.isNotEmpty) {
-                                if (cursor == 0) {
-                                  return _ReasoningActivityGroup(
-                                    groups: activityGroups,
-                                    visual: visual,
-                                    working: sessionWorking,
-                                  );
-                                }
-                                cursor -= 1;
-                              }
+                              var cursor = index - conversationItems.length;
                               if (cursor < sessionApprovals.length)
                                 return _ApprovalCard(
                                     approval: sessionApprovals[cursor]);
@@ -3267,31 +4258,26 @@ class _SessionScreenState extends State<SessionScreen>
                                     request: inputRequests[cursor]);
                               }
                               cursor -= inputRequests.length;
-                              if (cursor < queuedMessages.length) {
-                                final queued = queuedMessages[cursor];
-                                return _QueuedInstructionCard(
-                                  message: queued,
+                              if (cursor < delegationTasks.length) {
+                                return _DelegationTaskCard(
+                                  task: delegationTasks[cursor],
                                   visual: visual,
-                                  onCancel: () => unawaited(
-                                      store.cancelQueuedMessage(queued.id)),
+                                  onOpenChild: (child) {
+                                    final childSession = child.sessionId == null
+                                        ? null
+                                        : store.sessions
+                                            .where((item) =>
+                                                item.id == child.sessionId)
+                                            .firstOrNull;
+                                    if (childSession == null) return;
+                                    store.openSessionForView(childSession);
+                                    unawaited(Navigator.of(context).push(
+                                        sessionScreenRoute(childSession.id)));
+                                  },
                                 );
                               }
-                              cursor -= queuedMessages.length;
-                              return _DelegationTaskCard(
-                                task: delegationTasks[cursor],
-                                visual: visual,
-                                onOpenChild: (child) {
-                                  final childSession = child.sessionId == null
-                                      ? null
-                                      : store.sessions
-                                          .where((item) =>
-                                              item.id == child.sessionId)
-                                          .firstOrNull;
-                                  if (childSession == null) return;
-                                  store.openSessionForView(childSession);
-                                  unawaited(Navigator.of(context).push(
-                                      sessionScreenRoute(childSession.id)));
-                                },
+                              return _CompactionProgressRow(
+                                compactionKind: sessionContext?.compactionKind,
                               );
                             },
                           ),
@@ -3326,11 +4312,10 @@ class _SessionScreenState extends State<SessionScreen>
                                 : () => _openWallet(store, session,
                                     displayedModelId, modelOptions),
                             reasoningLabel: displayedReasoningLabel,
-                            reasoningVisible: sessionWorking ||
-                                (modelSelectionSupported &&
-                                    reasoningEfforts.isNotEmpty),
-                            reasoningEnabled:
-                                !sessionWorking && reasoningEfforts.isNotEmpty,
+                            reasoningVisible: displayedReasoningEffort != null,
+                            reasoningEnabled: !sessionWorking &&
+                                modelSelectionSupported &&
+                                reasoningEfforts.isNotEmpty,
                             effortIsUltra: displayedReasoningEffort == 'ultra',
                             onReasoningTap: () => _chooseReasoningEffort(
                                 reasoningEfforts, displayedModelId),
@@ -3339,17 +4324,22 @@ class _SessionScreenState extends State<SessionScreen>
                                 : 'Eyes: ${_visionProxySelection!.modelId}',
                             visionEnabled: !sessionWorking,
                             onVisionTap: _chooseVisionProxy,
-                            deliveryLabel:
-                                deliveryMode == 'steer' ? 'Steer' : 'Queue',
+                            deliveryLabel: switch (deliveryMode) {
+                              'steer' => 'Steer',
+                              'send' => 'Send',
+                              _ => 'Queue',
+                            },
                             onDeliveryTap: () => _chooseDeliveryMode(
                               steeringSupported: steeringSupported,
                               steeringAvailable: steeringAvailable,
                             ),
                           ),
-                          if (_meshSuggestionVisible)
-                            _MeshCommandSuggestion(
+                          if (_slashCommandPaletteVisible)
+                            _SlashCommandPalette(
+                              commands: _slashCommandSuggestions ?? const [],
+                              selectedIndex: _slashCommandSelection,
                               visual: visual,
-                              onSelected: () => unawaited(_activateMesh()),
+                              onSelected: _activateSlashCommand,
                             ),
                           if (_meshTargets.isNotEmpty)
                             _MeshComposerPanel(
@@ -3401,6 +4391,8 @@ class _SessionScreenState extends State<SessionScreen>
                                         overflow: TextOverflow.ellipsis),
                                     onDeleted: () => setState(() {
                                       _attachments.removeAt(index);
+                                      store.setDraftAttachments(
+                                          widget.sessionId, _attachments);
                                       if (_attachments.isEmpty) {
                                         _imageModelNoticeId = null;
                                       }
@@ -3427,304 +4419,266 @@ class _SessionScreenState extends State<SessionScreen>
                                 setState(() => _imageModelNoticeId = null);
                               },
                             ),
+                          if (queuedMessages.isNotEmpty && session != null)
+                            _QueuedInstructionStrip(
+                              messages: queuedMessages,
+                              visual: visual,
+                              onCancel: (message) => unawaited(
+                                  store.cancelQueuedMessage(message.id)),
+                              onActions: (message) => unawaited(
+                                  _openQueuedInstructionActions(
+                                      store, session, message)),
+                            ),
+                          if (_simplifySettings != null &&
+                              _containsSimplifyCommand(_composer.text))
+                            _SimplifyComposerChip(
+                              settings: _simplifySettings!,
+                              visual: visual,
+                              onPressed: () =>
+                                  unawaited(_openSimplifySettings()),
+                              onDeleted: _removeSimplify,
+                            ),
                           Padding(
                             padding: const EdgeInsets.fromLTRB(8, 7, 8, 9),
-                            child: Row(
-                              crossAxisAlignment: CrossAxisAlignment.end,
-                              children: <Widget>[
-                                SizedBox.square(
-                                  dimension: 48,
-                                  child: IconButton(
-                                    key: const Key('add-attachment'),
-                                    tooltip: 'Attach from this phone or device',
-                                    style: IconButton.styleFrom(
-                                      padding: EdgeInsets.zero,
-                                      side: BorderSide(color: visual.border),
-                                      shape: RoundedRectangleBorder(
-                                          borderRadius:
-                                              BorderRadius.circular(9)),
+                            child: Container(
+                              key: const Key('session-composer-shell'),
+                              constraints: BoxConstraints(
+                                maxHeight:
+                                    ((MediaQuery.sizeOf(context).height * .4) -
+                                            (_attachments.isNotEmpty ? 42 : 0))
+                                        .clamp(56.0, 360.0)
+                                        .toDouble(),
+                              ),
+                              decoration: BoxDecoration(
+                                color: visual.surface,
+                                borderRadius: BorderRadius.circular(16),
+                                border: Border.all(color: visual.border),
+                              ),
+                              child: Row(
+                                crossAxisAlignment: CrossAxisAlignment.end,
+                                children: <Widget>[
+                                  SizedBox.square(
+                                    dimension: 48,
+                                    child: IconButton(
+                                      key: const Key('add-attachment'),
+                                      tooltip:
+                                          'Attach from this phone or device',
+                                      style: IconButton.styleFrom(
+                                        padding: EdgeInsets.zero,
+                                        shape: const CircleBorder(),
+                                      ),
+                                      onPressed: imageAttachmentSupported
+                                          ? _showAttachmentMenu
+                                          : null,
+                                      icon: const Icon(Icons.add_rounded,
+                                          size: 25),
                                     ),
-                                    onPressed: imageAttachmentSupported
-                                        ? _showAttachmentMenu
-                                        : null,
-                                    icon:
-                                        const Icon(Icons.add_rounded, size: 25),
                                   ),
-                                ),
-                                const SizedBox(width: 7),
-                                Expanded(
-                                  child: Row(
-                                    crossAxisAlignment: CrossAxisAlignment.end,
-                                    children: <Widget>[
-                                      Expanded(
-                                        child: TextField(
-                                          key: const Key('session-composer'),
-                                          controller: _composer,
-                                          minLines: 1,
-                                          maxLines: 7,
-                                          onChanged: (value) {
-                                            store.setDraft(
-                                                widget.sessionId, value);
-                                            final showSuggestion =
-                                                _shouldShowMeshSuggestion(
-                                                    value);
-                                            if (showSuggestion !=
-                                                _meshSuggestionVisible) {
-                                              setState(() =>
-                                                  _meshSuggestionVisible =
-                                                      showSuggestion);
-                                            }
-                                            if (_meshTargets.isEmpty &&
-                                                value.toLowerCase() ==
-                                                    '/mesh ') {
-                                              unawaited(_activateMesh());
-                                            }
-                                          },
-                                          decoration: InputDecoration(
-                                            hintText: _dictationHint,
-                                            hintMaxLines: 1,
-                                            hintStyle: TextStyle(
-                                              color: Theme.of(context)
-                                                  .colorScheme
-                                                  .onSurface
-                                                  .withValues(alpha: 0.48),
-                                              overflow: TextOverflow.ellipsis,
-                                            ),
-                                            filled: true,
-                                            fillColor: visual.surface,
-                                            border: OutlineInputBorder(
-                                              borderRadius:
-                                                  BorderRadius.circular(9),
-                                              borderSide: BorderSide(
-                                                  color: visual.border),
-                                            ),
-                                            enabledBorder: OutlineInputBorder(
-                                              borderRadius:
-                                                  BorderRadius.circular(9),
-                                              borderSide: BorderSide(
-                                                  color: visual.border),
-                                            ),
-                                            focusedBorder: OutlineInputBorder(
-                                              borderRadius:
-                                                  BorderRadius.circular(9),
-                                              borderSide: BorderSide(
-                                                  color: visual.accent),
-                                            ),
-                                            contentPadding:
-                                                EdgeInsets.symmetric(
-                                                    horizontal: 13,
-                                                    vertical: 12),
-                                          ),
-                                        ),
-                                      ),
-                                      const SizedBox(width: 7),
-                                      SizedBox.square(
-                                        dimension: 48,
-                                        child: Semantics(
-                                          button: true,
-                                          label: 'Voice dictation',
-                                          hint: dictationTooltip,
-                                          child: Tooltip(
-                                            message: dictationTooltip,
-                                            triggerMode:
-                                                TooltipTriggerMode.manual,
-                                            child: GestureDetector(
-                                              behavior: HitTestBehavior.opaque,
-                                              onLongPress: _recordingDictation ||
-                                                      _transcribingDictation
-                                                  ? null
-                                                  : _openDictationSourcePicker,
-                                              child: Stack(
-                                                alignment: Alignment.center,
-                                                clipBehavior: Clip.none,
-                                                children: <Widget>[
-                                                  IconButton(
-                                                    key: const Key(
-                                                        'dictation-button'),
-                                                    onPressed:
-                                                        _transcribingDictation
-                                                            ? null
-                                                            : _toggleDictation,
-                                                    style: IconButton.styleFrom(
-                                                      backgroundColor:
-                                                          visual.surfaceRaised,
-                                                      foregroundColor:
-                                                          _recordingDictation
-                                                              ? visual.accent
-                                                              : null,
-                                                      disabledBackgroundColor:
-                                                          visual.surfaceRaised,
-                                                      disabledForegroundColor:
-                                                          Theme.of(context)
-                                                              .disabledColor,
-                                                      side: BorderSide(
-                                                          color: visual.border),
-                                                      shape:
-                                                          const CircleBorder(),
-                                                    ),
-                                                    icon: _transcribingDictation
-                                                        ? const SizedBox.square(
-                                                            dimension: 17,
-                                                            child:
-                                                                CircularProgressIndicator(
-                                                                    strokeWidth:
-                                                                        2),
-                                                          )
-                                                        : Icon(
-                                                            _recordingDictation
-                                                                ? Icons
-                                                                    .stop_circle_outlined
-                                                                : Icons
-                                                                    .mic_none_rounded,
-                                                            size: 21,
-                                                          ),
-                                                  ),
-                                                  if (!_recordingDictation &&
-                                                      !_transcribingDictation)
-                                                    Positioned(
-                                                      right: 3,
-                                                      bottom: 3,
-                                                      child: IgnorePointer(
-                                                        child: Container(
-                                                          key: const Key(
-                                                              'dictation-menu-badge'),
-                                                          width: 15,
-                                                          height: 15,
-                                                          decoration:
-                                                              BoxDecoration(
-                                                            shape:
-                                                                BoxShape.circle,
-                                                            color: visual
-                                                                .surfaceRaised,
-                                                            border: Border.all(
-                                                                color: visual
-                                                                    .border),
-                                                          ),
-                                                          child: const Icon(
-                                                            Icons
-                                                                .keyboard_arrow_down_rounded,
-                                                            size: 11,
-                                                          ),
-                                                        ),
-                                                      ),
-                                                    ),
-                                                ],
-                                              ),
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-                                      const SizedBox(width: 7),
-                                      ValueListenableBuilder<TextEditingValue>(
-                                        valueListenable: _composer,
-                                        builder: (context, composerValue, _) {
-                                          final composerEmpty =
-                                              composerValue.text.trim().isEmpty;
-                                          return SizedBox.square(
-                                            dimension: 48,
-                                            child: IconButton(
+                                  const SizedBox(width: 7),
+                                  Expanded(
+                                    child: Row(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.end,
+                                      children: <Widget>[
+                                        Expanded(
+                                          child: Focus(
+                                            onKeyEvent: _handleComposerKey,
+                                            child: TextField(
                                               key:
-                                                  const Key('send-instruction'),
-                                              tooltip: 'Send message',
-                                              style: IconButton.styleFrom(
-                                                backgroundColor: visual.accent,
-                                                foregroundColor:
-                                                    visual.background,
-                                                disabledBackgroundColor:
-                                                    visual.surfaceRaised,
-                                                disabledForegroundColor:
-                                                    Theme.of(context)
-                                                        .disabledColor,
-                                                side: BorderSide(
-                                                    color: visual.border),
-                                                shape: const CircleBorder(),
+                                                  const Key('session-composer'),
+                                              controller: _composer,
+                                              focusNode: _composerFocus,
+                                              minLines: 1,
+                                              maxLines: null,
+                                              scrollPhysics:
+                                                  const ClampingScrollPhysics(),
+                                              onChanged: (value) =>
+                                                  _onComposerChanged(
+                                                      store, value),
+                                              decoration: InputDecoration(
+                                                hintText: _composerHint(store),
+                                                hintMaxLines: 1,
+                                                hintStyle: TextStyle(
+                                                  color: Theme.of(context)
+                                                      .colorScheme
+                                                      .onSurface
+                                                      .withValues(alpha: 0.48),
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                ),
+                                                border: InputBorder.none,
+                                                enabledBorder: InputBorder.none,
+                                                focusedBorder: InputBorder.none,
+                                                contentPadding:
+                                                    EdgeInsets.symmetric(
+                                                        horizontal: 13,
+                                                        vertical: 12),
                                               ),
-                                              onPressed: _sending ||
-                                                      composerEmpty
-                                                  ? null
-                                                  : () async {
-                                                      setState(() =>
-                                                          _sending = true);
-                                                      try {
-                                                        if (_meshTargets
-                                                            .isNotEmpty) {
-                                                          if (_attachments
+                                            ),
+                                          ),
+                                        ),
+                                        const SizedBox(width: 3),
+                                        _DictationComposerControl(
+                                          visual: visual,
+                                          tooltip: dictationTooltip,
+                                          recording: _recordingDictation,
+                                          transcribing: _transcribingDictation,
+                                          onToggle: _toggleDictation,
+                                          onChooseSource:
+                                              _openDictationSourcePicker,
+                                        ),
+                                        SizedBox.square(
+                                          dimension: 44,
+                                          child: IconButton(
+                                            key: const Key('open-side-chat'),
+                                            tooltip: 'Open side chat',
+                                            onPressed: session == null ||
+                                                    preparedSession ||
+                                                    store.connectionState !=
+                                                        BridgeConnectionState
+                                                            .online
+                                                ? null
+                                                : () => unawaited(
+                                                    _createSideChat(store)),
+                                            icon: const Icon(
+                                                Icons.more_horiz_rounded,
+                                                size: 23),
+                                          ),
+                                        ),
+                                        ValueListenableBuilder<
+                                            TextEditingValue>(
+                                          valueListenable: _composer,
+                                          builder: (context, composerValue, _) {
+                                            final composerEmpty = composerValue
+                                                .text
+                                                .trim()
+                                                .isEmpty;
+                                            return SizedBox.square(
+                                              dimension: 48,
+                                              child: IconButton(
+                                                key: const Key(
+                                                    'send-instruction'),
+                                                tooltip: 'Send message',
+                                                style: IconButton.styleFrom(
+                                                  backgroundColor:
+                                                      visual.accent,
+                                                  foregroundColor:
+                                                      visual.background,
+                                                  disabledBackgroundColor:
+                                                      visual.surfaceRaised,
+                                                  disabledForegroundColor:
+                                                      Theme.of(context)
+                                                          .disabledColor,
+                                                  side: BorderSide(
+                                                      color: visual.border),
+                                                  shape: const CircleBorder(),
+                                                ),
+                                                onPressed: _sending ||
+                                                        composerEmpty
+                                                    ? null
+                                                    : () async {
+                                                        setState(() =>
+                                                            _sending = true);
+                                                        try {
+                                                          if (_meshTargets
                                                               .isNotEmpty) {
-                                                            throw StateError(
-                                                                '/mesh attachments are not available yet. Send the attachment in a child session after it opens.');
+                                                            if (_attachments
+                                                                .isNotEmpty) {
+                                                              throw StateError(
+                                                                  '/mesh attachments are not available yet. Send the attachment in a child session after it opens.');
+                                                            }
+                                                            await store
+                                                                .startDelegation(
+                                                              widget.sessionId,
+                                                              _composer.text,
+                                                              List<DelegationSelection>.of(
+                                                                  _meshTargets),
+                                                            );
+                                                          } else {
+                                                            final createdSessionId =
+                                                                await store
+                                                                    .submitMessage(
+                                                              widget.sessionId,
+                                                              _composer.text,
+                                                              deliveryMode:
+                                                                  deliveryMode,
+                                                              modelId:
+                                                                  _selectedModelId,
+                                                              reasoningEffort:
+                                                                  _selectedReasoningEffort,
+                                                              attachments:
+                                                                  _attachments,
+                                                              simplify: _containsSimplifyCommand(
+                                                                      _composer
+                                                                          .text)
+                                                                  ? _simplifySettings
+                                                                  : null,
+                                                            );
+                                                            _composer.clear();
+                                                            _attachments
+                                                                .clear();
+                                                            _meshTargets
+                                                                .clear();
+                                                            _imageModelNoticeId =
+                                                                null;
+                                                            _simplifySettings =
+                                                                null;
+                                                            _slashCommandPaletteDismissed =
+                                                                false;
+                                                            if (createdSessionId !=
+                                                                    null &&
+                                                                mounted) {
+                                                              unawaited(Navigator
+                                                                      .of(this
+                                                                          .context)
+                                                                  .pushReplacement(
+                                                                      sessionScreenRoute(
+                                                                          createdSessionId)));
+                                                            }
                                                           }
-                                                          await store
-                                                              .startDelegation(
-                                                            widget.sessionId,
-                                                            _composer.text,
-                                                            List<DelegationSelection>.of(
-                                                                _meshTargets),
-                                                          );
-                                                        } else {
-                                                          final createdSessionId =
-                                                              await store
-                                                                  .submitMessage(
-                                                            widget.sessionId,
-                                                            _composer.text,
-                                                            deliveryMode:
-                                                                deliveryMode,
-                                                            modelId:
-                                                                _selectedModelId,
-                                                            reasoningEffort:
-                                                                _selectedReasoningEffort,
-                                                            attachments:
-                                                                _attachments,
-                                                          );
                                                           _composer.clear();
                                                           _attachments.clear();
                                                           _meshTargets.clear();
                                                           _imageModelNoticeId =
                                                               null;
-                                                          if (createdSessionId !=
-                                                                  null &&
-                                                              mounted) {
-                                                            unawaited(Navigator
-                                                                    .of(this
-                                                                        .context)
-                                                                .pushReplacement(
-                                                                    sessionScreenRoute(
-                                                                        createdSessionId)));
+                                                          _simplifySettings =
+                                                              null;
+                                                          _slashCommandPaletteDismissed =
+                                                              false;
+                                                          store.setDraftSimplifySettings(
+                                                              widget.sessionId,
+                                                              null);
+                                                        } on Object catch (caught) {
+                                                          if (mounted) {
+                                                            _showDictationError(
+                                                                caught);
+                                                          }
+                                                        } finally {
+                                                          if (mounted) {
+                                                            setState(() =>
+                                                                _sending =
+                                                                    false);
                                                           }
                                                         }
-                                                        _composer.clear();
-                                                        _attachments.clear();
-                                                        _meshTargets.clear();
-                                                        _imageModelNoticeId =
-                                                            null;
-                                                      } on Object catch (caught) {
-                                                        if (mounted) {
-                                                          _showDictationError(
-                                                              caught);
-                                                        }
-                                                      } finally {
-                                                        if (mounted) {
-                                                          setState(() =>
-                                                              _sending = false);
-                                                        }
-                                                      }
-                                                    },
-                                              icon: _sending
-                                                  ? const SizedBox.square(
-                                                      dimension: 17,
-                                                      child:
-                                                          CircularProgressIndicator(
-                                                              strokeWidth: 2))
-                                                  : const Icon(
-                                                      Icons.send_rounded,
-                                                      size: 23),
-                                            ),
-                                          );
-                                        },
-                                      ),
-                                    ],
+                                                      },
+                                                icon: _sending
+                                                    ? const SizedBox.square(
+                                                        dimension: 17,
+                                                        child:
+                                                            CircularProgressIndicator(
+                                                                strokeWidth: 2))
+                                                    : const Icon(
+                                                        Icons.send_rounded,
+                                                        size: 23),
+                                              ),
+                                            );
+                                          },
+                                        ),
+                                      ],
+                                    ),
                                   ),
-                                ),
-                              ],
+                                ],
+                              ),
                             ),
                           ),
                         ],
@@ -3737,6 +4691,128 @@ class _SessionScreenState extends State<SessionScreen>
       ),
     );
   }
+}
+
+class _DictationComposerControl extends StatelessWidget {
+  const _DictationComposerControl({
+    required this.visual,
+    required this.tooltip,
+    required this.recording,
+    required this.transcribing,
+    required this.onToggle,
+    required this.onChooseSource,
+  });
+
+  final ProviderVisualTheme visual;
+  final String tooltip;
+  final bool recording;
+  final bool transcribing;
+  final VoidCallback onToggle;
+  final VoidCallback onChooseSource;
+
+  @override
+  Widget build(BuildContext context) => SizedBox.square(
+        dimension: 48,
+        child: Stack(
+          alignment: Alignment.center,
+          children: <Widget>[
+            Positioned(
+              left: 0,
+              right: 0,
+              top: 0,
+              bottom: 7,
+              child: Semantics(
+                button: true,
+                label: 'Voice dictation',
+                child: Tooltip(
+                  message: tooltip,
+                  child: IconButton(
+                    key: const Key('dictation-button'),
+                    onPressed: transcribing ? null : onToggle,
+                    style: IconButton.styleFrom(
+                      backgroundColor: Colors.transparent,
+                      foregroundColor: recording ? visual.accent : null,
+                      disabledBackgroundColor: Colors.transparent,
+                      disabledForegroundColor: Theme.of(context).disabledColor,
+                      shape: const CircleBorder(),
+                    ),
+                    icon: transcribing
+                        ? const SizedBox.square(
+                            dimension: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : Icon(
+                            recording
+                                ? Icons.stop_circle_outlined
+                                : Icons.mic_none_rounded,
+                            size: 25,
+                          ),
+                  ),
+                ),
+              ),
+            ),
+            if (!recording && !transcribing)
+              Positioned(
+                left: 4,
+                right: 4,
+                bottom: 0,
+                height: 19,
+                child: Semantics(
+                  button: true,
+                  label: 'Choose dictation provider',
+                  child: Tooltip(
+                    message: 'Choose dictation provider',
+                    child: Material(
+                      color: Colors.transparent,
+                      child: InkWell(
+                        key: const Key('dictation-menu-badge'),
+                        onTap: onChooseSource,
+                        borderRadius: const BorderRadius.vertical(
+                            bottom: Radius.circular(24)),
+                        child: CustomPaint(
+                          painter: _DictationCrescentPainter(
+                            color: Theme.of(context)
+                                .colorScheme
+                                .onSurface
+                                .withValues(alpha: .72),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      );
+}
+
+class _DictationCrescentPainter extends CustomPainter {
+  const _DictationCrescentPainter({required this.color});
+
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final stroke = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.8
+      ..strokeCap = StrokeCap.round;
+    final crescent = Path()
+      ..moveTo(3, 2)
+      ..quadraticBezierTo(size.width / 2, size.height - 2, size.width - 3, 2);
+    canvas.drawPath(crescent, stroke);
+    final center = size.width / 2;
+    canvas.drawLine(Offset(center - 3.5, size.height - 7),
+        Offset(center, size.height - 3.5), stroke);
+    canvas.drawLine(Offset(center, size.height - 3.5),
+        Offset(center + 3.5, size.height - 7), stroke);
+  }
+
+  @override
+  bool shouldRepaint(covariant _DictationCrescentPainter oldDelegate) =>
+      oldDelegate.color != color;
 }
 
 enum _SourceSessionAction { handoff, branch }
@@ -4032,6 +5108,242 @@ class _ModelChoice {
 
   final String providerId;
   final String modelId;
+}
+
+class _QueuedTaskChoice {
+  const _QueuedTaskChoice(
+    this.providerId,
+    this.modelId,
+    this.reasoningEffort,
+  );
+
+  final String providerId;
+  final String modelId;
+  final String? reasoningEffort;
+}
+
+class _QueuedNewTaskSheet extends StatefulWidget {
+  const _QueuedNewTaskSheet({
+    required this.models,
+    required this.sessions,
+    required this.recentModels,
+    required this.sourceSession,
+    required this.message,
+  });
+
+  final List<RemoteModel> models;
+  final List<RemoteSession> sessions;
+  final List<RemoteModel> recentModels;
+  final RemoteSession sourceSession;
+  final RemoteQueuedMessage message;
+
+  @override
+  State<_QueuedNewTaskSheet> createState() => _QueuedNewTaskSheetState();
+}
+
+class _QueuedNewTaskSheetState extends State<_QueuedNewTaskSheet> {
+  String _query = '';
+  late RemoteModel _selectedModel;
+  String? _reasoningEffort;
+
+  @override
+  void initState() {
+    super.initState();
+    _selectedModel = widget.models
+            .where((model) =>
+                model.providerId == widget.sourceSession.providerId &&
+                model.id == widget.sourceSession.modelId)
+            .firstOrNull ??
+        widget.recentModels.firstOrNull ??
+        widget.models.where((model) => model.isDefault).firstOrNull ??
+        widget.models.first;
+    _reasoningEffort = _queuedTaskReasoningEffort(
+      widget.sessions,
+      _selectedModel,
+    );
+  }
+
+  bool _matches(RemoteModel model) {
+    final query = _query.trim().toLowerCase();
+    if (query.isEmpty) return true;
+    return <String>[
+      model.displayName,
+      model.id,
+      model.providerId,
+      model.description ?? '',
+      providerVisualThemeFor(model.providerId).displayName,
+    ].join(' ').toLowerCase().contains(query);
+  }
+
+  void _choose(RemoteModel model) {
+    setState(() {
+      _selectedModel = model;
+      _reasoningEffort = _queuedTaskReasoningEffort(widget.sessions, model);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final matches = widget.models.where(_matches).toList(growable: false);
+    final groups = <String, List<RemoteModel>>{};
+    for (final model in matches) {
+      groups.putIfAbsent(model.providerId, () => <RemoteModel>[]).add(model);
+    }
+    final providerIds = groups.keys.toList()
+      ..sort((left, right) => providerVisualThemeFor(left)
+          .displayName
+          .compareTo(providerVisualThemeFor(right).displayName));
+    final efforts = _selectedModel.reasoningEfforts;
+    return Column(
+      key: const Key('queued-new-task-picker'),
+      children: <Widget>[
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 0, 12, 10),
+          child: Row(
+            children: <Widget>[
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text('Send to new task',
+                        style: Theme.of(context).textTheme.titleLarge),
+                    const SizedBox(height: 3),
+                    Text(
+                      widget.message.content.trim().split('\n').first,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                            color: Theme.of(context)
+                                .colorScheme
+                                .onSurface
+                                .withValues(alpha: .58),
+                          ),
+                    ),
+                  ],
+                ),
+              ),
+              IconButton(
+                tooltip: 'Close',
+                onPressed: () => Navigator.pop(context),
+                icon: const Icon(Icons.close_rounded),
+              ),
+            ],
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: TextField(
+            key: const Key('queued-new-task-model-search'),
+            autofocus: true,
+            onChanged: (value) => setState(() => _query = value),
+            decoration: const InputDecoration(
+              hintText: 'Search models or providers',
+              prefixIcon: Icon(Icons.search_rounded),
+              border: OutlineInputBorder(),
+            ),
+          ),
+        ),
+        const SizedBox(height: 8),
+        Expanded(
+          child: matches.isEmpty
+              ? const Center(child: Text('No models match that search.'))
+              : ListView(
+                  keyboardDismissBehavior:
+                      ScrollViewKeyboardDismissBehavior.onDrag,
+                  children: providerIds
+                      .expand((providerId) => <Widget>[
+                            _ModelGroupHeader(
+                              title: providerVisualThemeFor(providerId)
+                                  .displayName,
+                              providerId: providerId,
+                            ),
+                            ...groups[providerId]!.map((model) => ListTile(
+                                  key: ValueKey<String>(
+                                      'queued-model-${model.providerId}-${model.id}'),
+                                  selected: model.providerId ==
+                                          _selectedModel.providerId &&
+                                      model.id == _selectedModel.id,
+                                  leading: ProviderLogo(
+                                      providerId: model.providerId, size: 25),
+                                  title: Text(model.displayName,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis),
+                                  subtitle: model.description == null
+                                      ? null
+                                      : Text(model.description!,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis),
+                                  trailing: model.providerId ==
+                                              _selectedModel.providerId &&
+                                          model.id == _selectedModel.id
+                                      ? const Icon(Icons.check_rounded)
+                                      : null,
+                                  onTap: () => _choose(model),
+                                )),
+                          ])
+                      .toList(growable: false),
+                ),
+        ),
+        Container(
+          padding: const EdgeInsets.fromLTRB(16, 10, 16, 12),
+          decoration: BoxDecoration(
+            color: Theme.of(context).colorScheme.surfaceContainerLow,
+            border: Border(
+              top: BorderSide(
+                  color: Theme.of(context).dividerColor.withValues(alpha: .6)),
+            ),
+          ),
+          child: Row(
+            children: <Widget>[
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text('Model',
+                        style: Theme.of(context).textTheme.labelSmall),
+                    const SizedBox(height: 3),
+                    Text(_selectedModel.displayName,
+                        maxLines: 1, overflow: TextOverflow.ellipsis),
+                  ],
+                ),
+              ),
+              if (efforts.isNotEmpty) ...<Widget>[
+                const SizedBox(width: 12),
+                DropdownButton<String>(
+                  key: const Key('queued-new-task-reasoning'),
+                  value: _reasoningEffort,
+                  underline: const SizedBox.shrink(),
+                  items: efforts
+                      .map((option) => DropdownMenuItem<String>(
+                            value: option.id,
+                            child: Text(_effortDisplayLabel(
+                                option.id, _selectedModel.id)),
+                          ))
+                      .toList(growable: false),
+                  onChanged: (value) =>
+                      setState(() => _reasoningEffort = value),
+                ),
+              ],
+              const SizedBox(width: 12),
+              FilledButton.icon(
+                key: const Key('queued-new-task-start'),
+                onPressed: () => Navigator.pop(
+                  context,
+                  _QueuedTaskChoice(
+                    _selectedModel.providerId,
+                    _selectedModel.id,
+                    _reasoningEffort,
+                  ),
+                ),
+                icon: const Icon(Icons.call_split_rounded, size: 17),
+                label: const Text('Start task'),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
 }
 
 class _ModelPickerSheet extends StatefulWidget {
@@ -4645,60 +5957,337 @@ String _walletSourceLabel(ProviderWalletStatus wallet) => wallet.isDirectApi
         ? 'Subscription'
         : wallet.label;
 
-class _MeshCommandSuggestion extends StatelessWidget {
-  const _MeshCommandSuggestion({
+final RegExp _simplifyCommandPattern = RegExp(
+  r'(^|[\s(])/simplify\b[,:;]?',
+  caseSensitive: false,
+);
+
+bool _containsSimplifyCommand(String value) =>
+    _simplifyCommandPattern.hasMatch(value.trim());
+
+String _withoutSimplifyCommand(String value) => value
+    .replaceAllMapped(
+      _simplifyCommandPattern,
+      (match) => match.group(1) ?? '',
+    )
+    .replaceAllMapped(
+      RegExp(r'[ \t]+([,.;!?])'),
+      (match) => match.group(1)!,
+    )
+    .replaceAll(RegExp(r'[ \t]{2,}'), ' ')
+    .replaceFirst(RegExp(r'^\s*[,;:]\s*'), '')
+    .trim();
+
+class _SlashCommandDefinition {
+  const _SlashCommandDefinition({
+    required this.id,
+    required this.command,
+    required this.description,
+    required this.icon,
+  });
+
+  final String id;
+  final String command;
+  final String description;
+  final IconData icon;
+}
+
+const List<_SlashCommandDefinition> _slashCommands = <_SlashCommandDefinition>[
+  _SlashCommandDefinition(
+    id: 'simplify',
+    command: '/simplify',
+    description: 'Shorten the previous or upcoming answer',
+    icon: Icons.short_text_rounded,
+  ),
+  _SlashCommandDefinition(
+    id: 'mesh',
+    command: '/mesh',
+    description: 'Delegate to another connected harness',
+    icon: Icons.hub_outlined,
+  ),
+];
+
+List<_SlashCommandDefinition>? _filteredSlashCommands(String value) {
+  final match =
+      RegExp(r'^/([a-z0-9_-]*)$', caseSensitive: false).firstMatch(value);
+  if (match == null) return null;
+  final query = (match.group(1) ?? '').toLowerCase();
+  return _slashCommands
+      .where((item) => item.command.substring(1).startsWith(query))
+      .toList(growable: false);
+}
+
+class _SlashCommandPalette extends StatelessWidget {
+  const _SlashCommandPalette({
+    required this.commands,
+    required this.selectedIndex,
     required this.visual,
     required this.onSelected,
   });
 
+  final List<_SlashCommandDefinition> commands;
+  final int selectedIndex;
   final ProviderVisualTheme visual;
-  final VoidCallback onSelected;
+  final ValueChanged<_SlashCommandDefinition> onSelected;
 
   @override
-  Widget build(BuildContext context) => Material(
-        color: visual.surface.withValues(alpha: 0.92),
-        child: InkWell(
-          key: const Key('mesh-command-suggestion'),
-          onTap: onSelected,
-          child: Container(
-            padding: const EdgeInsets.fromLTRB(13, 9, 13, 9),
-            decoration: BoxDecoration(
-              border: Border(
-                bottom:
-                    BorderSide(color: visual.border.withValues(alpha: 0.72)),
+  Widget build(BuildContext context) => Container(
+        key: const Key('slash-command-palette'),
+        constraints: const BoxConstraints(maxHeight: 132),
+        margin: const EdgeInsets.fromLTRB(8, 3, 8, 2),
+        padding: const EdgeInsets.all(3),
+        decoration: BoxDecoration(
+          color: visual.surface.withValues(alpha: 0.96),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: commands.isEmpty
+            ? const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 10, vertical: 11),
+                child: Text('No commands match'),
+              )
+            : ListView.builder(
+                shrinkWrap: true,
+                itemCount: commands.length,
+                itemBuilder: (context, index) {
+                  final command = commands[index];
+                  final selected = index == selectedIndex;
+                  return InkWell(
+                    key: Key('${command.id}-command-suggestion'),
+                    borderRadius: BorderRadius.circular(7),
+                    onTap: () => onSelected(command),
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 70),
+                      constraints: const BoxConstraints(minHeight: 48),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 10, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: selected
+                            ? visual.surfaceRaised.withValues(alpha: 0.9)
+                            : Colors.transparent,
+                        borderRadius: BorderRadius.circular(7),
+                      ),
+                      child: Row(
+                        children: <Widget>[
+                          Icon(command.icon, color: visual.accent, size: 19),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: <Widget>[
+                                Text(command.command,
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .bodyMedium
+                                        ?.copyWith(
+                                            fontWeight: FontWeight.w600)),
+                                Text(command.description,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .labelSmall
+                                        ?.copyWith(
+                                            color: Theme.of(context)
+                                                .colorScheme
+                                                .onSurface
+                                                .withValues(alpha: 0.58))),
+                              ],
+                            ),
+                          ),
+                          const Icon(Icons.keyboard_return_rounded, size: 17),
+                        ],
+                      ),
+                    ),
+                  );
+                },
               ),
+      );
+}
+
+class _SimplifyComposerChip extends StatelessWidget {
+  const _SimplifyComposerChip({
+    required this.settings,
+    required this.visual,
+    required this.onPressed,
+    required this.onDeleted,
+  });
+
+  final SimplifySettings settings;
+  final ProviderVisualTheme visual;
+  final VoidCallback onPressed;
+  final VoidCallback onDeleted;
+
+  @override
+  Widget build(BuildContext context) => SizedBox(
+        height: 44,
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(8, 3, 8, 1),
+          scrollDirection: Axis.horizontal,
+          children: <Widget>[
+            InputChip(
+              key: const Key('simplify-composer-chip'),
+              avatar: Icon(Icons.short_text_rounded,
+                  size: 17, color: visual.accent),
+              label: Text('Simplify · ${settings.maxWords} words'),
+              tooltip: 'Simplify settings',
+              onPressed: onPressed,
+              onDeleted: onDeleted,
+              deleteIcon: const Icon(Icons.close_rounded, size: 17),
+              visualDensity: VisualDensity.compact,
             ),
-            child: Row(
-              children: <Widget>[
-                Icon(Icons.hub_outlined, color: visual.accent, size: 18),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: <Widget>[
-                      Text('/mesh',
-                          style: Theme.of(context)
-                              .textTheme
-                              .bodyMedium
-                              ?.copyWith(fontWeight: FontWeight.w600)),
-                      Text('Delegate to another connected harness',
-                          style: Theme.of(context)
-                              .textTheme
-                              .labelSmall
-                              ?.copyWith(
-                                  color: Theme.of(context)
-                                      .colorScheme
-                                      .onSurface
-                                      .withValues(alpha: 0.58))),
-                    ],
-                  ),
-                ),
-                const Icon(Icons.keyboard_return_rounded, size: 17),
-              ],
-            ),
-          ),
+          ],
         ),
       );
+}
+
+class _SimplifySettingsSheet extends StatefulWidget {
+  const _SimplifySettingsSheet({required this.initial});
+
+  final SimplifySettings initial;
+
+  @override
+  State<_SimplifySettingsSheet> createState() => _SimplifySettingsSheetState();
+}
+
+class _SimplifySettingsSheetState extends State<_SimplifySettingsSheet> {
+  static const List<int> _presets = <int>[100, 200, 300];
+
+  late final TextEditingController _customWords;
+  late final TextEditingController _guidance;
+  int? _preset;
+
+  @override
+  void initState() {
+    super.initState();
+    _preset = _presets.contains(widget.initial.maxWords)
+        ? widget.initial.maxWords
+        : null;
+    _customWords =
+        TextEditingController(text: widget.initial.maxWords.toString());
+    _guidance = TextEditingController(text: widget.initial.guidance ?? '');
+  }
+
+  @override
+  void dispose() {
+    _customWords.dispose();
+    _guidance.dispose();
+    super.dispose();
+  }
+
+  int? get _selectedWordCount {
+    if (_preset != null) return _preset;
+    final value = int.tryParse(_customWords.text.trim());
+    if (value == null ||
+        value < 1 ||
+        value > SimplifySettings.maximumMaxWords) {
+      return null;
+    }
+    return value;
+  }
+
+  void _apply() {
+    final maxWords = _selectedWordCount;
+    if (maxWords == null) return;
+    Navigator.pop(
+      context,
+      SimplifySettings(maxWords: maxWords, guidance: _guidance.text),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final customValid = _preset != null || _selectedWordCount != null;
+    return SafeArea(
+      top: false,
+      child: AnimatedPadding(
+        duration: const Duration(milliseconds: 100),
+        padding: EdgeInsets.only(
+          left: 18,
+          right: 18,
+          bottom: MediaQuery.viewInsetsOf(context).bottom + 14,
+        ),
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Text('Simplify response',
+                  style: Theme.of(context).textTheme.titleLarge),
+              const SizedBox(height: 4),
+              Text(
+                'On its own, /simplify shortens the previous answer. With a request, it shapes the next answer.',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+              const SizedBox(height: 14),
+              Text('Maximum words',
+                  style: Theme.of(context).textTheme.labelLarge),
+              const SizedBox(height: 7),
+              Wrap(
+                spacing: 8,
+                runSpacing: 7,
+                children: <Widget>[
+                  ..._presets.map((words) => ChoiceChip(
+                        key: Key('simplify-preset-$words'),
+                        label: Text(words == SimplifySettings.defaultMaxWords
+                            ? '$words (default)'
+                            : '$words'),
+                        selected: _preset == words,
+                        onSelected: (_) => setState(() => _preset = words),
+                      )),
+                  ChoiceChip(
+                    key: const Key('simplify-preset-custom'),
+                    label: const Text('Custom'),
+                    selected: _preset == null,
+                    onSelected: (_) => setState(() => _preset = null),
+                  ),
+                ],
+              ),
+              if (_preset == null) ...<Widget>[
+                const SizedBox(height: 10),
+                TextField(
+                  key: const Key('simplify-custom-words'),
+                  controller: _customWords,
+                  keyboardType: TextInputType.number,
+                  inputFormatters: <TextInputFormatter>[
+                    FilteringTextInputFormatter.digitsOnly,
+                  ],
+                  onChanged: (_) => setState(() {}),
+                  decoration: InputDecoration(
+                    labelText: 'Word limit',
+                    helperText: '1–${SimplifySettings.maximumMaxWords}',
+                    errorText: customValid ? null : 'Enter a valid word limit',
+                  ),
+                ),
+              ],
+              const SizedBox(height: 12),
+              TextField(
+                key: const Key('simplify-guidance'),
+                controller: _guidance,
+                minLines: 1,
+                maxLines: 3,
+                maxLength: SimplifySettings.maximumGuidanceLength,
+                decoration: const InputDecoration(
+                  labelText: 'Extra guidance (optional)',
+                  hintText: 'For example: keep the concrete example',
+                ),
+              ),
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                height: 46,
+                child: FilledButton(
+                  key: const Key('apply-simplify-settings'),
+                  onPressed: customValid ? _apply : null,
+                  child: const Text('Apply'),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _MeshComposerPanel extends StatelessWidget {
@@ -4768,10 +6357,12 @@ class _MeshComposerPanel extends StatelessWidget {
                     ?.displayName ??
                 target.modelId ??
                 'Harness default';
+            final targetEffort =
+                _concreteReasoningEffort(target.reasoningEffort);
             final details = <String>[
               modelLabel,
-              if (target.reasoningEffort != null)
-                _effortDisplayLabel(target.reasoningEffort!, target.modelId),
+              if (targetEffort != null)
+                _effortDisplayLabel(targetEffort, target.modelId),
             ];
             return Padding(
               padding: const EdgeInsets.only(bottom: 4),
@@ -4903,6 +6494,7 @@ class _DelegationTaskCard extends StatelessWidget {
                     .firstOrNull
                     ?.displayName ??
                 child.modelId;
+            final childEffort = _concreteReasoningEffort(child.reasoningEffort);
             return InkWell(
               onTap: child.sessionId == null ? null : () => onOpenChild(child),
               child: Padding(
@@ -4921,9 +6513,8 @@ class _DelegationTaskCard extends StatelessWidget {
                           Text(
                             <String>[
                               if (modelLabel != null) modelLabel,
-                              if (child.reasoningEffort != null)
-                                _effortDisplayLabel(
-                                    child.reasoningEffort!, child.modelId),
+                              if (childEffort != null)
+                                _effortDisplayLabel(childEffort, child.modelId),
                               _titleCase(child.state),
                             ].join(' · '),
                             maxLines: 1,
@@ -5258,6 +6849,7 @@ bool _messageHasFinalContent(RemoteMessage message) => message.parts.any(
       (part) =>
           !part.isAttachment &&
           part.type != 'subagent' &&
+          !_isToolTracePart(part) &&
           !_isArtifactPart(part) &&
           _messagePartText(part).trim().isNotEmpty &&
           !_isRawMarkupOnly(_messagePartText(part)),
@@ -5334,16 +6926,507 @@ String _conversationBoundaryLabel(RemoteMessage message) {
       .whereType<String>()
       .join(' ')
       .toLowerCase();
-  return text.contains('earlier conversation summary') ||
-          text.contains('compact') ||
-          metadata.contains('compact')
-      ? 'Context compacted'
-      : 'System context';
+  final isCompaction = text.contains('earlier conversation summary') ||
+      text.contains('compact') ||
+      metadata.contains('compact');
+  if (!isCompaction) return 'System context';
+  return text.contains('automatically compacted') ||
+          text.contains('automatic compaction') ||
+          metadata.contains('automatic compaction')
+      ? 'Automatically compacted context'
+      : 'Context compacted';
 }
 
 enum _AssistantTextTone { finalAnswer, commentary, privateReasoning }
 
 enum _MessageAction { copy, edit }
+
+enum _QueuedMessageAction { edit, deliver, disableQueue, sideChat, newTask }
+
+enum _ReasoningDetailKind { thinking, toolCall }
+
+enum _ReasoningDisplayMode { compact, expanded }
+
+class _ReasoningDetail {
+  const _ReasoningDetail({
+    required this.id,
+    required this.kind,
+    required this.summary,
+    required this.detail,
+    this.activity,
+  });
+
+  final String id;
+  final _ReasoningDetailKind kind;
+  final String summary;
+  final String detail;
+  final _ActivityEventGroup? activity;
+}
+
+class _ReasoningSegment {
+  const _ReasoningSegment({required this.kind, required this.details});
+
+  final _ReasoningDetailKind kind;
+  final List<_ReasoningDetail> details;
+}
+
+class _ConversationTimelineItem {
+  _ConversationTimelineItem.message({
+    required RemoteMessage message,
+    required this.firstMessageIndex,
+    required this.working,
+    this.showFinalBoundary = false,
+  })  : message = message,
+        id = message.id,
+        reasoningSegments = const <_ReasoningSegment>[];
+
+  const _ConversationTimelineItem.reasoning({
+    required this.id,
+    required this.reasoningSegments,
+    required this.working,
+    this.firstMessageIndex,
+  })  : message = null,
+        showFinalBoundary = false;
+
+  final String id;
+  final RemoteMessage? message;
+  final int? firstMessageIndex;
+  final List<_ReasoningSegment> reasoningSegments;
+  final bool working;
+  final bool showFinalBoundary;
+}
+
+enum _TimelineSpeaker { user, assistant, neutral }
+
+const double _turnBoundaryGap = 21;
+
+_TimelineSpeaker _timelineSpeaker(_ConversationTimelineItem item) {
+  if (item.reasoningSegments.isNotEmpty) return _TimelineSpeaker.assistant;
+  return switch (item.message?.role.toLowerCase()) {
+    'user' => _TimelineSpeaker.user,
+    'assistant' => _TimelineSpeaker.assistant,
+    _ => _TimelineSpeaker.neutral,
+  };
+}
+
+Widget _withTurnBoundarySpacing({
+  required List<_ConversationTimelineItem> items,
+  required int index,
+  required Widget child,
+}) {
+  if (index <= 0) return child;
+  final previous = _timelineSpeaker(items[index - 1]);
+  final current = _timelineSpeaker(items[index]);
+  final crossesTurn = previous != current &&
+      previous != _TimelineSpeaker.neutral &&
+      current != _TimelineSpeaker.neutral;
+  if (!crossesTurn) return child;
+  return Padding(
+    key: ValueKey<String>('turn-boundary-${items[index].id}'),
+    padding: const EdgeInsets.only(top: _turnBoundaryGap),
+    child: child,
+  );
+}
+
+class _ConversationAtom {
+  const _ConversationAtom.message({
+    required this.message,
+    required this.messageIndex,
+    required this.occurredAt,
+    required this.order,
+    required this.working,
+    this.showFinalBoundary = false,
+  })  : reasoningSegments = const <_ReasoningSegment>[],
+        isMessage = true;
+
+  const _ConversationAtom.reasoning({
+    required this.reasoningSegments,
+    required this.occurredAt,
+    required this.order,
+    required this.working,
+    this.messageIndex,
+  })  : message = null,
+        isMessage = false,
+        showFinalBoundary = false;
+
+  final RemoteMessage? message;
+  final int? messageIndex;
+  final List<_ReasoningSegment> reasoningSegments;
+  final DateTime occurredAt;
+  final int order;
+  final bool working;
+  final bool isMessage;
+  final bool showFinalBoundary;
+}
+
+List<_ConversationTimelineItem> _conversationTimelineItems(
+  List<RemoteMessage> messages,
+  List<_ActivityEventGroup> activities,
+  bool sessionWorking,
+) {
+  final atoms = <_ConversationAtom>[];
+  for (final entry in messages.indexed) {
+    final message = entry.$2;
+    if (message.role.toLowerCase() != 'assistant' ||
+        _isConversationBoundary(message)) {
+      atoms.add(_ConversationAtom.message(
+        message: message,
+        messageIndex: entry.$1,
+        occurredAt: message.createdAt,
+        order: entry.$1 * 1000,
+        working: message.status == 'streaming',
+      ));
+      continue;
+    }
+    _appendAssistantMessageAtoms(
+      atoms,
+      message: message,
+      messageIndex: entry.$1,
+      orderBase: entry.$1 * 1000,
+    );
+  }
+  for (final entry in activities.indexed) {
+    final group = entry.$2;
+    final presentation = _activityPresentation(group);
+    final providerSummary = _firstUsefulString(
+      group.events.expand((event) => <Object?>[
+            event.payload['summary'],
+            event.payload['title'],
+            event.payload['description'],
+          ]),
+    );
+    final fallbackSummary = <String>[
+      presentation.label,
+      if (presentation.target?.isNotEmpty == true) presentation.target!,
+    ].join(' ');
+    final detail = _ReasoningDetail(
+      id: 'activity-${group.events.first.eventId}',
+      kind: _ReasoningDetailKind.toolCall,
+      summary: _conciseReasoningLabel(providerSummary ?? fallbackSummary),
+      detail: presentation.snippet,
+      activity: group,
+    );
+    atoms.add(_ConversationAtom.reasoning(
+      reasoningSegments: <_ReasoningSegment>[
+        _ReasoningSegment(
+          kind: _ReasoningDetailKind.toolCall,
+          details: <_ReasoningDetail>[detail],
+        ),
+      ],
+      occurredAt: group.events.first.occurredAt,
+      order: messages.length * 1000 + entry.$1,
+      working: sessionWorking && !_activityGroupFinished(group.events),
+    ));
+  }
+  atoms.sort((left, right) {
+    final date = left.occurredAt.compareTo(right.occurredAt);
+    return date == 0 ? left.order.compareTo(right.order) : date;
+  });
+
+  final result = <_ConversationTimelineItem>[];
+  for (final atom in atoms) {
+    if (atom.message != null) {
+      result.add(_ConversationTimelineItem.message(
+        message: atom.message!,
+        firstMessageIndex: atom.messageIndex!,
+        working: atom.working,
+        showFinalBoundary: atom.showFinalBoundary,
+      ));
+      continue;
+    }
+    if (result.isNotEmpty && result.last.reasoningSegments.isNotEmpty) {
+      final previous = result.removeLast();
+      final combined = <_ReasoningSegment>[...previous.reasoningSegments];
+      _appendReasoningSegments(combined, atom.reasoningSegments);
+      result.add(_ConversationTimelineItem.reasoning(
+        id: previous.id,
+        reasoningSegments: List<_ReasoningSegment>.unmodifiable(combined),
+        firstMessageIndex: previous.firstMessageIndex,
+        working: previous.working || atom.working,
+      ));
+      continue;
+    }
+    result.add(_ConversationTimelineItem.reasoning(
+      id: atom.reasoningSegments.first.details.first.id,
+      reasoningSegments:
+          List<_ReasoningSegment>.unmodifiable(atom.reasoningSegments),
+      firstMessageIndex: atom.messageIndex,
+      working: atom.working,
+    ));
+  }
+  // The newest reasoning is not always the last item: visible commentary can
+  // follow it inside the same turn. Looking only at the final entry made a
+  // present reasoning group look absent, which both dropped its shimmer and
+  // added a second, redundant "Working…" disclosure beneath it.
+  final latestReasoningIndex = sessionWorking
+      ? result.lastIndexWhere((item) => item.reasoningSegments.isNotEmpty)
+      : -1;
+  final normalized = <_ConversationTimelineItem>[
+    for (final entry in result.indexed)
+      if (entry.$2.reasoningSegments.isNotEmpty)
+        _ConversationTimelineItem.reasoning(
+          id: entry.$2.id,
+          reasoningSegments: entry.$2.reasoningSegments,
+          firstMessageIndex: entry.$2.firstMessageIndex,
+          working: entry.$1 == latestReasoningIndex,
+        )
+      else
+        entry.$2,
+  ];
+  if (sessionWorking && latestReasoningIndex < 0) {
+    normalized.add(const _ConversationTimelineItem.reasoning(
+      id: 'tethoq-live-reasoning',
+      reasoningSegments: <_ReasoningSegment>[
+        _ReasoningSegment(
+          kind: _ReasoningDetailKind.thinking,
+          details: <_ReasoningDetail>[
+            _ReasoningDetail(
+              id: 'tethoq-live-reasoning-working',
+              kind: _ReasoningDetailKind.thinking,
+              summary: 'Working…',
+              detail: 'Working…',
+            ),
+          ],
+        ),
+      ],
+      working: true,
+    ));
+  }
+  return normalized;
+}
+
+void _appendAssistantMessageAtoms(
+  List<_ConversationAtom> atoms, {
+  required RemoteMessage message,
+  required int messageIndex,
+  required int orderBase,
+}) {
+  if (!message.parts.any(_isReasoningTracePart)) {
+    atoms.add(_ConversationAtom.message(
+      message: message,
+      messageIndex: messageIndex,
+      occurredAt: message.createdAt,
+      order: orderBase,
+      working: message.status == 'streaming',
+    ));
+    return;
+  }
+  final attachments =
+      message.parts.where((part) => part.isAttachment).toList(growable: false);
+  final visibleParts = <ContentPart>[];
+  var attachmentsPlaced = false;
+  var chunkIndex = 0;
+  var partOrder = 0;
+  var reasoningSinceVisible = false;
+
+  void flushVisible() {
+    if (visibleParts.isEmpty) return;
+    final parts = <ContentPart>[
+      if (!attachmentsPlaced) ...attachments,
+      ...visibleParts,
+    ];
+    attachmentsPlaced = true;
+    final synthetic = RemoteMessage(
+      id: '${message.id}-visible-$chunkIndex',
+      sessionId: message.sessionId,
+      role: message.role,
+      createdAt: message.createdAt,
+      parts: List<ContentPart>.unmodifiable(parts),
+      status: message.status,
+      editable: message.editable,
+      providerMessageId: message.providerMessageId,
+      origin: message.origin,
+    );
+    atoms.add(_ConversationAtom.message(
+      message: synthetic,
+      messageIndex: messageIndex,
+      occurredAt: message.createdAt,
+      order: orderBase + partOrder,
+      working: message.status == 'streaming',
+      showFinalBoundary: reasoningSinceVisible,
+    ));
+    visibleParts.clear();
+    chunkIndex += 1;
+    partOrder += 1;
+    reasoningSinceVisible = false;
+  }
+
+  for (final entry in message.parts.indexed) {
+    final part = entry.$2;
+    if (part.isAttachment) continue;
+    if (_isReasoningTracePart(part)) {
+      flushVisible();
+      atoms.add(_ConversationAtom.reasoning(
+        reasoningSegments: _reasoningSegmentsFromParts(
+            '${message.id}-part-${entry.$1}', <ContentPart>[part]),
+        messageIndex: messageIndex,
+        occurredAt: message.createdAt,
+        order: orderBase + partOrder,
+        working: message.status == 'streaming',
+      ));
+      partOrder += 1;
+      reasoningSinceVisible = true;
+    } else {
+      visibleParts.add(part);
+    }
+  }
+  flushVisible();
+  if (!attachmentsPlaced && attachments.isNotEmpty) {
+    final synthetic = RemoteMessage(
+      id: '${message.id}-attachments',
+      sessionId: message.sessionId,
+      role: message.role,
+      createdAt: message.createdAt,
+      parts: attachments,
+      status: message.status,
+      editable: message.editable,
+      providerMessageId: message.providerMessageId,
+      origin: message.origin,
+    );
+    atoms.add(_ConversationAtom.message(
+      message: synthetic,
+      messageIndex: messageIndex,
+      occurredAt: message.createdAt,
+      order: orderBase + partOrder,
+      working: message.status == 'streaming',
+    ));
+  }
+}
+
+void _appendReasoningSegments(
+  List<_ReasoningSegment> target,
+  List<_ReasoningSegment> incoming,
+) {
+  for (final segment in incoming) {
+    if (target.isNotEmpty &&
+        target.last.kind == _ReasoningDetailKind.toolCall &&
+        segment.kind == _ReasoningDetailKind.toolCall) {
+      final previous = target.removeLast();
+      target.add(_ReasoningSegment(
+        kind: _ReasoningDetailKind.toolCall,
+        details: <_ReasoningDetail>[...previous.details, ...segment.details],
+      ));
+    } else {
+      target.add(segment);
+    }
+  }
+}
+
+List<_ReasoningSegment> _reasoningSegmentsFromParts(
+  String messageId,
+  List<ContentPart> parts,
+) {
+  final result = <_ReasoningSegment>[];
+  for (final entry in parts.indexed) {
+    final part = entry.$2;
+    final kind = _isToolTracePart(part)
+        ? _ReasoningDetailKind.toolCall
+        : _ReasoningDetailKind.thinking;
+    final detail = _ReasoningDetail(
+      id: '$messageId-${kind.name}-${entry.$1}',
+      kind: kind,
+      summary: _reasoningPartSummary(part),
+      detail: _reasoningPartDetail(part),
+    );
+    if (kind == _ReasoningDetailKind.toolCall &&
+        result.isNotEmpty &&
+        result.last.kind == kind) {
+      final previous = result.removeLast();
+      result.add(_ReasoningSegment(
+        kind: kind,
+        details: <_ReasoningDetail>[...previous.details, detail],
+      ));
+    } else {
+      result.add(_ReasoningSegment(
+        kind: kind,
+        details: <_ReasoningDetail>[detail],
+      ));
+    }
+  }
+  return result;
+}
+
+bool _isReasoningTracePart(ContentPart part) =>
+    _assistantTextTone(part, false) == _AssistantTextTone.privateReasoning ||
+    _isToolTracePart(part);
+
+bool _isToolTracePart(ContentPart part) {
+  final type = part.type.toLowerCase();
+  if (const <String>{'command', 'tool', 'file_change', 'error'}
+      .contains(type)) {
+    return true;
+  }
+  final phase = '${part.data['phase'] ?? ''}'.toLowerCase();
+  final kind = '${part.data['kind'] ?? ''}'.toLowerCase();
+  return phase.contains('tool') || kind.contains('tool');
+}
+
+String _reasoningPartSummary(ContentPart part) {
+  final providerSummary = _firstUsefulString(<Object?>[
+    part.data['summary'],
+    part.data['shortSummary'],
+    part.data['short_summary'],
+    part.data['title'],
+    part.data['label'],
+  ]);
+  if (providerSummary != null) {
+    return _conciseReasoningLabel(providerSummary);
+  }
+  if (_isToolTracePart(part)) {
+    final name = _firstUsefulString(<Object?>[
+          part.data['name'],
+          part.data['tool'],
+          part.data['toolName'],
+          part.data['command'],
+          part.data['path'],
+        ]) ??
+        part.summary;
+    return _conciseReasoningLabel(name.isEmpty ? 'Tool call' : name);
+  }
+  return _conciseReasoningLabel(_messagePartText(part));
+}
+
+String _reasoningPartDetail(ContentPart part) {
+  final direct = _firstUsefulString(<Object?>[
+    part.data['text'],
+    part.data['output'],
+    part.data['result'],
+    part.data['content'],
+    part.data['command'],
+    part.data['diff'],
+    part.data['message'],
+    part.data['path'],
+  ]);
+  return direct ?? _messagePartText(part);
+}
+
+String? _firstUsefulString(Iterable<Object?> values) {
+  for (final value in values) {
+    if (value is String && value.trim().isNotEmpty) return value.trim();
+  }
+  return null;
+}
+
+String _conciseReasoningLabel(String value, {int maxLength = 92}) {
+  final normalized = value
+      .replaceAll('_', ' ')
+      .replaceAll(RegExp(r'[`*_#]+'), '')
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .trim();
+  if (normalized.isEmpty) return 'Details';
+  final sentence = RegExp(r'^.*?(?:[.!?](?:\s|$)|$)')
+          .firstMatch(normalized)
+          ?.group(0)
+          ?.trim() ??
+      normalized;
+  if (sentence.length <= maxLength) return sentence;
+  final clipped = sentence.substring(0, maxLength - 1).trimRight();
+  final lastSpace = clipped.lastIndexOf(' ');
+  final clean = lastSpace > maxLength * .62
+      ? clipped.substring(0, lastSpace).trimRight()
+      : clipped;
+  return '$clean…';
+}
 
 String _copyableMessageText(RemoteMessage message) {
   final role = message.role.toLowerCase();
@@ -5372,12 +7455,173 @@ String _copyableMessageText(RemoteMessage message) {
 
 _AssistantTextTone _assistantTextTone(ContentPart part, bool isUser) {
   if (isUser || !_isArtifactPart(part)) {
-    return _AssistantTextTone.finalAnswer;
+    return !isUser && _isToolTracePart(part)
+        ? _AssistantTextTone.privateReasoning
+        : _AssistantTextTone.finalAnswer;
   }
   if (part.type == 'reasoning' && part.data['phase'] != 'commentary') {
     return _AssistantTextTone.privateReasoning;
   }
   return _AssistantTextTone.commentary;
+}
+
+class _WorkflowMessageAttachment extends StatelessWidget {
+  const _WorkflowMessageAttachment({
+    required this.part,
+    required this.visual,
+    super.key,
+  });
+
+  final ContentPart part;
+  final ProviderVisualTheme visual;
+
+  JsonMap get _workflow {
+    final value = part.data['workflow'];
+    return value is Map<Object?, Object?>
+        ? value.map((key, value) => MapEntry(key.toString(), value))
+        : const <String, Object?>{};
+  }
+
+  String get _name => optionalString(_workflow, 'name') ?? 'Recorded workflow';
+  int get _events =>
+      _workflow['eventCount'] is int ? _workflow['eventCount']! as int : 0;
+  int get _screenshots => _workflow['screenshotCount'] is int
+      ? _workflow['screenshotCount']! as int
+      : 0;
+  List<String> get _applications => (_workflow['applications'] is List<Object?>
+          ? _workflow['applications']! as List<Object?>
+          : const <Object?>[])
+      .whereType<String>()
+      .take(8)
+      .toList(growable: false);
+
+  void _open(BuildContext context) {
+    unawaited(showDialog<void>(
+      context: context,
+      builder: (dialogContext) => Dialog(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 360),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Row(children: <Widget>[
+                  Icon(Icons.account_tree_outlined,
+                      size: 20, color: visual.accent),
+                  const SizedBox(width: 9),
+                  Expanded(
+                      child: Text(_name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontWeight: FontWeight.w600))),
+                  IconButton(
+                    tooltip: 'Close',
+                    onPressed: () => Navigator.of(dialogContext).pop(),
+                    icon: const Icon(Icons.close, size: 19),
+                  ),
+                ]),
+                Text('Recorded workflow attached to this message.',
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: Theme.of(context)
+                            .colorScheme
+                            .onSurface
+                            .withValues(alpha: .62))),
+                const SizedBox(height: 14),
+                Row(children: <Widget>[
+                  Expanded(
+                      child:
+                          _WorkflowMetric(label: 'Events', value: '$_events')),
+                  const SizedBox(width: 8),
+                  Expanded(
+                      child: _WorkflowMetric(
+                          label: 'Screenshots', value: '$_screenshots')),
+                ]),
+                if (_applications.isNotEmpty) ...<Widget>[
+                  const SizedBox(height: 12),
+                  Text('Captured in ${_applications.join(', ')}',
+                      style: Theme.of(context).textTheme.bodySmall),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    ));
+  }
+
+  @override
+  Widget build(BuildContext context) => Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: () => _open(context),
+          borderRadius: BorderRadius.circular(7),
+          child: Ink(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+            decoration: BoxDecoration(
+              color: visual.surfaceRaised.withValues(alpha: .9),
+              borderRadius: BorderRadius.circular(7),
+            ),
+            child: Row(mainAxisSize: MainAxisSize.min, children: <Widget>[
+              Icon(Icons.account_tree_outlined,
+                  size: 18, color: visual.accent.withValues(alpha: .82)),
+              const SizedBox(width: 8),
+              Flexible(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text(_name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                            fontSize: 12, fontWeight: FontWeight.w600)),
+                    Text('$_events events · $_screenshots screenshots',
+                        style: TextStyle(
+                            fontSize: 10,
+                            color: Theme.of(context)
+                                .colorScheme
+                                .onSurface
+                                .withValues(alpha: .54))),
+                  ],
+                ),
+              ),
+            ]),
+          ),
+        ),
+      );
+}
+
+class _WorkflowMetric extends StatelessWidget {
+  const _WorkflowMetric({required this.label, required this.value});
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) => DecoratedBox(
+        decoration: BoxDecoration(
+          color: Theme.of(context).colorScheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(7),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(10),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Text(label.toUpperCase(),
+                  style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                      fontSize: 9,
+                      color: Theme.of(context)
+                          .colorScheme
+                          .onSurface
+                          .withValues(alpha: .5))),
+              const SizedBox(height: 3),
+              Text(value),
+            ],
+          ),
+        ),
+      );
 }
 
 class _MessageCard extends StatelessWidget {
@@ -5431,7 +7675,10 @@ class _MessageCard extends StatelessWidget {
     final hasMemoryContext = !isUser &&
         message.parts.any((part) => _hasMemoryCitation(part.summary));
     final renderedParts = message.parts
-        .where((part) => !part.isAttachment && part.type != 'subagent')
+        .where((part) =>
+            !part.isAttachment &&
+            part.type != 'subagent' &&
+            part.type != 'workflow')
         .map((part) => (
               text: _withoutMemoryCitation(
                   _messagePartText(part, stripAttachmentEnvelope: isUser)),
@@ -5444,6 +7691,9 @@ class _MessageCard extends StatelessWidget {
         .toList(growable: false);
     final subagentParts = message.parts
         .where((part) => part.type == 'subagent')
+        .toList(growable: false);
+    final workflowParts = message.parts
+        .where((part) => part.type == 'workflow')
         .toList(growable: false);
     final attachments = attachmentParts.indexed
         .map((entry) => _MessageAttachmentView.fromPart(
@@ -5466,6 +7716,7 @@ class _MessageCard extends StatelessWidget {
     if (renderedParts.isEmpty &&
         displayedAttachments.isEmpty &&
         subagentParts.isEmpty &&
+        workflowParts.isEmpty &&
         !hasMemoryContext) {
       return const SizedBox.shrink();
     }
@@ -5513,6 +7764,25 @@ class _MessageCard extends StatelessWidget {
                   isUser ? CrossAxisAlignment.end : CrossAxisAlignment.start,
               mainAxisSize: MainAxisSize.min,
               children: <Widget>[
+                if (message.origin?.kind == 'cross_session')
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(4, 2, 4, 0),
+                    child: Text(
+                      message.origin?.sourceTitle?.trim().isNotEmpty == true
+                          ? 'From another Tethoq task · ${message.origin!.sourceTitle!.trim()}'
+                          : 'From another Tethoq task',
+                      key: ValueKey<String>('message-origin-${message.id}'),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                            fontSize: 12,
+                            color: Theme.of(context)
+                                .colorScheme
+                                .onSurface
+                                .withValues(alpha: .56),
+                          ),
+                    ),
+                  ),
                 GestureDetector(
                   behavior: HitTestBehavior.translucent,
                   onLongPress: onLongPress,
@@ -5545,6 +7815,21 @@ class _MessageCard extends StatelessWidget {
                         mainAxisSize: MainAxisSize.min,
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: <Widget>[
+                          ...workflowParts.indexed.map((entry) => Padding(
+                                padding: EdgeInsets.only(
+                                    bottom: renderedParts.isNotEmpty ||
+                                            displayedAttachments.isNotEmpty ||
+                                            subagentParts.isNotEmpty ||
+                                            entry.$1 < workflowParts.length - 1
+                                        ? 8
+                                        : 0),
+                                child: _WorkflowMessageAttachment(
+                                  key: ValueKey<String>(
+                                      'message-workflow-${message.id}-${entry.$1}'),
+                                  part: entry.$2,
+                                  visual: visual,
+                                ),
+                              )),
                           ...displayedAttachments.indexed.map((entry) =>
                               Padding(
                                 padding: EdgeInsets.only(
@@ -5700,6 +7985,8 @@ class _ConversationBoundary extends StatelessWidget {
   Widget build(BuildContext context) {
     final color =
         Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.42);
+    final isCompaction = label == 'Context compacted' ||
+        label == 'Automatically compacted context';
     return Semantics(
       key: ValueKey<String>('conversation-boundary-$messageId'),
       container: true,
@@ -5708,9 +7995,12 @@ class _ConversationBoundary extends StatelessWidget {
         padding: const EdgeInsets.symmetric(horizontal: 34, vertical: 10),
         child: Row(
           children: <Widget>[
-            Expanded(
-                child: Divider(height: 1, color: color.withValues(alpha: .5))),
-            const SizedBox(width: 8),
+            if (!isCompaction) ...<Widget>[
+              Expanded(
+                  child:
+                      Divider(height: 1, color: color.withValues(alpha: .5))),
+              const SizedBox(width: 8),
+            ],
             Icon(Icons.compress_rounded, size: 14, color: color),
             const SizedBox(width: 5),
             ExcludeSemantics(
@@ -5723,10 +8013,96 @@ class _ConversationBoundary extends StatelessWidget {
                     ),
               ),
             ),
-            const SizedBox(width: 8),
-            Expanded(
-                child: Divider(height: 1, color: color.withValues(alpha: .5))),
+            if (!isCompaction) ...<Widget>[
+              const SizedBox(width: 8),
+              Expanded(
+                  child:
+                      Divider(height: 1, color: color.withValues(alpha: .5))),
+            ],
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class _CompactionProgressRow extends StatefulWidget {
+  const _CompactionProgressRow({this.compactionKind});
+
+  final String? compactionKind;
+
+  @override
+  State<_CompactionProgressRow> createState() => _CompactionProgressRowState();
+}
+
+class _CompactionProgressRowState extends State<_CompactionProgressRow>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1900),
+  )..repeat();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final color = Theme.of(context).colorScheme.onSurface.withValues(alpha: .5);
+    final label = widget.compactionKind == 'automatic'
+        ? 'Automatically compacting context…'
+        : 'Compacting context…';
+    final content = Row(
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        const Icon(Icons.compress_rounded, size: 15, color: Colors.white),
+        const SizedBox(width: 7),
+        Text(
+          label,
+          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: Colors.white,
+                fontWeight: FontWeight.w500,
+              ),
+        ),
+      ],
+    );
+    final reduceMotion = MediaQuery.disableAnimationsOf(context);
+    return Semantics(
+      key: const Key('compaction-progress-row'),
+      container: true,
+      liveRegion: true,
+      label: label,
+      child: ExcludeSemantics(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(34, 8, 8, 10),
+          child: reduceMotion
+              ? ColorFiltered(
+                  colorFilter: ColorFilter.mode(color, BlendMode.srcIn),
+                  child: content,
+                )
+              : AnimatedBuilder(
+                  animation: _controller,
+                  builder: (context, child) => ShaderMask(
+                    blendMode: BlendMode.srcIn,
+                    shaderCallback: (bounds) => LinearGradient(
+                      begin: Alignment(-2.4 + _controller.value * 4.8, 0),
+                      end: Alignment(-1.1 + _controller.value * 4.8, 0),
+                      colors: <Color>[
+                        color,
+                        Theme.of(context)
+                            .colorScheme
+                            .onSurface
+                            .withValues(alpha: .82),
+                        color,
+                      ],
+                      stops: const <double>[0, .5, 1],
+                    ).createShader(bounds),
+                    child: child,
+                  ),
+                  child: content,
+                ),
         ),
       ),
     );
@@ -5764,8 +8140,62 @@ bool _isSafeMarkdownUri(Uri? uri) =>
     (uri.scheme == 'https' || uri.scheme == 'http') &&
     uri.host.isNotEmpty;
 
+bool _isDesktopLocalPath(String? href, Uri? uri) {
+  if (href == null || href.trim().isEmpty) return false;
+  final value = href.trim();
+  return uri?.scheme.toLowerCase() == 'file' ||
+      RegExp(r'^[a-zA-Z]:[\\/]').hasMatch(value) ||
+      value.startsWith(r'\\') ||
+      value.startsWith('/');
+}
+
+Future<void> _offerDesktopPathCopy(BuildContext context, String path) async {
+  final copy = await showModalBottomSheet<bool>(
+    context: context,
+    showDragHandle: true,
+    builder: (sheetContext) => SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Text('Desktop path',
+                style: Theme.of(sheetContext).textTheme.titleMedium),
+            const SizedBox(height: 4),
+            Text(
+              'This path belongs to the paired computer, so it cannot open on this phone.',
+              style: Theme.of(sheetContext).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 8),
+            ListTile(
+              key: const Key('copy-desktop-path'),
+              contentPadding: EdgeInsets.zero,
+              minTileHeight: 44,
+              leading: const Icon(Icons.copy_rounded),
+              title: const Text('Copy path'),
+              onTap: () => Navigator.pop(sheetContext, true),
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+  if (copy != true) return;
+  await Clipboard.setData(ClipboardData(text: path));
+  if (context.mounted) {
+    ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+      const SnackBar(content: Text('Path copied')),
+    );
+  }
+}
+
 Future<void> _openMarkdownLink(BuildContext context, String? href) async {
   final uri = href == null ? null : Uri.tryParse(href);
+  if (_isDesktopLocalPath(href, uri)) {
+    await _offerDesktopPathCopy(context, href!.trim());
+    return;
+  }
   if (!_isSafeMarkdownUri(uri)) {
     ScaffoldMessenger.maybeOf(context)?.showSnackBar(
       const SnackBar(content: Text('This link type is blocked.')),
@@ -6374,158 +8804,173 @@ String _subagentActionLabel(String action, String? tool) => switch (action) {
       _ => tool?.trim().isNotEmpty == true ? tool! : 'Agent activity',
     };
 
-class _QueuedInstructionCard extends StatefulWidget {
-  const _QueuedInstructionCard({
-    required this.message,
+class _QueuedInstructionStrip extends StatelessWidget {
+  const _QueuedInstructionStrip({
+    required this.messages,
     required this.visual,
     required this.onCancel,
+    required this.onActions,
   });
 
-  final RemoteQueuedMessage message;
+  final List<RemoteQueuedMessage> messages;
   final ProviderVisualTheme visual;
-  final VoidCallback onCancel;
+  final ValueChanged<RemoteQueuedMessage> onCancel;
+  final ValueChanged<RemoteQueuedMessage> onActions;
 
   @override
-  State<_QueuedInstructionCard> createState() => _QueuedInstructionCardState();
+  Widget build(BuildContext context) => ConstrainedBox(
+        key: const Key('queued-instruction-strip'),
+        constraints: const BoxConstraints(maxHeight: 104),
+        child: ColoredBox(
+          color: visual.surface.withValues(alpha: .32),
+          child: ListView.separated(
+            shrinkWrap: true,
+            padding: const EdgeInsets.symmetric(vertical: 3),
+            itemCount: messages.length,
+            separatorBuilder: (_, __) => Divider(
+              height: 1,
+              indent: 42,
+              color: visual.border.withValues(alpha: .34),
+            ),
+            itemBuilder: (context, index) {
+              final message = messages[index];
+              final sending = message.state == 'sending';
+              String? thumbnailUri;
+              for (final attachment in message.attachments) {
+                thumbnailUri = attachment.localImageDataUri;
+                if (thumbnailUri != null) break;
+              }
+              return SizedBox(
+                key: ValueKey<String>('queued-instruction-${message.id}'),
+                height: 48,
+                child: Row(
+                  children: <Widget>[
+                    SizedBox.square(
+                      dimension: 44,
+                      child: Center(
+                        child: sending
+                            ? SizedBox.square(
+                                dimension: 16,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 1.7,
+                                  color: visual.accent,
+                                ),
+                              )
+                            : Icon(Icons.schedule_send_outlined,
+                                size: 18, color: visual.accent),
+                      ),
+                    ),
+                    Expanded(
+                      child: InkWell(
+                        onTap: () => onActions(message),
+                        child: Row(
+                          children: <Widget>[
+                            Expanded(
+                              child: Text(
+                                message.content
+                                    .replaceAll(RegExp(r'[\r\n]+'), ' '),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .bodyMedium
+                                    ?.copyWith(fontSize: 13.5),
+                              ),
+                            ),
+                            if (message.attachments.isNotEmpty) ...<Widget>[
+                              const SizedBox(width: 6),
+                              if (thumbnailUri != null)
+                                ClipRRect(
+                                  key: ValueKey<String>(
+                                      'queued-image-preview-${message.id}'),
+                                  borderRadius: BorderRadius.circular(4),
+                                  child: _MemoizedDataUriImage(
+                                    dataUri: thumbnailUri,
+                                    width: 28,
+                                    height: 28,
+                                    fit: BoxFit.cover,
+                                    cacheWidth: 56,
+                                    fallback: Icon(
+                                      Icons.image_outlined,
+                                      size: 16,
+                                      color: Theme.of(context)
+                                          .colorScheme
+                                          .onSurface
+                                          .withValues(alpha: .58),
+                                    ),
+                                  ),
+                                )
+                              else
+                                Icon(
+                                  message.attachments.any((attachment) =>
+                                          attachment.mimeType
+                                              .startsWith('image/'))
+                                      ? Icons.image_outlined
+                                      : Icons.attach_file_rounded,
+                                  size: 16,
+                                  color: Theme.of(context)
+                                      .colorScheme
+                                      .onSurface
+                                      .withValues(alpha: .58),
+                                ),
+                              const SizedBox(width: 2),
+                              Text('${message.attachments.length}',
+                                  style:
+                                      Theme.of(context).textTheme.labelSmall),
+                            ],
+                          ],
+                        ),
+                      ),
+                    ),
+                    SizedBox.square(
+                      dimension: 44,
+                      child: IconButton(
+                        key: ValueKey<String>('queued-actions-${message.id}'),
+                        tooltip: 'Queued message actions',
+                        onPressed: () => onActions(message),
+                        icon: const Icon(Icons.more_horiz_rounded, size: 20),
+                      ),
+                    ),
+                    SizedBox.square(
+                      dimension: 44,
+                      child: IconButton(
+                        key: ValueKey<String>('cancel-queued-${message.id}'),
+                        tooltip: 'Remove queued message',
+                        onPressed: sending ? null : () => onCancel(message),
+                        icon: const Icon(Icons.close_rounded, size: 20),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        ),
+      );
 }
 
-class _QueuedInstructionCardState extends State<_QueuedInstructionCard> {
-  bool _expanded = false;
+class _QueueActionTile extends StatelessWidget {
+  const _QueueActionTile({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+    super.key,
+  });
+
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
 
   @override
-  void didUpdateWidget(covariant _QueuedInstructionCard oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.message.id != widget.message.id) _expanded = false;
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final message = widget.message;
-    final visual = widget.visual;
-    final failed = message.state == 'failed';
-    final sending = message.state == 'sending';
-    final label = failed
-        ? 'COULD NOT SEND'
-        : sending
-            ? 'SENDING NEXT'
-            : 'QUEUED NEXT';
-    final color = failed ? Theme.of(context).colorScheme.error : visual.accent;
-    return Container(
-      key: ValueKey<String>('queued-instruction-${message.id}'),
-      margin: const EdgeInsets.only(top: 7, bottom: 3),
-      padding: const EdgeInsets.fromLTRB(11, 9, 4, 9),
-      decoration: BoxDecoration(
-        color: visual.surface.withValues(alpha: 0.34),
-        border: Border(
-          left: BorderSide(color: color.withValues(alpha: 0.88), width: 2),
-          top: BorderSide(color: visual.border.withValues(alpha: 0.42)),
-          bottom: BorderSide(color: visual.border.withValues(alpha: 0.42)),
+  Widget build(BuildContext context) => SizedBox(
+        height: 52,
+        child: ListTile(
+          minLeadingWidth: 32,
+          leading: Icon(icon, size: 21),
+          title: Text(label),
+          onTap: onTap,
         ),
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: <Widget>[
-          Padding(
-            padding: const EdgeInsets.only(top: 1),
-            child: sending
-                ? SizedBox.square(
-                    dimension: 15,
-                    child: CircularProgressIndicator(
-                        strokeWidth: 1.7, color: color))
-                : Icon(Icons.schedule_send_outlined, size: 17, color: color),
-          ),
-          const SizedBox(width: 9),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                Text(label,
-                    style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                          color: color,
-                          fontSize: 11,
-                          fontWeight: FontWeight.w700,
-                          letterSpacing: 0.7,
-                        )),
-                const SizedBox(height: 3),
-                Text(message.content,
-                    maxLines: _expanded ? null : 4,
-                    overflow: _expanded
-                        ? TextOverflow.visible
-                        : TextOverflow.ellipsis,
-                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          fontSize: 12.5,
-                          height: 1.35,
-                          color: Theme.of(context)
-                              .colorScheme
-                              .onSurface
-                              .withValues(alpha: 0.82),
-                        )),
-                if (message.content.length > 220)
-                  Align(
-                    alignment: Alignment.centerLeft,
-                    child: TextButton(
-                      key: ValueKey<String>('expand-queued-${message.id}'),
-                      onPressed: () => setState(() => _expanded = !_expanded),
-                      style: TextButton.styleFrom(
-                        foregroundColor: color.withValues(alpha: 0.86),
-                        minimumSize: const Size(44, 44),
-                        padding: const EdgeInsets.only(right: 8),
-                        visualDensity: VisualDensity.compact,
-                      ),
-                      child: Text(_expanded ? 'Collapse' : 'Show full'),
-                    ),
-                  ),
-                if (message.attachments.isNotEmpty) ...<Widget>[
-                  const SizedBox(height: 5),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 3,
-                    children: message.attachments
-                        .map((attachment) => Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: <Widget>[
-                                Icon(
-                                    attachment.mimeType.startsWith('image/')
-                                        ? Icons.image_outlined
-                                        : Icons.insert_drive_file_outlined,
-                                    size: 13,
-                                    color: color.withValues(alpha: 0.72)),
-                                const SizedBox(width: 3),
-                                Text(
-                                  attachment.name,
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .labelSmall
-                                      ?.copyWith(fontSize: 12),
-                                ),
-                              ],
-                            ))
-                        .toList(growable: false),
-                  ),
-                ],
-                if (message.error?.isNotEmpty == true) ...<Widget>[
-                  const SizedBox(height: 4),
-                  Text(message.error!,
-                      style: Theme.of(context)
-                          .textTheme
-                          .labelSmall
-                          ?.copyWith(color: color)),
-                ],
-              ],
-            ),
-          ),
-          if (!sending)
-            IconButton(
-              key: ValueKey<String>('cancel-queued-${message.id}'),
-              tooltip: 'Remove queued instruction',
-              visualDensity: VisualDensity.compact,
-              onPressed: widget.onCancel,
-              icon: const Icon(Icons.close_rounded, size: 17),
-            ),
-        ],
-      ),
-    );
-  }
+      );
 }
 
 class _ActivityEventGroup {
@@ -6560,45 +9005,178 @@ class _ActivityPresentation {
   final String snippet;
 }
 
-class _ReasoningActivityGroup extends StatefulWidget {
-  const _ReasoningActivityGroup({
-    required this.groups,
+class _MessageReasoningSpan extends StatelessWidget {
+  const _MessageReasoningSpan({
+    required this.id,
+    required this.segments,
     required this.visual,
+    required this.providerId,
+    required this.showIdentity,
     required this.working,
+    this.displayMode = _ReasoningDisplayMode.compact,
+    super.key,
   });
 
-  final List<_ActivityEventGroup> groups;
+  final String id;
+  final List<_ReasoningSegment> segments;
   final ProviderVisualTheme visual;
+  final String providerId;
+  final bool showIdentity;
   final bool working;
+  final _ReasoningDisplayMode displayMode;
 
   @override
-  State<_ReasoningActivityGroup> createState() =>
-      _ReasoningActivityGroupState();
+  Widget build(BuildContext context) {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          SizedBox(
+            width: 34,
+            child: showIdentity
+                ? Padding(
+                    padding: const EdgeInsets.only(top: 11),
+                    child: ProviderLogo(
+                      key: ValueKey<String>('assistant-identity-reasoning-$id'),
+                      providerId: providerId,
+                      size: 22,
+                    ),
+                  )
+                : null,
+          ),
+          Expanded(
+            child: _ReasoningDisclosure(
+              id: id,
+              segments: segments,
+              visual: visual,
+              working: working,
+              displayMode: displayMode,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
-class _ReasoningActivityGroupState extends State<_ReasoningActivityGroup> {
+class _ReasoningDisclosure extends StatefulWidget {
+  const _ReasoningDisclosure({
+    required this.id,
+    required this.segments,
+    required this.visual,
+    required this.working,
+    this.displayMode = _ReasoningDisplayMode.compact,
+  });
+
+  final String id;
+  final List<_ReasoningSegment> segments;
+  final ProviderVisualTheme visual;
+  final bool working;
+  final _ReasoningDisplayMode displayMode;
+
+  @override
+  State<_ReasoningDisclosure> createState() => _ReasoningDisclosureState();
+}
+
+class _ReasoningDisclosureState extends State<_ReasoningDisclosure> {
   bool _expanded = false;
+  final Set<String> _expandedSegments = <String>{};
+  final Set<String> _expandedToolDetails = <String>{};
+
+  @override
+  void initState() {
+    super.initState();
+    _applyExpandedThinkingDefault();
+  }
+
+  @override
+  void didUpdateWidget(covariant _ReasoningDisclosure oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.displayMode != oldWidget.displayMode ||
+        widget.segments.length != oldWidget.segments.length) {
+      _applyExpandedThinkingDefault();
+    }
+  }
+
+  void _applyExpandedThinkingDefault() {
+    if (widget.displayMode != _ReasoningDisplayMode.expanded) return;
+    _expandedSegments.addAll(widget.segments
+        .where((segment) => segment.kind == _ReasoningDetailKind.thinking)
+        .map((segment) => segment.details.first.id));
+  }
+
+  String _segmentId(_ReasoningSegment segment) => segment.details.first.id;
+
+  Iterable<_ReasoningSegment> get _thinkingSegments => widget.segments
+      .where((segment) => segment.kind == _ReasoningDetailKind.thinking);
+
+  Iterable<_ReasoningSegment> get _toolSegments => widget.segments
+      .where((segment) => segment.kind == _ReasoningDetailKind.toolCall);
+
+  void _toggleAllThinking() {
+    final ids = _thinkingSegments.map(_segmentId).toSet();
+    final collapse = ids.isNotEmpty && ids.every(_expandedSegments.contains);
+    setState(() {
+      if (collapse) {
+        _expandedSegments.removeAll(ids);
+      } else {
+        _expandedSegments.addAll(ids);
+      }
+    });
+  }
+
+  void _toggleAllTools() {
+    final segments = _toolSegments.toList(growable: false);
+    final segmentIds = segments.map(_segmentId).toSet();
+    final detailIds = segments
+        .expand((segment) => segment.details)
+        .map((detail) => detail.id)
+        .toSet();
+    final collapse = segmentIds.isNotEmpty &&
+        segmentIds.every(_expandedSegments.contains) &&
+        detailIds.every(_expandedToolDetails.contains);
+    setState(() {
+      if (collapse) {
+        _expandedSegments.removeAll(segmentIds);
+        _expandedToolDetails.removeAll(detailIds);
+      } else {
+        _expandedSegments.addAll(segmentIds);
+        _expandedToolDetails.addAll(detailIds);
+      }
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
     final motionDisabled = MediaQuery.disableAnimationsOf(context);
+    final muted =
+        Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.62);
     final labelStyle = Theme.of(context).textTheme.bodyMedium?.copyWith(
-          color:
-              Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.64),
+          color: muted,
           fontWeight: FontWeight.w500,
         );
+    final thinking = _thinkingSegments.toList(growable: false);
+    final tools = _toolSegments.toList(growable: false);
+    final allThinkingExpanded = thinking.isNotEmpty &&
+        thinking.map(_segmentId).every(_expandedSegments.contains);
+    final allToolsExpanded = tools.isNotEmpty &&
+        tools.map(_segmentId).every(_expandedSegments.contains) &&
+        tools
+            .expand((segment) => segment.details)
+            .map((detail) => detail.id)
+            .every(_expandedToolDetails.contains);
     return Padding(
-      padding: const EdgeInsets.only(left: 34, right: 4, top: 2, bottom: 4),
+      padding: const EdgeInsets.only(right: 4, top: 1, bottom: 2),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
           Semantics(
             button: true,
             expanded: _expanded,
-            label:
-                _expanded ? 'Hide reasoning actions' : 'Show reasoning actions',
+            label: _expanded ? 'Hide reasoning' : 'Show reasoning',
             child: InkWell(
-              key: const Key('reasoning-activity-toggle'),
+              key: ValueKey<String>('reasoning-toggle-${widget.id}'),
               borderRadius: BorderRadius.circular(6),
               onTap: () => setState(() => _expanded = !_expanded),
               child: ConstrainedBox(
@@ -6618,10 +9196,7 @@ class _ReasoningActivityGroupState extends State<_ReasoningActivityGroup> {
                           ? Icons.keyboard_arrow_up_rounded
                           : Icons.keyboard_arrow_down_rounded,
                       size: 21,
-                      color: Theme.of(context)
-                          .colorScheme
-                          .onSurface
-                          .withValues(alpha: 0.56),
+                      color: muted,
                     ),
                   ],
                 ),
@@ -6631,25 +9206,349 @@ class _ReasoningActivityGroupState extends State<_ReasoningActivityGroup> {
           AnimatedSize(
             duration: motionDisabled
                 ? Duration.zero
-                : const Duration(milliseconds: 160),
+                : const Duration(milliseconds: 140),
             curve: Curves.easeOutCubic,
             alignment: Alignment.topCenter,
-            child: _expanded
-                ? Column(
+            child: !_expanded
+                ? const SizedBox.shrink()
+                : Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: widget.groups
-                        .map((group) => _EventCard(
-                              key: ValueKey<String>(
-                                  'activity-${group.events.first.eventId}'),
-                              group: group,
-                              visual: widget.visual,
-                            ))
-                        .toList(growable: false),
-                  )
-                : const SizedBox.shrink(),
+                    children: <Widget>[
+                      _ReasoningBulkControls(
+                        thinkingAvailable: thinking.isNotEmpty,
+                        toolsAvailable: tools.isNotEmpty,
+                        thinkingExpanded: allThinkingExpanded,
+                        toolsExpanded: allToolsExpanded,
+                        onThinkingTap: _toggleAllThinking,
+                        onToolsTap: _toggleAllTools,
+                      ),
+                      ...widget.segments.map((segment) {
+                        final id = _segmentId(segment);
+                        return _ReasoningSegmentPanel(
+                          key: ValueKey<String>('reasoning-segment-$id'),
+                          segment: segment,
+                          visual: widget.visual,
+                          expanded: _expandedSegments.contains(id),
+                          expandedToolDetails: _expandedToolDetails,
+                          onExpandedChanged: (expanded) => setState(() {
+                            if (expanded) {
+                              _expandedSegments.add(id);
+                            } else {
+                              _expandedSegments.remove(id);
+                            }
+                          }),
+                          onToolDetailChanged: (detailId, expanded) =>
+                              setState(() {
+                            if (expanded) {
+                              _expandedToolDetails.add(detailId);
+                            } else {
+                              _expandedToolDetails.remove(detailId);
+                            }
+                          }),
+                        );
+                      }),
+                    ],
+                  ),
           ),
         ],
       ),
+    );
+  }
+}
+
+class _ReasoningBulkControls extends StatelessWidget {
+  const _ReasoningBulkControls({
+    required this.thinkingAvailable,
+    required this.toolsAvailable,
+    required this.thinkingExpanded,
+    required this.toolsExpanded,
+    required this.onThinkingTap,
+    required this.onToolsTap,
+  });
+
+  final bool thinkingAvailable;
+  final bool toolsAvailable;
+  final bool thinkingExpanded;
+  final bool toolsExpanded;
+  final VoidCallback onThinkingTap;
+  final VoidCallback onToolsTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final divider =
+        Theme.of(context).colorScheme.onSurface.withValues(alpha: .16);
+    return Semantics(
+      container: true,
+      label: 'Reasoning expansion controls',
+      child: Row(
+        children: <Widget>[
+          Expanded(
+            child: TextButton(
+              key: const Key('expand-reasoning-thinking'),
+              onPressed: thinkingAvailable ? onThinkingTap : null,
+              style: TextButton.styleFrom(
+                minimumSize: const Size(44, 44),
+                padding: const EdgeInsets.symmetric(horizontal: 6),
+              ),
+              child: Text(
+                thinkingExpanded ? 'Collapse thinking' : 'Expand thinking',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ),
+          SizedBox(
+              height: 22, child: VerticalDivider(width: 1, color: divider)),
+          Expanded(
+            child: TextButton(
+              key: const Key('expand-reasoning-tools'),
+              onPressed: toolsAvailable ? onToolsTap : null,
+              style: TextButton.styleFrom(
+                minimumSize: const Size(44, 44),
+                padding: const EdgeInsets.symmetric(horizontal: 6),
+              ),
+              child: Text(
+                toolsExpanded ? 'Collapse tool calls' : 'Expand tool calls',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ReasoningSegmentPanel extends StatelessWidget {
+  const _ReasoningSegmentPanel({
+    required this.segment,
+    required this.visual,
+    required this.expanded,
+    required this.expandedToolDetails,
+    required this.onExpandedChanged,
+    required this.onToolDetailChanged,
+    super.key,
+  });
+
+  final _ReasoningSegment segment;
+  final ProviderVisualTheme visual;
+  final bool expanded;
+  final Set<String> expandedToolDetails;
+  final ValueChanged<bool> onExpandedChanged;
+  final void Function(String id, bool expanded) onToolDetailChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final first = segment.details.first;
+    final summary = segment.kind == _ReasoningDetailKind.toolCall &&
+            segment.details.length > 1
+        ? '${first.summary} + ${segment.details.length - 1} more'
+        : first.summary;
+    final muted =
+        Theme.of(context).colorScheme.onSurface.withValues(alpha: .68);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        Semantics(
+          button: true,
+          expanded: expanded,
+          label: '$summary, ${expanded ? 'Collapse' : 'Expand'} details',
+          child: InkWell(
+            key: ValueKey<String>('reasoning-segment-toggle-${first.id}'),
+            onTap: () => onExpandedChanged(!expanded),
+            borderRadius: BorderRadius.circular(6),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(minHeight: 44),
+              child: Row(
+                children: <Widget>[
+                  Icon(
+                    segment.kind == _ReasoningDetailKind.thinking
+                        ? Icons.psychology_alt_outlined
+                        : Icons.terminal_rounded,
+                    size: 18,
+                    color: visual.accent.withValues(alpha: .78),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      summary,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                            color: muted,
+                            fontStyle:
+                                segment.kind == _ReasoningDetailKind.thinking
+                                    ? FontStyle.italic
+                                    : FontStyle.normal,
+                          ),
+                    ),
+                  ),
+                  Icon(
+                    expanded
+                        ? Icons.keyboard_arrow_up_rounded
+                        : Icons.keyboard_arrow_down_rounded,
+                    size: 20,
+                    color: muted,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        if (expanded)
+          if (segment.kind == _ReasoningDetailKind.thinking)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(26, 0, 8, 8),
+              child: _ReasoningThinkingDetail(
+                id: first.id,
+                text: first.detail,
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      height: 1.4,
+                      color: muted,
+                      fontStyle: FontStyle.italic,
+                    ),
+                visual: visual,
+              ),
+            )
+          else
+            Padding(
+              padding: const EdgeInsets.only(left: 18),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: segment.details.map((detail) {
+                  if (detail.activity != null) {
+                    return _EventCard(
+                      key: ValueKey<String>(detail.id),
+                      group: detail.activity!,
+                      visual: visual,
+                      expanded: expandedToolDetails.contains(detail.id),
+                      onExpandedChanged: (value) =>
+                          onToolDetailChanged(detail.id, value),
+                    );
+                  }
+                  return _ReasoningToolDetail(
+                    key: ValueKey<String>('tool-detail-${detail.id}'),
+                    detail: detail,
+                    visual: visual,
+                    expanded: expandedToolDetails.contains(detail.id),
+                    onExpandedChanged: (value) =>
+                        onToolDetailChanged(detail.id, value),
+                  );
+                }).toList(growable: false),
+              ),
+            ),
+      ],
+    );
+  }
+}
+
+class _ReasoningThinkingDetail extends StatelessWidget {
+  const _ReasoningThinkingDetail({
+    required this.id,
+    required this.text,
+    required this.style,
+    required this.visual,
+  });
+
+  final String id;
+  final String text;
+  final TextStyle? style;
+  final ProviderVisualTheme visual;
+
+  @override
+  Widget build(BuildContext context) {
+    final body = _SafeMessageMarkdown(
+      text: text,
+      style: style,
+      visual: visual,
+    );
+    final lineCount = RegExp(r'\r?\n').allMatches(text).length + 1;
+    if (text.length <= 720 && lineCount <= 14) return body;
+    final maxHeight =
+        (MediaQuery.sizeOf(context).height * .42).clamp(180, 360).toDouble();
+    return ConstrainedBox(
+      key: ValueKey<String>('reasoning-thinking-scroll-$id'),
+      constraints: BoxConstraints(maxHeight: maxHeight),
+      child: Scrollbar(
+        child: SingleChildScrollView(
+          primary: false,
+          padding: const EdgeInsets.only(right: 6),
+          child: body,
+        ),
+      ),
+    );
+  }
+}
+
+class _ReasoningToolDetail extends StatelessWidget {
+  const _ReasoningToolDetail({
+    required this.detail,
+    required this.visual,
+    required this.expanded,
+    required this.onExpandedChanged,
+    super.key,
+  });
+
+  final _ReasoningDetail detail;
+  final ProviderVisualTheme visual;
+  final bool expanded;
+  final ValueChanged<bool> onExpandedChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final muted =
+        Theme.of(context).colorScheme.onSurface.withValues(alpha: .66);
+    final hasDetail = detail.detail.trim().isNotEmpty;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        InkWell(
+          key: ValueKey<String>('tool-detail-toggle-${detail.id}'),
+          onTap: hasDetail ? () => onExpandedChanged(!expanded) : null,
+          borderRadius: BorderRadius.circular(6),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(minHeight: 44),
+            child: Row(
+              children: <Widget>[
+                const Icon(Icons.terminal_rounded, size: 17),
+                const SizedBox(width: 7),
+                Expanded(
+                  child: Text(
+                    detail.summary,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodyMedium
+                        ?.copyWith(color: muted),
+                  ),
+                ),
+                if (hasDetail)
+                  Icon(
+                    expanded
+                        ? Icons.keyboard_arrow_up_rounded
+                        : Icons.keyboard_arrow_down_rounded,
+                    size: 20,
+                    color: muted,
+                  ),
+              ],
+            ),
+          ),
+        ),
+        if (expanded && hasDetail)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 0, 6, 8),
+            child: _SafeMessageMarkdown(
+              text: detail.detail,
+              style: Theme.of(context)
+                  .textTheme
+                  .bodySmall
+                  ?.copyWith(color: muted, height: 1.38),
+              visual: visual,
+            ),
+          ),
+      ],
     );
   }
 }
@@ -6658,11 +9557,15 @@ class _EventCard extends StatefulWidget {
   const _EventCard({
     required this.group,
     required this.visual,
+    this.expanded,
+    this.onExpandedChanged,
     super.key,
   });
 
   final _ActivityEventGroup group;
   final ProviderVisualTheme visual;
+  final bool? expanded;
+  final ValueChanged<bool>? onExpandedChanged;
 
   @override
   State<_EventCard> createState() => _EventCardState();
@@ -6672,16 +9575,28 @@ class _EventCardState extends State<_EventCard> {
   bool _expanded = false;
   bool _enlarged = false;
 
-  void _collapse() => setState(() {
-        _expanded = false;
-        _enlarged = false;
-      });
+  bool get _isExpanded => widget.expanded ?? _expanded;
+
+  void _setExpanded(bool value) {
+    if (widget.onExpandedChanged != null) {
+      widget.onExpandedChanged!(value);
+      if (!value && mounted) setState(() => _enlarged = false);
+      return;
+    }
+    setState(() {
+      _expanded = value;
+      if (!value) _enlarged = false;
+    });
+  }
+
+  void _collapse() => _setExpanded(false);
 
   @override
   Widget build(BuildContext context) {
     final presentation = _activityPresentation(widget.group);
     final hasSnippet = presentation.snippet.isNotEmpty;
     final longSnippet = _isLongActivitySnippet(presentation.snippet);
+    final expanded = _isExpanded;
     final motionDisabled = MediaQuery.disableAnimationsOf(context);
     final targetColor =
         Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.58);
@@ -6690,19 +9605,17 @@ class _EventCardState extends State<_EventCard> {
       children: <Widget>[
         Semantics(
           button: hasSnippet,
-          expanded: hasSnippet ? _expanded : null,
+          expanded: hasSnippet ? expanded : null,
           label: <String>[
             presentation.label,
             if (presentation.target != null) presentation.target!,
-            if (hasSnippet) _expanded ? 'Collapse details' : 'Expand details',
+            if (hasSnippet) expanded ? 'Collapse details' : 'Expand details',
           ].join(', '),
           child: InkWell(
             key: ValueKey<String>(
                 'activity-disclosure-${widget.group.events.first.eventId}'),
             borderRadius: BorderRadius.circular(6),
-            onTap: hasSnippet
-                ? () => setState(() => _expanded = !_expanded)
-                : null,
+            onTap: hasSnippet ? () => _setExpanded(!expanded) : null,
             child: ConstrainedBox(
               constraints: const BoxConstraints(minHeight: 44),
               child: Row(
@@ -6741,7 +9654,7 @@ class _EventCardState extends State<_EventCard> {
                     const Spacer(),
                   if (hasSnippet)
                     Icon(
-                      _expanded
+                      expanded
                           ? Icons.keyboard_arrow_up_rounded
                           : Icons.keyboard_arrow_down_rounded,
                       size: 20,
@@ -6758,7 +9671,7 @@ class _EventCardState extends State<_EventCard> {
               : const Duration(milliseconds: 160),
           curve: Curves.easeOutCubic,
           alignment: Alignment.topCenter,
-          child: _expanded
+          child: expanded && hasSnippet
               ? _ActivitySnippet(
                   key: ValueKey<String>(
                       'activity-snippet-${widget.group.events.first.eventId}'),
@@ -7553,7 +10466,7 @@ class HostsScreen extends StatelessWidget {
                 minLines: 5,
                 maxLines: 10,
                 decoration: const InputDecoration(
-                  hintText: 'OpenCode\nKronos\nSlyRS',
+                  hintText: 'OpenCode\nTypeScript\nPostgreSQL',
                   border: OutlineInputBorder(),
                 ),
               ),
@@ -7581,21 +10494,138 @@ class HostsScreen extends StatelessWidget {
   Future<void> _showDictationSourceDetails(BuildContext context,
       RemoteAppStore store, TranscriptionSource source) async {
     final ready = store.isDictationSourceReady(source);
+    final controller = TextEditingController();
+    var busy = false;
+    String? error;
     await showModalBottomSheet<void>(
       context: context,
       useSafeArea: true,
       showDragHandle: true,
-      builder: (sheetContext) => _SettingsDetailsSheet(
-        title: source.label,
-        details: <(String, String)>[
-          ('Status', ready ? 'Ready' : 'Setup needed'),
-          if (!ready) ('Computer setting', source.setupEnvironmentVariable),
-        ],
-        note: ready
-            ? 'Dictation audio is sent through your paired computer.'
-            : 'Add this credential to Tethoq Bridge on your computer, then reconnect.',
+      isScrollControlled: true,
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (sheetContext, setSheetState) => Padding(
+          padding: EdgeInsets.fromLTRB(
+              20, 0, 20, 20 + MediaQuery.viewInsetsOf(sheetContext).bottom),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                Text(source.label,
+                    style: Theme.of(sheetContext).textTheme.titleMedium),
+                const SizedBox(height: 6),
+                if (!ready) ...<Widget>[
+                  Text(
+                    'Setup needed',
+                    style: Theme.of(sheetContext).textTheme.bodySmall?.copyWith(
+                          color: Theme.of(sheetContext)
+                              .colorScheme
+                              .onSurfaceVariant,
+                          fontWeight: FontWeight.w600,
+                        ),
+                  ),
+                  const SizedBox(height: 4),
+                ],
+                Text(
+                  'Uses ${source.credentialLabel ?? 'an API key'}, separate from a consumer subscription. The key is checked with the provider and encrypted on your paired computer.',
+                  style: Theme.of(sheetContext).textTheme.bodySmall,
+                ),
+                const SizedBox(height: 14),
+                TextField(
+                  key: Key('dictation-api-key-${source.id}'),
+                  controller: controller,
+                  autofocus: !ready,
+                  obscureText: true,
+                  autocorrect: false,
+                  enableSuggestions: false,
+                  maxLength: 512,
+                  decoration: InputDecoration(
+                    labelText: source.credentialLabel ?? 'API key',
+                    hintText: 'Paste API key',
+                    errorText: error,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  alignment: WrapAlignment.end,
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: <Widget>[
+                    if (source.credentialSetupUrl != null)
+                      TextButton.icon(
+                        onPressed: busy
+                            ? null
+                            : () => unawaited(launchUrl(
+                                Uri.parse(source.credentialSetupUrl!),
+                                mode: LaunchMode.externalApplication)),
+                        icon: const Icon(Icons.open_in_new_rounded, size: 18),
+                        label: const Text('Get API key'),
+                      ),
+                    if (ready)
+                      TextButton(
+                        onPressed: busy
+                            ? null
+                            : () async {
+                                setSheetState(() => busy = true);
+                                try {
+                                  await store.configureDictationSource(
+                                      source.id,
+                                      clear: true);
+                                  if (sheetContext.mounted) {
+                                    Navigator.pop(sheetContext);
+                                  }
+                                } on Object catch (caught) {
+                                  setSheetState(() {
+                                    busy = false;
+                                    error = caught.toString();
+                                  });
+                                }
+                              },
+                        child: const Text('Remove saved key'),
+                      ),
+                    TextButton(
+                      onPressed:
+                          busy ? null : () => Navigator.pop(sheetContext),
+                      child: const Text('Cancel'),
+                    ),
+                    FilledButton(
+                      onPressed: busy
+                          ? null
+                          : () async {
+                              final key = controller.text.trim();
+                              if (key.length < 8) {
+                                setSheetState(
+                                    () => error = 'Paste a valid API key.');
+                                return;
+                              }
+                              setSheetState(() {
+                                busy = true;
+                                error = null;
+                              });
+                              try {
+                                await store.configureDictationSource(source.id,
+                                    apiKey: key);
+                                if (sheetContext.mounted) {
+                                  Navigator.pop(sheetContext);
+                                }
+                              } on Object catch (caught) {
+                                setSheetState(() {
+                                  busy = false;
+                                  error = caught.toString();
+                                });
+                              }
+                            },
+                      child: Text(busy ? 'Checking…' : 'Save and use'),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
+    controller.dispose();
   }
 
   Future<void> _removeHost(
@@ -7715,9 +10745,102 @@ class HostsScreen extends StatelessWidget {
     }
   }
 
+  Future<void> _editAgentDefault(BuildContext context, RemoteAppStore store,
+      ProviderConnection provider) async {
+    final models = await store.loadModels(provider.providerId);
+    if (!context.mounted) return;
+    if (models.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+            content:
+                Text('No models are available for ${provider.displayName}.')),
+      );
+      return;
+    }
+    final current = store.agentDefaultSelectionFor(provider.providerId, models);
+    final selected = await showModalBottomSheet<_ModelChoice>(
+      context: context,
+      constraints: const BoxConstraints(maxWidth: 760),
+      showDragHandle: true,
+      isScrollControlled: true,
+      useSafeArea: true,
+      builder: (sheetContext) => FractionallySizedBox(
+        heightFactor: .9,
+        child: _ModelPickerSheet(
+          models: models,
+          recentModels: store.recentModels(models),
+          currentProviderId: provider.providerId,
+          selectedModelId: current?.modelId,
+          visual: providerVisualThemeFor(provider.providerId),
+        ),
+      ),
+    );
+    if (!context.mounted || selected == null) return;
+    final model = models
+        .where((candidate) => candidate.id == selected.modelId)
+        .firstOrNull;
+    if (model == null) return;
+    final efforts = model.reasoningEfforts;
+    String? reasoningEffort;
+    if (efforts.isNotEmpty) {
+      final initialEffort = current?.modelId == model.id &&
+              efforts.any((effort) => effort.id == current?.reasoningEffort)
+          ? current?.reasoningEffort
+          : _defaultConcreteReasoningEffort(model) ?? efforts.first.id;
+      reasoningEffort = await showModalBottomSheet<String>(
+        context: context,
+        constraints: const BoxConstraints(maxWidth: 640),
+        showDragHandle: true,
+        useSafeArea: true,
+        builder: (sheetContext) => Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            ListTile(
+              title: const Text('Reasoning for new tasks'),
+              subtitle: Text(model.displayName),
+            ),
+            ...efforts.map((effort) => ListTile(
+                  key: Key('agent-default-reasoning-${effort.id}'),
+                  selected: effort.id == initialEffort,
+                  title: Text(_effortDisplayLabel(effort.id, model.id)),
+                  trailing: effort.id == initialEffort
+                      ? const Icon(Icons.check_rounded)
+                      : null,
+                  onTap: () => Navigator.pop(sheetContext, effort.id),
+                )),
+            const SizedBox(height: 8),
+          ],
+        ),
+      );
+      if (!context.mounted || reasoningEffort == null) return;
+    }
+    try {
+      await store.setAgentDefault(DelegationSelection(
+        providerId: provider.providerId,
+        modelId: model.id,
+        reasoningEffort: reasoningEffort,
+      ));
+    } on Object catch (caught) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(caught
+            .toString()
+            .replaceFirst(RegExp(r'^(Exception|StateError):\s*'), '')),
+      ));
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final store = StoreScope.of(context);
+    final agents = store.providers
+        .where((provider) =>
+            provider.detected &&
+            provider.capabilities.createSession &&
+            provider.capabilities.modelEnumeration &&
+            _supportsTurnModelSelection(provider.providerId))
+        .toList(growable: false)
+      ..sort((left, right) => left.displayName.compareTo(right.displayName));
     return Scaffold(
       appBar: AppBar(title: const Text('Settings')),
       body: _AdaptivePage(
@@ -7747,6 +10870,85 @@ class HostsScreen extends StatelessWidget {
                   },
                 ),
               ),
+              ListTile(
+                contentPadding: const EdgeInsets.symmetric(horizontal: 2),
+                title: const Text('Reasoning display'),
+                subtitle: const Text(
+                    'Only changes what opens here, not model effort.'),
+                trailing: DropdownButton<String>(
+                  key: const Key('reasoning-display-mode'),
+                  value: store.reasoningDisplayMode,
+                  underline: const SizedBox.shrink(),
+                  items: const <DropdownMenuItem<String>>[
+                    DropdownMenuItem(value: 'compact', child: Text('Compact')),
+                    DropdownMenuItem(
+                        value: 'expanded', child: Text('Expanded')),
+                  ],
+                  onChanged: (value) {
+                    if (value != null) {
+                      unawaited(store.setReasoningDisplayMode(value));
+                    }
+                  },
+                ),
+              ),
+              if (agents.isNotEmpty) ...<Widget>[
+                const Divider(height: 1),
+                _SettingsExpansion(
+                  key: const Key('settings-section-agent-defaults'),
+                  title: 'Agent defaults',
+                  subtitle: 'Model and reasoning for new tasks',
+                  onExpansionChanged: (expanded) {
+                    if (!expanded) return;
+                    for (final agent in agents) {
+                      unawaited(store
+                          .loadModels(agent.providerId)
+                          .catchError((Object _) => const <RemoteModel>[]));
+                    }
+                  },
+                  children: <Widget>[
+                    ...agents.map((agent) {
+                      final models = store.modelsByProvider[agent.providerId];
+                      final defaults = models == null
+                          ? null
+                          : store.agentDefaultSelectionFor(
+                              agent.providerId, models);
+                      final model = models
+                          ?.where(
+                              (candidate) => candidate.id == defaults?.modelId)
+                          .firstOrNull;
+                      final summary = models == null
+                          ? 'Loading model choices…'
+                          : model == null
+                              ? 'No model choices available'
+                              : <String>[
+                                  model.displayName,
+                                  if (defaults?.reasoningEffort != null)
+                                    _effortDisplayLabel(
+                                        defaults!.reasoningEffort!, model.id),
+                                ].join(' · ');
+                      return Column(
+                        children: <Widget>[
+                          ListTile(
+                            key: Key('agent-default-${agent.providerId}'),
+                            contentPadding:
+                                const EdgeInsets.symmetric(horizontal: 2),
+                            leading: ProviderLogo(
+                                providerId: agent.providerId, size: 28),
+                            title: Text(agent.displayName),
+                            subtitle: Text(summary,
+                                maxLines: 1, overflow: TextOverflow.ellipsis),
+                            trailing: const Icon(Icons.chevron_right_rounded,
+                                size: 20),
+                            onTap: () => unawaited(
+                                _editAgentDefault(context, store, agent)),
+                          ),
+                          const Divider(height: 1),
+                        ],
+                      );
+                    }),
+                  ],
+                ),
+              ],
               const Divider(height: 24),
               _SettingsExpansion(
                 key: const Key('settings-section-dictation'),
@@ -7969,12 +11171,14 @@ class _SettingsExpansion extends StatelessWidget {
     required this.title,
     required this.children,
     this.subtitle,
+    this.onExpansionChanged,
     super.key,
   });
 
   final String title;
   final String? subtitle;
   final List<Widget> children;
+  final ValueChanged<bool>? onExpansionChanged;
 
   @override
   Widget build(BuildContext context) => ExpansionTile(
@@ -7982,6 +11186,7 @@ class _SettingsExpansion extends StatelessWidget {
         childrenPadding: EdgeInsets.zero,
         shape: const Border(),
         collapsedShape: const Border(),
+        onExpansionChanged: onExpansionChanged,
         title: Text(
           title,
           style: Theme.of(context)
@@ -8041,13 +11246,11 @@ class _SettingsDetailsSheet extends StatelessWidget {
   const _SettingsDetailsSheet({
     required this.title,
     required this.details,
-    this.note,
     this.action,
   });
 
   final String title;
   final List<(String, String)> details;
-  final String? note;
   final Widget? action;
 
   @override
@@ -8090,10 +11293,6 @@ class _SettingsDetailsSheet extends StatelessWidget {
                         ],
                       ),
                     )),
-                if (note != null) ...<Widget>[
-                  const SizedBox(height: 12),
-                  Text(note!, style: Theme.of(context).textTheme.bodyMedium),
-                ],
                 if (action != null) ...<Widget>[
                   const SizedBox(height: 18),
                   Align(alignment: Alignment.centerLeft, child: action!),
@@ -8227,6 +11426,8 @@ bool _showsConversationEvent(String type) =>
     type != 'message.queued' &&
     type != 'message.queue_updated' &&
     type != 'message.queue_removed' &&
+    type != 'context.compaction_started' &&
+    type != 'context.compaction_completed' &&
     type != 'agent.completed' &&
     type != 'agent.interrupted' &&
     type != 'approval.requested' &&
@@ -8638,6 +11839,77 @@ String _effortDisplayLabel(String effort, String? modelId) {
   return _titleCase(effort);
 }
 
+String? _concreteReasoningEffort(String? value) {
+  final trimmed = value?.trim();
+  if (trimmed == null || trimmed.isEmpty) return null;
+  final normalized = trimmed.toLowerCase().replaceAll('_', '-');
+  if (const <String>{
+    'auto',
+    'automatic',
+    'default',
+    'model-default',
+    'unknown',
+    'unspecified',
+    'inherit',
+    'inherited',
+  }.contains(normalized)) {
+    return null;
+  }
+  return trimmed;
+}
+
+String? _defaultConcreteReasoningEffort(RemoteModel? model) {
+  final advertised = _concreteReasoningEffort(model?.defaultReasoningEffort);
+  if (advertised != null) return advertised;
+  final supported = model?.reasoningEfforts ?? const <ReasoningEffortOption>[];
+  return supported.length == 1 ? supported.single.id : null;
+}
+
+String? _queuedTaskReasoningEffort(
+    Iterable<RemoteSession> sessions, RemoteModel model) {
+  final supported = model.reasoningEfforts.map((option) => option.id).toSet();
+  if (supported.isEmpty) return null;
+  final matching = sessions
+      .where((session) =>
+          session.providerId == model.providerId &&
+          session.modelId == model.id &&
+          supported.contains(_concreteReasoningEffort(
+              session.reasoningEffort ?? session.variantId)))
+      .toList(growable: false)
+    ..sort(
+        (left, right) => right.lastActivityAt.compareTo(left.lastActivityAt));
+  final recent = matching.firstOrNull;
+  final recentEffort =
+      _concreteReasoningEffort(recent?.reasoningEffort ?? recent?.variantId);
+  return recentEffort ??
+      _defaultConcreteReasoningEffort(model) ??
+      model.reasoningEfforts.first.id;
+}
+
+String? _resolveReasoningEffort({
+  required RemoteSession? session,
+  required String? selectedEffort,
+  required String? displayedModelId,
+  required RemoteModel? model,
+  required bool sessionWorking,
+}) {
+  final selected = _concreteReasoningEffort(selectedEffort);
+  if (!sessionWorking && selected != null) return selected;
+
+  final sessionMatchesDisplayedModel = displayedModelId == null ||
+      session?.modelId == null ||
+      session?.modelId == displayedModelId;
+  if (sessionMatchesDisplayedModel) {
+    final sessionEffort = _concreteReasoningEffort(session?.reasoningEffort) ??
+        _concreteReasoningEffort(session?.variantId);
+    if (sessionEffort != null) return sessionEffort;
+  }
+
+  final modelMatchesDisplayed = model != null &&
+      (displayedModelId == null || model.id == displayedModelId);
+  return modelMatchesDisplayed ? _defaultConcreteReasoningEffort(model) : null;
+}
+
 class _AgentStateIcon extends StatelessWidget {
   const _AgentStateIcon({required this.state});
 
@@ -8680,11 +11952,11 @@ String _contextPercentLabel(SessionContextState context) {
 String _compactTokenCount(int? value) {
   if (value == null) return '—';
   if (value >= 1000000) {
-    final digits = value >= 10000000 ? 0 : 1;
+    final digits = value % 1000000 == 0 || value >= 10000000 ? 0 : 1;
     return '${(value / 1000000).toStringAsFixed(digits)}m';
   }
   if (value >= 1000) {
-    final digits = value >= 100000 ? 0 : 1;
+    final digits = value % 1000 == 0 || value >= 100000 ? 0 : 1;
     return '${(value / 1000).toStringAsFixed(digits)}k';
   }
   return '$value';
@@ -8704,6 +11976,20 @@ String? _contextCost(SessionContextState context) {
   return prefix.isEmpty ? '$value $currency' : '$prefix$value';
 }
 
+int? _configuredContextLimit(SessionContextState context) {
+  final threshold = context.compactionThresholdTokens;
+  if (threshold != null && threshold > 0) return threshold;
+  final capacity = context.contextWindowTokens;
+  return capacity != null && capacity > 0 ? capacity : null;
+}
+
+String? _compactContextUsage(SessionContextState context) {
+  final used = context.usedTokens;
+  final limit = _configuredContextLimit(context);
+  if (used == null || limit == null) return null;
+  return '${_compactTokenCount(used)} / ${_compactTokenCount(limit)}';
+}
+
 class _SessionContextButton extends StatelessWidget {
   const _SessionContextButton(
       {required this.context, required this.visual, required this.onTap});
@@ -8716,9 +12002,10 @@ class _SessionContextButton extends StatelessWidget {
   Widget build(BuildContext context) {
     final usage = this.context;
     final fraction = usage == null ? null : _contextFraction(usage);
-    final label = fraction == null
+    final compactUsage = usage == null ? null : _compactContextUsage(usage);
+    final label = compactUsage == null
         ? 'Context usage unavailable. Tap for details.'
-        : '${_contextPercentLabel(usage!)} of context used. Tap for automatic compaction settings.';
+        : 'Context window: $compactUsage. Tap for details.';
     return Semantics(
       button: true,
       label: label,
@@ -8729,19 +12016,24 @@ class _SessionContextButton extends StatelessWidget {
           onTap: onTap,
           borderRadius: BorderRadius.circular(8),
           child: SizedBox(
-            width: 68,
+            width: 94,
             height: 44,
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 7),
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: <Widget>[
-                  if (usage != null && fraction != null) ...<Widget>[
-                    Text(_contextPercentLabel(usage),
-                        style: TextStyle(
-                            color: visual.accent,
-                            fontSize: 12,
-                            fontWeight: FontWeight.w700)),
+                  if (compactUsage != null) ...<Widget>[
+                    FittedBox(
+                      fit: BoxFit.scaleDown,
+                      child: Text(compactUsage,
+                          maxLines: 1,
+                          softWrap: false,
+                          style: TextStyle(
+                              color: visual.accent,
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w700)),
+                    ),
                     const SizedBox(height: 5),
                   ],
                   ClipRRect(

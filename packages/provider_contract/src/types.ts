@@ -11,6 +11,7 @@ import type {
   ConfigureWalletRequest,
   ProviderWalletStatus,
   SessionContextState,
+  WorkflowReference,
 } from "../../protocol/src/index.js";
 
 export interface ProviderDetection {
@@ -65,6 +66,8 @@ export interface CreateSessionOptions {
   readonly firstInstruction?: string;
   /** Hidden, session-scoped role guidance. Never synthesize this as a user message. */
   readonly developerInstructions?: string;
+  /** Guidance applied only while dispatching firstInstruction, never installed on the session. */
+  readonly firstInstructionDeveloperInstructions?: string;
   /** Provider-native non-persistent session when supported. */
   readonly ephemeral?: boolean;
   /** Internal helpers omit bridge client tools so they cannot recurse. */
@@ -90,9 +93,12 @@ export interface MessageAttachment {
 export interface SendMessageRequest {
   readonly requestId: string;
   readonly content: string;
+  /** Per-turn response guidance. Providers should keep this out of user-visible transcript text when their API permits it. */
+  readonly developerInstructions?: string;
   readonly modelId?: string;
   readonly reasoningEffort?: string;
   readonly attachments?: readonly MessageAttachment[];
+  readonly workflows?: readonly WorkflowReference[];
   readonly metadata?: JsonObject;
 }
 
@@ -135,11 +141,20 @@ export interface ProviderQueuedMessage {
   readonly content: string;
   readonly state: "queued" | "sending" | "failed";
   readonly createdAt: string;
+  /** Private response guidance retained with a provider-owned queue item. */
+  readonly developerInstructions?: string;
   readonly error?: string;
 }
 
 export interface EnqueueProviderMessageRequest extends SendMessageRequest {
   readonly workingDirectory: string;
+}
+
+/** Restores a provider-owned queue item after a failed manual dispatch. */
+export interface RestoreProviderMessageRequest extends EnqueueProviderMessageRequest {
+  readonly originalMessage: ProviderQueuedMessage;
+  /** Provider-native ID of the sibling that originally followed this item. */
+  readonly beforeMessageId?: string;
 }
 
 export interface EditMessageRequest {
@@ -206,7 +221,7 @@ export interface AgentProviderAdapter {
   listModels?(): Promise<readonly RemoteModel[]>;
 
   /** Returns provider-native usage/context data without starting an LLM turn. */
-  getSessionContext?(providerSessionId: string): Promise<Omit<SessionContextState, "sessionId" | "compactionThresholdTokens" | "minimumThresholdTokens" | "supportsThreshold" | "isCompacting">>;
+  getSessionContext?(providerSessionId: string): Promise<Omit<SessionContextState, "sessionId" | "compactionThresholdTokens" | "minimumThresholdTokens" | "supportsThreshold" | "isCompacting" | "compactionKind">>;
   /** Requests provider-native context compaction without sending a user message. */
   compactSession?(providerSessionId: string): Promise<void>;
   /** Returns the funding/authentication source without exposing credentials. */
@@ -225,6 +240,10 @@ export interface AgentProviderAdapter {
   sendMessage(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult>;
   listQueuedMessages?(): Promise<readonly ProviderQueuedMessage[]>;
   enqueueQueuedMessage?(providerSessionId: string, request: EnqueueProviderMessageRequest): Promise<ProviderQueuedMessage>;
+  /** Restores the original identity, time, and position after a failed move out of the provider queue. */
+  restoreQueuedMessage?(providerSessionId: string, request: RestoreProviderMessageRequest): Promise<ProviderQueuedMessage>;
+  /** Replaces one queued message in place without changing its order or identity. */
+  updateQueuedMessage?(providerSessionId: string, messageId: string, content: string): Promise<ProviderQueuedMessage | null>;
   cancelQueuedMessage?(providerSessionId: string, messageId: string): Promise<boolean>;
   steerMessage?(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult>;
   editMessage?(providerSessionId: string, request: EditMessageRequest): Promise<SendMessageResult>;
@@ -233,6 +252,8 @@ export interface AgentProviderAdapter {
   subscribe(providerSessionId: string | null, sink: ProviderEventSink): Promise<Subscription>;
   respondToApproval?(response: ProviderApprovalResponse): Promise<void>;
   respondToUserInput?(response: ProviderUserInputResponse): Promise<void>;
+  /** Releases a restartable provider transport while preserving cached session and event state. */
+  releaseIdleResources?(): Promise<void>;
   dispose(): Promise<void>;
 }
 

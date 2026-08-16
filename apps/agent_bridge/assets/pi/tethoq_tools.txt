@@ -63,6 +63,8 @@ async function callRuntime(runtime, sessionID, name, input) {
 
 export default function tethoqTools(pi) {
   const tools = [
+    ["mesh_list_sessions", "Find Tethoq tasks", "Find other indexed Tethoq tasks without scanning local session data.", Type.Object({ query: Type.Optional(Type.String({ maxLength: 200 })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 25 })) })],
+    ["mesh_message_session", "Message Tethoq task", "Send an isolated, queue-safe message to another indexed Tethoq task.", Type.Object({ target_session_id: Type.String(), message: Type.String({ maxLength: 32000 }), request_id: Type.String({ maxLength: 256 }) })],
     ["mesh_list_children", "List delegated children", "List cross-harness child sessions delegated by this parent.", Type.Object({})],
     ["mesh_message_child", "Message delegated child", "Send a follow-up instruction to a delegated child.", Type.Object({ child_session_id: Type.String(), message: Type.String() })],
     ["mesh_wait", "Wait for delegated children", "Wait for selected delegated children when their result is needed.", Type.Object({ child_session_ids: Type.Optional(Type.Array(Type.String())), timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 300 })) })],

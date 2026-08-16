@@ -166,6 +166,28 @@ test("Codex history normalization preserves user, assistant, command, file, and 
   assert.equal(declinedCommand.status, "failed");
 });
 
+test("Codex history hides the synthetic desktop bootstrap user message", () => {
+  const messages = messagesFromCodexThread("host_1", {
+    id: "thread_bootstrap",
+    sessionId: "thread_bootstrap",
+    preview: "Actual request",
+    modelProvider: "openai",
+    createdAt: 1_760_000_000,
+    updatedAt: 1_760_000_100,
+    recencyAt: 1_760_000_100,
+    status: { type: "idle" },
+    cwd: "/workspace",
+    cliVersion: "fixture",
+    turns: [{ items: [
+      { id: "bootstrap", type: "userMessage", content: [{ type: "text", text: "<recommended_plugins>plugins</recommended_plugins>\n# AGENTS.md instructions for C:\\workspace\n<environment_context>private bootstrap</environment_context>", text_elements: [] }] },
+      { id: "actual", type: "userMessage", content: [{ type: "text", text: "Actual request", text_elements: [] }] },
+    ] }],
+  });
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0]?.parts[0]?.type, "text");
+  assert.equal(messages[0]?.parts[0]?.type === "text" ? messages[0].parts[0].text : "", "Actual request");
+});
+
 test("Codex history never flattens unknown structured traces into assistant prose", () => {
   const messages = messagesFromCodexThread("host_1", {
     id: "thread_unknown_trace",

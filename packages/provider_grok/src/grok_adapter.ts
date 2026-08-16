@@ -13,6 +13,7 @@ import {
   ProviderAdapterError,
   ProviderEventHub,
   UnsupportedProviderCapabilityError,
+  providerPromptContent,
   buildSpawnCommand,
   resolveCommand,
   type AgentProviderAdapter,
@@ -96,8 +97,12 @@ export interface AcpRuntimeOptions {
   readonly cwd?: string;
   readonly transportFactory?: () => JsonRpcTransport;
   readonly requestTimeoutMs?: number;
+  /** Grace period before a bridge-approved idle transport is closed. */
+  readonly idleReleaseMs?: number;
   readonly now?: () => Date;
 }
+
+const defaultIdleReleaseMs = 3_000;
 
 export interface AcpProviderAdapterOptions extends AcpRuntimeOptions {
   readonly providerId: string;
@@ -560,6 +565,7 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
   readonly #cwd: string | undefined;
   readonly #transportFactory: (() => JsonRpcTransport) | undefined;
   readonly #requestTimeoutMs: number;
+  readonly #idleReleaseMs: number;
   readonly #now: () => Date;
   readonly #identity: AcpProviderIdentity;
   readonly #capabilityNote: string;
@@ -576,7 +582,12 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
   readonly #openableSubagentSessions = new Map<string, string>();
   readonly #activeSessions = new Set<string>();
   #peer: JsonRpcPeer | null = null;
+  #startingPeer: JsonRpcPeer | null = null;
   #initializing: Promise<JsonRpcPeer> | null = null;
+  #closing: Promise<void> | null = null;
+  #idleReleaseTimer: ReturnType<typeof setTimeout> | null = null;
+  #resourceGeneration = 0;
+  #disposed = false;
   #initializeResponse: AcpInitializeResponse | null = null;
   #eventCounter = 0;
   #clientTooling: ProviderClientTooling | undefined;
@@ -590,6 +601,7 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     this.#cwd = options.cwd;
     this.#transportFactory = options.transportFactory;
     this.#requestTimeoutMs = options.requestTimeoutMs ?? 60_000;
+    this.#idleReleaseMs = options.idleReleaseMs ?? defaultIdleReleaseMs;
     this.#now = options.now ?? (() => new Date());
     this.#identity = {
       providerId: options.providerId,
@@ -865,7 +877,7 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     void peer.request<unknown>("session/prompt", {
       sessionId: providerSessionId,
       prompt: [
-        { type: "text", text: request.content },
+        { type: "text", text: providerPromptContent(request) },
         ...attachments.map((attachment) => ({
           type: "image",
           data: attachment.dataBase64,
@@ -909,7 +921,23 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     await this.emit({ type: "approval.resolved", providerSessionId: pending.providerSessionId, payload: { providerRequestId: response.providerRequestId, choiceId: response.choiceId } });
   }
 
+  public async releaseIdleResources(): Promise<void> {
+    if (this.#disposed) return;
+    this.cancelIdleRelease();
+    const generation = this.#resourceGeneration;
+    const timer = setTimeout(() => {
+      if (this.#idleReleaseTimer === timer) this.#idleReleaseTimer = null;
+      void this.closeIdlePeer(generation).catch(() => undefined);
+    }, this.#idleReleaseMs);
+    timer.unref();
+    this.#idleReleaseTimer = timer;
+  }
+
   public async dispose(): Promise<void> {
+    if (this.#disposed) return;
+    this.#disposed = true;
+    this.#resourceGeneration += 1;
+    this.cancelIdleRelease();
     for (const pending of this.#pendingPermissions.values()) pending.reject(new Error(`${this.displayName} adapter disposed`));
     this.#pendingPermissions.clear();
     this.#historyCapture.clear();
@@ -923,10 +951,16 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     this.#openableSubagentSessions.clear();
     this.#activeSessions.clear();
     this.#events.clear();
+    const startingPeer = this.#startingPeer;
+    if (startingPeer !== null) await startingPeer.close().catch(() => undefined);
+    const initializing = this.#initializing;
+    if (initializing !== null) await initializing.catch(() => undefined);
+    const closing = this.#closing;
+    if (closing !== null) await closing.catch(() => undefined);
     const peer = this.#peer;
     this.#peer = null;
     this.#initializeResponse = null;
-    if (peer !== null) await peer.close();
+    if (peer !== null) await peer.close().catch(() => undefined);
   }
 
   private async ensureInitialized(): Promise<AcpInitializeResponse> {
@@ -935,13 +969,22 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     return this.#initializeResponse;
   }
 
-  private peer(): Promise<JsonRpcPeer> {
-    if (this.#peer !== null) return Promise.resolve(this.#peer);
-    if (this.#initializing !== null) return this.#initializing;
-    this.#initializing = this.initialize().finally(() => {
-      this.#initializing = null;
-    });
-    return this.#initializing;
+  private async peer(): Promise<JsonRpcPeer> {
+    if (this.#disposed) throw new ProviderAdapterError(this.providerId, "ADAPTER_DISPOSED", `${this.displayName} adapter has been disposed`, false);
+    this.#resourceGeneration += 1;
+    this.cancelIdleRelease();
+    const closing = this.#closing;
+    if (closing !== null) await closing;
+    if (this.#disposed) throw new ProviderAdapterError(this.providerId, "ADAPTER_DISPOSED", `${this.displayName} adapter has been disposed`, false);
+    if (this.#peer !== null) return this.#peer;
+    if (this.#initializing !== null) return await this.#initializing;
+    const initializing = this.initialize();
+    this.#initializing = initializing;
+    try {
+      return await initializing;
+    } finally {
+      if (this.#initializing === initializing) this.#initializing = null;
+    }
   }
 
   private mcpServers(providerSessionId?: string): readonly unknown[] {
@@ -964,6 +1007,7 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
         payload: { message: error.message, source: "json_rpc_callback" },
       }),
     });
+    this.#startingPeer = peer;
     peer.onNotification((method, params) => this.handleNotification(method, params));
     peer.onRequest((method, params, id) => this.handleClientRequest(method, params, id));
     try {
@@ -977,13 +1021,54 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
         _meta: { clientType: "tethoq", clientIdentifier: "tethoq" },
       });
       if (response.protocolVersion !== undefined && response.protocolVersion !== 1) throw new Error(`Unsupported negotiated ACP version ${response.protocolVersion}`);
+      if (this.#disposed) throw new Error(`${this.displayName} adapter disposed during initialization`);
       this.#initializeResponse = response;
       this.#peer = peer;
       return peer;
     } catch (error) {
       await peer.close();
       throw new ProviderAdapterError(this.providerId, "INITIALIZE_FAILED", `${this.displayName} ACP initialization failed: ${error instanceof Error ? error.message : String(error)}`, true, { cause: error });
+    } finally {
+      if (this.#startingPeer === peer) this.#startingPeer = null;
     }
+  }
+
+  private cancelIdleRelease(): void {
+    if (this.#idleReleaseTimer === null) return;
+    clearTimeout(this.#idleReleaseTimer);
+    this.#idleReleaseTimer = null;
+  }
+
+  private async closeIdlePeer(generation: number): Promise<void> {
+    if (this.#disposed || generation !== this.#resourceGeneration) return;
+    const initializing = this.#initializing;
+    if (initializing !== null) await initializing.catch(() => undefined);
+    if (this.#disposed || generation !== this.#resourceGeneration) return;
+    const peer = this.#peer;
+    if (peer === null) return;
+    if (this.#activeSessions.size > 0 && !this.canRestoreActiveSessions()) return;
+    this.#peer = null;
+    this.resetProcessState();
+    const closing = peer.close();
+    this.#closing = closing;
+    try {
+      await closing;
+    } finally {
+      if (this.#closing === closing) this.#closing = null;
+    }
+  }
+
+  private resetProcessState(): void {
+    this.#initializeResponse = null;
+    this.#activeSessions.clear();
+    this.#sessionClientToolModes.clear();
+    this.#sessionConfigOptions.clear();
+    this.#appliedSessionSelections.clear();
+  }
+
+  private canRestoreActiveSessions(): boolean {
+    const native = this.#initializeResponse?.agentCapabilities;
+    return boolCapability(native, ["sessionCapabilities", "resume"]) || boolCapability(native, ["loadSession"]);
   }
 
   private authMethods(response: AcpInitializeResponse): readonly { readonly id: string; readonly name: string }[] {

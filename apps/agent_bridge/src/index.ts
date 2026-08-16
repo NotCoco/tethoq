@@ -8,6 +8,8 @@ export * from "./request_router.js";
 export * from "./user_inputs.js";
 export * from "./transport.js";
 export * from "./dictation.js";
+export * from "./dictation_credentials.js";
 export * from "./providers.js";
 export * from "./pairing_store.js";
+export * from "./cross_session_store.js";
 export * from "./desktop_lifecycle.js";

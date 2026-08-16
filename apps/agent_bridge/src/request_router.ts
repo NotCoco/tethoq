@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import {
   CURRENT_PROTOCOL_VERSION,
+  normalizeSimplifySettings,
+  parseSimplifyCommand,
+  simplifyDeveloperInstructions,
   validateApprovalResponse,
   validateSessionTransferRequest,
   validateUserInputResponse,
@@ -13,6 +16,7 @@ import {
   type RemoteSession,
   type RequestEnvelope,
   type ResponseEnvelope,
+  type WorkflowReference,
 } from "../../../packages/protocol/src/index.js";
 import type { AuthRequest, CreateSessionOptions, MessageAttachment, SendMessageRequest } from "../../../packages/provider_contract/src/index.js";
 import { AgentBridge } from "./bridge.js";
@@ -66,6 +70,61 @@ function queuedMessageInput(input: Record<string, unknown>, requestId: string) {
     ...(typeof input.modelId === "string" ? { modelId: input.modelId } : {}),
     ...(typeof input.reasoningEffort === "string" ? { reasoningEffort: input.reasoningEffort } : {}),
     ...(input.attachmentIds !== undefined ? { attachmentIds: stringArray(input.attachmentIds, "attachmentIds", 4) } : {}),
+    ...(input.workflows !== undefined ? { workflows: workflowReferences(input.workflows) } : {}),
+    ...(input.simplify !== undefined ? { metadata: { simplify: simplifyMetadata(input.simplify) } } : {}),
+  };
+}
+
+function workflowReferences(value: unknown): readonly WorkflowReference[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 4) throw new Error("workflows must contain between one and four recordings");
+  return value.map((entry) => {
+    const input = record(entry, "workflow");
+    const id = stringField(input, "id").trim();
+    const name = stringField(input, "name").trim();
+    const promptReference = stringField(input, "promptReference").trim();
+    const eventCount = input.eventCount;
+    const screenshotCount = input.screenshotCount;
+    if (!id || id.length > 160 || !name || name.length > 160 || !promptReference || promptReference.length > 8_000) throw new Error("workflow reference is invalid");
+    if (!Number.isSafeInteger(eventCount) || (eventCount as number) < 0 || !Number.isSafeInteger(screenshotCount) || (screenshotCount as number) < 0) throw new Error("workflow summary is invalid");
+    const applications = input.applications === undefined
+      ? []
+      : stringArray(input.applications, "applications", 8).map((item) => item.trim()).filter(Boolean);
+    return {
+      id,
+      name,
+      eventCount: eventCount as number,
+      screenshotCount: screenshotCount as number,
+      ...(applications.length ? { applications } : {}),
+      promptReference,
+    };
+  });
+}
+
+function simplifyMetadata(value: unknown): JsonObject {
+  const settings = normalizeSimplifySettings(value);
+  const source = typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const target = source.target === "previous" || source.target === "upcoming" ? source.target : undefined;
+  return {
+    maxWords: settings.maxWords,
+    ...(settings.guidance !== undefined ? { guidance: settings.guidance } : {}),
+    ...(target !== undefined ? { target } : {}),
+  };
+}
+
+function simplifiedFirstInstruction(content: string, settingsValue: unknown): {
+  readonly content: string;
+  readonly developerInstructions?: string;
+} {
+  const parsed = parseSimplifyCommand(content);
+  const explicit = typeof settingsValue === "object" && settingsValue !== null && !Array.isArray(settingsValue)
+    && ((settingsValue as Record<string, unknown>).target === "previous" || (settingsValue as Record<string, unknown>).target === "upcoming")
+      ? (settingsValue as Record<string, unknown>).target as "previous" | "upcoming"
+      : undefined;
+  if (!parsed.active && explicit === undefined) return { content };
+  const settings = normalizeSimplifySettings(settingsValue);
+  return {
+    content: parsed.active ? parsed.content : content,
+    developerInstructions: simplifyDeveloperInstructions(settings, explicit ?? parsed.target),
   };
 }
 
@@ -433,11 +492,36 @@ export class BridgeRequestRouter {
       }
       case "sessions.list":
         return toJson({ sessions: this.bridge.sessions().map((session) => clientSession(session)) });
+      case "session.remote_targets": {
+        const input = record(payload, "payload");
+        const limit = input.limit === undefined ? 20 : input.limit;
+        if (typeof limit !== "number" || !Number.isInteger(limit)) throw new Error("limit must be an integer");
+        return toJson({ sessions: this.bridge.crossSessionTargets(
+          stringField(input, "sessionId"),
+          typeof input.query === "string" ? input.query : "",
+          limit,
+        ).map((session) => clientSession(session)) });
+      }
+      case "session.remote_inbox.list": {
+        const input = record(payload, "payload");
+        const limit = input.limit === undefined ? 100 : input.limit;
+        if (typeof limit !== "number" || !Number.isInteger(limit)) throw new Error("limit must be an integer");
+        return toJson({ messages: this.bridge.crossSessionInbox(stringField(input, "sessionId"), limit) });
+      }
+      case "session.remote_message.send": {
+        const input = record(payload, "payload");
+        return toJson({ message: await this.bridge.sendCrossSessionMessage(
+          stringField(input, "sourceSessionId"),
+          stringField(input, "targetSessionId"),
+          requestId,
+          stringField(input, "content"),
+        ) });
+      }
       case "session.open": {
         const input = record(payload, "payload");
         const cursor = typeof input.cursor === "string" ? input.cursor : undefined;
         const limit = typeof input.limit === "number" && Number.isInteger(input.limit) ? input.limit : 40;
-        const opened = await this.bridge.openSession(stringField(input, "sessionId"), cursor, limit);
+        const opened = await this.bridge.openSession(stringField(input, "sessionId"), cursor, limit, input.refresh === true);
         const page = clientMessagePage(opened.messages, opened.nextCursor, (message, partIndex, uri, mimeType, name) =>
           this.#images.remember(opened.session.id, message.id, partIndex, uri, mimeType, name));
         return toJson({
@@ -512,12 +596,16 @@ export class BridgeRequestRouter {
       }
       case "session.create": {
         const input = record(payload, "payload");
+        const first = typeof input.firstInstruction === "string"
+          ? simplifiedFirstInstruction(input.firstInstruction, input.simplify)
+          : undefined;
         const options: CreateSessionOptions = {
           workingDirectory: typeof input.workingDirectory === "string" ? input.workingDirectory : "",
           ...(typeof input.title === "string" ? { title: input.title } : {}),
           ...(typeof input.modelId === "string" ? { modelId: input.modelId } : {}),
           ...(typeof input.reasoningEffort === "string" ? { reasoningEffort: input.reasoningEffort } : {}),
-          ...(typeof input.firstInstruction === "string" ? { firstInstruction: input.firstInstruction } : {}),
+          ...(first !== undefined ? { firstInstruction: first.content } : {}),
+          ...(first?.developerInstructions !== undefined ? { firstInstructionDeveloperInstructions: first.developerInstructions } : {}),
         };
         return toJson({ session: clientSession(await this.bridge.createSession(stringField(input, "providerId"), options)) });
       }
@@ -529,6 +617,24 @@ export class BridgeRequestRouter {
       case "session.branch": {
         const input = validateSessionTransferRequest(payload);
         const result = await this.bridge.branchSession(input.sessionId, input.prompt);
+        return toJson({ ...result, session: clientSession(result.session) });
+      }
+      case "side_chat.list": {
+        const parentSessionId = payload.parentSessionId === undefined ? undefined : stringField(payload, "parentSessionId");
+        return toJson({ sessions: this.bridge.sideChats(parentSessionId).map(clientSession) });
+      }
+      case "side_chat.create": {
+        const input = record(payload, "payload");
+        const result = await this.bridge.createSideChat(
+          stringField(input, "parentSessionId"),
+          typeof input.prompt === "string" ? input.prompt : undefined,
+          typeof input.queuedMessageId === "string" ? input.queuedMessageId : undefined,
+        );
+        return toJson({ ...result, session: clientSession(result.session) });
+      }
+      case "side_chat.promote": {
+        const input = record(payload, "payload");
+        const result = await this.bridge.promoteSideChat(stringField(input, "sessionId"));
         return toJson({ ...result, session: clientSession(result.session) });
       }
       case "session.send_message": {
@@ -545,6 +651,8 @@ export class BridgeRequestRouter {
           ...(typeof input.modelId === "string" ? { modelId: input.modelId } : {}),
           ...(typeof input.reasoningEffort === "string" ? { reasoningEffort: input.reasoningEffort } : {}),
           ...(input.attachments !== undefined ? { attachments: messageAttachments(input.attachments) } : {}),
+          ...(input.workflows !== undefined ? { workflows: workflowReferences(input.workflows) } : {}),
+          ...(input.simplify !== undefined ? { metadata: { simplify: simplifyMetadata(input.simplify) } } : {}),
         };
         const sessionId = stringField(input, "sessionId");
         return toJson(attachmentIds === undefined
@@ -562,6 +670,30 @@ export class BridgeRequestRouter {
       case "message_queue.cancel": {
         const input = record(payload, "payload");
         return { cancelled: await this.bridge.cancelQueuedMessage(stringField(input, "messageId")) };
+      }
+      case "message_queue.edit": {
+        const input = record(payload, "payload");
+        return toJson({ message: await this.bridge.editQueuedMessage(
+          stringField(input, "messageId"),
+          stringField(input, "content"),
+        ) });
+      }
+      case "message_queue.deliver": {
+        const input = record(payload, "payload");
+        const mode = input.mode;
+        if (mode !== "send" && mode !== "steer") throw new Error("mode must be send or steer");
+        return { delivered: await this.bridge.deliverQueuedMessage(stringField(input, "messageId"), mode) };
+      }
+      case "message_queue.move_to_new_task": {
+        const input = record(payload, "payload");
+        return toJson({ session: clientSession(await this.bridge.moveQueuedMessageToNewTask(
+          stringField(input, "messageId"),
+          {
+            providerId: stringField(input, "providerId"),
+            modelId: stringField(input, "modelId"),
+            ...(typeof input.reasoningEffort === "string" ? { reasoningEffort: input.reasoningEffort } : {}),
+          },
+        )) });
       }
       case "session.steer_message": {
         const input = record(payload, "payload");
@@ -617,6 +749,17 @@ export class BridgeRequestRouter {
       }
       case "dictation.source.list":
         return toJson({ sources: this.bridge.transcriptionSources() });
+      case "dictation.source.configure": {
+        const input = record(payload, "payload");
+        const sourceId = stringField(input, "sourceId");
+        const clear = input.clear === true;
+        if (clear && input.apiKey !== undefined) throw new Error("apiKey and clear cannot be used together");
+        const apiKey = clear ? undefined : stringField(input, "apiKey").trim();
+        if (apiKey !== undefined && (apiKey.length < 8 || apiKey.length > 512)) {
+          throw new Error("apiKey must contain between 8 and 512 characters");
+        }
+        return toJson({ sources: await this.bridge.configureTranscriptionSource(sourceId, apiKey) });
+      }
       case "session.interrupt": {
         const input = record(payload, "payload");
         await this.bridge.interrupt(stringField(input, "sessionId"));

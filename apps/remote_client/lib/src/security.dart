@@ -219,11 +219,13 @@ class DeviceSecurity {
 
   static const _hostIndexKey = 'uar.paired_host_ids.v1';
   static const _defaultDeliveryModeKey = 'uar.default_delivery_mode.v1';
+  static const _reasoningDisplayModeKey = 'uar.reasoning_display_mode.v1';
   static const _dictationDictionaryKey = 'uar.dictation_dictionary.v1';
   static const _dictationSourceKey = 'uar.dictation_source.v1';
   static const _dictationSourcePreferencesKey =
       'uar.dictation_source_preferences.v1';
   static const _delegationPreferencesKey = 'uar.delegation_preferences.v1';
+  static const _agentDefaultsKey = 'uar.agent_defaults.v1';
   static const _recentModelsKey = 'uar.recent_models.v1';
   final FlutterSecureStorage _storage;
   final Ed25519 _algorithm = Ed25519();
@@ -369,6 +371,18 @@ class DeviceSecurity {
     await _storage.write(key: _defaultDeliveryModeKey, value: value);
   }
 
+  Future<String> readReasoningDisplayMode() async {
+    final value = await _storage.read(key: _reasoningDisplayModeKey);
+    return value == 'expanded' ? 'expanded' : 'compact';
+  }
+
+  Future<void> saveReasoningDisplayMode(String value) async {
+    if (value != 'compact' && value != 'expanded') {
+      throw ArgumentError.value(value, 'value', 'must be compact or expanded');
+    }
+    await _storage.write(key: _reasoningDisplayModeKey, value: value);
+  }
+
   Future<List<String>> readDictationDictionary() async {
     final raw = await _storage.read(key: _dictationDictionaryKey);
     if (raw == null) return <String>[];
@@ -473,6 +487,73 @@ class DeviceSecurity {
     );
   }
 
+  Future<Map<String, DelegationSelection>> readAgentDefaults() async {
+    final raw = await _storage.read(key: _agentDefaultsKey);
+    if (raw == null) return <String, DelegationSelection>{};
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map<Object?, Object?>) {
+      return <String, DelegationSelection>{};
+    }
+    final result = <String, DelegationSelection>{};
+    for (final entry in decoded.entries) {
+      if (entry.key is! String || entry.value is! Map<Object?, Object?>) {
+        continue;
+      }
+      try {
+        final selection = DelegationSelection.fromJson(entry.value);
+        final providerId = selection.providerId.trim().toLowerCase();
+        final modelId = selection.modelId?.trim();
+        final reasoningEffort = selection.reasoningEffort?.trim();
+        if (providerId.isEmpty ||
+            providerId.length > 80 ||
+            modelId == null ||
+            modelId.isEmpty ||
+            modelId.length > 300 ||
+            (reasoningEffort != null && reasoningEffort.length > 80)) {
+          continue;
+        }
+        result[providerId] = DelegationSelection(
+          providerId: providerId,
+          modelId: modelId,
+          reasoningEffort:
+              reasoningEffort?.isEmpty == true ? null : reasoningEffort,
+        );
+        if (result.length == 40) break;
+      } on FormatException {
+        // Ignore a malformed saved default without breaking app startup.
+      }
+    }
+    return result;
+  }
+
+  Future<void> saveAgentDefault(DelegationSelection selection) async {
+    final providerId = selection.providerId.trim().toLowerCase();
+    final modelId = selection.modelId?.trim();
+    final reasoningEffort = selection.reasoningEffort?.trim();
+    if (providerId.isEmpty ||
+        providerId.length > 80 ||
+        modelId == null ||
+        modelId.isEmpty ||
+        modelId.length > 300 ||
+        (reasoningEffort != null && reasoningEffort.length > 80)) {
+      throw ArgumentError.value(selection, 'selection',
+          'must name a valid Agent, model, and reasoning value');
+    }
+    final current = await readAgentDefaults();
+    current[providerId] = DelegationSelection(
+      providerId: providerId,
+      modelId: modelId,
+      reasoningEffort:
+          reasoningEffort?.isEmpty == true ? null : reasoningEffort,
+    );
+    await _storage.write(
+      key: _agentDefaultsKey,
+      value: jsonEncode(<String, Object?>{
+        for (final entry in current.entries) entry.key: entry.value.toJson(),
+      }),
+    );
+  }
+
   Future<List<String>> readRecentModelKeys() async {
     final raw = await _storage.read(key: _recentModelsKey);
     if (raw == null) return <String>[];
@@ -523,34 +604,39 @@ class DeviceSecurity {
     return '-----BEGIN PUBLIC KEY-----\n${lines.join('\n')}\n-----END PUBLIC KEY-----\n';
   }
 
-  List<int> _pemToRawPublicKey(String pem) {
-    final body = pem.replaceAll(
-        RegExp(r'-----BEGIN PUBLIC KEY-----|-----END PUBLIC KEY-----|\s'), '');
-    final der = base64.decode(body);
-    const prefix = <int>[
-      0x30,
-      0x2a,
-      0x30,
-      0x05,
-      0x06,
-      0x03,
-      0x2b,
-      0x65,
-      0x70,
-      0x03,
-      0x21,
-      0x00
-    ];
-    if (der.length != prefix.length + 32)
+  List<int> _pemToRawPublicKey(String pem) => ed25519RawPublicKeyFromPem(pem);
+}
+
+/// Unwraps an Ed25519 SubjectPublicKeyInfo PEM into its raw 32 bytes. The
+/// secure transport needs the same conversion to check the computer's signed
+/// encryption key against the identity stored at pairing.
+List<int> ed25519RawPublicKeyFromPem(String pem) {
+  final body = pem.replaceAll(
+      RegExp(r'-----BEGIN PUBLIC KEY-----|-----END PUBLIC KEY-----|\s'), '');
+  final der = base64.decode(body);
+  const prefix = <int>[
+    0x30,
+    0x2a,
+    0x30,
+    0x05,
+    0x06,
+    0x03,
+    0x2b,
+    0x65,
+    0x70,
+    0x03,
+    0x21,
+    0x00
+  ];
+  if (der.length != prefix.length + 32)
+    throw const FormatException(
+        'Host public key is not an Ed25519 SubjectPublicKeyInfo key');
+  for (var index = 0; index < prefix.length; index += 1) {
+    if (der[index] != prefix[index])
       throw const FormatException(
-          'Host public key is not an Ed25519 SubjectPublicKeyInfo key');
-    for (var index = 0; index < prefix.length; index += 1) {
-      if (der[index] != prefix[index])
-        throw const FormatException(
-            'Host public key uses an unexpected algorithm');
-    }
-    return der.sublist(prefix.length);
+          'Host public key uses an unexpected algorithm');
   }
+  return der.sublist(prefix.length);
 }
 
 extension _FirstOrNull<T> on Iterable<T> {

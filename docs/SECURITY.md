@@ -23,7 +23,7 @@ Adapters use documented provider surfaces. They do not steal browser cookies, sc
 
 Phone dictation uses a separately configured, documented speech-to-text API only when the host operator explicitly supplies `TETHOQ_OPENAI_API_KEY` for OpenAI speech-to-text or `XAI_API_KEY` for xAI speech-to-text to Tethoq Bridge. These credentials remain on the host and are never included in pairing data, device responses, or relay configuration. Source discovery exposes readiness and upload capabilities, never key values. Dictation source selection is independent of the active chat harness; Tethoq does not reuse harness login state or private authentication files for transcription.
 
-Provider-owned configuration mutation is disabled unless the host operator sets `TETHOQ_ALLOW_PROVIDER_CONFIG_MUTATION=1`. Without that opt-in, Tethoq does not run Codex MCP add/remove commands or write an OpenCode tool into the user's configuration directory. Undocumented local-state readers are independently disabled unless `TETHOQ_ENABLE_CODEX_LOCAL_STATE=1` or `TETHOQ_ENABLE_OPENCODE_LOCAL_STATE=1` is set. These flags permit host-local access only; their data is still subject to the normal bridge response and event boundaries. Legacy `UAR_*` names are compatibility fallbacks.
+Provider-owned configuration mutation is disabled unless the host operator sets `TETHOQ_ALLOW_PROVIDER_CONFIG_MUTATION=1`. Without that opt-in, Tethoq does not run Codex MCP add/remove commands or write an OpenCode tool into the user's configuration directory. The installed Desktop app enables bounded host-local Codex rollout/queue and OpenCode activity readers so externally owned work and queued instructions remain visible; it does not expose either provider's raw state file. The standalone Bridge keeps those readers disabled unless `TETHOQ_ENABLE_CODEX_LOCAL_STATE=1` or `TETHOQ_ENABLE_OPENCODE_LOCAL_STATE=1` is set. These flags permit host-local access only; their data is still subject to the normal bridge response and event boundaries. Legacy `UAR_*` names are compatibility fallbacks.
 
 - Codex App Server owns Codex authentication and documented login flows.
 - OpenCode owns its model-provider credentials; optional Basic Auth protects the OpenCode HTTP server itself.
@@ -128,15 +128,102 @@ The bridge initiates the outbound connection, so no unauthenticated public host 
 Current relay security properties:
 
 - Timing-safe comparison of token digests.
+- **Host attachment is signed.** The room token is handed to every paired
+  device, so possession of it cannot decide who the host is. A host proves
+  possession of its Ed25519 identity, and the relay pins that key for the life
+  of the room. Without this a paired phone could attach as `role: "host"`, evict
+  the computer, and become the centre of the room. The signature covers the
+  host ID, a fresh attachment ID, a timestamp, and the room token's digest, so
+  it cannot be replayed, reused after its window, or moved to another token.
+  `TETHOQ_RELAY_ALLOW_UNSIGNED_HOST=1` exists only for a migration window and
+  logs a warning; never set it on a networked deployment.
+- **Device attachment is signed.** A device presents the host-signed credential
+  it already holds and signs with the key named inside it. The relay verifies
+  the credential against the host key it pinned for the room, so it learns the
+  device ID the host actually issued rather than the one the client claimed.
+  Without this any paired phone could take a sibling's device ID, evict its
+  tunnel, and receive everything addressed to it. `TETHOQ_RELAY_ALLOW_UNSIGNED_DEVICE=1`
+  exists only for a migration window and logs a warning.
+- Together these mean the shared room token carries no authority. It is a
+  routing hint and a cheap pre-filter, not a credential.
 - One active host tunnel per host ID.
 - One active tunnel per device ID.
+- Every rejected attachment closes with one identical reason, so an
+  unauthenticated peer cannot probe which host IDs or tokens exist.
+- The attachment is the only message accepted before authentication and is held
+  to `TETHOQ_RELAY_MAX_ATTACH_BYTES` (16 KiB), far below the routed payload
+  ceiling, so an unauthenticated peer cannot make the relay parse megabytes.
+- Connections from one address are bounded both by concurrent holds and by
+  arrival rate, so open/close churn cannot spend handshake work indefinitely.
+- Browser origins are refused. Only native clients speak this protocol, so a
+  connection carrying an `Origin` header is a page some site pointed at the
+  relay and is closed before it can consume a slot.
+- Replay memory for attachment IDs is bounded, so valid-looking attachments
+  cannot grow it without limit.
 - Heartbeats, attachment timeout, payload limits, message/byte rate limits.
+- Bounded totals: connections, connections per client address, rooms, and
+  devices per room. An unattached socket is refused before it is parsed, so a
+  flood cannot spend memory on connections that never attach.
+- Rate limits are charged per connection **and** per client address, so opening
+  more sockets buys no extra allowance. Behind the relay's own reverse proxy
+  every socket appears to come from loopback, so `x-forwarded-for` is read only
+  from a peer listed in `TETHOQ_RELAY_TRUSTED_PROXIES` (default `loopback`), and
+  only its right-most hop. Anything trusted there can choose the address the
+  limits apply to.
 - Device actions are still checked by the host.
+- Payloads are encrypted end to end, so the relay routes ciphertext it cannot
+  read. Each connection agrees a key by signed ephemeral X25519 exchange
+  authenticated with the Ed25519 identities established at pairing, derives one
+  HKDF-SHA256 key per direction, and seals frames with AES-256-GCM under a
+  monotonic counter. Ephemeral keys mean recorded traffic stays unreadable even
+  if a device key later leaks, and a device that has once seen a computer
+  encrypt refuses a later connection that silently drops the offer.
+
+- Revoking a device disconnects it. The host names the revoked device to the
+  relay, which closes the live tunnel and refuses it back even though the room
+  token is shared. A direct connection is dropped the same way. Because the
+  relay keeps nothing durably, the host re-sends its revocation list on every
+  attach and remains the single authority. A device that pairs again is not
+  blocked by its own history.
 
 Current relay limitations:
 
-- Payloads are signed but not application-layer encrypted. TLS endpoints can read session content.
-- A room uses one shared token across devices. Revoking a device credential blocks host actions, but a device holding the room token may retain relay connectivity until token rotation or a future per-device relay ACL is deployed.
+- Relay routing fields stay in clear text, so a relay operator still learns
+  which device is talking to which host, when, and how much. Only the message
+  contents are protected. The relay process logs only startup and shutdown, and
+  those identifiers travel inside WebSocket frames rather than URLs, so a
+  fronting reverse proxy does not see them either. Keep it that way: a
+  deployment that adds request or frame logging turns live-only metadata into a
+  durable record of which devices belong to which computers.
+- Revocation is published by the host, so it depends on the host reaching the
+  relay. A relay that predates the `relay.revoke` capability does not announce
+  it and is never sent one; against such a relay a revoked device keeps an idle
+  tunnel, with every action still refused, until the relay is updated.
+- Revocation depends on the host being reachable to publish it. A revoked device
+  can still open a tunnel while the computer is offline, though it cannot
+  complete a secure handshake or have any action accepted. Per-device relay
+  tokens would remove that dependency.
+- The relay holds room state in memory only. If the process restarts while a
+  host is offline, the next signed attachment for that host ID re-pins the key.
+  Host IDs are random UUIDs, so this is not reachable by guessing, but a
+  durable pin would close it completely.
+
+### Relay deployment settings
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `TETHOQ_RELAY_TRUSTED_PROXIES` | `loopback` | Peers whose `x-forwarded-for` is believed. Anything listed here chooses the address every per-address limit applies to. |
+| `TETHOQ_RELAY_MAX_CONNECTIONS` | `4000` | Total sockets held, attached or not. |
+| `TETHOQ_RELAY_MAX_CONNECTIONS_PER_ADDRESS` | `32` | Concurrent sockets per client address. |
+| `TETHOQ_RELAY_MAX_CONNECTIONS_PER_ADDRESS_PER_MINUTE` | `120` | New connections per address per minute. |
+| `TETHOQ_RELAY_MAX_ROOMS` | `2000` | Rooms held in memory. |
+| `TETHOQ_RELAY_MAX_DEVICES_PER_ROOM` | `16` | Devices served per room. |
+| `TETHOQ_RELAY_MAX_ATTACH_BYTES` | `16384` | Ceiling on the unauthenticated attachment message. |
+| `TETHOQ_RELAY_ALLOW_UNSIGNED_HOST` | unset | Migration only. Lets any room-token holder claim the host role. |
+| `TETHOQ_RELAY_ALLOW_UNSIGNED_DEVICE` | unset | Migration only. Lets any room-token holder claim another device's ID. |
+
+Neither migration flag should be set on a networked deployment; both log a
+warning at startup when they are.
 - The relay is in-memory and single-process; there is no durable room registry, audit log, multi-region routing, DDoS layer, or production identity provider.
 - TLS is expected from a reverse proxy/deployment layer and is not terminated by the Node process.
 

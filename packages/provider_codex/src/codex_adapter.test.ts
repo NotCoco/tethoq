@@ -1,6 +1,6 @@
 ﻿import assert from "node:assert/strict";
 import test from "node:test";
-import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CodexAdapter } from "./codex_adapter.js";
@@ -10,6 +10,8 @@ class FakeTransport implements JsonRpcTransport {
   readonly sent: unknown[] = [];
   readonly listeners = new Set<(message: unknown) => void>();
   readonly methodResults = new Map<string, unknown>();
+  readonly blockedMethods = new Set<string>();
+  public closeCalls = 0;
   public async send(message: unknown): Promise<void> {
     this.sent.push(message);
     // Auto-respond to client requests so peer initialization completes.
@@ -17,6 +19,7 @@ class FakeTransport implements JsonRpcTransport {
       const record = message as Record<string, unknown>;
       if (typeof record.id === "string" || typeof record.id === "number") {
         if (typeof record.method === "string" && !("result" in record) && !("error" in record)) {
+          if (this.blockedMethods.has(record.method)) return;
           const id = record.id;
           const result = this.methodResults.has(record.method)
             ? this.methodResults.get(record.method)
@@ -30,7 +33,7 @@ class FakeTransport implements JsonRpcTransport {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
-  public async close(): Promise<void> {}
+  public async close(): Promise<void> { this.closeCalls += 1; }
   public push(message: unknown): void {
     for (const listener of [...this.listeners]) listener(message);
   }
@@ -68,12 +71,64 @@ test("Codex advertises the native desktop queue only when synchronization is con
   });
   assert.equal(standard.listQueuedMessages, undefined);
   assert.equal(standard.enqueueQueuedMessage, undefined);
+  assert.equal(standard.restoreQueuedMessage, undefined);
+  assert.equal(standard.updateQueuedMessage, undefined);
   assert.equal(standard.cancelQueuedMessage, undefined);
   assert.equal(typeof synchronized.listQueuedMessages, "function");
   assert.equal(typeof synchronized.enqueueQueuedMessage, "function");
+  assert.equal(typeof synchronized.restoreQueuedMessage, "function");
+  assert.equal(typeof synchronized.updateQueuedMessage, "function");
   assert.equal(typeof synchronized.cancelQueuedMessage, "function");
   standard.dispose();
   synchronized.dispose();
+});
+
+test("Codex releases an idle app-server after a grace period and reopens it on demand", async () => {
+  const transports: FakeTransport[] = [];
+  const adapter = new CodexAdapter({
+    hostId: "host_idle",
+    idleReleaseMs: 5,
+    transportFactory: () => {
+      const transport = new FakeTransport();
+      transports.push(transport);
+      return transport;
+    },
+  });
+
+  await adapter.getAuthStatus();
+  await adapter.releaseIdleResources();
+  await adapter.getAuthStatus();
+  await delay(15);
+  assert.equal(transports[0]?.closeCalls, 0, "peer use cancels the pending idle close");
+
+  await adapter.releaseIdleResources();
+  await delay(15);
+  assert.equal(transports[0]?.closeCalls, 1);
+  await adapter.getAuthStatus();
+  assert.equal(transports.length, 2);
+  await adapter.dispose();
+});
+
+test("Codex dispose closes a peer whose initialize request is still pending", async () => {
+  const transport = new FakeTransport();
+  transport.blockedMethods.add("initialize");
+  const adapter = new CodexAdapter({
+    hostId: "host_dispose_initializing",
+    requestTimeoutMs: 1_000,
+    transportFactory: () => transport,
+  });
+  const initialization = adapter.getAuthStatus().then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+  while (!transport.sent.some((message) => typeof message === "object" && message !== null && (message as Record<string, unknown>).method === "initialize")) {
+    await delay(1);
+  }
+
+  await adapter.dispose();
+
+  assert.equal(transport.closeCalls, 1);
+  assert.ok(await initialization instanceof Error);
 });
 
 test("Codex forwards next-turn model, effort, and phone image data", async () => {
@@ -280,7 +335,11 @@ test("Codex rollout metadata enriches listed sessions and emits normalized live 
   const directory = await mkdtemp(join(tmpdir(), "uar-codex-adapter-metadata-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const rollout = join(directory, "rollout.jsonl");
-  await writeFile(rollout, `${JSON.stringify({ type: "turn_context", payload: { model: "gpt-initial", effort: "medium" } })}\n`, "utf8");
+  await writeFile(rollout, [
+    `${JSON.stringify({ type: "turn_context", payload: { model: "gpt-initial", effort: "medium" } })}\n`,
+    `${JSON.stringify({ timestamp: "2026-08-15T13:15:00.000Z", type: "response_item", payload: { type: "reasoning", id: "reason-live", summary: [{ type: "summary_text", text: "Checking the live state" }] } })}\n`,
+    `${JSON.stringify({ timestamp: "2026-08-15T13:15:01.000Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 390_000, cached_input_tokens: 380_000, output_tokens: 9_748, total_tokens: 399_748 }, model_context_window: 1_000_000 } } })}\n`,
+  ].join(""), "utf8");
   const transport = new FakeTransport();
   transport.methodResults.set("thread/list", {
     data: [{
@@ -308,9 +367,17 @@ test("Codex rollout metadata enriches listed sessions and emits normalized live 
   await adapter.subscribe(null, (event) => { events.push(event); });
 
   const page = await adapter.listSessions();
+  assert.equal(page.sessions[0]?.state, "working");
   assert.equal(page.sessions[0]?.modelId, "gpt-initial");
   assert.equal(page.sessions[0]?.reasoningEffort, "medium");
   assert.deepEqual(events.filter((event) => event.type === "session.updated"), []);
+  const context = await adapter.getSessionContext("desktop-thread");
+  assert.equal(context.usedTokens, 399_748);
+  assert.equal(context.contextWindowTokens, 1_000_000);
+  assert.equal(context.usedPercent, 39.9748);
+  const messages = await adapter.getMessages("desktop-thread");
+  assert.equal(messages.at(-1)?.status, "streaming");
+  assert.equal(messages.at(-1)?.parts[0]?.type, "reasoning");
 
   await appendFile(rollout, `${JSON.stringify({ type: "turn_context", payload: { model: "gpt-current", reasoning_effort: "high" } })}\n`, "utf8");
   const deadline = Date.now() + 500;
@@ -319,6 +386,44 @@ test("Codex rollout metadata enriches listed sessions and emits normalized live 
   assert.equal(update?.providerSessionId, "desktop-thread");
   assert.deepEqual(update?.payload, { modelId: "gpt-current", reasoningEffort: "high" });
   assert.equal(update?.nativeEvent, undefined);
+});
+
+test("Codex includes an externally active locked thread even when thread list omits it", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "uar-codex-active-list-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const activeId = "019ffeab-3a74-7140-87f2-cd348d5ee856";
+  const rollout = join(directory, "rollout.jsonl");
+  await mkdir(join(directory, "thread-writer-locks"), { recursive: true });
+  await writeFile(join(directory, "thread-writer-locks", `${activeId}.lock`), "");
+  await writeFile(rollout, [
+    `${JSON.stringify({ type: "event_msg", payload: { type: "task_started" } })}\n`,
+    `${JSON.stringify({ timestamp: "2026-08-15T13:52:33.000Z", type: "response_item", payload: { type: "message", id: "current-user-message", role: "user", content: [{ type: "input_text", text: "Also, this chat itself is not showing up in that session list." }] } })}\n`,
+  ].join(""), "utf8");
+  const thread = {
+    id: activeId,
+    sessionId: activeId,
+    preview: "Active external task",
+    modelProvider: "openai",
+    createdAt: 1,
+    updatedAt: 2,
+    recencyAt: 2,
+    status: { type: "notLoaded" },
+    path: rollout,
+    cwd: directory,
+    cliVersion: "0.147.0",
+  };
+  const transport = new FakeTransport();
+  transport.methodResults.set("thread/list", { data: [], nextCursor: null });
+  transport.methodResults.set("thread/read", { thread });
+  const adapter = new CodexAdapter({ hostId: "host_1", transportFactory: () => transport, localActivity: { codexHome: directory } });
+  t.after(() => adapter.dispose());
+
+  const page = await adapter.listSessions();
+  assert.equal(page.sessions.length, 1);
+  assert.equal(page.sessions[0]?.providerSessionId, activeId);
+  assert.equal(page.sessions[0]?.state, "working");
+  assert.equal(page.sessions[0]?.preview, "Also, this chat itself is not showing up in that session list.");
+  assert.equal(page.sessions[0]?.lastActivityAt, "2026-08-15T13:52:33.000Z");
 });
 
 test("Codex approval responses match each server request kind", async () => {

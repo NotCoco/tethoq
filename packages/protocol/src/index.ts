@@ -5,3 +5,6 @@ export * from "./validation.js";
 export * from "./event_buffer.js";
 export * from "./backoff.js";
 export * from "./pairing.js";
+export * from "./secure_transport.js";
+export * from "./relay_attach.js";
+export * from "./simplify.js";

@@ -141,6 +141,16 @@ export function persistableBranchMessages(messages: readonly RemoteMessage[]): r
         ...(part.name !== undefined ? { name: part.name } : {}),
       }];
       if (part.type === "file") return [part];
+      if (part.type === "workflow") return [{
+        type: part.type,
+        workflow: {
+          id: part.workflow.id,
+          name: part.workflow.name,
+          eventCount: part.workflow.eventCount,
+          screenshotCount: part.workflow.screenshotCount,
+          ...(part.workflow.applications !== undefined ? { applications: part.workflow.applications } : {}),
+        },
+      }];
       return [{
         ...part,
         ...(part.prompt !== undefined ? { prompt: safeTranscriptText(part.prompt) } : {}),
@@ -232,6 +242,16 @@ function transcriptPart(part: ContentPart): JsonObject {
     ...(part.name !== undefined ? { name: part.name } : {}),
   };
   if (part.type === "file") return { type: part.type, name: part.name, ...(part.mimeType !== undefined ? { mimeType: part.mimeType } : {}) };
+  if (part.type === "workflow") return {
+    type: part.type,
+    workflow: {
+      id: part.workflow.id,
+      name: part.workflow.name,
+      eventCount: part.workflow.eventCount,
+      screenshotCount: part.workflow.screenshotCount,
+      ...(part.workflow.applications !== undefined ? { applications: [...part.workflow.applications] } : {}),
+    },
+  };
   return {
     type: part.type,
     tool: part.tool,

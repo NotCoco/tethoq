@@ -1,9 +1,59 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { PairingManager, createDeviceIdentity, createHostIdentity, signRelayDeviceAttach, signRelayHostAttach } from "../../../packages/protocol/src/index.js";
 import { RelayServer } from "./relay.js";
 
 function testToken(label: string): string {
   return `${label}-${"x".repeat(40)}`;
+}
+
+const testHostIdentity = createHostIdentity();
+
+/** Host attachment must prove possession of the host key, not just the room token. */
+function hostAttachMessage(hostId: string, token: string): string {
+  return JSON.stringify({
+    type: "relay.attach",
+    role: "host",
+    hostId,
+    token,
+    proof: signRelayHostAttach({
+      hostId,
+      token,
+      hostPublicKeyPem: testHostIdentity.publicKeyPem,
+      hostPrivateKeyPem: testHostIdentity.privateKeyPem,
+    }),
+  });
+}
+
+/**
+ * Device attachment must prove which device it is, so the test pairs a real one
+ * rather than asserting on a bare identifier.
+ */
+function deviceAttachMessage(hostId: string, deviceId: string, token: string): string {
+  const manager = new PairingManager(hostId, testHostIdentity);
+  const device = createDeviceIdentity(deviceId);
+  const pairing = manager.startPairing();
+  const credential = manager.confirmPairing({
+    pairingId: pairing.pairingId,
+    secret: pairing.secret,
+    shortCode: pairing.shortCode,
+    deviceId,
+    devicePublicKeyPem: device.publicKeyPem,
+  });
+  return JSON.stringify({
+    type: "relay.attach",
+    role: "device",
+    hostId,
+    token,
+    deviceId,
+    proof: signRelayDeviceAttach({
+      hostId,
+      deviceId,
+      token,
+      credential,
+      devicePrivateKeyPem: device.privateKeyPem,
+    }),
+  });
 }
 
 class JsonInbox {
@@ -55,9 +105,11 @@ test("relay routes opaque payloads between one outbound host and its paired devi
   const device = await connect(url);
   context.after(() => { host.socket.close(); device.socket.close(); });
 
-  host.socket.send(JSON.stringify({ type: "relay.attach", role: "host", hostId: "host_1", token }));
-  assert.deepEqual(await host.inbox.next(), { type: "relay.attached", role: "host", hostId: "host_1", devices: 0 });
-  device.socket.send(JSON.stringify({ type: "relay.attach", role: "device", hostId: "host_1", token, deviceId: "device_1" }));
+  host.socket.send(hostAttachMessage("host_1", token));
+  // The attachment reply also announces capabilities, so a newer host knows
+  // which messages this relay understands before it sends one.
+  assert.deepEqual(await host.inbox.next(), { type: "relay.attached", role: "host", hostId: "host_1", devices: 0, supports: ["relay.revoke"] });
+  device.socket.send(deviceAttachMessage("host_1", "device_1", token));
   assert.deepEqual(await device.inbox.next(), { type: "relay.attached", role: "device", hostId: "host_1", deviceId: "device_1" });
 
   device.socket.send("opaque-device-request");
@@ -77,12 +129,12 @@ test("relay rejects a device that presents the wrong channel token", async (cont
   const url = `ws://127.0.0.1:${address.port}/relay`;
   const host = await connect(url);
   context.after(() => host.socket.close());
-  host.socket.send(JSON.stringify({ type: "relay.attach", role: "host", hostId: "host_1", token: testToken("correct") }));
+  host.socket.send(hostAttachMessage("host_1", testToken("correct")));
   await host.inbox.next();
 
   const device = await connect(url);
   context.after(() => device.socket.close());
-  device.socket.send(JSON.stringify({ type: "relay.attach", role: "device", hostId: "host_1", token: testToken("incorrect"), deviceId: "device_1" }));
+  device.socket.send(deviceAttachMessage("host_1", "device_1", testToken("incorrect")));
   const closed = await new Promise<boolean>((resolve) => {
     const timer = setTimeout(() => resolve(false), 2_000);
     device.socket.addEventListener("close", () => { clearTimeout(timer); resolve(true); }, { once: true });

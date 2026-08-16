@@ -5,10 +5,13 @@ import { AgentBridge } from "../../../agent_bridge/src/bridge.js";
 import type { BridgeConfig } from "../../../agent_bridge/src/config.js";
 import { DelegationStateStore, defaultDelegationStatePath } from "../../../agent_bridge/src/delegation_store.js";
 import { SessionTransferStateStore, defaultSessionTransferStatePath } from "../../../agent_bridge/src/session_transfer_store.js";
+import { CrossSessionInboxStore, defaultCrossSessionInboxStatePath } from "../../../agent_bridge/src/cross_session_store.js";
 import { PairingStateStore, defaultPairingStatePath } from "../../../agent_bridge/src/pairing_store.js";
 import { BridgeRequestRouter } from "../../../agent_bridge/src/request_router.js";
 import { defaultMeshRuntimePath, MeshToolGateway, meshToolDefinitions } from "../../../agent_bridge/src/mesh_tools.js";
-import { tethoqEnvironmentFlag, tethoqEnvironmentValue } from "../../../agent_bridge/src/environment.js";
+import { tethoqEnvironmentValue } from "../../../agent_bridge/src/environment.js";
+import { defaultTranscriptionSourceRegistry } from "../../../agent_bridge/src/dictation.js";
+import { DictationCredentialStore, defaultDictationCredentialStatePath } from "../../../agent_bridge/src/dictation_credentials.js";
 import { installOpenCodeMeshTools } from "../../../agent_bridge/src/opencode_tools.js";
 import { installPiTools, piToolExtensionPath } from "../../../agent_bridge/src/pi_tools.js";
 import { CodexAdapter } from "../../../../packages/provider_codex/src/codex_adapter.js";
@@ -37,6 +40,7 @@ export interface DesktopRuntimeOptions {
   readonly appVersion: string;
   readonly providerAssetsDirectory: string;
   readonly browserWorkspace: BrowserWorkspaceManager;
+  readonly globalAgentInstructions?: () => Promise<string | undefined>;
 }
 
 export class DesktopRuntime {
@@ -51,11 +55,13 @@ export class DesktopRuntime {
   readonly #meshRuntimePath: string;
   readonly #openCode: OpenCodeSupervisor;
   readonly #browserWorkspace: BrowserWorkspaceManager;
+  readonly #globalAgentInstructions: (() => Promise<string | undefined>) | undefined;
   #bridge: AgentBridge | undefined;
   #router: BridgeRequestRouter | undefined;
   #pairingStore: PairingStateStore | undefined;
   #delegationStore: DelegationStateStore | undefined;
   #sessionTransferStore: SessionTransferStateStore | undefined;
+  #crossSessionStore: CrossSessionInboxStore | undefined;
   #restartPromise: Promise<void> | undefined;
   #eventTimer: NodeJS.Timeout | undefined;
   #windowVisible = true;
@@ -77,6 +83,7 @@ export class DesktopRuntime {
     this.#providerAssetsDirectory = options.providerAssetsDirectory;
     this.#meshRuntimePath = defaultMeshRuntimePath(options.config.hostId);
     this.#browserWorkspace = options.browserWorkspace;
+    this.#globalAgentInstructions = options.globalAgentInstructions;
     const openCodeUrl = tethoqEnvironmentValue(process.env, "TETHOQ_OPENCODE_URL");
     const openCodeCommand = tethoqEnvironmentValue(process.env, "TETHOQ_OPENCODE_COMMAND");
     this.#openCode = new OpenCodeSupervisor({
@@ -195,7 +202,7 @@ export class DesktopRuntime {
     clearTimeout(this.#eventTimer);
     this.#eventTimer = undefined;
     await Promise.allSettled([this.#bridge?.dispose(), this.#clientTools?.close(), this.#connectorRegistry?.dispose(), this.#openCode.dispose()]);
-    await Promise.allSettled([this.#pairingStore?.flush(), this.#delegationStore?.flush(), this.#sessionTransferStore?.flush()]);
+    await Promise.allSettled([this.#pairingStore?.flush(), this.#delegationStore?.flush(), this.#sessionTransferStore?.flush(), this.#crossSessionStore?.flush()]);
   }
 
   private async startOnce(): Promise<void> {
@@ -203,17 +210,25 @@ export class DesktopRuntime {
     try {
       await installOpenCodeMeshTools({ sourcePath: join(this.#providerAssetsDirectory, "opencode", "uar_mesh.txt") });
       await installPiTools({ sourcePath: join(this.#providerAssetsDirectory, "pi", "tethoq_tools.txt") });
-      await this.#openCode.ensureRunning();
+      await this.#openCode.probe();
       const pairingStore = new PairingStateStore(defaultPairingStatePath(this.#configPath));
       const delegationStore = new DelegationStateStore(defaultDelegationStatePath(this.#configPath));
       const sessionTransferStore = new SessionTransferStateStore(defaultSessionTransferStatePath(this.#configPath));
+      const crossSessionStore = new CrossSessionInboxStore(defaultCrossSessionInboxStatePath(this.#configPath));
+      const dictationCredentialStore = new DictationCredentialStore(
+        defaultDictationCredentialStatePath(this.#configPath),
+        this.#config.identity.privateKeyPem,
+      );
       this.#pairingStore = pairingStore;
       this.#delegationStore = delegationStore;
       this.#sessionTransferStore = sessionTransferStore;
-      const [pairingState, delegationState, sessionTransferState] = await Promise.all([
+      this.#crossSessionStore = crossSessionStore;
+      const [pairingState, delegationState, sessionTransferState, crossSessionState, dictationCredentials] = await Promise.all([
         pairingStore.read(),
         delegationStore.read(),
         sessionTransferStore.read(),
+        crossSessionStore.read(),
+        dictationCredentialStore.read(),
       ]);
       const openCodeUrl = tethoqEnvironmentValue(process.env, "TETHOQ_OPENCODE_URL") ?? this.#openCode.status().url;
       const configuredWorkingDirectory = tethoqEnvironmentValue(process.env, "TETHOQ_PROJECT_DIRECTORY");
@@ -249,7 +264,8 @@ export class DesktopRuntime {
           hostId: this.#config.hostId,
           ...(codexCommand !== undefined ? { command: codexCommand } : {}),
           ...(codexArgs !== undefined ? { commandArgs: codexArgs } : {}),
-          ...(tethoqEnvironmentFlag(process.env, "TETHOQ_ENABLE_CODEX_LOCAL_STATE") ? { localActivity: {}, desktopQueue: {} } : {}),
+          localActivity: {},
+          desktopQueue: {},
         }),
         new OpenCodeAdapter({
           hostId: this.#config.hostId,
@@ -257,9 +273,7 @@ export class DesktopRuntime {
           ...(configuredWorkingDirectory !== undefined ? { directory: configuredWorkingDirectory } : {}),
           ...(openCodeUsername !== undefined ? { username: openCodeUsername } : {}),
           ...(openCodePassword !== undefined ? { password: openCodePassword } : {}),
-          ...(tethoqEnvironmentFlag(process.env, "TETHOQ_ENABLE_OPENCODE_LOCAL_STATE")
-            ? { localActivity: openCodeDatabasePath === undefined ? {} : { databasePath: openCodeDatabasePath } }
-            : {}),
+          localActivity: openCodeDatabasePath === undefined ? {} : { databasePath: openCodeDatabasePath },
         }),
         new GrokProviderAdapter({
           hostId: this.#config.hostId,
@@ -300,6 +314,17 @@ export class DesktopRuntime {
         onDelegationsChange: (tasks) => delegationStore.scheduleWrite(tasks),
         sessionTransfers: sessionTransferState.transfers,
         onSessionTransfersChange: (transfers) => sessionTransferStore.scheduleWrite(transfers),
+        crossSessionMessages: crossSessionState.messages,
+        onCrossSessionMessagesChange: (messages) => crossSessionStore.scheduleWrite(messages),
+        transcriptionSources: defaultTranscriptionSourceRegistry({
+          ...(dictationCredentials["openai-stt"] !== undefined ? { openAiApiKey: dictationCredentials["openai-stt"] } : {}),
+          ...(dictationCredentials["xai-stt"] !== undefined ? { xAiApiKey: dictationCredentials["xai-stt"] } : {}),
+        }),
+        onTranscriptionCredentialChange: (sourceId, apiKey) => {
+          if (sourceId !== "openai-stt" && sourceId !== "xai-stt") throw new Error("Dictation source is not configurable");
+          return dictationCredentialStore.set(sourceId, apiKey);
+        },
+        ...(this.#globalAgentInstructions !== undefined ? { globalAgentInstructions: this.#globalAgentInstructions } : {}),
       });
       const browserTools = new BrowserAgentTools(this.#browserWorkspace, {
         onCapture: async (parentSessionId, capture, question) => {

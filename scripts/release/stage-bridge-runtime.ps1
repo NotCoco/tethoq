@@ -45,6 +45,17 @@ function Reset-Directory([string]$Path) {
   New-Item -ItemType Directory -Path $Path -Force | Out-Null
 }
 
+function Get-Sha256([string]$Path) {
+  $hasher = [System.Security.Cryptography.SHA256]::Create()
+  $stream = [System.IO.File]::OpenRead($Path)
+  try {
+    return ([System.BitConverter]::ToString($hasher.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
+  } finally {
+    $stream.Dispose()
+    $hasher.Dispose()
+  }
+}
+
 function Get-RelativePath([string]$BasePath, [string]$TargetPath) {
   $baseFull = [System.IO.Path]::GetFullPath($BasePath).TrimEnd('\') + '\'
   $targetFull = [System.IO.Path]::GetFullPath($TargetPath)
@@ -74,7 +85,7 @@ function Get-VerifiedDownload(
   if (-not (Test-Path -LiteralPath $Destination)) {
     Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $Destination
   }
-  $actualHash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash.ToLowerInvariant()
+  $actualHash = Get-Sha256 $Destination
   if ($actualHash -ne $Sha256) {
     throw "$Label checksum mismatch: expected $Sha256, got $actualHash"
   }

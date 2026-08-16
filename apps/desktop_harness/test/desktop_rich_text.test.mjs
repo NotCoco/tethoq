@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { mkdir, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -10,7 +9,7 @@ import { build } from "esbuild";
 
 const testDirectory = dirname(fileURLToPath(import.meta.url));
 const appRoot = join(testDirectory, "..");
-const outputDirectory = join(tmpdir(), `tethoq-rich-text-${process.pid}-${Date.now()}`);
+const outputDirectory = join(appRoot, "node_modules", ".tethoq-test", `rich-text-${process.pid}-${Date.now()}`);
 const bundle = join(outputDirectory, "rich-text.mjs");
 await mkdir(outputDirectory, { recursive: true });
 await build({
@@ -20,8 +19,9 @@ await build({
   format: "esm",
   platform: "node",
   target: "node22",
+  external: ["react", "react-dom"],
 });
-const { RichText, codeBlockText, safeMarkdownUrl } = await import(`file:///${bundle.replaceAll("\\", "/")}`);
+const { RichText, codeBlockText, localLocationFromHref, localPathSegments, safeMarkdownUrl } = await import(`file:///${bundle.replaceAll("\\", "/")}`);
 process.on("exit", () => { void rm(outputDirectory, { recursive: true, force: true }); });
 
 test("rich transcript text renders GFM structure and ordinary line breaks", () => {
@@ -72,6 +72,33 @@ test("rich transcript text drops raw HTML and unsafe URL protocols", () => {
   assert.equal(safeMarkdownUrl("mailto:private@example.test", "href"), "");
   assert.equal(safeMarkdownUrl("/relative", "href"), "");
   assert.equal(safeMarkdownUrl("https://example.test/docs", "href"), "https://example.test/docs");
+  assert.equal(safeMarkdownUrl("file:///C:/cli_remote/package.json", "href"), "file:///C:/cli_remote/package.json");
   assert.equal(safeMarkdownUrl("file:///C:/secret.png", "src"), "");
   assert.equal(safeMarkdownUrl("https://example.test/image.png", "src"), "https://example.test/image.png");
+});
+
+test("local Windows paths and file URIs become safe open actions without touching fenced code", () => {
+  const markdown = [
+    "Open C:\\cli_remote\\apps\\desktop_harness\\package.json:12 or `C:\\Program Files\\Tethoq\\notes.txt`.",
+    "Also C:\\Users\\example\\My Documents\\file.ts:12 is actionable without extra Markdown.",
+    "",
+    "[Workspace](file:///C:/cli_remote/apps/desktop_harness)",
+    "[Source](C:/Users/example/My%20Documents/file.ts:9)",
+    "Raw URI: file:///C:/cli_remote/README.md",
+    "",
+    "```text",
+    "C:\\cli_remote\\do-not-link-inside-a-snippet.txt",
+    "```",
+  ].join("\n");
+  const markup = renderToStaticMarkup(React.createElement(RichText, null, markdown));
+  assert.equal((markup.match(/class="rich-local-path"/g) ?? []).length, 6);
+  assert.match(markup, /<a href="#" class="rich-local-path">C:\\cli_remote\\apps\\desktop_harness\\package\.json:12<\/a>/);
+  assert.match(markup, /<a href="#" class="rich-local-path"><code>C:\\Program Files\\Tethoq\\notes\.txt<\/code><\/a>/);
+  assert.match(markup, /<pre><code class="language-text">C:\\cli_remote\\do-not-link-inside-a-snippet\.txt/);
+  const first = localPathSegments("See C:\\cli_remote\\README.md:44:3.").find((segment) => segment.location)?.location;
+  assert.deepEqual(first, { path: "C:\\cli_remote\\README.md", line: 44, column: 3 });
+  const spaced = localPathSegments("C:\\Users\\example\\My Documents\\file.ts:12").find((segment) => segment.location)?.location;
+  assert.deepEqual(spaced, { path: "C:\\Users\\example\\My Documents\\file.ts", line: 12 });
+  assert.deepEqual(localLocationFromHref("file:///C:/cli_remote/README.md"), { path: "C:/cli_remote/README.md" });
+  assert.equal(localLocationFromHref("file://server/share/file.txt"), null);
 });

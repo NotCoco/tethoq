@@ -6,6 +6,7 @@ import { defaultConfigPath, loadOrCreateConfig, type BridgeConfig } from "./conf
 import { PairingStateStore, defaultPairingStatePath } from "./pairing_store.js";
 import { DelegationStateStore, defaultDelegationStatePath } from "./delegation_store.js";
 import { SessionTransferStateStore, defaultSessionTransferStatePath } from "./session_transfer_store.js";
+import { CrossSessionInboxStore, defaultCrossSessionInboxStatePath } from "./cross_session_store.js";
 import { createConfiguredProviders } from "./providers.js";
 import { BridgeRelayClient, BridgeSocketServer } from "./transport.js";
 import { defaultMeshRuntimePath, MeshToolGateway } from "./mesh_tools.js";
@@ -18,6 +19,8 @@ import { startPhonePairTunnel, type PhonePairTunnel } from "./phone_pair_tunnel.
 import { configuredDesktopLifecycle } from "./desktop_lifecycle.js";
 import { CompanionControlServer } from "./companion_control.js";
 import { tethoqEnvironmentFlag, tethoqEnvironmentValue } from "./environment.js";
+import { defaultTranscriptionSourceRegistry } from "./dictation.js";
+import { DictationCredentialStore, defaultDictationCredentialStatePath } from "./dictation_credentials.js";
 
 interface CliOptions {
   readonly configPath: string;
@@ -119,6 +122,17 @@ const delegationStore = new DelegationStateStore(defaultDelegationStatePath(opti
 const delegationState = await delegationStore.read();
 const sessionTransferStore = new SessionTransferStateStore(defaultSessionTransferStatePath(options.configPath));
 const sessionTransferState = await sessionTransferStore.read();
+const crossSessionStore = new CrossSessionInboxStore(defaultCrossSessionInboxStatePath(options.configPath));
+const crossSessionState = await crossSessionStore.read();
+const dictationCredentialStore = new DictationCredentialStore(
+  defaultDictationCredentialStatePath(options.configPath),
+  config.identity.privateKeyPem,
+);
+const dictationCredentials = await dictationCredentialStore.read();
+const transcriptionSources = defaultTranscriptionSourceRegistry({
+  ...(dictationCredentials["openai-stt"] !== undefined ? { openAiApiKey: dictationCredentials["openai-stt"] } : {}),
+  ...(dictationCredentials["xai-stt"] !== undefined ? { xAiApiKey: dictationCredentials["xai-stt"] } : {}),
+});
 let companionControl: CompanionControlServer | undefined;
 const bridge = new AgentBridge(config, createConfiguredProviders(
   config,
@@ -135,6 +149,13 @@ const bridge = new AgentBridge(config, createConfiguredProviders(
   onDelegationsChange: (tasks) => delegationStore.scheduleWrite(tasks),
   sessionTransfers: sessionTransferState.transfers,
   onSessionTransfersChange: (transfers) => sessionTransferStore.scheduleWrite(transfers),
+  crossSessionMessages: crossSessionState.messages,
+  onCrossSessionMessagesChange: (messages) => crossSessionStore.scheduleWrite(messages),
+  transcriptionSources,
+  onTranscriptionCredentialChange: (sourceId, apiKey) => {
+    if (sourceId !== "openai-stt" && sourceId !== "xai-stt") throw new Error("Dictation source is not configurable");
+    return dictationCredentialStore.set(sourceId, apiKey);
+  },
 });
 const desktopLifecycle = configuredDesktopLifecycle();
 const meshTools = new MeshToolGateway(
@@ -269,7 +290,7 @@ const shutdown = async (signal: string) => {
   await local.close();
   await meshTools.close();
   await bridge.dispose();
-  await Promise.all([pairingStore.flush(), delegationStore.flush(), sessionTransferStore.flush()]);
+  await Promise.all([pairingStore.flush(), delegationStore.flush(), sessionTransferStore.flush(), crossSessionStore.flush(), dictationCredentialStore.flush()]);
   process.exit(0);
 };
 process.once("SIGINT", () => void shutdown("SIGINT"));

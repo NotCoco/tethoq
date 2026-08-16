@@ -258,7 +258,24 @@ export interface CapturedFrame {
   readonly cursorPath: string;
   readonly fullRelativePath: string;
   readonly cursorRelativePath: string;
+  readonly cursor?: {
+    readonly screen: Point;
+    readonly image: Point;
+    readonly normalized: Point;
+    readonly embeddedInImage: boolean;
+  };
   readonly bytesWritten: number;
+}
+
+export interface WorkflowScreenshot {
+  readonly frameId: string;
+  readonly name: string;
+}
+
+export interface WorkflowScreenshotImage extends WorkflowScreenshot {
+  readonly dataUrl: string;
+  readonly width: number;
+  readonly height: number;
 }
 
 export interface DragSummaryRequest {

@@ -18,6 +18,9 @@ import {
   JsonLineProcessTransport,
   ProviderAdapterError,
   ProviderEventHub,
+  providerPromptContent,
+  providerPromptWorkflows,
+  stripProviderPromptGuidance,
   resolveCommand,
   type AgentProviderAdapter,
   type AuthStatus,
@@ -354,7 +357,7 @@ export class PiRpcProviderAdapter implements AgentProviderAdapter {
     const runtime = this.runtime(providerSessionId);
     await this.applyModelOptions(runtime, request);
     await runtime.client.request("prompt", {
-      message: request.content,
+      message: providerPromptContent(request),
       ...(request.attachments?.length ? { images: request.attachments.map((attachment) => ({ type: "image", data: attachment.dataBase64, mimeType: attachment.mimeType })) } : {}),
     });
     return { accepted: true, details: [`${this.displayName} accepted the RPC prompt.`] };
@@ -363,7 +366,7 @@ export class PiRpcProviderAdapter implements AgentProviderAdapter {
   public async steerMessage(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
     const runtime = this.runtime(providerSessionId);
     await runtime.client.request("steer", {
-      message: request.content,
+      message: providerPromptContent(request),
       ...(request.attachments?.length ? { images: request.attachments.map((attachment) => ({ type: "image", data: attachment.dataBase64, mimeType: attachment.mimeType })) } : {}),
     });
     return { accepted: true, details: [`${this.displayName} queued the steering message.`] };
@@ -373,7 +376,7 @@ export class PiRpcProviderAdapter implements AgentProviderAdapter {
     await this.runtime(providerSessionId).client.request("abort");
   }
 
-  public async getSessionContext(providerSessionId: string): Promise<Omit<SessionContextState, "sessionId" | "compactionThresholdTokens" | "minimumThresholdTokens" | "supportsThreshold" | "isCompacting">> {
+  public async getSessionContext(providerSessionId: string): Promise<Omit<SessionContextState, "sessionId" | "compactionThresholdTokens" | "minimumThresholdTokens" | "supportsThreshold" | "isCompacting" | "compactionKind">> {
     const runtime = this.runtime(providerSessionId);
     const data = await runtime.client.request<unknown>("get_session_stats");
     const stats = isRecord(data) ? data : {};
@@ -706,11 +709,19 @@ function normalizePiMessage(hostId: string, providerId: string, providerSessionI
 }
 
 function piContentParts(content: unknown, role: "user" | "assistant" | "tool"): readonly ContentPart[] {
-  if (typeof content === "string") return [{ type: "text", text: content }];
+  if (typeof content === "string") {
+    if (role !== "user") return [{ type: "text", text: content }];
+    const text = stripProviderPromptGuidance(content);
+    return [...(text.trim() ? [{ type: "text" as const, text }] : []), ...providerPromptWorkflows(content).map((workflow): ContentPart => ({ type: "workflow", workflow }))];
+  }
   if (!Array.isArray(content)) return [];
   return content.flatMap((entry): readonly ContentPart[] => {
     if (!isRecord(entry)) return [];
-    if (entry.type === "text" && typeof entry.text === "string") return [{ type: "text", text: entry.text }];
+    if (entry.type === "text" && typeof entry.text === "string") {
+      if (role !== "user") return [{ type: "text", text: entry.text }];
+      const text = stripProviderPromptGuidance(entry.text);
+      return [...(text.trim() ? [{ type: "text" as const, text }] : []), ...providerPromptWorkflows(entry.text).map((workflow): ContentPart => ({ type: "workflow", workflow }))];
+    }
     if (entry.type === "thinking" && typeof entry.thinking === "string") return [{ type: "reasoning", text: entry.thinking, redacted: false }];
     if (entry.type === "image") return [{ type: "image", ...(typeof entry.mimeType === "string" ? { mimeType: entry.mimeType } : {}) }];
     if (entry.type === "toolCall") return [{ type: "tool", name: typeof entry.name === "string" ? entry.name : "tool", ...(typeof entry.id === "string" ? { callId: entry.id } : {}), ...(isRecord(entry.arguments) ? { input: jsonObject(entry.arguments) } : {}), status: "completed" }];

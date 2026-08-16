@@ -14,7 +14,9 @@ import type { JsonObject } from "../../../../packages/protocol/src/index.js";
 import {
   DESKTOP_PROVIDERS,
   IPC_CHANNELS,
+  MAX_TASK_TITLE_CHARACTERS,
   type DesktopBootstrap,
+  type TaskOverride,
   type ConnectorAction,
   type BrowserAction,
   type BrowserWorkspaceState,
@@ -22,15 +24,20 @@ import {
   type RecorderState,
   type WorkflowAttachment,
   type WorkflowDescriptor,
+  type WorkflowScreenshot,
+  type WorkflowScreenshotImage,
   type SelectedFile,
   type SelectedImage,
   type ScreenCaptureSource,
   type LiveSessionAction,
+  type LocalOpenHandlerId,
+  type LocalOpenState,
   type PreferencesAction,
 } from "../shared/desktop_api.js";
 import type { DesktopRuntime } from "./runtime.js";
 import type { DesktopPreferencesStore } from "./preferences.js";
 import type { LiveSessionManager } from "./live_session/manager.js";
+import { detectLocalOpenHandlers, existingLocalTarget, openExistingLocalTarget, publicLocalOpenHandlers } from "./local_open.js";
 
 const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
 const MAX_SELECTED_IMAGES = 4;
@@ -62,6 +69,9 @@ const ALLOWED_REQUESTS = new Set([
   "session.context.compact",
   "session.context_handoff",
   "session.branch",
+  "side_chat.list",
+  "side_chat.create",
+  "side_chat.promote",
   "session.vision.get",
   "session.vision.configure",
   "session.vision.ask",
@@ -72,6 +82,9 @@ const ALLOWED_REQUESTS = new Set([
   "session.interrupt",
   "message_queue.list",
   "message_queue.enqueue",
+  "message_queue.edit",
+  "message_queue.deliver",
+  "message_queue.move_to_new_task",
   "message_queue.cancel",
   "delegation.list",
   "delegation.start",
@@ -80,6 +93,7 @@ const ALLOWED_REQUESTS = new Set([
   "attachment.upload.complete",
   "attachment.upload.cancel",
   "dictation.source.list",
+  "dictation.source.configure",
   "dictation.transcribe",
   "approval.list",
   "approval.respond",
@@ -125,6 +139,8 @@ export interface RegisterDesktopIpcOptions {
     finalize(name: string): Promise<WorkflowDescriptor>;
     discard(): Promise<unknown>;
     list(): Promise<readonly WorkflowDescriptor[]>;
+    screenshots(id: string): Promise<readonly WorkflowScreenshot[]>;
+    screenshot(id: string, frameId: string, variant: "thumbnail" | "full"): Promise<WorkflowScreenshotImage>;
     delete(id: string): Promise<unknown>;
     reveal(id: string): Promise<unknown>;
     attachment(id: string): Promise<WorkflowAttachment>;
@@ -135,6 +151,15 @@ export interface RegisterDesktopIpcOptions {
 
 export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => void {
   const { window, runtime } = options;
+  const localOpenHandlers = detectLocalOpenHandlers();
+  const localOpenState = async (): Promise<LocalOpenState> => {
+    const handlers = await localOpenHandlers;
+    const preferred = options.preferences.value().localOpenHandlerId;
+    return {
+      defaultHandlerId: handlers.some((handler) => handler.id === preferred) ? preferred : "system",
+      handlers: publicLocalOpenHandlers(handlers),
+    };
+  };
   const handle = <T extends unknown[]>(channel: string, listener: (event: IpcMainInvokeEvent, ...args: T) => unknown): void => {
     ipcMain.handle(channel, (event, ...args) => {
       assertTrustedSender(event, window);
@@ -147,7 +172,28 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
     const input = record(value, "request");
     const type = nonEmptyString(input.type, "request type", 80);
     if (!ALLOWED_REQUESTS.has(type)) throw new Error(`Desktop request ${type} is not allowed`);
-    const payload = jsonObject(input.payload ?? {}, "request payload");
+    let payload = jsonObject(input.payload ?? {}, "request payload");
+    if (payload.workflowIds !== undefined) {
+      if (!new Set(["session.send_message", "session.steer_message", "message_queue.enqueue"]).has(type)) throw new Error("Workflows can only be attached to a message");
+      if (!options.recorder) throw new Error("Workflow recording is not available");
+      if (!Array.isArray(payload.workflowIds) || payload.workflowIds.length === 0 || payload.workflowIds.length > 4
+        || !payload.workflowIds.every((id) => typeof id === "string" && id.length > 0 && id.length <= 160)) {
+        throw new Error("Choose between one and four valid workflows");
+      }
+      const workflows = await Promise.all(payload.workflowIds.map(async (id) => {
+        const workflow = await options.recorder!.attachment(id as string);
+        return {
+          id: workflow.id,
+          name: workflow.name,
+          eventCount: workflow.summary.eventCount,
+          screenshotCount: workflow.summary.screenshotCount,
+          applications: [...workflow.summary.apps].slice(0, 8),
+          promptReference: workflow.promptReference,
+        };
+      }));
+      const { workflowIds: _workflowIds, ...rest } = payload;
+      payload = { ...rest, workflows } as JsonObject;
+    }
     const allowedProviderIds = options.allowedProviderIds();
     validateProviderTarget(payload, type === "wallet.get" || type === "wallet.configure" ? new Set([...allowedProviderIds, "direct"]) : allowedProviderIds);
     const requestId = input.requestId === undefined ? undefined : nonEmptyString(input.requestId, "request ID", 160);
@@ -188,6 +234,35 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
     const path = safeAbsolutePath(record(value, "path options").path);
     const error = await shell.openPath(path);
     return error === "";
+  });
+  handle(IPC_CHANNELS.localOpenHandlers, async () => await localOpenState());
+  handle(IPC_CHANNELS.openLocalTarget, async (_event, value: unknown) => {
+    const input = record(value, "local open target");
+    const path = nonEmptyString(input.path, "path", 32_768);
+    const line = optionalPositiveInteger(input.line, "line");
+    const column = optionalPositiveInteger(input.column, "column");
+    const handlers = await localOpenHandlers;
+    const preferredId = input.handlerId === undefined
+      ? options.preferences.value().localOpenHandlerId
+      : localOpenHandlerId(input.handlerId);
+    const handler = handlers.find((candidate) => candidate.id === preferredId) ?? (input.handlerId === undefined ? handlers[0] : undefined);
+    if (!handler) throw new Error("That application is not installed");
+    if (input.rememberAsDefault !== undefined && typeof input.rememberAsDefault !== "boolean") throw new Error("The default application setting is invalid");
+    const target = await existingLocalTarget(path, line, column);
+    await openExistingLocalTarget(target, handler, { shell });
+    if (input.rememberAsDefault === true) await options.preferences.setLocalOpenHandler(handler.id);
+    return { opened: true as const, handlerId: handler.id, state: await localOpenState() };
+  });
+  handle(IPC_CHANNELS.openDictationSetupPage, async (_event, value: unknown) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Dictation source is invalid");
+    const sourceId = (value as { readonly sourceId?: unknown }).sourceId;
+    const url = sourceId === "openai-stt"
+      ? "https://platform.openai.com/api-keys"
+      : sourceId === "xai-stt"
+        ? "https://console.x.ai/"
+        : undefined;
+    if (url === undefined) throw new Error("Dictation source is invalid");
+    await shell.openExternal(url);
   });
   handle(IPC_CHANNELS.showWindow, () => { showWindow(window); });
   handle(IPC_CHANNELS.hideWindow, () => { window.hide(); });
@@ -238,6 +313,8 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
       case "finalize": return await options.recorder.finalize(action.name);
       case "discard": await options.recorder.discard(); return options.recorder.state();
       case "list": return await options.recorder.list();
+      case "screenshots": return await options.recorder.screenshots(action.id);
+      case "screenshot-data": return await options.recorder.screenshot(action.id, action.frameId, action.variant);
       case "delete": await options.recorder.delete(action.id); return options.recorder.state();
       case "reveal": await options.recorder.reveal(action.id); return null;
       case "attachment": return await options.recorder.attachment(action.id);
@@ -246,7 +323,28 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   handle(IPC_CHANNELS.preferencesGet, () => options.preferences.value());
   handle(IPC_CHANNELS.preferencesAction, async (_event, value: unknown) => {
     const action = validatePreferencesAction(value);
-    return await options.preferences.setExperimentalFeatures(action.enabled);
+    switch (action.type) {
+      case "set-experimental-features": return await options.preferences.setExperimentalFeatures(action.enabled);
+      case "set-reasoning-display": return await options.preferences.setReasoningDisplay(action.value);
+      case "set-close-action": return await options.preferences.setCloseAction(action.value);
+      case "set-launch-at-login": return await options.preferences.setLaunchAtLogin(action.value);
+      case "set-alerts": return await options.preferences.setAlerts(action.value);
+      case "choose-global-agents": {
+        const result = await dialog.showOpenDialog(window, {
+          title: "Choose global AGENTS.md",
+          properties: ["openFile"],
+          filters: [{ name: "AGENTS.md", extensions: ["md"] }],
+        });
+        if (result.canceled || result.filePaths[0] === undefined) return options.preferences.value();
+        return await options.preferences.setGlobalAgentsPath(result.filePaths[0]);
+      }
+      case "clear-global-agents": return await options.preferences.setGlobalAgentsPath(null);
+      case "set-task-override": return await options.preferences.setTaskOverride(action.sessionId, action.override);
+      case "set-agent-default": return await options.preferences.setAgentDefault(action.providerId, {
+        modelId: action.modelId,
+        ...(action.reasoningEffort ? { reasoningEffort: action.reasoningEffort } : {}),
+      });
+    }
   });
   handle(IPC_CHANNELS.liveSessionGetState, () => {
     if (!options.liveSession) throw new Error("Instant sessions are not available");
@@ -320,15 +418,59 @@ function validateRecorderAction(value: unknown): RecorderAction {
   if (type === "start" || type === "discard" || type === "list") return { type };
   if (type === "stop") return { type, ...(input.reason === "panic-shortcut" || input.reason === "app-shutdown" || input.reason === "user" ? { reason: input.reason } : {}) };
   if (type === "finalize") return { type, name: nonEmptyString(input.name, "workflow name", 120).trim() };
-  if (type === "delete" || type === "reveal" || type === "attachment") return { type, id: nonEmptyString(input.id, "workflow ID", 160) };
+  if (type === "delete" || type === "reveal" || type === "attachment" || type === "screenshots") return { type, id: nonEmptyString(input.id, "workflow ID", 160) };
+  if (type === "screenshot-data") {
+    const variant = input.variant === "thumbnail" || input.variant === "full" ? input.variant : undefined;
+    if (variant === undefined) throw new Error("Unknown workflow screenshot size");
+    const frameId = nonEmptyString(input.frameId, "workflow screenshot ID", 32);
+    if (!/^frame-\d{6}$/u.test(frameId)) throw new Error("Invalid workflow screenshot ID");
+    return { type, id: nonEmptyString(input.id, "workflow ID", 160), frameId, variant };
+  }
   throw new Error("Unknown recorder action");
 }
 
 function validatePreferencesAction(value: unknown): PreferencesAction {
   const input = record(value, "preferences action");
-  if (input.type !== "set-experimental-features") throw new Error("Unknown preferences action");
-  if (typeof input.enabled !== "boolean") throw new Error("The experimental features setting must be true or false");
-  return { type: "set-experimental-features", enabled: input.enabled };
+  if (input.type === "set-experimental-features") {
+    if (typeof input.enabled !== "boolean") throw new Error("The experimental features setting must be true or false");
+    return { type: "set-experimental-features", enabled: input.enabled };
+  }
+  if (input.type === "set-reasoning-display") {
+    if (input.value !== "compact" && input.value !== "expanded") throw new Error("The reasoning display setting must be compact or expanded");
+    return { type: "set-reasoning-display", value: input.value };
+  }
+  if (input.type === "set-close-action") {
+    if (input.value !== "tray" && input.value !== "quit") throw new Error("The close setting must be tray or quit");
+    return { type: "set-close-action", value: input.value };
+  }
+  if (input.type === "set-launch-at-login") {
+    if (input.value !== "off" && input.value !== "window" && input.value !== "tray") throw new Error("The startup setting must be off, window, or tray");
+    return { type: "set-launch-at-login", value: input.value };
+  }
+  if (input.type === "set-alerts") {
+    if (input.value !== "all" && input.value !== "attention" && input.value !== "off") throw new Error("The alerts setting must be all, attention, or off");
+    return { type: "set-alerts", value: input.value };
+  }
+  if (input.type === "choose-global-agents" || input.type === "clear-global-agents") return { type: input.type };
+  if (input.type === "set-task-override") {
+    const sessionId = nonEmptyString(input.sessionId, "task ID", 400).trim();
+    const patch = record(input.override, "task override");
+    const title = patch.title === undefined || patch.title === "" ? undefined : nonEmptyString(patch.title, "task name", MAX_TASK_TITLE_CHARACTERS).trim();
+    const override: TaskOverride = {
+      // An explicit empty title clears the local name and restores the provider's own.
+      ...(patch.title === undefined ? {} : { title: title ?? "" }),
+      ...(patch.pinned === undefined ? {} : { pinned: patch.pinned === true }),
+      ...(patch.archived === undefined ? {} : { archived: patch.archived === true }),
+    };
+    return { type: "set-task-override", sessionId, override };
+  }
+  if (input.type === "set-agent-default") {
+    const providerId = nonEmptyString(input.providerId, "provider ID", 160).trim();
+    const modelId = nonEmptyString(input.modelId, "model ID", 320).trim();
+    const reasoningEffort = input.reasoningEffort === undefined ? undefined : nonEmptyString(input.reasoningEffort, "reasoning effort", 80).trim();
+    return { type: "set-agent-default", providerId, modelId, ...(reasoningEffort ? { reasoningEffort } : {}) };
+  }
+  throw new Error("Unknown preferences action");
 }
 
 function validateLiveSessionAction(value: unknown): LiveSessionAction {
@@ -395,6 +537,17 @@ function jsonObject(value: unknown, name: string): JsonObject {
 function nonEmptyString(value: unknown, name: string, maximum: number): string {
   if (typeof value !== "string" || value.length === 0 || value.length > maximum) throw new Error(`${name} is invalid`);
   return value;
+}
+
+function optionalPositiveInteger(value: unknown, name: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > 100_000_000) throw new Error(`${name} is invalid`);
+  return value;
+}
+
+function localOpenHandlerId(value: unknown): LocalOpenHandlerId {
+  if (value === "system" || value === "vscode" || value === "cursor" || value === "windsurf" || value === "sublime" || value === "notepadpp" || value === "zed") return value;
+  throw new Error("That application is not available");
 }
 
 function safeAbsolutePath(value: unknown): string {
