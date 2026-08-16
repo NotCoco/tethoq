@@ -61,7 +61,7 @@ win:
     - nsis
 artifactName: Tethoq-Desktop-${version}-${arch}.${ext}
 nsis:
-  include: build/installer.nsh
+  include: scripts/installer.nsh
   oneClick: false
   perMachine: false
   allowToChangeInstallationDirectory: true

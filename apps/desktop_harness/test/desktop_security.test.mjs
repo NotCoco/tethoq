@@ -245,7 +245,7 @@ test("Windows packaging embeds one independently launchable Bridge companion", a
     readFile(new URL("../package.json", import.meta.url), "utf8"),
     readFile(new URL("../scripts/write-release-metadata.cjs", import.meta.url), "utf8"),
     readFile(new URL("../electron-builder.yml", import.meta.url), "utf8"),
-    readFile(new URL("../build/installer.nsh", import.meta.url), "utf8"),
+    readFile(new URL("../scripts/installer.nsh", import.meta.url), "utf8"),
     readFile(new URL("../scripts/verify-embedded-bridge.cjs", import.meta.url), "utf8"),
   ]);
 

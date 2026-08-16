@@ -514,7 +514,6 @@ function waitForChildExit(child, timeoutMs) {
   if (child.exitCode !== null || child.killed || timeoutMs <= 0) return Promise.resolve();
   return new Promise((resolve) => {
     const timeout = setTimeout(done, timeoutMs);
-    timeout.unref?.();
     function done() {
       clearTimeout(timeout);
       child.off?.('exit', done);

@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { access, readFile } from "node:fs/promises";
 import { createConnection, type Socket } from "node:net";
-import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
+import { dirname, win32 } from "node:path";
 import type { DesktopLifecycleController, DesktopProcessState } from "./request_router.js";
 import { DesktopLifecycleError } from "./request_router.js";
 
@@ -43,10 +43,10 @@ export class InstalledDesktopLifecycle implements DesktopLifecycleController {
   #wakePromise: Promise<{ readonly state: "running" | "starting"; readonly launched: boolean }> | undefined;
 
   public constructor(options: InstalledDesktopLifecycleOptions) {
-    if (!isAbsolute(options.executablePath) || options.executablePath.includes("\0")) {
+    if (!win32.isAbsolute(options.executablePath) || options.executablePath.includes("\0")) {
       throw new Error("Desktop executable path must be an absolute trusted path");
     }
-    this.#executablePath = normalize(resolve(options.executablePath));
+    this.#executablePath = win32.normalize(win32.resolve(options.executablePath));
     this.#resolveReadiness = options.resolveReadiness;
     this.#launch = options.launch ?? launchDesktop;
     this.#pathExists = options.pathExists ?? existingFile;
@@ -124,7 +124,7 @@ export function configuredDesktopLifecycle(
   const executablePath = trustedDesktopExecutablePath(environment, runtimeExecutablePath);
   const readinessFile = trustedDesktopReadinessPath(environment);
   if (executablePath === undefined || readinessFile === undefined) return undefined;
-  const fixedReadinessFile = normalize(resolve(readinessFile));
+  const fixedReadinessFile = win32.normalize(win32.resolve(readinessFile));
   return new InstalledDesktopLifecycle({
     executablePath,
     resolveReadiness: async () => await readDesktopReadiness(fixedReadinessFile),
@@ -141,35 +141,35 @@ export function trustedDesktopExecutablePath(
   runtimeExecutablePath: string,
 ): string | undefined {
   const override = environment.TETHOQ_DESKTOP_EXECUTABLE;
-  if (override !== undefined) return isAbsolute(override) && !override.includes("\0") ? normalize(resolve(override)) : undefined;
+  if (override !== undefined) return win32.isAbsolute(override) && !override.includes("\0") ? win32.normalize(win32.resolve(override)) : undefined;
 
-  if (isAbsolute(runtimeExecutablePath)) {
-    const runtimeDirectory = dirname(runtimeExecutablePath);
-    const bridgeDirectory = dirname(runtimeDirectory);
-    const resourcesDirectory = dirname(bridgeDirectory);
-    const companionDirectory = dirname(resourcesDirectory);
+  if (win32.isAbsolute(runtimeExecutablePath)) {
+    const runtimeDirectory = win32.dirname(runtimeExecutablePath);
+    const bridgeDirectory = win32.dirname(runtimeDirectory);
+    const resourcesDirectory = win32.dirname(bridgeDirectory);
+    const companionDirectory = win32.dirname(resourcesDirectory);
     if (
-      basename(runtimeDirectory).toLowerCase() === "runtime"
-      && basename(bridgeDirectory).toLowerCase() === "bridge"
-      && basename(resourcesDirectory).toLowerCase() === "resources"
-      && basename(companionDirectory).toLowerCase() === "bridge-companion"
-      && basename(dirname(companionDirectory)).toLowerCase() === "resources"
+      win32.basename(runtimeDirectory).toLowerCase() === "runtime"
+      && win32.basename(bridgeDirectory).toLowerCase() === "bridge"
+      && win32.basename(resourcesDirectory).toLowerCase() === "resources"
+      && win32.basename(companionDirectory).toLowerCase() === "bridge-companion"
+      && win32.basename(win32.dirname(companionDirectory)).toLowerCase() === "resources"
     ) {
-      return normalize(resolve(companionDirectory, "..", "..", "Tethoq.exe"));
+      return win32.normalize(win32.resolve(companionDirectory, "..", "..", "Tethoq.exe"));
     }
   }
 
   const localAppData = environment.LOCALAPPDATA;
-  if (localAppData === undefined || !isAbsolute(localAppData) || localAppData.includes("\0")) return undefined;
-  return normalize(join(resolve(localAppData), "Programs", "Tethoq", "Tethoq.exe"));
+  if (localAppData === undefined || !win32.isAbsolute(localAppData) || localAppData.includes("\0")) return undefined;
+  return win32.normalize(win32.join(win32.resolve(localAppData), "Programs", "Tethoq", "Tethoq.exe"));
 }
 
 export function trustedDesktopReadinessPath(environment: NodeJS.ProcessEnv): string | undefined {
   const override = environment.TETHOQ_DESKTOP_READINESS_FILE;
-  if (override !== undefined) return isAbsolute(override) && !override.includes("\0") ? normalize(resolve(override)) : undefined;
+  if (override !== undefined) return win32.isAbsolute(override) && !override.includes("\0") ? win32.normalize(win32.resolve(override)) : undefined;
   const appData = environment.APPDATA;
-  if (appData === undefined || !isAbsolute(appData) || appData.includes("\0")) return undefined;
-  return normalize(join(resolve(appData), "Tethoq", "desktop-readiness.json"));
+  if (appData === undefined || !win32.isAbsolute(appData) || appData.includes("\0")) return undefined;
+  return win32.normalize(win32.join(win32.resolve(appData), "Tethoq", "desktop-readiness.json"));
 }
 
 export async function readDesktopReadiness(path: string): Promise<DesktopReadinessDescriptor | undefined> {
