@@ -2084,7 +2084,7 @@ function Conversation({ timeline, approvals, inputs, session, provider, notify, 
   // apart from one the reader caused. Following a streaming reply writes every frame,
   // and a blanket "ignore while we are writing" flag would swallow their scrolls.
   const writtenScrollTop = useRef<number | null>(null);
-  const releaseFrame = useRef<number | undefined>(undefined);
+  const releaseTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const loadOlderProp = useRef(onLoadOlder);
   const timelineSignature = useMemo(
     () => timeline ? `${timeline.length}:${timeline[0]?.id ?? ""}:${timeline[timeline.length - 1]?.id ?? ""}` : "none",
@@ -2112,9 +2112,7 @@ function Conversation({ timeline, approvals, inputs, session, provider, notify, 
     anchoredSignature.current = null;
     loadingOlderRef.current = false;
   }, []);
-  useEffect(() => () => {
-    if (releaseFrame.current !== undefined) window.cancelAnimationFrame(releaseFrame.current);
-  }, []);
+  useEffect(() => () => { if (releaseTimer.current !== undefined) clearTimeout(releaseTimer.current); }, []);
   useLayoutEffect(() => {
     const element = scroller.current;
     const composer = element?.parentElement?.querySelector<HTMLElement>(".composer-wrap");
@@ -2189,16 +2187,17 @@ function Conversation({ timeline, approvals, inputs, session, provider, notify, 
     loadingOlderRef.current = true;
     anchoredSignature.current = signature.current;
     historyAnchor.current = distanceFromEnd(element);
-    if (releaseFrame.current !== undefined) window.cancelAnimationFrame(releaseFrame.current);
+    if (releaseTimer.current !== undefined) clearTimeout(releaseTimer.current);
     try {
       await load();
     } finally {
-      // Nothing arrived — no page, or a rejected one. Hand scrolling back rather than
-      // leaving the reader pinned to a stale anchor.
-      releaseFrame.current = window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
-        releaseFrame.current = undefined;
+      // Nothing arrived — a rejected page, or a request the loader declined. Hand
+      // scrolling back rather than leaving the reader pinned to a stale anchor. A
+      // timer rather than a frame, so an occluded window still releases the guard.
+      releaseTimer.current = setTimeout(() => {
+        releaseTimer.current = undefined;
         if (anchoredSignature.current === signature.current) releaseHistoryAnchor();
-      }));
+      }, 300);
     }
   }, [loadingOlder, olderAvailable, releaseHistoryAnchor]);
   useEffect(() => {
