@@ -54,6 +54,7 @@ TETHOQ_ACCOUNT_CREDENTIALS.md
 
 # Local, non-repository working files belong here
 /local-artifacts/
+/apps/desktop_harness/local-artifacts/
 
 # Operating-system metadata
 .DS_Store

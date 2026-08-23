@@ -40,11 +40,14 @@ export const IPC_CHANNELS = Object.freeze({
   selectFiles: "tethoq:select-files",
   captureScreens: "tethoq:capture-screens",
   revealPath: "tethoq:reveal-path",
+  copyText: "tethoq:copy-text",
   localOpenHandlers: "tethoq:local-open-handlers",
   openLocalTarget: "tethoq:open-local-target",
   openDictationSetupPage: "tethoq:open-dictation-setup-page",
   showWindow: "tethoq:show-window",
   hideWindow: "tethoq:hide-window",
+  /** Renderer has its first snapshot and is worth looking at. */
+  rendererReady: "tethoq:renderer-ready",
   openCodeStatus: "tethoq:opencode-status",
   restartOpenCode: "tethoq:restart-opencode",
   connectorAction: "tethoq:connector-action",
@@ -161,12 +164,15 @@ export interface DesktopRuntimeState {
   readonly message?: string;
 }
 
+export type AttachmentOrigin = "file-picker" | "drag-drop" | "clipboard" | "dictation";
+
 export interface SelectedImage {
   readonly name: string;
   readonly path: string;
   readonly mimeType: string;
   readonly byteLength: number;
   readonly dataBase64: string;
+  readonly origin?: AttachmentOrigin;
 }
 
 /** A single user-selected file. The main process rejects folders and executable/package binaries. */
@@ -177,6 +183,7 @@ export interface SelectedFile {
   readonly mimeType: string;
   readonly byteLength: number;
   readonly dataBase64: string;
+  readonly origin?: AttachmentOrigin;
 }
 
 /** A bounded desktop snapshot prepared by the main process for interactive cropping. */
@@ -283,6 +290,18 @@ export interface DesktopPreferencesState {
   readonly globalAgentsPath: string | null;
   /** Local, user-owned task organisation keyed by session ID. Provider titles are never overwritten upstream. */
   readonly taskOverrides: Readonly<Record<string, TaskOverride>>;
+  /** Master gate for spawning subagents on a different provider/harness. Off by default. */
+  readonly allowForeignSubagents?: boolean;
+  /** Explicit per-session choices recorded by the user; absent keys follow the gate's default. */
+  readonly foreignSubagentOverrides?: Readonly<Record<string, boolean>>;
+  /** Dictation preprocessing: enabled state, audio-capable model, and verbatim/cleaned mode. */
+  readonly ears: EarsSettings;
+}
+export interface EarsSettings {
+  readonly enabled: boolean;
+  readonly providerId: string | null;
+  readonly modelId: string | null;
+  readonly mode: "verbatim" | "cleaned";
 }
 export type DesktopCloseAction = "tray" | "quit";
 export type DesktopLaunchAtLogin = "off" | "window" | "tray";
@@ -307,7 +326,10 @@ export type PreferencesAction =
   | { readonly type: "set-alerts"; readonly value: DesktopAlertLevel }
   | { readonly type: "choose-global-agents" | "clear-global-agents" }
   | { readonly type: "set-task-override"; readonly sessionId: string; readonly override: TaskOverride }
-  | { readonly type: "set-agent-default"; readonly providerId: string; readonly modelId: string; readonly reasoningEffort?: string };
+  | { readonly type: "set-agent-default"; readonly providerId: string; readonly modelId: string; readonly reasoningEffort?: string }
+  | { readonly type: "set-allow-foreign-subagents"; readonly enabled: boolean }
+  | { readonly type: "set-session-foreign-subagents"; readonly sessionId: string; readonly allowed: boolean }
+  | { readonly type: "set-ears"; readonly ears: EarsSettings };
 
 export type LocalOpenHandlerId = "system" | "vscode" | "cursor" | "windsurf" | "sublime" | "notepadpp" | "zed";
 export type LocalOpenHandlerIcon = "explorer" | "vscode" | "cursor" | "windsurf" | "sublime" | "notepadpp" | "zed";
@@ -427,11 +449,20 @@ export interface DesktopHarnessApi {
   selectFiles(providerId: DesktopProviderId): Promise<readonly SelectedFile[]>;
   captureScreens(): Promise<readonly ScreenCaptureSource[]>;
   revealPath(path: string): Promise<boolean>;
+  /**
+   * Copy through the desktop's own clipboard rather than the web one. The window
+   * runs from file:// under a permission policy that grants nothing but audio, so
+   * navigator.clipboard.writeText is refused outright — the copy controls could
+   * never have worked. Resolves false when there was nothing to copy.
+   */
+  copyText(text: string): Promise<boolean>;
   localOpenHandlers(): Promise<LocalOpenState>;
   openLocalTarget(target: LocalOpenTarget): Promise<LocalOpenResult>;
   openDictationSetupPage(sourceId: "openai-stt" | "xai-stt"): Promise<void>;
   showWindow(): Promise<void>;
   hideWindow(): Promise<void>;
+  /** Tells the shell the first snapshot has landed, so the window can be revealed already populated. */
+  notifyReady(): void;
   openCodeStatus(): Promise<OpenCodeProcessStatus>;
   restartOpenCode(): Promise<OpenCodeProcessStatus>;
   connectorAction(action: ConnectorAction): Promise<ConnectorActionResult>;

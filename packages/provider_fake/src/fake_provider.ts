@@ -93,6 +93,7 @@ export class FakeProviderAdapter implements AgentProviderAdapter {
   readonly #requestResults = new Map<string, SendMessageResult>();
   #eventCounter = 0;
   #online = true;
+  public holdActiveTurn = false;
   #failListing = false;
   #disposed = false;
 
@@ -224,6 +225,10 @@ export class FakeProviderAdapter implements AgentProviderAdapter {
       });
     });
     return result;
+  }
+
+  public hasActiveTurn(_providerSessionId: string): boolean {
+    return this.holdActiveTurn;
   }
 
   public async steerMessage(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {

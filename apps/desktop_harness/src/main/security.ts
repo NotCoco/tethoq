@@ -26,8 +26,8 @@ export function hardenSession(session: Session): void {
     const headers = { ...details.responseHeaders };
     headers["Content-Security-Policy"] = [
       process.env.ELECTRON_RENDERER_URL === undefined
-        ? "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http://localhost:* http://127.0.0.1:* http://[::1]:*; connect-src 'none'; font-src 'self'; media-src 'self' blob:; worker-src 'none'"
-        : "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http://localhost:* http://127.0.0.1:* http://[::1]:*; connect-src 'self' ws:; font-src 'self'; media-src 'self' blob:; worker-src 'none'",
+        ? "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http://localhost:* http://127.0.0.1:* http://[::1]:*; connect-src 'none'; font-src 'self'; media-src 'self' blob: tethoq-media:; worker-src 'none'"
+        : "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http://localhost:* http://127.0.0.1:* http://[::1]:*; connect-src 'self' ws:; font-src 'self'; media-src 'self' blob: tethoq-media:; worker-src 'none'",
     ];
     headers["X-Content-Type-Options"] = ["nosniff"];
     headers["Referrer-Policy"] = ["no-referrer"];

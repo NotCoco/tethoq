@@ -102,6 +102,24 @@ function safeImageUri(value: unknown): string | undefined {
   return /^(?:data:image\/[a-z0-9.+-]+;base64,|https?:\/\/)/i.test(value) ? value : undefined;
 }
 
+function audioMimeType(uri: string, explicit: unknown): string | undefined {
+  if (typeof explicit === "string" && explicit.toLowerCase().startsWith("audio/")) return explicit;
+  const match = /^data:(audio\/[a-z0-9.+-]+);base64,/i.exec(uri);
+  return match?.[1];
+}
+
+function safeAudioUri(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  return /^(?:data:audio\/[a-z0-9.+-]+;base64,|https?:\/\/)/i.test(value) ? value : undefined;
+}
+
+function defaultAudioFilename(mimeType: string): string {
+  if (mimeType.toLowerCase() === "audio/mpeg") return "Recording.mp3";
+  if (mimeType.toLowerCase() === "audio/wav") return "Recording.wav";
+  if (mimeType.toLowerCase() === "audio/mp4") return "Recording.m4a";
+  return "Recording";
+}
+
 function wrapperFilename(text: string): string | undefined {
   const match = /^\s*<image\b[^>]*\bpath=(?:"([^"]+)"|'([^']+)')[^>]*>\s*$/i.exec(text);
   return safeFilename(match?.[1] ?? match?.[2]);
@@ -169,6 +187,24 @@ export function codexUserContentParts(value: unknown): readonly ContentPart[] {
         ...(mimeType !== undefined ? { mimeType } : {}),
         ...(name !== undefined ? { name } : {}),
       });
+      pendingFilename = undefined;
+      continue;
+    }
+    if (type === "audio" || type === "input_audio") {
+      const rawUri = value.audio_url ?? value.audioUrl ?? value.url ?? value.uri;
+      const uri = safeAudioUri(rawUri);
+      const mimeType = audioMimeType(uri ?? "", value.mimeType ?? value.mime);
+      if (uri !== undefined && mimeType !== undefined) {
+        parts.push({
+          type: "audio",
+          uri,
+          mimeType,
+          name: safeFilename(value.filename ?? value.fileName ?? value.name) ?? defaultAudioFilename(mimeType),
+          ...(typeof value.durationSeconds === "number" && Number.isFinite(value.durationSeconds) && value.durationSeconds >= 0
+            ? { durationSeconds: value.durationSeconds }
+            : {}),
+        });
+      }
       pendingFilename = undefined;
     }
   }
@@ -330,7 +366,7 @@ function contentParts(hostId: string, item: Record<string, unknown>): readonly C
       status: toolStatus(item.status),
     }];
   }
-  if (type === "contextCompaction") return [{ type: "text", text: "Context compacted" }];
+  if (type === "contextCompaction") return [{ type: "text", text: "Session compacted" }];
   // Codex may add structured item kinds before this client knows how to
   // present them. Do not flatten an unknown object into assistant prose: it
   // can contain an entire browser snapshot, command trace, or provider

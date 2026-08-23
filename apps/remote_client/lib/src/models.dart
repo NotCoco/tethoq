@@ -311,6 +311,8 @@ class ContentPart {
   bool get isAttachment =>
       type == 'image' ||
       type == 'input_image' ||
+      type == 'audio' ||
+      type == 'input_audio' ||
       type == 'file' ||
       type == 'attachment';
 
@@ -347,6 +349,14 @@ class ContentPart {
       return true;
     }
     return attachmentUri?.toLowerCase().startsWith('data:image/') == true;
+  }
+
+  bool get isAudioAttachment {
+    if (type == 'audio' || type == 'input_audio') return true;
+    if (attachmentMimeType?.toLowerCase().startsWith('audio/') == true) {
+      return true;
+    }
+    return attachmentUri?.toLowerCase().startsWith('data:audio/') == true;
   }
 
   String get summary {
@@ -386,12 +396,14 @@ class RemoteAttachment {
     required this.mimeType,
     required this.dataBase64,
     required this.byteLength,
+    this.origin,
   });
 
   final String name;
   final String mimeType;
   final String dataBase64;
   final int byteLength;
+  final String? origin;
 
   String get dataUri => 'data:$mimeType;base64,$dataBase64';
 
@@ -400,6 +412,7 @@ class RemoteAttachment {
         'mimeType': mimeType,
         'dataBase64': dataBase64,
         'byteLength': byteLength,
+        if (origin != null) 'origin': origin,
       };
 }
 
@@ -642,9 +655,14 @@ class ReasoningEffortOption {
   const ReasoningEffortOption({required this.id, this.description});
 
   factory ReasoningEffortOption.fromJson(Object? value) {
+    if (value is String && value.trim().isNotEmpty) {
+      return ReasoningEffortOption(id: value.trim());
+    }
     final json = jsonMap(value, name: 'reasoning effort');
     return ReasoningEffortOption(
       id: optionalString(json, 'reasoningEffort') ??
+          optionalString(json, 'id') ??
+          optionalString(json, 'value') ??
           optionalString(json, 'effort') ??
           'default',
       description: optionalString(json, 'description'),
@@ -689,14 +707,46 @@ class RemoteModel {
   final List<String> inputModalities;
   final JsonMap nativeMetadata;
 
-  List<ReasoningEffortOption> get reasoningEfforts =>
-      jsonList(nativeMetadata['supportedReasoningEfforts'])
-          .map(ReasoningEffortOption.fromJson)
-          .where((option) => _isConcreteReasoningEffort(option.id))
-          .toList(growable: false);
+  String? get sourceProviderId => optionalString(nativeMetadata, 'sourceProviderId');
+  String? get sourceProviderName => optionalString(nativeMetadata, 'sourceProviderName');
 
-  String? get defaultReasoningEffort =>
-      optionalString(nativeMetadata, 'defaultReasoningEffort');
+  String get routeProviderName {
+    if (providerId != 'opencode') return providerId;
+    return sourceProviderName ?? sourceProviderId ?? 'OpenCode';
+  }
+
+  String? get routeCarrierName {
+    if (providerId != 'opencode' || routeProviderName.toLowerCase() == 'opencode') return null;
+    return 'OpenCode';
+  }
+
+  String get routeProviderLabel => routeCarrierName == null
+      ? routeProviderName
+      : '$routeProviderName via $routeCarrierName';
+
+  List<ReasoningEffortOption> get reasoningEfforts {
+    final advertised = jsonList(nativeMetadata['supportedReasoningEfforts'])
+        .followedBy(jsonList(nativeMetadata['reasoningEfforts']))
+        .followedBy(jsonList(nativeMetadata['thoughtLevels']))
+        .followedBy(jsonList(nativeMetadata['thought_levels']))
+        .map(ReasoningEffortOption.fromJson)
+        .where((option) => _isConcreteReasoningEffort(option.id))
+        .toList();
+    if (advertised.isNotEmpty) return List<ReasoningEffortOption>.unmodifiable(advertised);
+    return List<ReasoningEffortOption>.unmodifiable(_knownReasoningEfforts(providerId, id, displayName)
+        .map((effort) => ReasoningEffortOption(id: effort)));
+  }
+
+  String? get defaultReasoningEffort {
+    final advertised = optionalString(nativeMetadata, 'defaultReasoningEffort');
+    if (advertised != null) return advertised;
+    final haystack = _knownReasoningHaystack(providerId, id, displayName);
+    if (RegExp(r'grok[- .]?4\.6').hasMatch(haystack) ||
+        RegExp(r'grok[- .]?4\.5').hasMatch(haystack)) {
+      return 'high';
+    }
+    return null;
+  }
 
   bool? get supportsImageInput {
     if (inputModalities.isNotEmpty) {
@@ -734,6 +784,42 @@ class RemoteModel {
         .any((value) => value == 'image' || value.startsWith('image/'));
   }
 
+  bool? get supportsAudioInput {
+    if (inputModalities.isNotEmpty) {
+      return inputModalities
+          .any((value) => value == 'audio' || value.startsWith('audio/'));
+    }
+    for (final key in const <String>[
+      'supportsAudioInput',
+      'supportsAudio',
+      'audioInput',
+    ]) {
+      final value = nativeMetadata[key];
+      if (value is bool) return value;
+    }
+
+    Object? modalities = nativeMetadata['inputModalities'] ??
+        nativeMetadata['supportedInputModalities'] ??
+        nativeMetadata['input_modalities'];
+    final grouped = nativeMetadata['modalities'];
+    if (modalities == null && grouped is Map<Object?, Object?>) {
+      modalities = grouped['input'];
+    }
+    if (modalities is! List<Object?> || modalities.isEmpty) return null;
+    final values = modalities
+        .map((value) => value is String
+            ? value
+            : value is Map<Object?, Object?>
+                ? value['type']
+                : null)
+        .whereType<String>()
+        .map((value) => value.toLowerCase())
+        .toList(growable: false);
+    if (values.isEmpty) return null;
+    return values
+        .any((value) => value == 'audio' || value.startsWith('audio/'));
+  }
+
   String? get endpointId {
     final explicit = optionalString(nativeMetadata, 'endpointId') ??
         optionalString(nativeMetadata, 'sourceProviderId');
@@ -758,6 +844,56 @@ bool _isConcreteReasoningEffort(String value) {
       normalized != 'model-default' &&
       normalized != 'unknown' &&
       normalized != 'unspecified';
+}
+
+String _knownReasoningHaystack(String providerId, String modelId, String displayName) =>
+    '$providerId $modelId $displayName'.toLowerCase();
+
+List<String> _knownReasoningEfforts(
+    String providerId, String modelId, String displayName) {
+  final haystack = _knownReasoningHaystack(providerId, modelId, displayName);
+  if (haystack.contains('non-reasoning') || haystack.contains('non_reasoning')) {
+    return const <String>[];
+  }
+  if (RegExp(r'grok[- .]?4\.6').hasMatch(haystack)) {
+    return const <String>['low', 'medium', 'high', 'xhigh'];
+  }
+  if (RegExp(r'grok[- .]?4\.5').hasMatch(haystack)) {
+    return const <String>['low', 'medium', 'high'];
+  }
+  if (RegExp(r'grok[- .]?4\.3').hasMatch(haystack)) {
+    return const <String>['none', 'low', 'medium', 'high'];
+  }
+  return const <String>[];
+}
+
+bool _usesCodexLightLabel(
+    String? providerId, String? modelId, String? displayName) {
+  final haystack =
+      _knownReasoningHaystack(providerId ?? '', modelId ?? '', displayName ?? '');
+  if (haystack.contains('grok')) return false;
+  if (providerId == 'codex') return true;
+  return RegExp(r'gpt[- .]?5\.6').hasMatch(haystack);
+}
+
+/// Compact human label. Codex `low` is Light; Grok's documented name is Low.
+String reasoningDisplayLabel(
+  String effort, {
+  String? providerId,
+  String? modelId,
+  String? displayName,
+}) {
+  final normalized = effort.trim().toLowerCase();
+  if (normalized.isEmpty) return effort;
+  if (normalized == 'low') {
+    return _usesCodexLightLabel(providerId, modelId, displayName)
+        ? 'Light'
+        : 'Low';
+  }
+  if (normalized == 'light') return 'Light';
+  if (normalized == 'xhigh' || normalized == 'x-high') return 'Extra high';
+  if (normalized == 'none' || normalized == 'off') return 'Off';
+  return '${normalized[0].toUpperCase()}${normalized.substring(1)}';
 }
 
 class ProviderWalletEndpoint {

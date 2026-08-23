@@ -98,7 +98,7 @@ test("Windows packaging applies Tethoq identity to executable, installer, shortc
   assert.match(assetScript, /Copy-Item[^\n]+tethoq-tray\.ico[^\n]+tethoq-tray\.ico/);
   assert.match(assetsReadme, /deterministic output/);
   assert.match(mainSource, /app\.setName\("Tethoq"\)/);
-  assert.match(mainSource, /app\.setAppUserModelId\("app\.tethoq\.desktop"\)/);
+  assert.match(mainSource, /app\.setAppUserModelId\(app\.isPackaged \? "app\.tethoq\.desktop" : "app\.tethoq\.desktop\.dev"\)/);
   assert.match(mainSource, /process\.platform === "win32"[\s\S]*?tethoq-icon\.ico/);
   assert.match(mainSource, /new Tray\(trayIconPath\(\)\)/);
   assert.match(mainSource, /process\.platform === "win32"[\s\S]*?tethoq-tray\.ico/);

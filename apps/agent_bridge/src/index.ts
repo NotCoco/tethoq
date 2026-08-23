@@ -4,6 +4,7 @@ export * from "./session_cache.js";
 export * from "./approvals.js";
 export * from "./config.js";
 export * from "./persistence.js";
+export * from "./compaction_threshold_store.js";
 export * from "./request_router.js";
 export * from "./user_inputs.js";
 export * from "./transport.js";

@@ -1,4 +1,5 @@
 import type { JsonObject, RemoteSession } from "../../../packages/protocol/src/index.js";
+import type { SessionSelection } from "./session_selection_store.js";
 
 const bridgeNativeMetadataKeys = [
   "relationshipKind",
@@ -13,10 +14,62 @@ const bridgeNativeMetadataKeys = [
   "tethoqClientTitle",
   "tethoqClientPreview",
   "tethoqInitialProviderTitle",
+  "tethoqObservedExternalLaunch",
 ] as const;
+
+export interface SessionCacheOptions {
+  /**
+   * Reports whether a cached session's "working" state reflects a turn the
+   * bridge itself knows is in flight. Provider session listings lag live
+   * turns, so a reconcile must not downgrade such sessions while this holds.
+   */
+  readonly preserveWorking?: (globalSessionId: string) => boolean;
+  /** Selections learned in an earlier run, so a restart is not blind. */
+  readonly knownSelections?: Readonly<Record<string, SessionSelection>>;
+  readonly onSelectionsChange?: (selections: Readonly<Record<string, SessionSelection>>) => void;
+  readonly now?: () => Date;
+}
+
+/** What the user asked for on the most recent turn of a session. */
+export interface RequestedSelection {
+  readonly modelId?: string;
+  readonly reasoningEffort?: string;
+}
 
 export class SessionCache {
   readonly #sessions = new Map<string, RemoteSession>();
+  readonly #knownSelections = new Map<string, SessionSelection>();
+  readonly #preserveWorking: (globalSessionId: string) => boolean;
+  readonly #onSelectionsChange: ((selections: Readonly<Record<string, SessionSelection>>) => void) | undefined;
+  readonly #now: () => Date;
+
+  public constructor(options: SessionCacheOptions = {}) {
+    this.#preserveWorking = options.preserveWorking ?? (() => false);
+    this.#onSelectionsChange = options.onSelectionsChange;
+    this.#now = options.now ?? (() => new Date());
+    for (const [sessionId, selection] of Object.entries(options.knownSelections ?? {})) {
+      this.#knownSelections.set(sessionId, selection);
+    }
+  }
+
+  /**
+   * Records what a harness says a session is running. This is the strong signal:
+   * it outranks anything Tethoq merely asked for, and is what later fills the gap
+   * for harnesses that only reveal the level once a session is opened.
+   */
+  public rememberReportedSelection(globalSessionId: string, selection: RequestedSelection): void {
+    this.recordSelection(globalSessionId, selection, "reported");
+  }
+
+  /** Seeds what an earlier run learned, without reporting it back as a change. */
+  public restoreSelections(selections: Readonly<Record<string, SessionSelection>>): void {
+    for (const [sessionId, selection] of Object.entries(selections)) {
+      if (this.#knownSelections.has(sessionId)) continue;
+      this.#knownSelections.set(sessionId, selection);
+      const session = this.#sessions.get(sessionId);
+      if (session !== undefined) this.#sessions.set(sessionId, this.withKnownSelection(session));
+    }
+  }
 
   public all(): readonly RemoteSession[] {
     return [...this.#sessions.values()].sort((left, right) => right.lastActivityAt.localeCompare(left.lastActivityAt));
@@ -26,8 +79,84 @@ export class SessionCache {
     return this.#sessions.get(globalSessionId);
   }
 
+  public delete(globalSessionId: string): void {
+    this.#sessions.delete(globalSessionId);
+    this.#knownSelections.delete(globalSessionId);
+  }
+
   public upsert(session: RemoteSession): void {
-    this.#sessions.set(session.id, withInferredSubagentRelationship(session));
+    // A listing that states the level is the harness reporting it, so learn from it.
+    this.learnFromSession(session);
+    this.#sessions.set(session.id, withInferredSubagentRelationship(this.withKnownSelection(session)));
+  }
+
+  /**
+   * Records the model and effort a turn was dispatched with, as a stand-in until
+   * the harness reports what it is actually running. It deliberately does not
+   * outrank the harness: a remembered value that wins forever is how a stale
+   * choice survives a change made outside Tethoq.
+   */
+  public rememberRequestedSelection(globalSessionId: string, selection: RequestedSelection): void {
+    this.recordSelection(globalSessionId, selection, "requested");
+  }
+
+  /** Everything learned so far, for persisting across restarts. */
+  public knownSelections(): Readonly<Record<string, SessionSelection>> {
+    return Object.fromEntries(this.#knownSelections);
+  }
+
+  private learnFromSession(session: RemoteSession): void {
+    if (session.modelId === undefined && session.reasoningEffort === undefined) return;
+    this.recordSelection(session.id, {
+      ...(session.modelId !== undefined ? { modelId: session.modelId } : {}),
+      ...(session.reasoningEffort !== undefined ? { reasoningEffort: session.reasoningEffort } : {}),
+    }, "reported");
+  }
+
+  private recordSelection(
+    globalSessionId: string,
+    selection: RequestedSelection,
+    source: SessionSelection["source"],
+  ): void {
+    const modelId = selection.modelId?.trim();
+    const reasoningEffort = selection.reasoningEffort?.trim();
+    if (!modelId && !reasoningEffort) return;
+    const previous = this.#knownSelections.get(globalSessionId);
+    // A model change invalidates an effort chosen for the previous model.
+    const keepsEffort = !reasoningEffort && (!modelId || modelId === previous?.modelId);
+    const carriedEffort = keepsEffort ? previous?.reasoningEffort : undefined;
+    const next: SessionSelection = {
+      ...(modelId ?? previous?.modelId ? { modelId: modelId ?? previous!.modelId! } : {}),
+      ...(reasoningEffort ?? carriedEffort ? { reasoningEffort: reasoningEffort ?? carriedEffort! } : {}),
+      source,
+      updatedAt: this.#now().toISOString(),
+    };
+    const changed = next.modelId !== previous?.modelId || next.reasoningEffort !== previous?.reasoningEffort;
+    this.#knownSelections.set(globalSessionId, next);
+    if (changed) this.#onSelectionsChange?.(this.knownSelections());
+    const session = this.#sessions.get(globalSessionId);
+    if (session === undefined) return;
+    // This is the newest thing known about the session, so it is applied directly.
+    const dropsEffort = previous?.reasoningEffort !== undefined && !reasoningEffort && !keepsEffort;
+    const base = dropsEffort ? withoutEffort(session) : session;
+    this.#sessions.set(globalSessionId, {
+      ...base,
+      ...(modelId ? { modelId } : {}),
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+    });
+  }
+
+  private withKnownSelection(session: RemoteSession): RemoteSession {
+    const selection = this.#knownSelections.get(session.id);
+    if (selection === undefined) return session;
+    // Fill only what the harness has not told us this time. Whatever it reports
+    // now is what the session is really running, including a level the user set
+    // inside the harness itself, and must not be overwritten by an older value.
+    return {
+      ...session,
+      ...(session.modelId === undefined && selection.modelId !== undefined ? { modelId: selection.modelId } : {}),
+      ...(session.reasoningEffort === undefined && selection.reasoningEffort !== undefined ? { reasoningEffort: selection.reasoningEffort } : {}),
+    };
   }
 
   public reconcileProvider(providerId: string, sessions: readonly RemoteSession[]): number {
@@ -39,7 +168,17 @@ export class SessionCache {
       if (this.reconcileSession(session)) newlyDiscovered += 1;
       priorIds.delete(session.id);
     }
-    for (const removedId of priorIds) this.#sessions.delete(removedId);
+    for (const removedId of priorIds) {
+      // A positively-linked child is durable evidence that this task is its
+      // mother. Some provider listings briefly omit an externally-owned parent;
+      // deleting it here makes the mother row blink out while its children stay
+      // cached. Keep only exact relationship sources, never title-like guesses.
+      const ownsLinkedSession = [...this.#sessions.values()].some((candidate) =>
+        candidate.relationship?.sourceSessionId === removedId);
+      if (ownsLinkedSession) continue;
+      this.#sessions.delete(removedId);
+      this.#knownSelections.delete(removedId);
+    }
     return newlyDiscovered;
   }
 
@@ -75,6 +214,25 @@ export class SessionCache {
     });
   }
 
+  /**
+   * Applies transient provider-owned status detail without manufacturing a
+   * transcript message. `null` is an explicit clear; omission is handled by
+   * the caller so unrelated events cannot accidentally erase the notice.
+   */
+  public updateProviderStatus(
+    globalSessionId: string,
+    providerStatus: NonNullable<RemoteSession["providerStatus"]> | null,
+  ): void {
+    const session = this.#sessions.get(globalSessionId);
+    if (session === undefined) return;
+    if (providerStatus === null) {
+      const { providerStatus: _cleared, ...rest } = session;
+      this.#sessions.set(globalSessionId, rest);
+      return;
+    }
+    this.#sessions.set(globalSessionId, { ...session, providerStatus });
+  }
+
   public updateMetadata(
     globalSessionId: string,
     metadata: Partial<Pick<RemoteSession, "modelId" | "reasoningEffort" | "variantId" | "parentSessionId" | "relationship" | "sessionKind" | "contextHandoffSummary" | "agentNickname" | "agentRole">>,
@@ -96,18 +254,25 @@ export class SessionCache {
   }
 
   private reconcileSession(session: RemoteSession): boolean {
+    this.learnFromSession(session);
     const existing = this.#sessions.get(session.id);
-    const state = session.state === "unknown" && existing !== undefined && existing.state !== "unknown"
-      ? existing.state
-      : session.state;
+    const state = this.#preserveWorking(session.id) && existing?.state === "working"
+      ? "working"
+      : session.state === "unknown" && existing !== undefined && existing.state !== "unknown" && existing.state !== "working"
+        ? existing.state
+        : session.state;
     const clientTitle = typeof existing?.nativeMetadata.tethoqClientTitle === "string" ? existing.nativeMetadata.tethoqClientTitle : undefined;
     const clientPreview = typeof existing?.nativeMetadata.tethoqClientPreview === "string" ? existing.nativeMetadata.tethoqClientPreview : undefined;
     const initialProviderTitle = typeof existing?.nativeMetadata.tethoqInitialProviderTitle === "string" ? existing.nativeMetadata.tethoqInitialProviderTitle : undefined;
     const keepClientTitle = clientTitle !== undefined && initialProviderTitle !== undefined && session.title === initialProviderTitle;
-    this.#sessions.set(session.id, withInferredSubagentRelationship({
+    // providerStatus deliberately has no existing-session fallback here. A
+    // canonical provider refresh that omits it is proof that a transient retry
+    // is no longer current, so preserving the cached value would revive a stale
+    // notice after reconnect or restart.
+    this.#sessions.set(session.id, withInferredSubagentRelationship(this.withKnownSelection({
       ...session,
       ...(keepClientTitle ? { title: clientTitle } : {}),
-      ...((session.preview === undefined || session.preview.trim() === "") && clientPreview !== undefined ? { preview: clientPreview } : {}),
+      ...((session.preview === undefined || session.preview.trim() === "" || session.preview.trim().toLocaleLowerCase() === session.title.trim().toLocaleLowerCase()) && clientPreview !== undefined ? { preview: clientPreview } : {}),
       state,
       stale: false,
       nativeMetadata: { ...session.nativeMetadata, ...bridgeNativeMetadata(existing?.nativeMetadata) },
@@ -120,9 +285,14 @@ export class SessionCache {
       ...(session.contextHandoffSummary === undefined && existing?.contextHandoffSummary !== undefined ? { contextHandoffSummary: existing.contextHandoffSummary } : {}),
       ...(session.agentNickname === undefined && existing?.agentNickname !== undefined ? { agentNickname: existing.agentNickname } : {}),
       ...(session.agentRole === undefined && existing?.agentRole !== undefined ? { agentRole: existing.agentRole } : {}),
-    }));
+    })));
     return existing === undefined;
   }
+}
+
+function withoutEffort(session: RemoteSession): RemoteSession {
+  const { reasoningEffort: _dropped, ...rest } = session;
+  return rest;
 }
 
 function bridgeNativeMetadata(metadata: JsonObject | undefined): JsonObject {
@@ -137,6 +307,8 @@ function bridgeNativeMetadata(metadata: JsonObject | undefined): JsonObject {
 
 function withInferredSubagentRelationship(session: RemoteSession): RemoteSession {
   if (session.relationship !== undefined || session.parentSessionId === undefined) return session;
+  const role = (session.agentRole ?? "").toLowerCase();
+  if (!role.includes("delegate") && !role.includes("subagent") && !role.includes("helper")) return session;
   return {
     ...session,
     relationship: {

@@ -8,15 +8,23 @@ abstract class DictationRecorder {
   Future<Uint8List> stop();
   Future<void> cancel();
   Future<void> dispose();
+  /// Live input level (0..1) while recording. Never emits outside recording.
+  Stream<double> get levelStream;
 }
 
 class MicrophoneDictationRecorder implements DictationRecorder {
   static const int _sampleRate = 16000;
 
   final AudioRecorder _recorder = AudioRecorder();
+  final StreamController<double> _levels =
+      StreamController<double>.broadcast();
   BytesBuilder? _audio;
   StreamSubscription<Uint8List>? _subscription;
   Completer<void>? _streamDone;
+  DateTime? _lastEmit;
+
+  @override
+  Stream<double> get levelStream => _levels.stream;
 
   @override
   Future<bool> start() async {
@@ -35,7 +43,10 @@ class MicrophoneDictationRecorder implements DictationRecorder {
       noiseSuppress: true,
     ));
     _subscription = stream.listen(
-      _audio!.add,
+      (chunk) {
+        _audio!.add(chunk);
+        _emitLevel(chunk);
+      },
       onError: (Object error, StackTrace stackTrace) {
         if (!(_streamDone?.isCompleted ?? true)) {
           _streamDone!.completeError(error, stackTrace);
@@ -60,6 +71,26 @@ class MicrophoneDictationRecorder implements DictationRecorder {
     return _waveFile(pcm, sampleRate: _sampleRate, channels: 1);
   }
 
+  void _emitLevel(Uint8List chunk) {
+    final now = DateTime.now();
+    final last = _lastEmit;
+    if (last != null && now.difference(last) < const Duration(milliseconds: 60)) {
+      return;
+    }
+    _lastEmit = now;
+    var sum = 0.0;
+    final count = chunk.length ~/ 2;
+    if (count == 0) return;
+    final view = ByteData.sublistView(chunk);
+    for (var index = 0; index < count; index += 1) {
+      final sample = view.getInt16(index * 2, Endian.little) / 32768.0;
+      sum += sample * sample;
+    }
+    final rms = (sum / count).clamp(0.0, 1.0);
+    final level = (rms.isFinite ? rms : 0.0).clamp(0.0, 1.0);
+    if (!_levels.isClosed) _levels.add(level);
+  }
+
   @override
   Future<void> cancel() async {
     await _recorder.cancel();
@@ -71,6 +102,7 @@ class MicrophoneDictationRecorder implements DictationRecorder {
   @override
   Future<void> dispose() async {
     await _subscription?.cancel();
+    await _levels.close();
     await _recorder.dispose();
   }
 }

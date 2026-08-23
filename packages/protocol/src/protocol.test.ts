@@ -81,7 +81,11 @@ test("event deduplication and replay sequencing survive out-of-order input", () 
   assert.equal(deduper.accept("e2"), true, "oldest event was evicted from bounded dedupe state");
 
   const replay = new EventReplayBuffer("host", 2);
+  let notified = 0;
+  const stop = replay.subscribe(() => { notified += 1; });
   replay.append({ eventId: "one", type: "message.started" });
+  assert.equal(notified, 1);
+  stop();
   replay.append({ eventId: "two", type: "message.delta" });
   replay.append({ eventId: "three", type: "message.completed" });
   assert.deepEqual(replay.since(0).map((event) => event.eventId), ["two", "three"]);

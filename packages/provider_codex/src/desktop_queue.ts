@@ -2,14 +2,18 @@ import { randomUUID } from "node:crypto";
 import { watch, type FSWatcher } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, extname, join } from "node:path";
 import { connect, type Socket } from "node:net";
 
 import type {
   EnqueueProviderMessageRequest,
+  ProviderQueuedMessageAttachment,
   ProviderQueuedMessage,
   RestoreProviderMessageRequest,
+  SendMessageRequest,
+  SendMessageResult,
 } from "../../provider_contract/src/index.js";
+import { codexTurnInput } from "./codex_input.js";
 
 interface DesktopQueuedMessage {
   readonly id: string;
@@ -40,9 +44,13 @@ export interface CodexDesktopQueueOptions {
 }
 
 const queueKey = "queued-follow-ups";
+const maximumQueuedPreviewCharacters = 192 * 1024;
+const maximumQueuedPreviewCharactersPerMessage = 640 * 1024;
 const ipcVersions: Readonly<Record<string, number>> = {
   "thread-owner-discovery": 1,
   "thread-follower-set-queued-follow-ups-state": 1,
+  "thread-follower-start-turn": 1,
+  "thread-follower-steer-turn": 1,
 };
 
 export class CodexDesktopQueue {
@@ -95,6 +103,94 @@ export class CodexDesktopQueue {
     };
     await this.replaceConversationQueue(providerSessionId, state, [...(state[providerSessionId] ?? []), desktopMessage]);
     return normalizeQueuedMessage(providerSessionId, desktopMessage);
+  }
+
+  /** Starts a real turn inside the Codex Desktop process that owns this task. */
+  public async startTurn(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
+    const result = await this.tryStartTurn(providerSessionId, request);
+    if (result === null) throw new Error("Open this Codex task on the desktop before sending its attachment");
+    return result;
+  }
+
+  /** Returns null when no Desktop window currently owns the task. */
+  public async tryStartTurn(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult | null> {
+    const client = await CodexIpcClient.connect(this.#pipePath);
+    try {
+      const owner = await client.request("thread-owner-discovery", { hostId: "local", conversationId: providerSessionId });
+      if (owner.resultType !== "success" || owner.handledByClientId === undefined) {
+        return null;
+      }
+      const response = await client.request(
+        "thread-follower-start-turn",
+        {
+          conversationId: providerSessionId,
+          turnStart: {
+            request: {
+              threadId: providerSessionId,
+              clientUserMessageId: request.requestId,
+              input: codexTurnInput(request),
+              ...(request.modelId !== undefined ? { model: request.modelId } : {}),
+              ...(request.reasoningEffort !== undefined ? { effort: request.reasoningEffort } : {}),
+            },
+          },
+        },
+        owner.handledByClientId,
+      );
+      if (response.resultType !== "success") throw new Error(response.error ?? "Codex Desktop rejected the attachment");
+      const forwarded = isRecord(response.result) && isRecord(response.result.result) ? response.result.result : undefined;
+      const turn = forwarded !== undefined && isRecord(forwarded.turn) ? forwarded.turn : undefined;
+      const turnId = turn !== undefined && typeof turn.id === "string" ? turn.id : undefined;
+      if (turnId === undefined || !turnId.trim()) throw new Error("Codex Desktop did not confirm that the audio turn started");
+      return { accepted: true, providerTurnId: turnId, details: [] };
+    } finally {
+      client.dispose();
+    }
+  }
+
+  /**
+   * Moves one native queued follow-up into the turn owned by Codex Desktop.
+   * The full original composer record is supplied as `restoreMessage`, so Codex
+   * can put back images/files/context if the active turn ends during the steer.
+   */
+  public async steerQueuedMessage(providerSessionId: string, messageId: string, request: SendMessageRequest): Promise<SendMessageResult> {
+    const state = await this.readState();
+    const current = [...(state[providerSessionId] ?? [])];
+    const index = current.findIndex((message) => message.id === messageId);
+    if (index < 0) throw new Error("That queued Codex instruction is no longer available");
+    const original = current[index]!;
+    const next = [...current.slice(0, index), ...current.slice(index + 1)];
+
+    const client = await CodexIpcClient.connect(this.#pipePath);
+    try {
+      const owner = await client.request("thread-owner-discovery", { hostId: "local", conversationId: providerSessionId });
+      if (owner.resultType !== "success" || owner.handledByClientId === undefined) {
+        throw new Error("Open this Codex task on the desktop before steering its queued instruction");
+      }
+      await this.replaceConversationQueueWithClient(client, owner.handledByClientId, providerSessionId, state, next);
+      try {
+        const response = await client.request(
+          "thread-follower-steer-turn",
+          {
+            conversationId: providerSessionId,
+            input: codexTurnInput({ ...request, content: original.text }),
+            restoreMessage: original,
+            serviceTier: null,
+            attachments: [],
+            clientUserMessageId: original.id,
+          },
+          owner.handledByClientId,
+        );
+        if (response.resultType !== "success") throw new Error(response.error ?? "Codex Desktop rejected the queued steer");
+        const forwarded = isRecord(response.result) && isRecord(response.result.result) ? response.result.result : undefined;
+        const turnId = forwarded !== undefined && typeof forwarded.turnId === "string" ? forwarded.turnId : undefined;
+        return { accepted: true, ...(turnId !== undefined ? { providerTurnId: turnId } : {}), details: [] };
+      } catch (error) {
+        await this.replaceConversationQueueWithClient(client, owner.handledByClientId, providerSessionId, state, current);
+        throw error;
+      }
+    } finally {
+      client.dispose();
+    }
   }
 
   public async restore(providerSessionId: string, request: RestoreProviderMessageRequest): Promise<ProviderQueuedMessage> {
@@ -186,24 +282,34 @@ export class CodexDesktopQueue {
     current: DesktopQueueState,
     messages: readonly DesktopQueuedMessage[],
   ): Promise<void> {
-    const state: DesktopQueueState = { ...current };
-    if (messages.length === 0) delete state[providerSessionId];
-    else state[providerSessionId] = messages;
     const client = await CodexIpcClient.connect(this.#pipePath);
     try {
       const owner = await client.request("thread-owner-discovery", { hostId: "local", conversationId: providerSessionId });
       if (owner.resultType !== "success" || owner.handledByClientId === undefined) {
         throw new Error("Open this Codex task on the desktop before changing its queue from the phone");
       }
-      const response = await client.request(
-        "thread-follower-set-queued-follow-ups-state",
-        { conversationId: providerSessionId, state },
-        owner.handledByClientId,
-      );
-      if (response.resultType !== "success") throw new Error(response.error ?? "Codex Desktop rejected the queue update");
+      await this.replaceConversationQueueWithClient(client, owner.handledByClientId, providerSessionId, current, messages);
     } finally {
       client.dispose();
     }
+  }
+
+  private async replaceConversationQueueWithClient(
+    client: CodexIpcClient,
+    ownerClientId: string,
+    providerSessionId: string,
+    current: DesktopQueueState,
+    messages: readonly DesktopQueuedMessage[],
+  ): Promise<void> {
+    const state: DesktopQueueState = { ...current };
+    if (messages.length === 0) delete state[providerSessionId];
+    else state[providerSessionId] = messages;
+    const response = await client.request(
+      "thread-follower-set-queued-follow-ups-state",
+      { conversationId: providerSessionId, state },
+      ownerClientId,
+    );
+    if (response.resultType !== "success") throw new Error(response.error ?? "Codex Desktop rejected the queue update");
     this.#messages = normalizeQueueState(state);
     await this.#onChanged(this.#messages);
   }
@@ -337,17 +443,116 @@ function normalizeQueueState(state: DesktopQueueState): readonly ProviderQueuedM
 
 function normalizeQueuedMessage(providerSessionId: string, message: DesktopQueuedMessage): ProviderQueuedMessage {
   const error = typeof message.pausedReason === "string" && message.pausedReason.trim() ? message.pausedReason : undefined;
+  const attachments = nativeQueuedAttachments(message.context);
   return {
     id: message.id,
     providerSessionId,
     content: message.text,
     state: error === undefined ? "queued" : "failed",
     createdAt: new Date(message.createdAt).toISOString(),
+    ...(attachments.length > 0 ? { attachments } : {}),
     ...(typeof message.context.tethoqDeveloperInstructions === "string" && message.context.tethoqDeveloperInstructions.trim()
       ? { developerInstructions: message.context.tethoqDeveloperInstructions }
       : {}),
     ...(error !== undefined ? { error } : {}),
   };
+}
+
+function nativeQueuedAttachments(context: Record<string, unknown>): readonly ProviderQueuedMessageAttachment[] {
+  const result: ProviderQueuedMessageAttachment[] = [];
+  let previewCharacters = 0;
+  const seen = new Set<string>();
+  const append = (value: unknown, fallbackName: string, fallbackMimeType: string): void => {
+    if (!isRecord(value)) return;
+    const previewCandidate = firstString(value.previewSrc, value.imageDataUrl, value.uploadSrc, value.src, value.dataUrl);
+    const preview = safeQueuedPreview(previewCandidate, previewCharacters);
+    if (preview !== undefined) previewCharacters += preview.length;
+    const pathCandidate = firstString(value.localPath, value.path, value.imagePath);
+    const name = firstString(value.filename, value.fileName, value.name, value.title)
+      ?? (pathCandidate === undefined ? undefined : basename(pathCandidate))
+      ?? fallbackName;
+    const mimeType = firstMimeType(value.mimeType, value.mediaType, value.contentType)
+      ?? mimeTypeFromDataUrl(preview)
+      ?? mimeTypeFromName(name)
+      ?? fallbackMimeType;
+    const byteLength = firstNonNegativeNumber(value.byteLength, value.size, value.fileSize)
+      ?? decodedDataUrlBytes(preview)
+      ?? 0;
+    const durationSeconds = firstPositiveNumber(value.durationSeconds, value.duration);
+    const key = `${name}\u0000${mimeType}\u0000${byteLength}\u0000${preview ?? ""}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    result.push({
+      name,
+      mimeType,
+      byteLength,
+      ...(preview !== undefined ? { dataUrl: preview } : {}),
+      ...(durationSeconds !== undefined ? { durationSeconds } : {}),
+    });
+  };
+  const appendArray = (value: unknown, fallbackName: string, fallbackMimeType: string): void => {
+    if (!Array.isArray(value)) return;
+    for (const item of value) append(item, fallbackName, fallbackMimeType);
+  };
+
+  appendArray(context.imageAttachments, "Image", "image/*");
+  appendArray(context.appshotContexts, "App screenshot", "image/*");
+  appendArray(context.mcpAppModelContextAttachments, "Image", "image/*");
+  appendArray(context.fileAttachments, "File", "application/octet-stream");
+  appendArray(context.pastedTextAttachments, "Pasted text", "text/plain");
+  return result;
+}
+
+function safeQueuedPreview(value: string | undefined, usedCharacters: number): string | undefined {
+  if (value === undefined || value.length > maximumQueuedPreviewCharacters) return undefined;
+  if (usedCharacters + value.length > maximumQueuedPreviewCharactersPerMessage) return undefined;
+  return /^data:(?:image|audio)\/[a-z0-9.+-]+;base64,[a-z0-9+/]*={0,2}$/iu.test(value) ? value : undefined;
+}
+
+function firstString(...values: readonly unknown[]): string | undefined {
+  for (const value of values) if (typeof value === "string" && value.trim()) return value.trim();
+  return undefined;
+}
+
+function firstMimeType(...values: readonly unknown[]): string | undefined {
+  return firstString(...values)?.match(/^[a-z0-9.+-]+\/[a-z0-9.+-]+$/iu)?.[0]?.toLowerCase();
+}
+
+function firstNonNegativeNumber(...values: readonly unknown[]): number | undefined {
+  for (const value of values) if (typeof value === "number" && Number.isFinite(value) && value >= 0) return Math.round(value);
+  return undefined;
+}
+
+function firstPositiveNumber(...values: readonly unknown[]): number | undefined {
+  for (const value of values) if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+  return undefined;
+}
+
+function mimeTypeFromDataUrl(value: string | undefined): string | undefined {
+  return value?.match(/^data:([^;,]+);base64,/iu)?.[1]?.toLowerCase();
+}
+
+function mimeTypeFromName(name: string): string | undefined {
+  switch (extname(name).toLowerCase()) {
+    case ".png": return "image/png";
+    case ".jpg": case ".jpeg": return "image/jpeg";
+    case ".gif": return "image/gif";
+    case ".webp": return "image/webp";
+    case ".mp3": return "audio/mpeg";
+    case ".wav": return "audio/wav";
+    case ".m4a": return "audio/mp4";
+    case ".txt": return "text/plain";
+    case ".md": return "text/markdown";
+    case ".pdf": return "application/pdf";
+    default: return undefined;
+  }
+}
+
+function decodedDataUrlBytes(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const encoded = value.slice(value.indexOf(",") + 1);
+  if (!encoded) return 0;
+  return Math.max(0, Math.floor(encoded.length * 3 / 4) - (encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0));
 }
 
 function isDesktopQueuedMessage(value: unknown): value is DesktopQueuedMessage {

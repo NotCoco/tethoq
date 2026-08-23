@@ -3,7 +3,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 export interface OpenCodeActivityReader {
-  readWorkingSessionIds(): Promise<ReadonlySet<string>>;
+  /** `undefined` means the activity source could not be read authoritatively. */
+  readWorkingSessionIds(): Promise<ReadonlySet<string> | undefined>;
   close(): void;
 }
 
@@ -62,15 +63,15 @@ export class SqliteOpenCodeActivityReader implements OpenCodeActivityReader {
     this.#now = options.now ?? (() => new Date());
   }
 
-  public async readWorkingSessionIds(): Promise<ReadonlySet<string>> {
+  public async readWorkingSessionIds(): Promise<ReadonlySet<string> | undefined> {
     const database = await this.database();
-    if (database === null) return new Set();
+    if (database === null) return undefined;
     try {
       const rows = database.prepare(activityQuery).all(this.#now().getTime() - this.#freshnessMs);
       return new Set(rows.flatMap((row) => isRecord(row) && typeof row.session_id === "string" ? [row.session_id] : []));
     } catch {
       this.close();
-      return new Set();
+      return undefined;
     }
   }
 

@@ -3,7 +3,9 @@ import {
   app,
   BrowserWindow,
   dialog,
+  ipcMain,
   Menu,
+  screen,
   session,
   Tray,
 } from "electron";
@@ -16,7 +18,8 @@ import { RecorderManager } from "./recorder/index.js";
 import { DesktopPreferencesStore, readGlobalAgentInstructions } from "./preferences.js";
 import { LiveSessionManager } from "./live_session/manager.js";
 import { hardenSession, hardenWindow, SECURE_WEB_PREFERENCES } from "./security.js";
-import { readWindowState, trackWindowState } from "./window_state.js";
+import { registerLocalMediaProtocol, registerLocalMediaScheme } from "./local_media.js";
+import { clampWindowStateToDisplay, readWindowState, trackWindowState } from "./window_state.js";
 import { startDesktopReadiness, type DesktopReadinessHandle } from "./desktop_readiness.js";
 import {
   IPC_CHANNELS,
@@ -43,10 +46,31 @@ let rendererRecoveryRequired = false;
 let rendererRecoveryInFlight: Promise<void> | undefined;
 let rendererCrashPromptOpen = false;
 
+registerLocalMediaScheme();
 app.setName("Tethoq");
-if (process.platform === "win32") app.setAppUserModelId("app.tethoq.desktop");
+app.commandLine.appendSwitch("disable-renderer-backgrounding");
+app.commandLine.appendSwitch("disable-background-timer-throttling");
+app.commandLine.appendSwitch("disable-backgrounding-occluded-windows");
+// Windows DWM occlusion can mark a visible side-by-side window as hidden,
+// which freezes paints until the next click. Live output must keep moving.
+app.commandLine.appendSwitch("disable-features", "CalculateNativeWinOcclusion");
+// Packaged builds own app.tethoq.desktop. An unpackaged (dev) run must use a
+// separate identity: Chromium auto-creates a Start Menu shortcut for unpackaged
+// electron.exe runs, and a shortcut sharing the packaged AppUserModelID hijacks
+// the real app's taskbar name and icon ("Electron").
+if (process.platform === "win32") app.setAppUserModelId(app.isPackaged ? "app.tethoq.desktop" : "app.tethoq.desktop.dev");
 
 export const HIDDEN_LAUNCH_ARGUMENT = "--hidden";
+/**
+ * A second launch carrying this argument asks the running instance to quit
+ * cleanly. The ordinary quit path stops the managed OpenCode server, so
+ * launchers that need a fresh app (scripts, updates) never orphan one.
+ */
+export const QUIT_INSTANCE_ARGUMENT = "--quit-other";
+/** After Chromium says the window can paint, wait this long for the first populated snapshot. */
+export const RENDERER_READY_REVEAL_MS = 4000;
+/** If ready-to-show never arrives, still show a launched window so the process cannot sit invisible. */
+export const STARTUP_REVEAL_FALLBACK_MS = 8000;
 
 /** Registration arguments for each startup choice. `tray` starts without a window. */
 export function loginItemSettingsFor(value: DesktopLaunchAtLogin): { openAtLogin: boolean; args: string[] } {
@@ -69,7 +93,14 @@ function applyLoginItem(value: DesktopLaunchAtLogin): void {
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.on("second-instance", (_event, argv) => { if (!argv.includes(HIDDEN_LAUNCH_ARGUMENT)) showMainWindow(); });
+  app.on("second-instance", (_event, argv) => {
+    if (argv.includes(QUIT_INSTANCE_ARGUMENT)) {
+      quitting = true;
+      app.quit();
+      return;
+    }
+    if (!argv.includes(HIDDEN_LAUNCH_ARGUMENT)) showMainWindow();
+  });
   app.whenReady().then(startApplication).catch((error: unknown) => {
     console.error("Tethoq desktop failed to start", error);
     dialog.showErrorBox("Tethoq could not start", "Tethoq could not open. Restart it and try again.");
@@ -79,6 +110,7 @@ if (!app.requestSingleInstanceLock()) {
 
 async function startApplication(): Promise<void> {
   Menu.setApplicationMenu(null);
+  registerLocalMediaProtocol(session.defaultSession);
   hardenSession(session.defaultSession);
 
   const configPath = desktopConfigPath(app);
@@ -148,6 +180,7 @@ async function startApplication(): Promise<void> {
     connectorsDirectory: join(app.getPath("userData"), "connectors"),
     connectorTrustStorePath: join(app.getPath("userData"), "connector-trust.json"),
     appVersion: app.getVersion(),
+    defaultWorkingDirectory: app.getPath("documents"),
     providerAssetsDirectory: app.isPackaged
       ? join(process.resourcesPath, "provider-tools")
       : join(app.getAppPath(), "..", "agent_bridge", "assets"),
@@ -192,7 +225,14 @@ async function startApplication(): Promise<void> {
 
 async function createMainWindow(): Promise<BrowserWindow> {
   const statePath = join(app.getPath("userData"), "window-state.json");
-  const saved = await readWindowState(statePath);
+  const remembered = await readWindowState(statePath);
+  const display = screen.getDisplayMatching({
+    x: remembered.x ?? 0,
+    y: remembered.y ?? 0,
+    width: remembered.width,
+    height: remembered.height,
+  });
+  const saved = clampWindowStateToDisplay(remembered, display.workArea);
   const window = new BrowserWindow({
     title: "Tethoq",
     width: saved.width,
@@ -201,10 +241,10 @@ async function createMainWindow(): Promise<BrowserWindow> {
     ...(saved.y !== undefined ? { y: saved.y } : {}),
     minWidth: 760,
     minHeight: 480,
-    backgroundColor: "#070707",
+    backgroundColor: "#0b0b0a",
     titleBarStyle: "hidden",
     titleBarOverlay: {
-      color: "#0d0d0c",
+      color: "#0b0b0a",
       symbolColor: "#c8cbc8",
       height: 46,
     },
@@ -213,14 +253,29 @@ async function createMainWindow(): Promise<BrowserWindow> {
     icon: appIconPath(),
     webPreferences: {
       ...SECURE_WEB_PREFERENCES,
-      backgroundThrottling: true,
+      // A visible unfocused window is still a live workspace. Chromium
+      // background throttling delays IPC and timers until the next click.
+      backgroundThrottling: false,
       preload: join(__dirname, "../preload/index.cjs"),
     },
   });
   hardenWindow(window);
+  window.webContents.setBackgroundThrottling(false);
   flushWindowState = trackWindowState(window, statePath);
   if (saved.maximized) window.maximize();
-  window.once("ready-to-show", () => {
+  // First paint is not the same as being worth looking at: showing there put an empty
+  // shell and its loading state on screen, and the unpainted frame behind the window
+  // controls never matched the overlay drawn over it. Waiting for the renderer's first
+  // snapshot means the window arrives already populated. The timer is a guarantee, not a
+  // schedule - a renderer that never reports must still produce a usable window.
+  let revealed = false;
+  let revealTimer: ReturnType<typeof setTimeout> | undefined;
+  let startupRevealTimer: ReturnType<typeof setTimeout> | undefined;
+  const reveal = (): void => {
+    if (revealed || window.isDestroyed()) return;
+    revealed = true;
+    if (revealTimer !== undefined) clearTimeout(revealTimer);
+    if (startupRevealTimer !== undefined) clearTimeout(startupRevealTimer);
     if (process.env.TETHOQ_PACKAGED_SMOKE === "1") {
       window.setSkipTaskbar(true);
       window.setIgnoreMouseEvents(true);
@@ -228,8 +283,18 @@ async function createMainWindow(): Promise<BrowserWindow> {
       window.showInactive();
     } else if (!startedHidden()) {
       window.show();
+      window.focus();
     }
+  };
+  const onRendererReady = (event: Electron.IpcMainEvent): void => {
+    if (event.sender === window.webContents) reveal();
+  };
+  ipcMain.on(IPC_CHANNELS.rendererReady, onRendererReady);
+  window.once("closed", () => { ipcMain.removeListener(IPC_CHANNELS.rendererReady, onRendererReady); });
+  window.once("ready-to-show", () => {
+    revealTimer = setTimeout(reveal, RENDERER_READY_REVEAL_MS);
   });
+  startupRevealTimer = setTimeout(reveal, STARTUP_REVEAL_FALLBACK_MS);
   window.on("close", (event) => {
     if (quitting) return;
     // Closing keeps Tethoq in the tray by default so running tasks and their

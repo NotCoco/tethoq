@@ -102,6 +102,12 @@ export interface SessionRelationship {
   readonly strategy: SessionRelationshipStrategy;
 }
 
+export interface RemoteSessionProviderStatus {
+  readonly kind: "retry";
+  readonly message: string;
+  readonly retryAt?: string;
+}
+
 export interface RemoteSession {
   readonly id: string;
   readonly hostId: string;
@@ -111,6 +117,7 @@ export interface RemoteSession {
   readonly project?: string;
   readonly workingDirectory?: string;
   readonly state: SessionState;
+  readonly providerStatus?: RemoteSessionProviderStatus;
   readonly createdAt?: string;
   readonly lastActivityAt: string;
   readonly preview?: string;
@@ -126,6 +133,8 @@ export interface RemoteSession {
   readonly agentRole?: string;
   readonly needsApproval: boolean;
   readonly stale: boolean;
+  /** Another local client owns the provider session writer, independently of turn activity. */
+  readonly externalWriter?: boolean;
   readonly nativeMetadata: JsonObject;
 }
 
@@ -160,13 +169,14 @@ export interface WorkflowReference {
 }
 
 export type ContentPart =
-  | { readonly type: "text"; readonly text: string }
-  | { readonly type: "reasoning"; readonly text: string; readonly redacted: boolean }
+  | { readonly type: "text"; readonly text: string; readonly providerPartId?: string }
+  | { readonly type: "reasoning"; readonly text: string; readonly redacted: boolean; readonly providerPartId?: string }
   | { readonly type: "tool"; readonly name: string; readonly callId?: string; readonly input?: JsonValue; readonly output?: string; readonly status: "pending" | "running" | "completed" | "failed" }
   | { readonly type: "command"; readonly command: string; readonly cwd?: string; readonly output?: string; readonly exitCode?: number; readonly status: "pending" | "running" | "completed" | "failed" }
   | { readonly type: "file_change"; readonly path: string; readonly patch?: string; readonly change: "added" | "modified" | "deleted" | "unknown" }
   | { readonly type: "error"; readonly message: string; readonly code?: string }
   | { readonly type: "image"; readonly uri?: string; readonly mimeType?: string; readonly name?: string; readonly retrievalId?: string }
+  | { readonly type: "audio"; readonly uri: string; readonly mimeType: string; readonly name: string; readonly durationSeconds?: number }
   | { readonly type: "file"; readonly name: string; readonly mimeType?: string }
   | { readonly type: "workflow"; readonly workflow: WorkflowReference }
   | {
@@ -232,6 +242,9 @@ export interface QueuedMessageAttachment {
   readonly name: string;
   readonly mimeType: string;
   readonly byteLength: number;
+  /** Bounded image/audio preview retained by a provider-owned queue. */
+  readonly dataUrl?: string;
+  readonly durationSeconds?: number;
 }
 
 export interface QueuedMessage {

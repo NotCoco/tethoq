@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
+  acpUpdateLooksLikeThought,
   appendAcpContentChunk,
   appendAcpSubagentPart,
   completeAcpMessages,
@@ -16,11 +17,15 @@ test("ACP session metadata normalizes into a Grok session", () => {
     cwd: "/workspace/grok-project",
     title: "Inspect Grok",
     updatedAt: "2026-08-07T10:00:00.000Z",
+    modelId: "grok-4.6",
+    thought_level: "xhigh",
   });
   assert.equal(session.providerId, "grok");
   assert.equal(session.project, "grok-project");
   assert.equal(session.lastActivityAt, "2026-08-07T10:00:00.000Z");
   assert.equal(session.state, "unknown");
+  assert.equal(session.modelId, "grok-4.6");
+  assert.equal(session.reasoningEffort, "xhigh");
 });
 
 test("untitled Grok sessions stay distinct from a titled chat in the same project", () => {
@@ -82,6 +87,36 @@ test("ACP streamed content chunks coalesce by messageId and complete in order", 
   assert.equal(part?.type, "text");
   assert.equal(part?.type === "text" ? part.text : undefined, "Hello from Grok");
   assert.equal(messages[0]?.status, "completed");
+});
+
+test("ACP thought flags and thinking content types look like live thought", () => {
+  assert.equal(acpUpdateLooksLikeThought({
+    content: { type: "thinking", thinking: "Tracing the failure" },
+  }, "agent_message_chunk"), true);
+  assert.equal(acpUpdateLooksLikeThought({
+    thought: true,
+    content: { type: "text", text: "Hidden trace" },
+  }, "agent_message_chunk"), true);
+  assert.equal(acpUpdateLooksLikeThought({
+    content: { type: "text", text: "Hello from Grok" },
+  }, "agent_message_chunk"), false);
+});
+
+test("ACP thought content blocks become reasoning text", () => {
+  const accumulator = createMessageAccumulator();
+  appendAcpContentChunk(
+    "host_1",
+    "grok-session-1",
+    "assistant",
+    { content: { type: "thought", thought: "Checking the failing test" } },
+    accumulator,
+    new Date("2026-08-07T10:00:00Z"),
+    true,
+    "assistant_prompt_prompt-1",
+    "reasoning",
+  );
+  const part = completeAcpMessages(accumulator)[0]?.parts[0];
+  assert.equal(part?.type === "reasoning" ? part.text : undefined, "Checking the failing test");
 });
 
 test("ACP thinking chunks preserve readable sentence boundaries", () => {

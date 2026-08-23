@@ -44,7 +44,7 @@ through the provider contract.
 | Interrupt an active turn | Yes | Yes | Yes | Yes |
 | Associate a working directory | Yes | Yes | Yes | Yes |
 | Native cursor pagination | Yes | No | No | Dynamic |
-| Steering during a turn | Yes | No | Yes | Protocol/version dependent |
+| Steering during a turn | Yes | Yes | Yes | Protocol/version dependent |
 | Session relationships | Yes | Yes | No | Not currently exposed |
 | Edit an existing user message | Yes | No | No | Not currently exposed |
 
@@ -116,7 +116,9 @@ experimental, so remote access still goes through Agent Bridge.
 The native session endpoint returns a complete array, so the adapter's cursor
 is local. Cost is the sum of the provider-reported assistant-message cost
 fields; it is not reconstructed from a pricing table. Persistent `always`
-approval is intentionally omitted from the normalized UI.
+approval is intentionally omitted from the normalized UI. A live follow-up
+uses OpenCode's asynchronous prompt endpoint while the session runner remains
+active, matching the native client's in-turn prompt behavior.
 
 ### Pi and OMP
 

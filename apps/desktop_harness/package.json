@@ -19,6 +19,13 @@
     "test": "node --test test/*.test.mjs",
     "verify": "npm run typecheck && npm test && npm run build",
     "qa:visual": "npm run build && electron scripts/visual-qa.cjs",
+    "qa:fake-model": "npm run build && electron scripts/fake-model-qa.cjs",
+    "qa:scroll-stability": "npm run build && electron scripts/scroll-stability-qa.cjs",
+    "qa:toast": "npm run build && electron scripts/toast-qa.cjs",
+    "qa:opencode-tools": "npm run build && electron scripts/opencode-tool-activity-qa.cjs",
+    "qa:opencode-queue": "npm run build && electron scripts/opencode-queue-steer-qa.cjs",
+    "sync:unpacked": "node scripts/sync-unpacked.cjs",
+    "relaunch": "node scripts/sync-unpacked.cjs && node scripts/launch-unpacked.cjs",
     "build:brand-assets": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-brand-assets.ps1",
     "install:release-dependencies": "npm ci --prefix ../.. --no-audit --no-fund",
     "build:connector-sdk": "npm --prefix ../../packages/connector_sdk run build",
@@ -28,10 +35,12 @@
     "stage:bridge-companion": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stage-bridge-companion.ps1",
     "smoke:embedded-bridge": "node scripts/verify-embedded-bridge.cjs",
     "release:metadata": "node scripts/write-release-metadata.cjs",
-    "pack:win": "npm run build:brand-assets && npm run install:release-dependencies && npm run build:connector-sdk && npm run package:bridge && npm run stage:bridge-companion && npm run build && electron-builder --win nsis --x64 --publish never && npm run smoke:embedded-bridge && npm run smoke:packaged && npm run release:metadata"
+    "pack:win": "npm run build:brand-assets && npm run install:release-dependencies && npm run build:connector-sdk && npm run package:bridge && npm run stage:bridge-companion && npm run build && electron-builder --win nsis --x64 --publish never && npm run smoke:embedded-bridge && npm run smoke:packaged && npm run release:metadata",
+    "probe:mic": "electron scripts/probe-microphone.cjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "lamejs": "^1.2.1",
     "qrcode": "^1.5.4",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",

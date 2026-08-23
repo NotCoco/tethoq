@@ -2,7 +2,9 @@
 import { randomUUID } from "node:crypto";
 import {
   makeGlobalSessionId,
+  type ContentPart,
   type JsonObject,
+  type JsonValue,
   type ProviderCapabilities,
   type RemoteMessage,
   type RemoteModel,
@@ -16,7 +18,6 @@ import {
   JsonRpcPeer,
   ProviderAdapterError,
   ProviderEventHub,
-  providerPromptContent,
   resolveCommand,
   type AgentProviderAdapter,
   type AuthRequest,
@@ -49,6 +50,8 @@ import {
   type CodexObservedMessage,
   type CodexTurnMetadata,
 } from "./activity.js";
+import { externalSessionLaunchesFromCommand } from "./external_launches.js";
+import { codexTurnInput } from "./codex_input.js";
 import { CodexDesktopQueue } from "./desktop_queue.js";
 import { isRecord, jsonObject, messagesFromCodexThread, normalizeCodexStatus, normalizeCodexThread } from "./normalize.js";
 import type { AccountReadResponse, ModelListResponse, ThreadForkResponse, ThreadListResponse, ThreadResponse, TurnResponse } from "./wire.js";
@@ -106,6 +109,35 @@ const capabilities: ProviderCapabilities = {
   ],
 };
 
+function codexHistoryIdentity(message: RemoteMessage): string {
+  return `${message.role}:${message.providerMessageId}:${message.parts.map((part) => part.type).join(",")}`;
+}
+
+function messageTextSize(message: RemoteMessage): number {
+  return message.parts.reduce((total, part) => total + ((part.type === "text" || part.type === "reasoning") ? part.text.length : 0), 0);
+}
+
+/** Authoritative thread history owns chronology; rollout observations add fresher live detail. */
+export function mergeCodexMessageHistory(
+  canonical: readonly RemoteMessage[],
+  observed: readonly RemoteMessage[],
+): readonly RemoteMessage[] {
+  const merged = [...canonical];
+  const indexes = new Map(merged.map((message, index) => [codexHistoryIdentity(message), index]));
+  for (const message of observed) {
+    const key = codexHistoryIdentity(message);
+    const index = indexes.get(key);
+    if (index === undefined) {
+      indexes.set(key, merged.length);
+      merged.push(message);
+      continue;
+    }
+    const current = merged[index]!;
+    if (message.status === "streaming" || messageTextSize(message) > messageTextSize(current)) merged[index] = message;
+  }
+  return merged.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+}
+
 export class CodexAdapter implements AgentProviderAdapter {
   public readonly providerId = "codex";
   public readonly displayName = "OpenAI Codex";
@@ -116,12 +148,15 @@ export class CodexAdapter implements AgentProviderAdapter {
   } as const;
   public readonly listQueuedMessages?: () => Promise<readonly ProviderQueuedMessage[]>;
   public readonly enqueueQueuedMessage?: (providerSessionId: string, request: EnqueueProviderMessageRequest) => Promise<ProviderQueuedMessage>;
+  public readonly sendMessageToExternalOwner?: (providerSessionId: string, request: SendMessageRequest) => Promise<SendMessageResult>;
   public readonly restoreQueuedMessage?: (providerSessionId: string, request: RestoreProviderMessageRequest) => Promise<ProviderQueuedMessage>;
   public readonly updateQueuedMessage?: (providerSessionId: string, messageId: string, content: string) => Promise<ProviderQueuedMessage | null>;
   public readonly cancelQueuedMessage?: (providerSessionId: string, messageId: string) => Promise<boolean>;
+  public readonly steerQueuedMessage?: (providerSessionId: string, messageId: string, request: SendMessageRequest) => Promise<SendMessageResult>;
   readonly #events = new ProviderEventHub();
   readonly #pendingServerRequests = new Map<string, PendingServerRequest>();
   readonly #currentTurns = new Map<string, string>();
+  readonly #ownedThreads = new Set<string>();
   readonly #hostId: string;
   readonly #command: string;
   readonly #args: readonly string[];
@@ -177,9 +212,12 @@ export class CodexAdapter implements AgentProviderAdapter {
         return desktopQueue.list();
       };
       this.enqueueQueuedMessage = async (providerSessionId, request) => await desktopQueue.enqueue(providerSessionId, request);
+      this.sendMessageToExternalOwner = async (providerSessionId, request) =>
+        await desktopQueue.tryStartTurn(providerSessionId, request) ?? await this.sendMessageToAppServer(providerSessionId, request);
       this.restoreQueuedMessage = async (providerSessionId, request) => await desktopQueue.restore(providerSessionId, request);
       this.updateQueuedMessage = async (providerSessionId, messageId, content) => await desktopQueue.update(providerSessionId, messageId, content);
       this.cancelQueuedMessage = async (providerSessionId, messageId) => await desktopQueue.cancel(providerSessionId, messageId);
+      this.steerQueuedMessage = async (providerSessionId, messageId, request) => await desktopQueue.steerQueuedMessage(providerSessionId, messageId, request);
     }
   }
 
@@ -259,7 +297,7 @@ export class CodexAdapter implements AgentProviderAdapter {
         const id = [value.id, value.model, value.slug].find((candidate): candidate is string => typeof candidate === "string");
         if (id === undefined) continue;
         const displayName = [value.displayName, value.name].find((candidate): candidate is string => typeof candidate === "string") ?? id;
-        const modalities = inputModalities(value.inputModalities);
+        const modalities = codexModelInputModalities(id, value.inputModalities);
         models.push({
           id,
           providerId: this.providerId,
@@ -311,43 +349,42 @@ export class CodexAdapter implements AgentProviderAdapter {
 
   public async getMessages(providerSessionId: string): Promise<readonly RemoteMessage[]> {
     const observed = await this.#activity?.recentMessages(providerSessionId) ?? [];
-    if (observed.length > 0) {
-      const sessionId = makeGlobalSessionId(this.#hostId, this.providerId, providerSessionId);
-      let latestLiveIndex = -1;
-      if (this.#sessionStates.get(providerSessionId) === "working") {
-        for (let index = observed.length - 1; index >= 0; index -= 1) {
-          const message = observed[index];
-          if (message?.role === "assistant" && (message.partType === "reasoning" || message.phase === "commentary")) {
-            latestLiveIndex = index;
-            break;
-          }
+    const sessionId = makeGlobalSessionId(this.#hostId, this.providerId, providerSessionId);
+    let latestLiveIndex = -1;
+    if (this.#sessionStates.get(providerSessionId) === "working") {
+      for (let index = observed.length - 1; index >= 0; index -= 1) {
+        const message = observed[index];
+        if (message?.role === "assistant" && (message.partType === "reasoning" || message.phase === "commentary")) {
+          latestLiveIndex = index;
+          break;
         }
       }
-      return observed.map((message, index) => {
-        const createdAt = validIsoTimestamp(message.createdAt) ?? new Date(index).toISOString();
-        const running = index === latestLiveIndex;
-        return {
-          id: `codex/rollout/${message.messageId}/${message.partType}`,
-          sessionId,
-          providerMessageId: message.messageId,
-          role: message.role,
-          createdAt,
-          ...(running ? {} : { completedAt: createdAt }),
-          parts: message.partType === "reasoning"
-            ? [{ type: "reasoning" as const, text: message.text, redacted: false }]
-            : message.parts?.length
-              ? message.parts
-              : [{ type: "text" as const, text: message.text }],
-          status: running ? "streaming" as const : "completed" as const,
-          nativeMetadata: {},
-        };
-      });
     }
+    const observedMessages: readonly RemoteMessage[] = observed.map((message, index) => {
+      const createdAt = validIsoTimestamp(message.createdAt) ?? new Date(index).toISOString();
+      const running = index === latestLiveIndex;
+      return {
+        id: `codex/rollout/${message.messageId}/${message.partType}`,
+        sessionId,
+        providerMessageId: message.messageId,
+        role: message.role,
+        createdAt,
+        ...(running ? {} : { completedAt: createdAt }),
+        parts: message.partType === "reasoning"
+          ? [{ type: "reasoning" as const, text: message.text, redacted: false }]
+          : message.parts?.length
+            ? message.parts
+            : [{ type: "text" as const, text: message.text }],
+        status: running ? "streaming" as const : "completed" as const,
+        nativeMetadata: message.phase !== undefined ? { phase: message.phase } : {},
+      };
+    });
     try {
       const response = await (await this.peer()).request<ThreadResponse>("thread/read", { threadId: providerSessionId, includeTurns: true });
-      return messagesFromCodexThread(this.#hostId, response.thread);
+      return mergeCodexMessageHistory(messagesFromCodexThread(this.#hostId, response.thread), observedMessages);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (observedMessages.length > 0) return observedMessages;
       if (/thread\s+[0-9a-f-]+\s+is not materialized yet; includeTurns is unavailable before first user message/iu.test(message)) return [];
       throw error;
     }
@@ -385,6 +422,7 @@ export class CodexAdapter implements AgentProviderAdapter {
         })),
       } : {}),
     });
+    this.#ownedThreads.add(response.thread.id);
     let session = (await this.normalizeThreads([response.thread]))[0] ?? normalizeCodexThread(this.#hostId, response.thread);
     if (options.modelId !== undefined) {
       await this.applySessionMetadata(response.thread.id, { modelId: options.modelId }, false);
@@ -403,6 +441,7 @@ export class CodexAdapter implements AgentProviderAdapter {
 
   public async branchSession(providerSessionId: string): Promise<RemoteSession> {
     const response = await (await this.peer()).request<ThreadForkResponse>("thread/fork", { threadId: providerSessionId });
+    this.#ownedThreads.add(response.thread.id);
     let session = (await this.normalizeThreads([response.thread]))[0] ?? normalizeCodexThread(this.#hostId, response.thread);
     const modelId = response.model ?? this.#sessionMetadata.get(providerSessionId)?.modelId;
     const reasoningEffort = response.reasoningEffort ?? this.#sessionMetadata.get(providerSessionId)?.reasoningEffort;
@@ -423,23 +462,40 @@ export class CodexAdapter implements AgentProviderAdapter {
   public async resumeSession(providerSessionId: string): Promise<void> {
     const response = await (await this.peer()).request<ThreadResponse>("thread/resume", { threadId: providerSessionId });
     if (response.thread.id !== providerSessionId) throw new ProviderAdapterError(this.providerId, "RESUME_ID_MISMATCH", "Codex resumed a different thread ID", false);
+    this.#ownedThreads.add(providerSessionId);
   }
 
   public async sendMessage(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
-    const input = [
-      { type: "text", text: providerPromptContent(request), text_elements: [] },
-      ...(request.attachments ?? []).map((attachment) => ({
-        type: "image",
-        url: `data:${attachment.mimeType};base64,${attachment.dataBase64}`,
-      })),
-    ];
-    const response = await (await this.peer()).request<TurnResponse>("turn/start", {
+    if ((request.attachments?.length ?? 0) > 0 && this.#desktopQueue !== null) {
+      const desktopResult = await this.#desktopQueue.tryStartTurn(providerSessionId, request);
+      if (desktopResult !== null) return desktopResult;
+    }
+    return await this.sendMessageToAppServer(providerSessionId, request);
+  }
+
+  private async sendMessageToAppServer(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
+    const input = codexTurnInput(request);
+    const peer = await this.peer();
+    const params = {
       threadId: providerSessionId,
       clientUserMessageId: request.requestId,
       input,
       ...(request.modelId !== undefined ? { model: request.modelId } : {}),
       ...(request.reasoningEffort !== undefined ? { effort: request.reasoningEffort } : {}),
-    });
+    };
+    let response: TurnResponse;
+    try {
+      response = await peer.request<TurnResponse>("turn/start", params);
+    } catch (error) {
+      if (!isCodexThreadNotFound(error)) throw error;
+      const resumed = await peer.request<ThreadResponse>("thread/resume", { threadId: providerSessionId });
+      if (resumed.thread.id !== providerSessionId) {
+        throw new ProviderAdapterError(this.providerId, "RESUME_ID_MISMATCH", "Codex resumed a different thread ID", false);
+      }
+      this.#ownedThreads.add(providerSessionId);
+      response = await peer.request<TurnResponse>("turn/start", params);
+    }
+    this.#ownedThreads.add(providerSessionId);
     const turnId = response.turn?.id;
     if (turnId !== undefined) this.#currentTurns.set(providerSessionId, turnId);
     if (request.modelId !== undefined || request.reasoningEffort !== undefined) {
@@ -451,18 +507,16 @@ export class CodexAdapter implements AgentProviderAdapter {
     return { accepted: true, ...(turnId !== undefined ? { providerTurnId: turnId } : {}), details: [] };
   }
 
+  public hasActiveTurn(providerSessionId: string): boolean {
+    return this.#sessionStates.get(providerSessionId) === "working";
+  }
+
   public async steerMessage(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
     const expectedTurnId = this.#currentTurns.get(providerSessionId);
     if (expectedTurnId === undefined) {
       throw new ProviderAdapterError(this.providerId, "NO_ACTIVE_TURN", "No active Codex turn is available to steer", false);
     }
-    const input = [
-      { type: "text", text: providerPromptContent(request), text_elements: [] },
-      ...(request.attachments ?? []).map((attachment) => ({
-        type: "image",
-        url: `data:${attachment.mimeType};base64,${attachment.dataBase64}`,
-      })),
-    ];
+    const input = codexTurnInput(request);
     const response = await (await this.peer()).request<{ readonly turnId: string }>("turn/steer", {
       threadId: providerSessionId,
       clientUserMessageId: request.requestId,
@@ -576,6 +630,7 @@ export class CodexAdapter implements AgentProviderAdapter {
     this.#activity?.dispose();
     for (const pending of this.#pendingServerRequests.values()) pending.reject(new Error("Codex adapter disposed"));
     this.#pendingServerRequests.clear();
+    this.#ownedThreads.clear();
     this.#events.clear();
     const startingPeer = this.#startingPeer;
     if (startingPeer !== null) await startingPeer.close().catch(() => undefined);
@@ -660,6 +715,7 @@ export class CodexAdapter implements AgentProviderAdapter {
     try {
       await closing;
     } finally {
+      this.#ownedThreads.clear();
       if (this.#closing === closing) this.#closing = null;
     }
   }
@@ -730,10 +786,15 @@ export class CodexAdapter implements AgentProviderAdapter {
       const total = isRecord(tokenUsage.total) ? tokenUsage.total : tokenUsage;
       const last = isRecord(tokenUsage.last) ? tokenUsage.last : {};
       const contextWindowTokens = firstFiniteNumber(tokenUsage.modelContextWindow, source.modelContextWindow);
-      const usedTokens = firstFiniteNumber(total.totalTokens, tokenUsage.totalTokens, last.totalTokens);
-      const inputTokens = firstFiniteNumber(total.inputTokens, tokenUsage.inputTokens);
-      const outputTokens = firstFiniteNumber(total.outputTokens, tokenUsage.outputTokens);
-      const cacheReadTokens = firstFiniteNumber(total.cachedInputTokens, total.cacheReadTokens, tokenUsage.cachedInputTokens);
+      // `total` is the lifetime amount billed across every turn in this thread.
+      // It can reach tens of millions while the model's current prompt still
+      // occupies only a few thousand tokens, especially immediately after a
+      // compaction. Automatic compaction must follow the current/last window or
+      // it will consider the task permanently full and compact after every turn.
+      const usedTokens = firstFiniteNumber(last.totalTokens, tokenUsage.lastTotalTokens, tokenUsage.totalTokens, total.totalTokens);
+      const inputTokens = firstFiniteNumber(last.inputTokens, tokenUsage.lastInputTokens, tokenUsage.inputTokens, total.inputTokens);
+      const outputTokens = firstFiniteNumber(last.outputTokens, tokenUsage.lastOutputTokens, tokenUsage.outputTokens, total.outputTokens);
+      const cacheReadTokens = firstFiniteNumber(last.cachedInputTokens, last.cacheReadTokens, tokenUsage.lastCachedInputTokens, tokenUsage.cachedInputTokens, total.cachedInputTokens, total.cacheReadTokens);
       this.#sessionContext.set(providerSessionId, {
         ...(this.#sessionMetadata.get(providerSessionId)?.modelId !== undefined ? { modelId: this.#sessionMetadata.get(providerSessionId)!.modelId } : {}),
         usedTokens: usedTokens ?? null,
@@ -784,12 +845,14 @@ export class CodexAdapter implements AgentProviderAdapter {
 
   private async normalizeThreads(threads: readonly import("./wire.js").CodexThread[]): Promise<readonly RemoteSession[]> {
     const sessions = threads.map((thread) => normalizeCodexThread(this.#hostId, thread));
+    const externalWriters = await Promise.all(sessions.map(async (session) =>
+      !this.#ownedThreads.has(session.providerSessionId) && await this.#activity?.hasWriterLock(session.providerSessionId) === true));
     const states = await this.#activity?.reconcile(threads.map((thread, index) => ({
       providerSessionId: thread.id,
       ...(thread.path !== undefined ? { path: thread.path } : {}),
       nativeState: sessions[index]?.state ?? "unknown",
     }))) ?? new Map<string, SessionState>();
-    return sessions.map((session) => {
+    return sessions.map((session, index) => {
       const state = states.get(session.providerSessionId) ?? session.state;
       const observedMetadata = this.#activity?.turnMetadata(session.providerSessionId);
       const observedContext = this.#activity?.context(session.providerSessionId);
@@ -806,6 +869,7 @@ export class CodexAdapter implements AgentProviderAdapter {
       return {
         ...session,
         state,
+        ...(externalWriters[index] === true ? { externalWriter: true } : {}),
         ...(metadata.modelId !== undefined ? { modelId: metadata.modelId } : {}),
         ...(metadata.reasoningEffort !== undefined ? { reasoningEffort: metadata.reasoningEffort } : {}),
       };
@@ -885,6 +949,42 @@ export class CodexAdapter implements AgentProviderAdapter {
   }
 
   private async emitObservedMessage(providerSessionId: string, message: CodexObservedMessage): Promise<void> {
+    const activities = message.parts ?? [];
+    const commands = activities.filter((activity): activity is Extract<ContentPart, { type: "command" }> => activity.type === "command");
+    if (commands.length > 0) {
+      for (const [index, activity] of commands.entries()) {
+        const observedAt = message.createdAt ?? this.#now().toISOString();
+        const launches = externalSessionLaunchesFromCommand(activity.command, observedAt);
+        await this.emit({
+          type: activity.status === "pending" || activity.status === "running" ? "command.started" : "command.completed",
+          providerSessionId,
+          payload: {
+            itemId: commands.length === 1 ? message.messageId : `${message.messageId}:${index + 1}`,
+            command: activity.command,
+            ...(activity.cwd !== undefined ? { cwd: activity.cwd } : {}),
+            ...(activity.output !== undefined ? { output: activity.output } : {}),
+            ...(launches.length > 0 ? { externalSessionLaunches: launches as unknown as JsonValue } : {}),
+            source: "codex-local-rollout",
+          },
+        });
+      }
+      return;
+    }
+    const activity = activities[0];
+    if (activity?.type === "tool") {
+      await this.emit({
+        type: activity.status === "pending" || activity.status === "running" ? "tool.started" : "tool.completed",
+        providerSessionId,
+        payload: {
+          callId: activity.callId ?? message.messageId,
+          name: activity.name,
+          ...(activity.input !== undefined ? { input: activity.input } : {}),
+          ...(activity.output !== undefined ? { output: activity.output } : {}),
+          source: "codex-local-rollout",
+        },
+      });
+      return;
+    }
     const base: JsonObject = {
       messageId: message.messageId,
       role: message.role,
@@ -892,13 +992,15 @@ export class CodexAdapter implements AgentProviderAdapter {
       source: "codex-local-rollout",
       ...(message.phase !== undefined ? { phase: message.phase } : {}),
     };
-    await this.emit({ type: "message.started", providerSessionId, payload: base });
-    await this.emit({
-      type: "message.delta",
-      providerSessionId,
-      payload: { ...base, text: message.text },
-    });
-    await this.emit({ type: "message.completed", providerSessionId, payload: base });
+    // A rollout response_item is already a complete persisted record. Replaying
+    // it as started/delta/completed made the renderer briefly mark finished work
+    // as live and the text-free completion could erase the answer until history
+    // catch-up restored it. One completed event is both faster and truthful.
+    await this.emit({ type: "message.completed", providerSessionId, payload: { ...base, text: message.text } });
+  }
+
+  public async getExternalSessionLaunches(providerSessionId: string, since: string) {
+    return await this.#activity?.externalSessionLaunches(providerSessionId, since) ?? [];
   }
 }
 
@@ -910,6 +1012,18 @@ function inputModalities(value: unknown): readonly ("text" | "image" | "audio")[
   if (!Array.isArray(value)) return undefined;
   const modalities = value.filter((entry): entry is "text" | "image" | "audio" => entry === "text" || entry === "image" || entry === "audio");
   return modalities.length > 0 ? modalities : undefined;
+}
+
+/** GPT-5.6 Sol accepts native MP3 input even when an older app-server omits it. */
+function codexModelInputModalities(id: string, value: unknown): readonly ("text" | "image" | "audio")[] | undefined {
+  const reported = inputModalities(value);
+  if (id.trim().toLowerCase() !== "gpt-5.6-sol") return reported;
+  return [...new Set([...(reported ?? ["text", "image"]), "audio" as const])];
+}
+
+function isCodexThreadNotFound(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /\bthread not found\b/iu.test(message);
 }
 
 function validIsoTimestamp(value: string | undefined): string | undefined {
@@ -1037,13 +1151,18 @@ function normalizeNotification(
     if (type.includes("Tool") || type === "webSearch") return { ...base, type: "tool.completed", payload: { item: jsonObject(item) } };
     if (type === "reasoning") return { ...base, type: "message.completed", payload: { partType: "reasoning", item: jsonObject(item) } };
     if (type === "agentMessage" || type === "plan") return { ...base, type: "message.completed", payload: { item: jsonObject(item) } };
-    if (type === "contextCompaction") return { ...base, type: "message.completed", payload: { text: "Context compacted", ...(typeof item.id === "string" ? { itemId: item.id } : {}) } };
+    if (type === "contextCompaction") return { ...base, type: "message.completed", payload: { text: "Session compacted", ...(typeof item.id === "string" ? { itemId: item.id } : {}) } };
     return null;
   }
   if (method === "item/commandExecution/outputDelta" || method === "command/exec/outputDelta" || method === "process/outputDelta") return { ...base, type: "command.output", payload: { output: typeof source.delta === "string" ? source.delta : typeof source.output === "string" ? source.output : "" } };
   if (method === "item/mcpToolCall/progress") return { ...base, type: "tool.output", payload: jsonObject(source) };
   if (method === "item/fileChange/outputDelta" || method === "item/fileChange/patchUpdated" || method === "turn/diff/updated" || method === "fs/changed") return { ...base, type: "file.changed", payload: jsonObject(source) };
   if (method === "error") return { ...base, type: "agent.error", payload: jsonObject(source) };
-  if (method === "warning" || method === "guardianWarning" || method === "configWarning") return { ...base, type: "agent.error", payload: { warning: true, ...jsonObject(source) } };
+  // The protocol currently has an error terminal but no warning terminal.
+  // Relabelling Codex's informational warnings as agent.error briefly fails a
+  // successful task and leaves a false "Agent error" row (notably after normal
+  // context compaction). Ignore them until there is a truthful warning surface;
+  // genuine App Server `error` notifications still flow above unchanged.
+  if (method === "warning" || method === "guardianWarning" || method === "configWarning") return null;
   return null;
 }

@@ -51,6 +51,14 @@ function stringField(value: Record<string, unknown>, field: string): string {
   return result;
 }
 
+function messageContentField(value: Record<string, unknown>, hasNonTextContent: boolean): string {
+  const result = value.content;
+  if (typeof result !== "string" || (result.length === 0 && !hasNonTextContent)) {
+    throw new Error("content must be a non-empty string");
+  }
+  return result;
+}
+
 function stringArray(value: unknown, field: string, maximum: number): readonly string[] {
   if (value === undefined) return [];
   if (!Array.isArray(value) || value.length > maximum || !value.every((entry) => typeof entry === "string" && entry.length > 0)) {
@@ -64,13 +72,15 @@ function requireEmptyPayload(value: JsonObject, requestType: string): void {
 }
 
 function queuedMessageInput(input: Record<string, unknown>, requestId: string) {
+  const attachmentIds = input.attachmentIds === undefined ? undefined : stringArray(input.attachmentIds, "attachmentIds", 4);
+  const workflows = input.workflows === undefined ? undefined : workflowReferences(input.workflows);
   return {
     requestId,
-    content: stringField(input, "content"),
+    content: messageContentField(input, (attachmentIds?.length ?? 0) > 0 || (workflows?.length ?? 0) > 0),
     ...(typeof input.modelId === "string" ? { modelId: input.modelId } : {}),
     ...(typeof input.reasoningEffort === "string" ? { reasoningEffort: input.reasoningEffort } : {}),
-    ...(input.attachmentIds !== undefined ? { attachmentIds: stringArray(input.attachmentIds, "attachmentIds", 4) } : {}),
-    ...(input.workflows !== undefined ? { workflows: workflowReferences(input.workflows) } : {}),
+    ...(attachmentIds !== undefined ? { attachmentIds } : {}),
+    ...(workflows !== undefined ? { workflows } : {}),
     ...(input.simplify !== undefined ? { metadata: { simplify: simplifyMetadata(input.simplify) } } : {}),
   };
 }
@@ -517,6 +527,16 @@ export class BridgeRequestRouter {
           stringField(input, "content"),
         ) });
       }
+      case "session.watch": {
+        const input = record(payload, "payload");
+        await this.bridge.watchSession(stringField(input, "sessionId"));
+        return {};
+      }
+      case "session.unwatch": {
+        const input = record(payload, "payload");
+        this.bridge.unwatchSession(stringField(input, "sessionId"));
+        return {};
+      }
       case "session.open": {
         const input = record(payload, "payload");
         const cursor = typeof input.cursor === "string" ? input.cursor : undefined;
@@ -539,6 +559,10 @@ export class BridgeRequestRouter {
       case "session.children": {
         const input = record(payload, "payload");
         return toJson({ sessions: (await this.bridge.listChildSessions(stringField(input, "sessionId"))).map((session) => clientSession(session)) });
+      }
+      case "session.side_chats": {
+        const input = record(payload, "payload");
+        return toJson({ sessions: await this.bridge.listSideChatSessions(stringField(input, "sessionId")) });
       }
       case "session.vision.get": {
         const input = record(payload, "payload");
@@ -645,13 +669,15 @@ export class BridgeRequestRouter {
         if (attachmentIds !== undefined && input.attachments !== undefined) {
           throw new Error("session.send_message accepts attachmentIds or inline attachments, not both");
         }
+        const attachments = input.attachments === undefined ? undefined : messageAttachments(input.attachments);
+        const workflows = input.workflows === undefined ? undefined : workflowReferences(input.workflows);
         const message: SendMessageRequest = {
           requestId,
-          content: stringField(input, "content"),
+          content: messageContentField(input, (attachmentIds?.length ?? 0) > 0 || (attachments?.length ?? 0) > 0 || (workflows?.length ?? 0) > 0),
           ...(typeof input.modelId === "string" ? { modelId: input.modelId } : {}),
           ...(typeof input.reasoningEffort === "string" ? { reasoningEffort: input.reasoningEffort } : {}),
-          ...(input.attachments !== undefined ? { attachments: messageAttachments(input.attachments) } : {}),
-          ...(input.workflows !== undefined ? { workflows: workflowReferences(input.workflows) } : {}),
+          ...(attachments !== undefined ? { attachments } : {}),
+          ...(workflows !== undefined ? { workflows } : {}),
           ...(input.simplify !== undefined ? { metadata: { simplify: simplifyMetadata(input.simplify) } } : {}),
         };
         const sessionId = stringField(input, "sessionId");
@@ -736,6 +762,22 @@ export class BridgeRequestRouter {
       case "attachment.upload.cancel": {
         const input = record(payload, "payload");
         return { discarded: this.bridge.discardAttachmentUpload(stringField(input, "uploadId")) };
+      }
+      case "ears.process": {
+        const input = record(payload, "payload");
+        const attachmentIds = stringArray(input.attachmentIds, "attachmentIds", 4);
+        return toJson(await this.bridge.processEars({
+          providerId: stringField(input, "providerId"),
+          modelId: stringField(input, "modelId"),
+          mode: stringField(input, "mode"),
+          attachmentIds,
+          ...(typeof input.sessionId === "string" ? { sessionId: input.sessionId } : {}),
+          ...(typeof input.requestId === "string" && input.requestId.trim() ? { requestId: input.requestId.trim() } : {}),
+        }));
+      }
+      case "ears.cancel": {
+        const input = record(payload, "payload");
+        return toJson(this.bridge.cancelEars(stringField(input, "requestId")));
       }
       case "dictation.transcribe": {
         const input = record(payload, "payload");

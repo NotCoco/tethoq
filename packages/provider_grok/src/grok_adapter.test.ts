@@ -8,6 +8,7 @@ import {
   createPublicAcpProviderAdapter,
   GrokProviderAdapter,
   PUBLIC_ACP_PROVIDER_PRESETS,
+  reportedModelSelection,
 } from "./grok_adapter.js";
 
 class FakeTransport implements JsonRpcTransport {
@@ -173,6 +174,153 @@ test("public ACP presets keep their documented launch commands and configured id
   assert.equal(session?.title, "Untitled Qwen Code session");
   assert.equal(message?.id, "qwen/message-1");
   assert.equal(message?.sessionId, "host_1/qwen/session-1");
+  await adapter.dispose();
+});
+
+test("Grok 4.6 catalogue exposes documented reasoning efforts", async () => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("initialize", {
+    protocolVersion: 1,
+    agentCapabilities: {},
+    _meta: {
+      model_state: {
+        currentModelId: "grok-4.6",
+        availableModels: [
+          { id: "grok-4.6", name: "Grok 4.6" },
+          { id: "grok-code", name: "Grok Code" },
+        ],
+      },
+    },
+  });
+  const adapter = new GrokProviderAdapter({ hostId: "host_1", transportFactory: () => transport });
+  const models = await adapter.listModels();
+  const grok46 = models.find((model) => model.id === "grok-4.6");
+  const grokCode = models.find((model) => model.id === "grok-code");
+  assert.deepEqual(grok46?.nativeMetadata.supportedReasoningEfforts, ["low", "medium", "high", "xhigh"]);
+  assert.equal(grok46?.nativeMetadata.defaultReasoningEffort, "high");
+  assert.equal(grokCode?.nativeMetadata.supportedReasoningEfforts, undefined);
+  await adapter.dispose();
+});
+
+test("Grok thinking content on an agent message is live reasoning", async () => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("initialize", { protocolVersion: 1, agentCapabilities: {} });
+  const adapter = new GrokProviderAdapter({ hostId: "host_1", transportFactory: () => transport });
+  const events: ProviderEvent[] = [];
+  await adapter.subscribe(null, (event) => { events.push(event); });
+  transport.push({
+    method: "session/update",
+    params: {
+      sessionId: "session-think",
+      update: { sessionUpdate: "agent_message_chunk", content: { type: "thinking", thinking: "Tracing the failure" } },
+    },
+  });
+  await delay();
+  const thought = events.find((event) => event.type === "message.delta");
+  assert.equal(thought?.payload.partType, "reasoning");
+  await adapter.dispose();
+});
+
+test("Grok marks a session working when a prompt starts", async () => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("initialize", { protocolVersion: 1, agentCapabilities: {} });
+  transport.methodResults.set("session/new", { sessionId: "session-prompt" });
+  transport.methodResults.set("session/prompt", { stopReason: "end_turn" });
+  const adapter = new GrokProviderAdapter({ hostId: "host_1", transportFactory: () => transport });
+  const events: ProviderEvent[] = [];
+  await adapter.subscribe(null, (event) => { events.push(event); });
+  await adapter.createSession({ workingDirectory: "C:\\workspace" });
+  await adapter.sendMessage("session-prompt", { requestId: "request-1", content: "Inspect" });
+  const working = events.find((event) => event.type === "session.status_changed");
+  assert.equal(working?.payload.state, "working");
+  assert.equal(adapter.hasActiveTurn("session-prompt"), true);
+  await adapter.dispose();
+});
+
+test("Grok native queue/changed entries are listed and published to the bridge", async () => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("initialize", { protocolVersion: 1, agentCapabilities: {} });
+  const adapter = new GrokProviderAdapter({ hostId: "host_1", transportFactory: () => transport });
+  const events: ProviderEvent[] = [];
+  await adapter.subscribe(null, (event) => { events.push(event); });
+  transport.push({
+    method: "_x.ai/queue/changed",
+    params: {
+      sessionId: "grok-session",
+      entries: [{ id: "native-q1", kind: "prompt", text: "Queued from the CLI" }],
+    },
+  });
+  await delay();
+  const listed = await adapter.listQueuedMessages?.();
+  assert.deepEqual(listed?.map((message) => [message.id, message.content, message.providerSessionId]), [
+    ["native-q1", "Queued from the CLI", "grok-session"],
+  ]);
+  const published = events.find((event) => event.type === "message.queue_updated");
+  assert.equal(Array.isArray(published?.payload.messages), true);
+  assert.equal((published?.payload.messages as { id: string }[])[0]?.id, "native-q1");
+  await adapter.dispose();
+});
+
+test("Grok enqueue uses session/prompt so the CLI owns the follow-up", async () => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("initialize", { protocolVersion: 1, agentCapabilities: {} });
+  transport.methodResults.set("session/new", { sessionId: "grok-session" });
+  transport.notificationsBeforeResult.set("session/prompt", [{
+    method: "_x.ai/queue/changed",
+    params: {
+      sessionId: "grok-session",
+      entries: [{ id: "native-q2", kind: "prompt", text: "Ask this next" }],
+    },
+  }]);
+  const adapter = new GrokProviderAdapter({ hostId: "host_1", transportFactory: () => transport });
+  await adapter.createSession({ workingDirectory: "C:\\workspace" });
+  const queued = await adapter.enqueueQueuedMessage?.("grok-session", {
+    requestId: "request-queue",
+    content: "Ask this next",
+    workingDirectory: "C:\\workspace",
+  });
+  assert.equal(queued?.id, "native-q2");
+  assert.equal(queued?.content, "Ask this next");
+  const prompt = transport.sent.find((message) => typeof message === "object"
+    && message !== null
+    && (message as Record<string, unknown>).method === "session/prompt") as Record<string, unknown>;
+  assert.deepEqual((prompt.params as Record<string, unknown>).prompt, [{ type: "text", text: "Ask this next" }]);
+  await adapter.dispose();
+});
+
+test("Grok queue edit and remove use native ACP notifications", async () => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("initialize", { protocolVersion: 1, agentCapabilities: {} });
+  const adapter = new GrokProviderAdapter({ hostId: "host_1", transportFactory: () => transport });
+  await adapter.subscribe(null, () => undefined);
+  transport.push({
+    method: "_x.ai/queue/changed",
+    params: {
+      sessionId: "grok-session",
+      entries: [{ id: "native-q3", kind: "prompt", text: "Original" }],
+    },
+  });
+  await delay();
+  const updated = await adapter.updateQueuedMessage?.("grok-session", "native-q3", "Revised");
+  assert.equal(updated?.content, "Revised");
+  const removed = await adapter.cancelQueuedMessage?.("grok-session", "native-q3");
+  assert.equal(removed, true);
+  const methods = transport.sent.flatMap((message) => (
+    typeof message === "object" && message !== null && typeof (message as Record<string, unknown>).method === "string"
+      ? [(message as Record<string, unknown>).method as string]
+      : []
+  ));
+  assert.ok(methods.includes("_x.ai/queue/edit"));
+  assert.ok(methods.includes("_x.ai/queue/remove"));
+  await adapter.dispose();
+});
+
+test("public ACP adapters do not claim Grok's native queue", async () => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("initialize", { protocolVersion: 1, agentCapabilities: {} });
+  const adapter = createPublicAcpProviderAdapter("qwen", { hostId: "host_1", transportFactory: () => transport });
+  assert.equal(adapter.enqueueQueuedMessage, undefined);
+  assert.equal(adapter.listQueuedMessages, undefined);
   await adapter.dispose();
 });
 
@@ -414,6 +562,76 @@ test("ACP session context uses only usage reported by prompt results and updates
   assert.equal(fromCanonicalUsageUpdate.usedPercent, 7.5);
   assert.equal(fromCanonicalUsageUpdate.usage.cost, 0.021);
   assert.equal(fromCanonicalUsageUpdate.usage.currency, "USD");
+
+  transport.push({
+    method: "session/update",
+    params: {
+      sessionId: "usage-session",
+      update: {
+        sessionUpdate: "session_info_update",
+        sessionUsage: { input_tokens: 180_000, output_tokens: 20_000, total_tokens: 400_000 },
+        context_usage: { used_tokens: 203_000, context_window_tokens: 500_000, used_percent: 40.6 },
+      },
+    },
+  });
+  await delay();
+  const occupancy = await adapter.getSessionContext("usage-session");
+  assert.equal(occupancy.usedTokens, 203_000);
+  assert.equal(occupancy.contextWindowTokens, 500_000);
+  assert.equal(occupancy.usage.totalTokens, 400_000);
+
+  transport.push({
+    method: "session/update",
+    params: {
+      sessionId: "usage-session",
+      update: {
+        sessionUpdate: "session_info_update",
+        tokens: 400_000,
+        sessionUsage: { total_tokens: 400_000 },
+      },
+    },
+  });
+  await delay();
+  const billedIsNotOccupancy = await adapter.getSessionContext("usage-session");
+  assert.equal(billedIsNotOccupancy.usedTokens, 203_000);
+  await adapter.dispose();
+});
+
+test("ACP context falls back to the reported total when no occupancy is given", async () => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("initialize", {
+    protocolVersion: 1,
+    agentCapabilities: {},
+    _meta: {
+      model_state: {
+        currentModelId: "coder",
+        availableModels: [{ id: "coder", context_window: 200_000 }],
+      },
+    },
+  });
+  transport.methodResults.set("session/new", { sessionId: "usage-only-session" });
+  // A prompt result with usage but no context_usage: the provider gives the
+  // billed request totals only, so the panel must reconcile "Used" with them
+  // instead of showing Unavailable next to real Input / Output figures.
+  transport.methodResults.set("session/prompt", {
+    stopReason: "end_turn",
+    modelId: "coder",
+    sessionUsage: { input_tokens: 14_684, output_tokens: 44, total_tokens: 14_728 },
+  });
+  const adapter = createPublicAcpProviderAdapter("qwen", { hostId: "host_1", transportFactory: () => transport });
+
+  await adapter.createSession({ workingDirectory: "C:\\workspace" });
+  await adapter.sendMessage("usage-only-session", { requestId: "request-usage", content: "Hi" });
+  await delay();
+  const context = await adapter.getSessionContext("usage-only-session");
+  assert.equal(context.usedTokens, 14_728, "used falls back to the reported total");
+  assert.equal(context.contextWindowTokens, 200_000);
+  assert.equal(context.usedPercent, 7.364);
+  assert.deepEqual(context.usage, {
+    inputTokens: 14_684,
+    outputTokens: 44,
+    totalTokens: 14_728,
+  });
   await adapter.dispose();
 });
 
@@ -640,6 +858,52 @@ test("ACP surfaces rejected JSON-RPC callbacks as a provider connection event", 
   await adapter.dispose();
 });
 
+test("Grok keeps live thought deltas flowing instead of session/load during a turn", async () => {
+  const transport = new FakeTransport();
+  transport.blockedMethods.add("session/prompt");
+  transport.methodResults.set("initialize", {
+    protocolVersion: 1,
+    agentCapabilities: { loadSession: true, sessionCapabilities: { resume: true } },
+  });
+  transport.methodResults.set("session/new", { sessionId: "live-session" });
+  const adapter = new GrokProviderAdapter({ hostId: "host_1", transportFactory: () => transport });
+  const events: ProviderEvent[] = [];
+  await adapter.subscribe(null, (event) => { events.push(event); });
+  await adapter.createSession({ workingDirectory: "C:\\workspace" });
+  await adapter.sendMessage("live-session", { requestId: "r1", content: "Think" });
+  assert.equal(adapter.hasActiveTurn("live-session"), true);
+  const loadCount = () => transport.sent.filter((message) => typeof message === "object" && message !== null && (message as Record<string, unknown>).method === "session/load").length;
+  const loadsBeforeThought = loadCount();
+  await adapter.getMessages("live-session");
+  assert.equal(loadCount(), loadsBeforeThought, "a live turn with no chunk yet must not session/load");
+
+  transport.push({
+    method: "session/update",
+    params: {
+      sessionId: "live-session",
+      update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Step one" } },
+    },
+  });
+  await delay();
+  assert.equal(events.filter((event) => event.type === "message.delta").at(-1)?.payload.text, "Step one");
+
+  const before = loadCount();
+  const liveHistory = await adapter.getMessages("live-session");
+  assert.equal(loadCount(), before, "an attached live turn must not session/load the transcript");
+  assert.equal(liveHistory.at(-1)?.parts.some((part) => part.type === "reasoning" && part.text === "Step one"), true);
+
+  transport.push({
+    method: "session/update",
+    params: {
+      sessionId: "live-session",
+      update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Step two" } },
+    },
+  });
+  await delay();
+  assert.equal(events.filter((event) => event.type === "message.delta").at(-1)?.payload.text, "Step two");
+  await adapter.dispose();
+});
+
 test("Grok accepts standard and xAI session updates and links only list-resolved children", async () => {
   const transport = new FakeTransport();
   transport.methodResults.set("initialize", {
@@ -668,6 +932,7 @@ test("Grok accepts standard and xAI session updates and links only list-resolved
   const thought = events.at(-1);
   assert.equal(thought?.type, "message.delta");
   assert.equal(thought?.payload.partType, "reasoning");
+  assert.equal(adapter.hasActiveTurn("parent-1"), true);
   assert.deepEqual(thought?.payload.content, {
     sessionUpdate: "agent_thought_chunk",
     content: { type: "text", text: "Inspecting the parser" },
@@ -729,5 +994,206 @@ test("Grok accepts standard and xAI session updates and links only list-resolved
   assert.ok(typeof unresolvedPart === "object" && unresolvedPart !== null && !Array.isArray(unresolvedPart));
   assert.deepEqual(unresolvedPart.receiverSessionIds, []);
 
+  await adapter.dispose();
+});
+
+test("Grok watch keeps the ACP peer and never replays history for an attached session", async () => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("initialize", {
+    protocolVersion: 1,
+    agentCapabilities: { loadSession: true, sessionCapabilities: { resume: true, list: true } },
+  });
+  transport.methodResults.set("session/list", {
+    sessions: [{ sessionId: "watched-session", cwd: "C:\\workspace" }],
+    nextCursor: null,
+  });
+  transport.methodResults.set("session/load", {});
+  transport.methodResults.set("session/resume", {});
+  const adapter = new GrokProviderAdapter({ hostId: "host_1", idleReleaseMs: 5, transportFactory: () => transport });
+  const events: ProviderEvent[] = [];
+  await adapter.subscribe(null, (event) => { events.push(event); });
+  await adapter.getMessages("watched-session");
+  const loadCount = () => transport.sent.filter((message) => typeof message === "object" && message !== null && (message as Record<string, unknown>).method === "session/load").length;
+  const loadsAfterOpen = loadCount();
+  assert.ok(loadsAfterOpen >= 1);
+
+  await adapter.watchSession("watched-session");
+  await adapter.releaseIdleResources();
+  await delay(20);
+  assert.equal(transport.closeCalls, 0, "a watched session must keep the live ACP connection");
+
+  await adapter.getMessages("watched-session");
+  assert.ok(loadCount() >= loadsAfterOpen, "a quiet attached session may catch up with session/load");
+
+  transport.push({
+    method: "session/update",
+    params: {
+      sessionId: "watched-session",
+      update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Only the new part" } },
+    },
+  });
+  await delay();
+  assert.equal(events.filter((event) => event.type === "message.delta").at(-1)?.payload.text, "Only the new part");
+  await adapter.dispose();
+});
+
+test("Grok session/load publishes the session's real reasoning effort", async () => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("initialize", {
+    protocolVersion: 1,
+    agentCapabilities: { loadSession: true, sessionCapabilities: { list: true } },
+  });
+  transport.methodResults.set("session/load", {
+    configOptions: [
+      {
+        id: "thinking",
+        name: "Thinking",
+        category: "thought_level",
+        type: "select",
+        currentValue: "xhigh",
+        options: [{ value: "low" }, { value: "medium" }, { value: "high" }, { value: "xhigh" }],
+      },
+    ],
+  });
+  transport.methodResults.set("session/list", {
+    sessions: [{ sessionId: "effort-session", cwd: "C:\\workspace", title: "Effort chat" }],
+    nextCursor: null,
+  });
+  const adapter = new GrokProviderAdapter({ hostId: "host_1", transportFactory: () => transport });
+  const events: ProviderEvent[] = [];
+  await adapter.subscribe(null, (event) => { events.push(event); });
+
+  const messages = await adapter.getMessages("effort-session");
+  assert.equal(messages.length, 0);
+  await delay();
+  const published = events.find((event) => event.type === "session.updated");
+  assert.equal(published?.payload.reasoningEffort, "xhigh", "reopening must publish the learned session effort");
+  assert.equal(published?.providerSessionId, "effort-session");
+
+  const session = await adapter.getSession("effort-session");
+  assert.equal(session.reasoningEffort, "xhigh", "the listed session carries the real effort");
+  await adapter.dispose();
+});
+
+test("a turn that streamed a moment ago still reports completion", async () => {
+  const events: ProviderEvent[] = [];
+  const adapter = createPublicAcpProviderAdapter("qwen", {
+    hostId: "host_terminal",
+    transportFactory: () => {
+      const transport = new FakeTransport();
+      transport.methodResults.set("initialize", { protocolVersion: 1, agentCapabilities: {} });
+      transport.methodResults.set("session/new", { sessionId: "live-session" });
+      transport.methodResults.set("session/prompt", { stopReason: "end_turn" });
+      // A chunk lands immediately before the prompt resolves. Chunk recency used
+      // to suppress the terminal event, leaving the task working and its rows
+      // shimmering with no way back except clicking away.
+      transport.notificationsBeforeResult.set("session/prompt", [{
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId: "live-session", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "PONG" } } },
+      }]);
+      return transport;
+    },
+  });
+  await adapter.subscribe(null, (event) => { events.push(event); });
+  await adapter.createSession({ workingDirectory: "C:\workspace" });
+
+  await adapter.sendMessage("live-session", { requestId: "one", content: "Say PONG" });
+  await delay(40);
+
+  assert.ok(events.some((event) => event.type === "message.delta" && event.providerSessionId === "live-session"));
+  assert.ok(events.some((event) => event.type === "agent.completed" && event.providerSessionId === "live-session"));
+  // The live-turn marker is cleared, so a later history catch-up is allowed again.
+  assert.equal(adapter.hasActiveTurn("live-session"), false);
+  await adapter.dispose();
+});
+
+test("the reasoning level a session is really running is read from the harness", async () => {
+  const events: ProviderEvent[] = [];
+  let transport: FakeTransport | undefined;
+  const adapter = createPublicAcpProviderAdapter("qwen", {
+    hostId: "host_effort",
+    transportFactory: () => {
+      const created = new FakeTransport();
+      created.methodResults.set("initialize", { protocolVersion: 1, agentCapabilities: {} });
+      created.methodResults.set("session/new", { sessionId: "effort-session" });
+      transport = created;
+      return created;
+    },
+  });
+  await adapter.subscribe(null, (event) => { if (event.type === "session.updated") events.push(event); });
+  await adapter.createSession({ workingDirectory: "C:\workspace" });
+
+  // The session listing the harness pushes on connect carries the real level, so
+  // reopening a chat shows what it is running rather than the model default.
+  transport?.push({
+    jsonrpc: "2.0",
+    method: "_x.ai/sessions/changed",
+    params: { upserted: [{ sessionId: "effort-session", modelId: "grok-4.6", reasoningEffort: "xhigh" }], removed: [] },
+  });
+  await delay(20);
+  assert.equal(events.at(-1)?.payload.reasoningEffort, "xhigh");
+  assert.equal(events.at(-1)?.providerSessionId, "effort-session");
+
+  // A level changed inside the harness itself is announced too, and must land.
+  transport?.push({
+    jsonrpc: "2.0",
+    method: "_x.ai/session_notification",
+    params: { sessionId: "effort-session", update: { sessionUpdate: "model_changed", model_id: "grok-4.6", reasoning_effort: "low" } },
+  });
+  await delay(20);
+  assert.equal(events.at(-1)?.payload.reasoningEffort, "low");
+
+  // Repeating what clients already know must not churn the UI.
+  const settled = events.length;
+  transport?.push({
+    jsonrpc: "2.0",
+    method: "_x.ai/sessions/changed",
+    params: { upserted: [{ sessionId: "effort-session", modelId: "grok-4.6", reasoningEffort: "low" }], removed: [] },
+  });
+  await delay(20);
+  assert.equal(events.length, settled);
+  await adapter.dispose();
+});
+
+test("reopening a chat learns its reasoning level from the session it loads", async () => {
+  // Grok's session listing carries no reasoning level, so a cold start can only
+  // learn it from the model block returned when the chat is opened.
+  const loadResult = {
+    models: {
+      currentModelId: "grok-4.6",
+      availableModels: [
+        { modelId: "grok-4.5", name: "Grok 4.5", _meta: { reasoningEffort: "high" } },
+        { modelId: "grok-4.6", name: "Grok 4.6", _meta: { supportsReasoningEffort: true, reasoningEffort: "xhigh" } },
+      ],
+    },
+  };
+  assert.deepEqual(reportedModelSelection(loadResult), { modelId: "grok-4.6", reasoningEffort: "xhigh" });
+  assert.equal(reportedModelSelection({ models: { currentModelId: "grok-4.6" } }), undefined);
+  assert.equal(reportedModelSelection({ sessions: [] }), undefined);
+
+  const events: ProviderEvent[] = [];
+  const adapter = createPublicAcpProviderAdapter("qwen", {
+    hostId: "host_reopen",
+    transportFactory: () => {
+      const transport = new FakeTransport();
+      transport.methodResults.set("initialize", {
+        protocolVersion: 1,
+        agentCapabilities: { loadSession: true, sessionCapabilities: { resume: true } },
+      });
+      transport.methodResults.set("session/new", { sessionId: "reopened" });
+      transport.methodResults.set("session/load", loadResult);
+      return transport;
+    },
+  });
+  await adapter.subscribe(null, (event) => { if (event.type === "session.updated") events.push(event); });
+  await adapter.createSession({ workingDirectory: "C:\workspace" });
+
+  await adapter.getMessages("reopened");
+  await delay(20);
+
+  const learned = events.filter((event) => event.payload.reasoningEffort !== undefined);
+  assert.equal(learned.at(-1)?.payload.reasoningEffort, "xhigh");
+  assert.equal(learned.at(-1)?.providerSessionId, "reopened");
   await adapter.dispose();
 });

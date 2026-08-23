@@ -6,6 +6,8 @@ import {
   type RemoteModel,
   type RemoteSession,
   type SessionTokenUsage,
+  matchReasoningEffort,
+  resolveModelReasoningProfile,
 } from "../../protocol/src/index.js";
 import {
   JsonLineProcessTransport,
@@ -17,6 +19,9 @@ import {
   buildSpawnCommand,
   resolveCommand,
   type AgentProviderAdapter,
+  type EnqueueProviderMessageRequest,
+  type ProviderQueuedMessage,
+  type RestoreProviderMessageRequest,
   type AuthRequest,
   type AuthResult,
   type AuthStatus,
@@ -40,6 +45,7 @@ import {
   appendAcpContentChunk,
   appendAcpSubagentPart,
   acpSubagentChildSessionId,
+  acpUpdateLooksLikeThought,
   asJsonObject,
   completeAcpMessages,
   createMessageAccumulator,
@@ -49,6 +55,12 @@ import {
   type AcpProviderIdentity,
   type AcpMessageAccumulator,
 } from "./normalize.js";
+import {
+  grokQueueEditParams,
+  grokQueueRemoveParams,
+  isGrokQueueChangedMethod,
+  parseGrokQueueChanged,
+} from "./queue.js";
 
 interface AcpInitializeResponse {
   readonly protocolVersion?: number;
@@ -228,6 +240,14 @@ function historyMessageId(
 
 type InputModality = "text" | "image" | "audio";
 
+function latestAcpChunkText(message: RemoteMessage): string | undefined {
+  for (let index = message.parts.length - 1; index >= 0; index -= 1) {
+    const part = message.parts[index];
+    if ((part?.type === "text" || part?.type === "reasoning") && part.text.trim().length > 0) return part.text;
+  }
+  return undefined;
+}
+
 function finiteNonNegative(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
@@ -357,6 +377,7 @@ function modelEntries(response: AcpInitializeResponse, providerId: string): read
   if (state === undefined) return [];
   const current = currentModelId(response);
   const fallbackModalities = advertisedPromptModalities(response.agentCapabilities);
+  const sharedReasoning = initializeReasoningProfile(response);
   const source = Array.isArray(state.availableModels)
     ? state.availableModels
     : Array.isArray(state.available_models)
@@ -365,28 +386,69 @@ function modelEntries(response: AcpInitializeResponse, providerId: string): read
         ? state.models
         : [];
   return source.flatMap((entry): readonly RemoteModel[] => {
-    if (typeof entry === "string") return [{
-      id: entry,
-      providerId,
-      displayName: entry,
-      isDefault: entry === current,
-      ...(fallbackModalities !== undefined ? { inputModalities: fallbackModalities } : {}),
-      nativeMetadata: {},
-    }];
+    if (typeof entry === "string") {
+      return [modelRecord(providerId, entry, entry, entry === current, fallbackModalities, {}, sharedReasoning)];
+    }
     if (!isRecord(entry)) return [];
     const id = [entry.id, entry.modelId, entry.model_id].find((value): value is string => typeof value === "string");
     if (id === undefined) return [];
+    const displayName = typeof entry.name === "string" ? entry.name : id;
     const inputModalities = modelInputModalities(entry, fallbackModalities);
-    return [{
-      id,
+    return [modelRecord(
       providerId,
-      displayName: typeof entry.name === "string" ? entry.name : id,
-      ...(typeof entry.description === "string" ? { description: entry.description } : {}),
-      isDefault: id === current || entry.default === true,
-      ...(inputModalities !== undefined ? { inputModalities } : {}),
-      nativeMetadata: asJsonObject(entry),
-    }];
+      id,
+      displayName,
+      id === current || entry.default === true,
+      inputModalities,
+      { ...entry, ...(typeof entry.description === "string" ? { description: entry.description } : {}) },
+      sharedReasoning,
+    )];
   });
+}
+
+function initializeReasoningProfile(response: AcpInitializeResponse): { readonly efforts: readonly string[]; readonly defaultEffort?: string } {
+  const options = sessionConfigOptions(response) ?? sessionConfigOptions(response._meta) ?? [];
+  const thought = configOptionFor(options, "thought_level");
+  const efforts = thought?.values ?? [];
+  return {
+    efforts,
+    ...(thought?.currentValue ? { defaultEffort: thought.currentValue } : {}),
+  };
+}
+
+function modelRecord(
+  providerId: string,
+  id: string,
+  displayName: string,
+  isDefault: boolean,
+  inputModalities: readonly InputModality[] | undefined,
+  native: Record<string, unknown>,
+  sharedReasoning: { readonly efforts: readonly string[]; readonly defaultEffort?: string },
+): RemoteModel {
+  const resolved = resolveModelReasoningProfile({
+    providerId,
+    modelId: id,
+    displayName,
+    advertised: native.supportedReasoningEfforts
+      ?? native.reasoningEfforts
+      ?? native.thoughtLevels
+      ?? native.thought_levels
+      ?? (sharedReasoning.efforts.length ? sharedReasoning.efforts : undefined),
+  });
+  const defaultEffort = resolved.defaultEffort ?? sharedReasoning.defaultEffort;
+  return {
+    id,
+    providerId,
+    displayName,
+    ...(typeof native.description === "string" ? { description: native.description } : {}),
+    isDefault,
+    ...(inputModalities !== undefined ? { inputModalities } : {}),
+    nativeMetadata: {
+      ...asJsonObject(native),
+      ...(resolved.efforts.length ? { supportedReasoningEfforts: [...resolved.efforts] } : {}),
+      ...(defaultEffort ? { defaultReasoningEffort: defaultEffort } : {}),
+    },
+  };
 }
 
 interface ParsedReportedContext {
@@ -472,7 +534,18 @@ function parseReportedContext(value: unknown): ParsedReportedContext | null {
   ];
   if (usage === undefined && directUsageKeys.some((key) => value[key] !== undefined)) usage = usageFromRecord(value);
   const contextSource = context ?? value;
-  const usedTokens = firstNumber(contextSource, ["usedTokens", "used_tokens", "contextTokens", "context_tokens", "tokensUsed", "tokens_used", "tokens", "used"]);
+  const occupancyKeys = ["usedTokens", "used_tokens", "contextTokens", "context_tokens", "tokensUsed", "tokens_used"] as const;
+  const occupancy = firstNumber(contextSource, occupancyKeys);
+  const usageUpdateUsed = firstPositiveInteger(contextSource, [
+    "size",
+    "contextWindowTokens",
+    "context_window_tokens",
+    "contextWindow",
+    "context_window",
+  ]) !== undefined
+    ? firstNumber(contextSource, ["used"])
+    : undefined;
+  const usedTokens = occupancy ?? usageUpdateUsed;
   const contextWindowTokens = firstPositiveInteger(contextSource, [
     "contextWindowTokens",
     "context_window_tokens",
@@ -542,6 +615,41 @@ function sessionConfigOptions(value: unknown): readonly AcpSessionConfigOption[]
   });
 }
 
+/** Harnesses spell the same field several ways; take the first that is present. */
+function firstUpdateString(source: Record<string, unknown>, keys: readonly string[]): string | undefined {
+  for (const key of keys) {
+    const value = source[key];
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  }
+  return undefined;
+}
+
+/**
+ * The model block a harness returns from session/new, session/load and
+ * session/resume. Grok states the level the session is running here, on the
+ * currently selected model, and this is the only place a cold start can learn it:
+ * its session listing carries no reasoning level at all.
+ */
+export function reportedModelSelection(value: unknown): { readonly modelId?: string; readonly reasoningEffort?: string } | undefined {
+  if (!isRecord(value)) return undefined;
+  const models = isRecord(value.models) ? value.models : value;
+  const available = Array.isArray(models.availableModels)
+    ? models.availableModels
+    : Array.isArray(models.available_models) ? models.available_models : undefined;
+  if (available === undefined) return undefined;
+  const modelId = firstUpdateString(models, ["currentModelId", "current_model_id", "modelId", "model_id"]);
+  const current = available.find((entry) => isRecord(entry) && firstUpdateString(entry, ["modelId", "model_id", "id"]) === modelId)
+    ?? available.find((entry) => isRecord(entry));
+  const meta = isRecord(current) && isRecord(current._meta) ? current._meta : {};
+  const reasoningEffort = firstUpdateString(meta, ["reasoningEffort", "reasoning_effort", "thoughtLevel", "thought_level"]);
+  if (modelId === undefined && reasoningEffort === undefined) return undefined;
+  return { ...(modelId !== undefined ? { modelId } : {}), ...(reasoningEffort !== undefined ? { reasoningEffort } : {}) };
+}
+
+export function isAcpSessionsChangedMethod(method: string): boolean {
+  return method === "_x.ai/sessions/changed" || method === "session/list_changed" || method === "sessions/changed";
+}
+
 function configOptionFor(
   options: readonly AcpSessionConfigOption[],
   category: "model" | "thought_level",
@@ -558,6 +666,11 @@ function configOptionFor(
 export class AcpProviderAdapter implements AgentProviderAdapter {
   public readonly providerId: string;
   public readonly displayName: string;
+  public readonly listQueuedMessages?: () => Promise<readonly ProviderQueuedMessage[]>;
+  public readonly enqueueQueuedMessage?: (providerSessionId: string, request: EnqueueProviderMessageRequest) => Promise<ProviderQueuedMessage>;
+  public readonly restoreQueuedMessage?: (providerSessionId: string, request: RestoreProviderMessageRequest) => Promise<ProviderQueuedMessage>;
+  public readonly updateQueuedMessage?: (providerSessionId: string, messageId: string, content: string) => Promise<ProviderQueuedMessage | null>;
+  public readonly cancelQueuedMessage?: (providerSessionId: string, messageId: string) => Promise<boolean>;
 
   readonly #hostId: string;
   readonly #command: string;
@@ -573,7 +686,10 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
   readonly #pendingPermissions = new Map<string, PendingPermission>();
   readonly #sessionContexts = new Map<string, SessionContext>();
   readonly #historyCapture = new Map<string, AcpMessageAccumulator>();
+  readonly #historyLoads = new Map<string, Promise<readonly RemoteMessage[]>>();
   readonly #liveMessages = new Map<string, AcpMessageAccumulator>();
+  readonly #lastLoadedMessages = new Map<string, readonly RemoteMessage[]>();
+  readonly #lastLiveUpdateAt = new Map<string, number>();
   readonly #reportedContexts = new Map<string, ReportedSessionContext>();
   readonly #sessionConfigOptions = new Map<string, readonly AcpSessionConfigOption[]>();
   readonly #appliedSessionSelections = new Map<string, AppliedSessionSelections>();
@@ -581,6 +697,17 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
   readonly #sessionClientToolModes = new Map<string, "enabled" | "disabled">();
   readonly #openableSubagentSessions = new Map<string, string>();
   readonly #activeSessions = new Set<string>();
+  readonly #watchedSessions = new Set<string>();
+  readonly #activePrompts = new Set<string>();
+  readonly #inFlightPromptCounts = new Map<string, number>();
+  readonly #nativeQueues = new Map<string, readonly ProviderQueuedMessage[]>();
+  readonly #runningPromptIds = new Map<string, string>();
+  readonly #queueWaiters: Array<{
+    readonly sessionId: string;
+    readonly text: string;
+    readonly resolve: (message: ProviderQueuedMessage) => void;
+    readonly timer: ReturnType<typeof setTimeout>;
+  }> = [];
   #peer: JsonRpcPeer | null = null;
   #startingPeer: JsonRpcPeer | null = null;
   #initializing: Promise<JsonRpcPeer> | null = null;
@@ -609,6 +736,13 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
       ...(options.sessionLabel !== undefined ? { sessionLabel: options.sessionLabel } : {}),
     };
     this.#capabilityNote = options.capabilityNote ?? `Uses the documented Agent Client Protocol mode exposed by ${options.displayName}.`;
+    if (options.providerId === "grok") {
+      this.listQueuedMessages = async () => this.listNativeQueuedMessages();
+      this.enqueueQueuedMessage = async (providerSessionId, request) => await this.enqueueNativeQueuedMessage(providerSessionId, request);
+      this.restoreQueuedMessage = async (providerSessionId, request) => await this.enqueueNativeQueuedMessage(providerSessionId, request);
+      this.updateQueuedMessage = async (providerSessionId, messageId, content) => await this.updateNativeQueuedMessage(providerSessionId, messageId, content);
+      this.cancelQueuedMessage = async (providerSessionId, messageId) => await this.cancelNativeQueuedMessage(providerSessionId, messageId);
+    }
   }
 
   public configureClientTooling(tooling: ProviderClientTooling): void {
@@ -699,6 +833,9 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     readonly usage: SessionTokenUsage;
   }> {
     const response = await this.ensureInitialized();
+    if (this.#reportedContexts.get(providerSessionId)?.usedTokens === undefined) {
+      await this.listSessions().catch(() => undefined);
+    }
     const reported = this.#reportedContexts.get(providerSessionId);
     const modelId = reported?.modelId ?? currentModelId(response);
     const model = modelId === undefined
@@ -706,7 +843,12 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
       : modelEntries(response, this.providerId).find((entry) => entry.id === modelId);
     const contextWindowTokens = reported?.contextWindowTokens
       ?? (model === undefined ? undefined : modelContextWindow(model.nativeMetadata));
-    const usedTokens = reported?.usedTokens;
+    // Occupancy (context_usage) is the authoritative "used" figure when the
+    // harness reports it; otherwise the latest request's total is the closest
+    // truthful proxy for the context actually in use, so the panel reconciles
+    // with the reported Input / Output figures instead of showing Unavailable.
+    const usedTokens = reported?.usedTokens
+      ?? (reported?.usage?.totalTokens !== undefined ? reported.usage.totalTokens : undefined);
     const usedPercent = reported?.usedPercent
       ?? (usedTokens !== undefined && contextWindowTokens !== undefined && contextWindowTokens > 0
         ? Math.max(0, Math.min(100, usedTokens / contextWindowTokens * 100))
@@ -733,8 +875,9 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     const sessions = result.sessions.map((entry) => {
       const session = normalizeAcpSession(this.#hostId, entry, this.#now(), this.#identity);
       this.captureReportedContext(session.providerSessionId, entry);
+      this.captureSessionConfigOptions(session.providerSessionId, entry);
       if (session.workingDirectory !== undefined) this.#sessionContexts.set(session.providerSessionId, { cwd: session.workingDirectory, additionalDirectories: additionalDirectories(entry) });
-      return session;
+      return this.decorateSessionSelections(session);
     });
     return { sessions, nextCursor: typeof result.nextCursor === "string" ? result.nextCursor : null };
   }
@@ -755,6 +898,28 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
   }
 
   public async getMessages(providerSessionId: string): Promise<readonly RemoteMessage[]> {
+    const inflight = this.#historyLoads.get(providerSessionId);
+    if (inflight !== undefined) return await inflight;
+    // Only skip a history reload while live chunks are actually arriving.
+    // An attached-but-quiet session must still be able to catch up — otherwise
+    // a Grok CLI turn that never pushed session/update stays frozen forever.
+    if (this.shouldKeepLiveTail(providerSessionId)) return this.historyWithLiveTail(providerSessionId);
+    const load = this.loadSessionHistory(providerSessionId);
+    this.#historyLoads.set(providerSessionId, load);
+    try {
+      return await load;
+    } finally {
+      if (this.#historyLoads.get(providerSessionId) === load) this.#historyLoads.delete(providerSessionId);
+    }
+  }
+
+  private shouldKeepLiveTail(providerSessionId: string): boolean {
+    // Reloading history mid-turn swallows session/update notifications into the
+    // load accumulator, so the open chat freezes and reasoning never shimmers.
+    return this.hasActiveTurn(providerSessionId);
+  }
+
+  private async loadSessionHistory(providerSessionId: string): Promise<readonly RemoteMessage[]> {
     const capabilities = await this.getCapabilities();
     if (!capabilities.sessionHistory) throw new UnsupportedProviderCapabilityError(this.providerId, "session/load history replay");
     const context = await this.contextFor(providerSessionId);
@@ -769,9 +934,12 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
       });
       this.captureReportedContext(providerSessionId, result);
       this.captureSessionConfigOptions(providerSessionId, result);
+      this.captureReportedModels(providerSessionId, result);
       this.#sessionClientToolModes.set(providerSessionId, this.#clientTooling === undefined ? "disabled" : "enabled");
       this.#activeSessions.add(providerSessionId);
-      return await this.hydrateCapturedSubagentLinks(providerSessionId, completeAcpMessages(accumulator, this.#now()));
+      const messages = await this.hydrateCapturedSubagentLinks(providerSessionId, completeAcpMessages(accumulator, this.#now()));
+      this.#lastLoadedMessages.set(providerSessionId, messages);
+      return messages;
     } finally {
       this.#historyCapture.delete(providerSessionId);
     }
@@ -804,6 +972,7 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     this.#sessionContexts.set(response.sessionId, { cwd: options.workingDirectory, additionalDirectories: stringArray(options.metadata?.additionalDirectories) });
     this.captureReportedContext(response.sessionId, response);
     this.captureSessionConfigOptions(response.sessionId, response);
+    this.captureReportedModels(response.sessionId, response);
     if (!clientToolsEnabled) this.#sessionClientToolModes.set(response.sessionId, "disabled");
     else if (binding !== undefined) this.#sessionClientToolModes.set(response.sessionId, "enabled");
     this.#activeSessions.add(response.sessionId);
@@ -824,7 +993,7 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
         ...(options.reasoningEffort !== undefined ? { reasoningEffort: options.reasoningEffort } : {}),
       });
     }
-    return session;
+    return this.decorateSessionSelections(session);
   }
 
   public async resumeSession(providerSessionId: string): Promise<void> {
@@ -839,6 +1008,7 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
       });
       this.captureReportedContext(providerSessionId, result);
       this.captureSessionConfigOptions(providerSessionId, result);
+      this.captureReportedModels(providerSessionId, result);
       this.#sessionClientToolModes.set(providerSessionId, this.#clientTooling === undefined ? "disabled" : "enabled");
       this.#activeSessions.add(providerSessionId);
       return;
@@ -852,6 +1022,7 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
       });
       this.captureReportedContext(providerSessionId, result);
       this.captureSessionConfigOptions(providerSessionId, result);
+      this.captureReportedModels(providerSessionId, result);
       this.#sessionClientToolModes.set(providerSessionId, this.#clientTooling === undefined ? "disabled" : "enabled");
       this.#activeSessions.add(providerSessionId);
       return;
@@ -873,8 +1044,127 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
       await this.resumeSession(providerSessionId);
     }
     await this.applySessionSelections(providerSessionId, request.modelId, request.reasoningEffort);
-    const peer = await this.peer();
-    void peer.request<unknown>("session/prompt", {
+    this.dispatchNativePrompt(providerSessionId, request);
+    return { accepted: true, providerTurnId: request.requestId, details: ["ACP session/prompt accepted; updates arrive through session/update notifications"] };
+  }
+
+  public hasActiveTurn(providerSessionId: string): boolean {
+    const lastLive = this.#lastLiveUpdateAt.get(providerSessionId);
+    return this.#activePrompts.has(providerSessionId)
+      || (this.#nativeQueues.get(providerSessionId)?.length ?? 0) > 0
+      || this.#runningPromptIds.has(providerSessionId)
+      || (lastLive !== undefined && this.#now().getTime() - lastLive < 15_000);
+  }
+
+  public async watchSession(providerSessionId: string): Promise<void> {
+    this.#watchedSessions.add(providerSessionId);
+    this.cancelIdleRelease();
+    if (this.#peer !== null && this.#activeSessions.has(providerSessionId) && this.#lastLoadedMessages.has(providerSessionId)) {
+      return;
+    }
+    await this.getMessages(providerSessionId);
+  }
+
+  public unwatchSession(providerSessionId: string): void {
+    this.#watchedSessions.delete(providerSessionId);
+  }
+
+  private historyWithLiveTail(providerSessionId: string): readonly RemoteMessage[] {
+    const loaded = this.#lastLoadedMessages.get(providerSessionId) ?? [];
+    const live = this.#liveMessages.get(providerSessionId);
+    if (live === undefined) return loaded;
+    const liveMessages = live.orderedIds.flatMap((id) => {
+      const message = live.messages.get(id);
+      return message === undefined ? [] : [message];
+    });
+    if (liveMessages.length === 0) return loaded;
+    const byId = new Map(loaded.map((message) => [message.providerMessageId, message]));
+    for (const message of liveMessages) byId.set(message.providerMessageId, message);
+    const extras = liveMessages.filter((message) => !loaded.some((entry) => entry.providerMessageId === message.providerMessageId));
+    return [...loaded.map((message) => byId.get(message.providerMessageId) ?? message), ...extras];
+  }
+
+  private markLiveTurn(providerSessionId: string): void {
+    this.#lastLiveUpdateAt.set(providerSessionId, this.#now().getTime());
+  }
+
+  private listNativeQueuedMessages(): readonly ProviderQueuedMessage[] {
+    return [...this.#nativeQueues.values()].flat();
+  }
+
+  private async enqueueNativeQueuedMessage(
+    providerSessionId: string,
+    request: EnqueueProviderMessageRequest,
+  ): Promise<ProviderQueuedMessage> {
+    const attachments = request.attachments ?? [];
+    if (attachments.some((attachment) => !attachment.mimeType.toLowerCase().startsWith("image/"))) {
+      throw new UnsupportedProviderCapabilityError(this.providerId, "non-image attachments");
+    }
+    if (!this.#activeSessions.has(providerSessionId)) await this.resumeSession(providerSessionId);
+    await this.applySessionSelections(providerSessionId, request.modelId, request.reasoningEffort);
+    const content = providerPromptContent(request);
+    const pending = this.waitForNativeQueueEntry(providerSessionId, content, request.requestId);
+    this.dispatchNativePrompt(providerSessionId, request);
+    return await pending;
+  }
+
+  private async updateNativeQueuedMessage(
+    providerSessionId: string,
+    messageId: string,
+    content: string,
+  ): Promise<ProviderQueuedMessage | null> {
+    const trimmed = content.trim();
+    if (!trimmed) return null;
+    const current = this.#nativeQueues.get(providerSessionId)?.find((entry) => entry.id === messageId);
+    if (current === undefined) return null;
+    await (await this.peer()).notify("_x.ai/queue/edit", grokQueueEditParams(providerSessionId, messageId, trimmed));
+    const updated = { ...current, content: trimmed };
+    this.#nativeQueues.set(providerSessionId, (this.#nativeQueues.get(providerSessionId) ?? []).map((entry) => (
+      entry.id === messageId ? updated : entry
+    )));
+    await this.publishNativeQueue();
+    return updated;
+  }
+
+  private async cancelNativeQueuedMessage(providerSessionId: string, messageId: string): Promise<boolean> {
+    const current = this.#nativeQueues.get(providerSessionId) ?? [];
+    if (!current.some((entry) => entry.id === messageId)) return false;
+    await (await this.peer()).notify("_x.ai/queue/remove", grokQueueRemoveParams(providerSessionId, messageId));
+    this.#nativeQueues.set(providerSessionId, current.filter((entry) => entry.id !== messageId));
+    await this.publishNativeQueue();
+    return true;
+  }
+
+  private waitForNativeQueueEntry(
+    providerSessionId: string,
+    text: string,
+    fallbackId: string,
+  ): Promise<ProviderQueuedMessage> {
+    const existing = this.#nativeQueues.get(providerSessionId)?.find((entry) => entry.content === text);
+    if (existing !== undefined) return Promise.resolve(existing);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        const index = this.#queueWaiters.findIndex((waiter) => waiter.timer === timer);
+        if (index >= 0) this.#queueWaiters.splice(index, 1);
+        const late = this.#nativeQueues.get(providerSessionId)?.find((entry) => entry.content === text);
+        resolve(late ?? {
+          id: fallbackId,
+          providerSessionId,
+          content: text,
+          state: "queued",
+          createdAt: this.#now().toISOString(),
+        });
+      }, 1_500);
+      this.#queueWaiters.push({ sessionId: providerSessionId, text, resolve, timer });
+    });
+  }
+
+  private dispatchNativePrompt(providerSessionId: string, request: SendMessageRequest): void {
+    const attachments = request.attachments ?? [];
+    void this.emit({ type: "session.status_changed", providerSessionId, payload: { state: "working" } });
+    this.#inFlightPromptCounts.set(providerSessionId, (this.#inFlightPromptCounts.get(providerSessionId) ?? 0) + 1);
+    this.#activePrompts.add(providerSessionId);
+    void this.peer().then((peer) => peer.request<unknown>("session/prompt", {
       sessionId: providerSessionId,
       prompt: [
         { type: "text", text: providerPromptContent(request) },
@@ -884,19 +1174,90 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
           mimeType: attachment.mimeType,
         })),
       ],
-    }).then(async (result) => {
+    })).then(async (result) => {
       this.captureReportedContext(providerSessionId, result);
-      this.#liveMessages.delete(providerSessionId);
-      await this.emit({ type: "agent.completed", providerSessionId, payload: { result: asJsonObject(result) } });
+      await this.settleNativePrompt(providerSessionId, "completed", { result: asJsonObject(result) });
     }).catch(async (error: unknown) => {
-      this.#liveMessages.delete(providerSessionId);
-      await this.emit({ type: "agent.error", providerSessionId, payload: { message: error instanceof Error ? error.message : String(error) } });
+      await this.settleNativePrompt(providerSessionId, "failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
     });
-    return { accepted: true, providerTurnId: request.requestId, details: ["ACP session/prompt accepted; updates arrive through session/update notifications"] };
+  }
+
+  private async settleNativePrompt(
+    providerSessionId: string,
+    outcome: "completed" | "failed",
+    payload: Record<string, unknown>,
+  ): Promise<void> {
+    const remaining = (this.#inFlightPromptCounts.get(providerSessionId) ?? 1) - 1;
+    if (remaining > 0) {
+      this.#inFlightPromptCounts.set(providerSessionId, remaining);
+      return;
+    }
+    this.#inFlightPromptCounts.delete(providerSessionId);
+    this.#activePrompts.delete(providerSessionId);
+    // Work that genuinely continues after this prompt keeps the turn open.
+    if (this.#runningPromptIds.has(providerSessionId) || (this.#nativeQueues.get(providerSessionId)?.length ?? 0) > 0) return;
+    // Recent chunks used to suppress this event. They are the wrong signal: the
+    // prompt has resolved, so the turn is over however recently it streamed.
+    // Without the terminal event the task stayed "working" and its rows kept
+    // shimmering until the user clicked away.
+    this.#lastLiveUpdateAt.delete(providerSessionId);
+    this.#liveMessages.delete(providerSessionId);
+    await this.emit({
+      type: outcome === "completed" ? "agent.completed" : "agent.error",
+      providerSessionId,
+      payload: asJsonObject(payload),
+    });
+  }
+
+  private applyReportedSessionList(params: unknown): void {
+    if (!isRecord(params) || !Array.isArray(params.upserted)) return;
+    for (const entry of params.upserted) {
+      if (!isRecord(entry)) continue;
+      const sessionId = firstUpdateString(entry, ["sessionId", "session_id", "id"]);
+      if (sessionId === undefined) continue;
+      this.captureReportedSelection(
+        sessionId,
+        firstUpdateString(entry, ["modelId", "model_id", "model"]),
+        firstUpdateString(entry, ["reasoningEffort", "reasoning_effort", "thoughtLevel", "thought_level"]),
+      );
+    }
+  }
+
+  private async applyNativeQueueChanged(params: unknown): Promise<void> {
+    const snapshot = parseGrokQueueChanged(params, this.#now());
+    if (snapshot === undefined) return;
+    this.#nativeQueues.set(snapshot.sessionId, snapshot.entries);
+    if (snapshot.runningPromptId !== undefined) this.#runningPromptIds.set(snapshot.sessionId, snapshot.runningPromptId);
+    else this.#runningPromptIds.delete(snapshot.sessionId);
+    const remaining = [...this.#queueWaiters];
+    this.#queueWaiters.length = 0;
+    for (const waiter of remaining) {
+      const match = snapshot.sessionId === waiter.sessionId
+        ? snapshot.entries.find((entry) => entry.content === waiter.text)
+        : undefined;
+      if (match !== undefined) {
+        clearTimeout(waiter.timer);
+        waiter.resolve(match);
+        continue;
+      }
+      this.#queueWaiters.push(waiter);
+    }
+    await this.publishNativeQueue();
+  }
+
+  private async publishNativeQueue(): Promise<void> {
+    await this.emit({
+      type: "message.queue_updated",
+      payload: asJsonObject({ messages: this.listNativeQueuedMessages() }),
+    });
   }
 
   public async interrupt(providerSessionId: string): Promise<void> {
     await (await this.peer()).notify("session/cancel", { sessionId: providerSessionId });
+    this.#inFlightPromptCounts.delete(providerSessionId);
+    this.#activePrompts.delete(providerSessionId);
     this.#liveMessages.delete(providerSessionId);
     for (const [requestId, pending] of this.#pendingPermissions) {
       if (pending.providerSessionId !== providerSessionId) continue;
@@ -942,6 +1303,15 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     this.#pendingPermissions.clear();
     this.#historyCapture.clear();
     this.#liveMessages.clear();
+    this.#lastLoadedMessages.clear();
+    this.#lastLiveUpdateAt.clear();
+    this.#watchedSessions.clear();
+    this.#activePrompts.clear();
+    this.#inFlightPromptCounts.clear();
+    this.#nativeQueues.clear();
+    this.#runningPromptIds.clear();
+    for (const waiter of this.#queueWaiters) clearTimeout(waiter.timer);
+    this.#queueWaiters.length = 0;
     this.#reportedContexts.clear();
     this.#sessionConfigOptions.clear();
     this.#appliedSessionSelections.clear();
@@ -1046,6 +1416,8 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     if (this.#disposed || generation !== this.#resourceGeneration) return;
     const peer = this.#peer;
     if (peer === null) return;
+    if (this.#watchedSessions.size > 0) return;
+    if (this.#activePrompts.size > 0 || this.#pendingPermissions.size > 0) return;
     if (this.#activeSessions.size > 0 && !this.canRestoreActiveSessions()) return;
     this.#peer = null;
     this.resetProcessState();
@@ -1114,18 +1486,56 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     });
   }
 
+  /** Reads the running model and reasoning level out of a harness reply. */
+  private captureReportedModels(providerSessionId: string, source: unknown): void {
+    const reported = reportedModelSelection(source);
+    if (reported === undefined) return;
+    this.captureReportedSelection(providerSessionId, reported.modelId, reported.reasoningEffort);
+  }
+
   private captureSessionConfigOptions(providerSessionId: string, source: unknown): void {
     const options = sessionConfigOptions(source);
     if (options === undefined) return;
     this.#sessionConfigOptions.set(providerSessionId, options);
+    // Harnesses that expose reasoning as an ACP config option report the current
+    // level here; Grok instead announces it through its own session updates.
+    this.captureReportedSelection(
+      providerSessionId,
+      configOptionFor(options, "model")?.currentValue,
+      configOptionFor(options, "thought_level")?.currentValue,
+    );
+  }
+
+  /**
+   * Records what the harness says a session is currently running, and tells
+   * clients when that differs from what they were shown. This is the only
+   * trustworthy source: the level a turn actually used belongs to the harness,
+   * not to anything Tethoq remembers, so it stays correct across restarts and
+   * after the user changes the level in the harness's own interface.
+   */
+  private captureReportedSelection(
+    providerSessionId: string,
+    modelId: string | undefined,
+    reasoningEffort: string | undefined,
+  ): void {
+    if (modelId === undefined && reasoningEffort === undefined) return;
     const prior = this.#appliedSessionSelections.get(providerSessionId);
-    const modelId = configOptionFor(options, "model")?.currentValue;
-    const reasoningEffort = configOptionFor(options, "thought_level")?.currentValue;
+    const learnedEffort = reasoningEffort !== undefined && reasoningEffort !== prior?.reasoningEffort;
+    const learnedModel = modelId !== undefined && modelId !== prior?.modelId;
+    if (!learnedEffort && !learnedModel) return;
     this.#appliedSessionSelections.set(providerSessionId, {
       ...(prior?.modelId !== undefined ? { modelId: prior.modelId } : {}),
       ...(prior?.reasoningEffort !== undefined ? { reasoningEffort: prior.reasoningEffort } : {}),
       ...(modelId !== undefined ? { modelId } : {}),
       ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+    });
+    void this.emit({
+      type: "session.updated",
+      providerSessionId,
+      payload: {
+        ...(learnedModel ? { modelId } : {}),
+        ...(learnedEffort ? { reasoningEffort } : {}),
+      },
     });
   }
 
@@ -1140,7 +1550,10 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
 
     const applied = this.#appliedSessionSelections.get(providerSessionId);
     const changeModel = !!modelId && applied?.modelId !== modelId;
-    const changeReasoning = !!reasoningEffort && applied?.reasoningEffort !== reasoningEffort;
+    const sameReasoning = !!reasoningEffort
+      && applied?.reasoningEffort !== undefined
+      && matchReasoningEffort(reasoningEffort, [applied.reasoningEffort]) === applied.reasoningEffort;
+    const changeReasoning = !!reasoningEffort && !sameReasoning;
     if (!changeModel && !changeReasoning) return;
 
     let options = this.#sessionConfigOptions.get(providerSessionId) ?? [];
@@ -1190,8 +1603,9 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     option: AcpSessionConfigOption,
     value: string,
   ): Promise<void> {
-    if (option.currentValue === value) return;
-    if (option.values.length > 0 && !option.values.includes(value)) {
+    const matched = matchReasoningEffort(value, option.values) ?? value;
+    if (option.currentValue === matched) return;
+    if (option.values.length > 0 && !option.values.includes(matched)) {
       throw new ProviderAdapterError(
         this.providerId,
         "SESSION_CONFIG_VALUE_INVALID",
@@ -1202,9 +1616,20 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     const result = await (await this.peer()).request<unknown>("session/set_config_option", {
       sessionId: providerSessionId,
       configId: option.id,
-      value,
+      value: matched,
     });
     this.captureSessionConfigOptions(providerSessionId, result);
+    this.captureReportedModels(providerSessionId, result);
+  }
+
+  private decorateSessionSelections(session: RemoteSession): RemoteSession {
+    const applied = this.#appliedSessionSelections.get(session.providerSessionId);
+    if (applied === undefined) return session;
+    return {
+      ...session,
+      ...(applied.modelId !== undefined ? { modelId: applied.modelId } : {}),
+      ...(applied.reasoningEffort !== undefined ? { reasoningEffort: applied.reasoningEffort } : {}),
+    };
   }
 
   private rememberSessionSelection(providerSessionId: string, update: AppliedSessionSelections): void {
@@ -1262,6 +1687,17 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
   }
 
   private async handleNotification(method: string, params: unknown): Promise<void> {
+    if (this.providerId === "grok" && isGrokQueueChangedMethod(method)) {
+      await this.applyNativeQueueChanged(params);
+      return;
+    }
+    // Grok pushes the authoritative model and reasoning level for every session
+    // it knows about, including on connect. Reading it is what keeps the composer
+    // showing the level a task is really running rather than the model default.
+    if (isAcpSessionsChangedMethod(method)) {
+      this.applyReportedSessionList(params);
+      return;
+    }
     if (!["session/update", "_x.ai/session/update", "_x.ai/session_notification"].includes(method)
       || !isRecord(params)
       || typeof params.sessionId !== "string"
@@ -1275,12 +1711,28 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
       : typeof update.session_update === "string"
         ? update.session_update
         : "unknown";
+    // The harness announces a level change the moment it happens, including one
+    // the user made in the harness's own interface rather than through Tethoq.
+    if (sessionUpdate === "model_changed") {
+      this.captureReportedSelection(
+        params.sessionId,
+        firstUpdateString(update, ["model_id", "modelId", "model"]),
+        firstUpdateString(update, ["reasoning_effort", "reasoningEffort", "thought_level", "thoughtLevel"]),
+      );
+      return;
+    }
     const capture = this.#historyCapture.get(params.sessionId);
     const live = this.#liveMessages.get(params.sessionId) ?? createMessageAccumulator();
     this.#liveMessages.set(params.sessionId, live);
-    if (sessionUpdate === "user_message_chunk" || sessionUpdate === "agent_message_chunk" || sessionUpdate === "agent_thought_chunk") {
+    if (sessionUpdate === "user_message_chunk" || sessionUpdate === "agent_message_chunk" || sessionUpdate === "agent_thought_chunk"
+      || sessionUpdate === "agent_thinking_chunk" || sessionUpdate === "thought_chunk" || sessionUpdate === "thinking_chunk") {
+      // The echoed prompt is the first sign a turn has begun. Leaving it out let
+      // a routine history reload start in that gap, and session/load then
+      // swallowed the whole answer into the capture accumulator instead of
+      // streaming it, so nothing moved until the turn was already over.
+      if (capture === undefined) this.markLiveTurn(params.sessionId);
       const role = sessionUpdate === "user_message_chunk" ? "user" : "assistant";
-      const partType = sessionUpdate === "agent_thought_chunk" ? "reasoning" : "text";
+      const partType = role === "assistant" && acpUpdateLooksLikeThought(update, sessionUpdate) ? "reasoning" : "text";
       // History replay needs the fully coalesced message. Live rendering only
       // needs the current delta, so retaining and re-copying the whole answer
       // for every ACP chunk would turn long responses into quadratic work.
@@ -1297,6 +1749,7 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
         this.#identity,
       );
       if (capture === undefined && message !== null) {
+        const text = latestAcpChunkText(message);
         await this.emit({
           type: role === "assistant" ? "message.delta" : "message.started",
           providerSessionId: params.sessionId,
@@ -1304,6 +1757,7 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
             messageId: message.providerMessageId,
             role,
             content: asJsonObject(update),
+            ...(text !== undefined ? { text } : {}),
             ...(partType === "reasoning" ? { partType } : {}),
           },
           nativeEvent: asJsonObject({ method, params }),
@@ -1313,6 +1767,7 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     }
     const subagent = normalizeAcpSubagentUpdate(update);
     if (subagent !== null) {
+      this.markLiveTurn(params.sessionId);
       if (capture !== undefined) {
         appendAcpSubagentPart(this.#hostId, params.sessionId, update, subagent, capture, this.#now(), this.#identity);
         return;

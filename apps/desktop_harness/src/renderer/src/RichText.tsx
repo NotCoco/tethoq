@@ -1,9 +1,11 @@
-import { isValidElement, type ReactNode } from "react";
+import { isValidElement, memo, useMemo, useRef, type ReactNode } from "react";
 import ReactMarkdown, { defaultUrlTransform, type Components, type UrlTransform } from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
+import { copyText } from "./clipboard";
 import { CopyIcon } from "./icons";
 import { LocalPathAction, type LocalOpenLocation } from "./LocalOpen";
+import { isLocalVideoPath, localMediaPathFromUrl, localMediaUrl } from "@shared/local_media";
 
 export interface RichTextImage {
   dataUrl: string;
@@ -142,7 +144,11 @@ function remarkLocalPaths() {
 
 /** Keep Markdown links useful without allowing executable or local-file URLs. */
 export const safeMarkdownUrl: UrlTransform = (value, key) => {
-  if (key === "src") return markdownImageUrl(value) ?? "";
+  if (key === "src") {
+    const localVideo = localLocationFromHref(value);
+    if (localVideo && isLocalVideoPath(localVideo.path)) return localMediaUrl(localVideo.path);
+    return markdownImageUrl(value) ?? "";
+  }
   if (key === "href" && localLocationFromHref(value)) return value;
   if (key === "href") return markdownLinkUrl(defaultUrlTransform(value)) ?? "";
   return "";
@@ -163,65 +169,84 @@ export function codeBlockText(value: ReactNode): string {
 function CodeBlock({ children }: { children?: ReactNode }) {
   const text = codeBlockText(children);
   const copy = async (button: HTMLButtonElement) => {
-    const label = button.querySelector("span");
     const status = button.nextElementSibling;
     const previousTimer = codeCopyResetTimers.get(button);
     if (previousTimer !== undefined) clearTimeout(previousTimer);
-    try {
-      const clipboard = globalThis.navigator?.clipboard;
-      if (!clipboard) throw new Error("Clipboard access is unavailable");
-      await clipboard.writeText(text);
+    if (await copyText(text)) {
       button.setAttribute("aria-label", "Code copied");
-      if (label) label.textContent = "Copied";
+      button.dataset.copyState = "copied";
       if (status) status.textContent = "Code copied to clipboard";
-    } catch {
+    } else {
       button.setAttribute("aria-label", "Code copy failed");
-      if (label) label.textContent = "Copy failed";
+      button.dataset.copyState = "failed";
       if (status) status.textContent = "Code could not be copied";
     }
     codeCopyResetTimers.set(button, setTimeout(() => {
       if (!button.isConnected) return;
       button.setAttribute("aria-label", "Copy code");
-      if (label) label.textContent = "Copy";
+      button.dataset.copyState = "idle";
       if (status) status.textContent = "";
       codeCopyResetTimers.delete(button);
     }, 1_800));
   };
   return <div className="rich-code-block">
     <pre>{children}</pre>
-    <button type="button" className="rich-code-copy" aria-label="Copy code" onClick={(event) => void copy(event.currentTarget)}><CopyIcon /><span>Copy</span></button>
+    <button type="button" className="rich-code-copy" data-copy-state="idle" aria-label="Copy code" onClick={(event) => void copy(event.currentTarget)}><CopyIcon /></button>
     <span className="rich-code-copy-status" role="status" aria-live="polite" />
   </div>;
 }
 
 const codeCopyResetTimers = new WeakMap<HTMLButtonElement, ReturnType<typeof setTimeout>>();
 
-export function RichText({ children, onImageOpen, onLinkOpen }: {
+function localVideoName(path: string): string {
+  return path.split(/[\\/]/u).at(-1) || "Video";
+}
+
+function LocalVideoPreview({ location, label, title }: { location: LocalOpenLocation; label?: string | undefined; title?: string | undefined }) {
+  const name = label?.trim() || title?.trim() || localVideoName(location.path);
+  return <span className="rich-local-video">
+    <video src={localMediaUrl(location.path)} controls preload="metadata" playsInline aria-label={name} title={title} />
+    <span className="rich-local-video-caption"><LocalPathAction location={location} className="rich-local-video-open">{name}</LocalPathAction></span>
+  </span>;
+}
+
+export const RichText = memo(function RichText({ children, onImageOpen, onLinkOpen }: {
   children: string;
   onImageOpen?: ((image: RichTextImage) => void) | undefined;
   onLinkOpen?: ((url: string) => void) | undefined;
 }) {
-  const components: Components = {
+  const imageOpen = useRef(onImageOpen);
+  const linkOpen = useRef(onLinkOpen);
+  imageOpen.current = onImageOpen;
+  linkOpen.current = onLinkOpen;
+  // ReactMarkdown treats each renderer function as a component type. Recreating
+  // this map on an unrelated session-list refresh unmounted every media element,
+  // briefly collapsed videos to their pre-metadata height, then expanded them
+  // again. Stable renderers keep playback and intrinsic geometry intact.
+  const components = useMemo<Components>(() => ({
     pre: ({ children: code }) => <CodeBlock>{code}</CodeBlock>,
     a: ({ children: label, href, title }) => {
       const local = href ? localLocationFromHref(href) : null;
+      if (local && isLocalVideoPath(local.path)) return <LocalVideoPreview location={local} label={nestedText(label)} title={title} />;
       if (local) return <LocalPathAction location={local} className="rich-local-path">{label}</LocalPathAction>;
       return href ? <a href={href} title={title} onClick={(event) => {
       event.preventDefault();
-      onLinkOpen?.(href);
+      linkOpen.current?.(href);
       }}>{label}</a> : <span className="rich-link-unavailable">{label}</span>;
     },
     table: ({ children: tableChildren }) => <div className="rich-table-scroll"><table>{tableChildren}</table></div>,
     img: ({ src, alt, title }) => {
+      const localVideoPath = typeof src === "string" ? localMediaPathFromUrl(src) : null;
+      if (localVideoPath) return <LocalVideoPreview location={{ path: localVideoPath }} label={alt} title={title} />;
       const safeSource = markdownImageUrl(typeof src === "string" ? src : "");
       const name = alt?.trim() || title?.trim() || "Image";
       if (!safeSource) return alt ? <span className="rich-image-unavailable">{alt}</span> : null;
-      return <button type="button" className="rich-text-image" aria-label={`Expand ${name}`} onClick={() => onImageOpen?.({ dataUrl: safeSource, name })}>
+      return <button type="button" className="rich-text-image" aria-label={`Expand ${name}`} onClick={() => imageOpen.current?.({ dataUrl: safeSource, name })}>
         <img src={safeSource} alt={alt ?? ""} title={title} referrerPolicy="no-referrer" />
       </button>;
     },
-  };
+  }), []);
   return <div className="rich-text">
     <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks, remarkLocalPaths]} skipHtml urlTransform={safeMarkdownUrl} components={components}>{children}</ReactMarkdown>
   </div>;
-}
+});

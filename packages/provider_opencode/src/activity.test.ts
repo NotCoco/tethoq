@@ -46,7 +46,9 @@ test("OpenCode persisted activity detects only fresh unfinished assistant work",
     await rm(directory, { recursive: true, force: true });
   });
 
-  assert.deepEqual([...await reader.readWorkingSessionIds()].sort(), ["active_part", "fresh"]);
+  const working = await reader.readWorkingSessionIds();
+  assert.ok(working);
+  assert.deepEqual([...working].sort(), ["active_part", "fresh"]);
 });
 
 test("OpenCode database path supports an explicit override and the XDG data home", () => {

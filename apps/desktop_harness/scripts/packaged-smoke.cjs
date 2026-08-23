@@ -79,9 +79,116 @@ async function startOpenCodeFixture() {
   const clients = new Set();
   const sessions = new Map();
   const messages = new Map();
+  const statuses = new Map();
+  const abortCalls = new Map();
+  const reasoningRuns = new Map();
+  const messageReads = new Map();
   const sendSse = (type, properties) => {
     const line = `data: ${JSON.stringify({ payload: { type, properties } })}\n\n`;
     for (const response of clients) response.write(line);
+  };
+  const beginReasoningRun = (sessionId, messageId, text) => {
+    const now = Date.now();
+    const assistantMessageId = `${messageId}-assistant`;
+    const reasoningPartId = `${assistantMessageId}-reasoning`;
+    const textPartId = `${assistantMessageId}-text`;
+    const fullReasoning = 'Checking the reasoning stream.';
+    const userInfo = { id: messageId, sessionID: sessionId, role: 'user', time: { created: now } };
+    const userPart = { id: `${messageId}-text`, sessionID: sessionId, messageID: messageId, type: 'text', text };
+    const assistantInfo = {
+      id: assistantMessageId,
+      sessionID: sessionId,
+      parentID: messageId,
+      role: 'assistant',
+      time: { created: now + 1 },
+    };
+    const reasoningPart = {
+      id: reasoningPartId,
+      sessionID: sessionId,
+      messageID: assistantMessageId,
+      type: 'reasoning',
+      text: '',
+    };
+    const finalTextPart = {
+      id: textPartId,
+      sessionID: sessionId,
+      messageID: assistantMessageId,
+      type: 'text',
+      text: 'Done.',
+    };
+    const history = messages.get(sessionId);
+    history?.push({ info: userInfo, parts: [userPart] });
+    const status = { type: 'busy' };
+    statuses.set(sessionId, status);
+
+    let stage = 'first';
+    let assistantStored = false;
+    const storeAssistant = () => {
+      if (assistantStored) return;
+      assistantStored = true;
+      history?.push({ info: assistantInfo, parts: [reasoningPart, finalTextPart] });
+    };
+    const run = {
+      sessionId,
+      messageId,
+      assistantMessageId,
+      reasoningPartId,
+      fullReasoning,
+      emitSecond() {
+        if (stage !== 'first') throw new Error(`Reasoning smoke cannot emit its second chunk from ${stage}.`);
+        stage = 'second';
+        sendSse('message.part.delta', {
+          sessionID: sessionId,
+          messageID: assistantMessageId,
+          partID: reasoningPartId,
+          field: 'text',
+          delta: 'reasoning stream.',
+        });
+      },
+      finish() {
+        if (stage !== 'second') throw new Error(`Reasoning smoke cannot finish from ${stage}.`);
+        stage = 'finished';
+        reasoningPart.text = fullReasoning;
+        assistantInfo.finish = 'stop';
+        assistantInfo.time.completed = Date.now();
+        storeAssistant();
+        // OpenCode republishes the completed cumulative part. It must not append
+        // another copy after the two native deltas above.
+        sendSse('message.part.updated', { part: reasoningPart });
+        sendSse('message.part.updated', { part: finalTextPart });
+        sendSse('message.updated', { info: assistantInfo });
+        statuses.delete(sessionId);
+        sendSse('session.idle', { sessionID: sessionId });
+      },
+      setHistoryReasoning(nextText) {
+        if (stage !== 'finished') throw new Error(`Reasoning smoke cannot reconcile history from ${stage}.`);
+        reasoningPart.text = nextText;
+      },
+    };
+    reasoningRuns.set(sessionId, run);
+
+    sendSse('message.updated', { info: userInfo });
+    sendSse('session.status', { sessionID: sessionId, status });
+    sendSse('session.diff', { sessionID: sessionId, diff: [] });
+    sendSse('message.part.updated', {
+      part: {
+        id: `${assistantMessageId}-empty-patch`,
+        sessionID: sessionId,
+        messageID: assistantMessageId,
+        type: 'patch',
+        files: [],
+      },
+    });
+    sendSse('message.updated', { info: assistantInfo });
+    sendSse('message.part.updated', { part: reasoningPart });
+    sendSse('message.part.delta', {
+      sessionID: sessionId,
+      messageID: assistantMessageId,
+      partID: reasoningPartId,
+      field: 'text',
+      delta: 'Checking the ',
+    });
+    return run;
   };
   const server = createServer(async (request, response) => {
     const url = new URL(request.url, `http://127.0.0.1:${fixturePort}`);
@@ -104,26 +211,69 @@ async function startOpenCodeFixture() {
       return;
     }
     if (url.pathname === '/provider') return json(response, { connected: ['fixture'], all: [], default: {} });
-    if (url.pathname === '/session/status') return json(response, {});
+    if (url.pathname === '/session/status') return json(response, Object.fromEntries(statuses));
     if (request.method === 'GET' && url.pathname === '/session') return json(response, [...sessions.values()]);
     if (request.method === 'POST' && url.pathname === '/session') {
       const id = `opencode-smoke-${Date.now()}`;
       const now = Date.now();
       const session = { id, title: 'OpenCode smoke', directory: url.searchParams.get('directory') ?? projectDirectory, time: { created: now, updated: now } };
-      sessions.set(id, session); messages.set(id, []);
+      sessions.set(id, session); messages.set(id, []); messageReads.set(id, 0); abortCalls.set(id, 0);
+      // Match OpenCode's native creation notification after the create response
+      // has had time to enter the Bridge cache. The renderer learns about tasks
+      // created outside its own composer from this event and re-lists them.
+      setTimeout(() => sendSse('session.created', { sessionID: id, info: session }), 20);
       return json(response, session);
     }
     const match = /^\/session\/([^/]+)(?:\/(.*))?$/.exec(url.pathname);
     if (match) {
       const id = decodeURIComponent(match[1]);
       if (request.method === 'GET' && !match[2]) return json(response, sessions.get(id));
-      if (request.method === 'GET' && match[2] === 'message') return json(response, messages.get(id) ?? []);
+      if (request.method === 'GET' && match[2] === 'message') {
+        messageReads.set(id, (messageReads.get(id) ?? 0) + 1);
+        return json(response, messages.get(id) ?? []);
+      }
       if (request.method === 'POST' && match[2] === 'prompt_async') {
         const body = await readJsonBody(request);
         const text = body?.parts?.find((part) => part?.type === 'text')?.text ?? '';
+        if (text === 'hello from the reasoning smoke') {
+          beginReasoningRun(id, body.messageID, text);
+          return json(response, {}, 204);
+        }
+        if (text === 'hello from the retry smoke') {
+          const now = Date.now();
+          const info = { id: body.messageID, sessionID: id, role: 'user', time: { created: now } };
+          const part = { id: `part-${now}`, sessionID: id, messageID: body.messageID, type: 'text', text };
+          messages.get(id)?.push({ info, parts: [part] });
+          sendSse('message.updated', { info });
+          const status = {
+            type: 'retry',
+            attempt: 1,
+            message: 'Weekly usage limit reached - https://fixture.invalid/raw-provider-link',
+            action: {
+              reason: 'account_rate_limit',
+              provider: 'opencode-go',
+              title: 'Go limit reached',
+              message: 'Weekly usage limit reached. It will reset in 6 days. To continue using this model now, enable usage from your available balance.',
+              label: 'open settings',
+              link: 'https://fixture.invalid/settings',
+            },
+            next: now + 6 * 24 * 60 * 60 * 1000,
+          };
+          statuses.set(id, status);
+          setTimeout(() => sendSse('session.status', { sessionID: id, status }), 20);
+          return json(response, {}, 204);
+        }
         const part = { id: `part-${Date.now()}`, sessionID: id, messageID: body.messageID, type: 'text', text: `Fixture: ${text}` };
         sendSse('message.part.updated', { part, delta: part.text });
         return json(response, {}, 204);
+      }
+      if (request.method === 'POST' && match[2] === 'abort') {
+        abortCalls.set(id, (abortCalls.get(id) ?? 0) + 1);
+        statuses.delete(id);
+        sendSse('session.error', { sessionID: id, error: { name: 'MessageAbortedError', data: { message: 'Aborted' } } });
+        sendSse('session.status', { sessionID: id, status: { type: 'idle' } });
+        sendSse('session.idle', { sessionID: id });
+        return json(response, {});
       }
     }
     json(response, { error: 'not found', path: url.pathname }, 404);
@@ -132,7 +282,7 @@ async function startOpenCodeFixture() {
     server.once('error', reject);
     server.listen(fixturePort, '127.0.0.1', resolve);
   });
-  return { server, clients };
+  return { server, clients, sessions, messages, statuses, abortCalls, reasoningRuns, messageReads };
 }
 
 function json(response, value, status = 200) {
@@ -148,7 +298,7 @@ async function readJsonBody(request) {
 
 async function connectCdp(port) {
   const target = await waitFor(async () => {
-    const response = await fetch(`http://127.0.0.1:${port}/json/list`);
+    const response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(2_000) });
     if (!response.ok) return null;
     const targets = await response.json();
     return targets.find((item) => item.type === 'page' && item.webSocketDebuggerUrl && /^file:/i.test(item.url ?? ''));
@@ -206,6 +356,280 @@ async function bridgeRequest(type, payload = {}, requestId) {
   const response = await cdp.evaluate(source);
   if (!response?.ok) throw new Error(response?.error?.message ?? `${type} failed`);
   return response.payload;
+}
+
+async function exerciseOpenCodeReasoningReconciliation() {
+  await waitFor(() => openCodeServer?.clients.size > 0, 'OpenCode fixture event subscription');
+  const created = await bridgeRequest('session.create', {
+    providerId: 'opencode',
+    workingDirectory: projectDirectory,
+    title: 'Reasoning stream smoke',
+  });
+  const sessionId = created.session.id;
+  const providerSessionId = created.session.providerSessionId;
+  await waitFor(() => cdp.evaluate(`Boolean(document.querySelector(${JSON.stringify(`[data-session-id="${sessionId}"]`)}))`), 'OpenCode reasoning smoke task row');
+  await cdp.evaluate(`document.querySelector(${JSON.stringify(`[data-session-id="${sessionId}"] > .session-row`)})?.click()`);
+  await waitFor(() => cdp.evaluate(`document.querySelector(${JSON.stringify(`[data-session-id="${sessionId}"] > .session-row`)})?.classList.contains('selected') === true`), 'OpenCode reasoning smoke task selection');
+
+  const eventBatches = cdp.evaluate(`new Promise((resolve) => {
+    const events = [];
+    const stop = window.tethoqDesktop.onEventBatch((batch) => {
+      events.push(...batch.events);
+      if (events.some((event) => event.type === 'agent.completed' && event.sessionId === ${JSON.stringify(sessionId)})) {
+        stop();
+        resolve(events);
+      }
+    });
+    setTimeout(() => { stop(); resolve(events); }, 10000);
+  })`);
+  const entered = await cdp.evaluate(`(() => {
+    const textarea = document.querySelector('textarea[aria-label="Message"]');
+    if (!(textarea instanceof HTMLTextAreaElement)) return false;
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+    setter?.call(textarea, 'hello from the reasoning smoke');
+    textarea.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: 'hello from the reasoning smoke' }));
+    return true;
+  })()`);
+  assert.equal(entered, true, 'The packaged reasoning smoke could not enter its message through the React textarea.');
+  await waitFor(() => cdp.evaluate(`document.querySelector('button[aria-label="Send instruction"]')?.disabled === false`), 'OpenCode reasoning smoke send control');
+  await cdp.evaluate(`document.querySelector('button[aria-label="Send instruction"]')?.click()`);
+
+  const first = await waitFor(async () => {
+    const state = await cdp.evaluate(`(() => {
+      const root = document.querySelector('.conversation-scroll');
+      const controls = [...(root?.querySelectorAll('.reasoning-disclosure') ?? [])];
+      const buttons = [...(root?.querySelectorAll('button.reasoning-disclosure') ?? [])];
+      const bodies = [...(root?.querySelectorAll('.reasoning-thinking-segment .rich-text') ?? [])].map((node) => node.textContent.trim());
+      return {
+        controls: controls.length,
+        buttons: buttons.length,
+        groups: root?.querySelectorAll('.reasoning-group').length ?? 0,
+        workingPulses: root?.querySelectorAll('.working-pulse').length ?? 0,
+        activities: root?.querySelectorAll('.activity-disclosure').length ?? 0,
+        expanded: buttons[0]?.getAttribute('aria-expanded'),
+        bodies,
+        transcript: root?.innerText ?? '',
+      };
+    })()`);
+    return state.controls === 1
+      && state.buttons === 1
+      && state.groups === 1
+      && state.workingPulses === 0
+      && state.expanded === 'true'
+      && state.bodies.length === 1
+      && state.bodies[0] === 'Checking the'
+      ? state
+      : null;
+  }, 'live OpenCode reasoning disclosure');
+  assert.equal(first.activities, 0, 'A pathless patch created visible file activity.');
+  assert.doesNotMatch(first.transcript, /File changed/u, 'A pathless patch rendered a fake File changed row.');
+
+  await cdp.evaluate(`document.querySelector('.conversation-scroll button.reasoning-disclosure')?.click()`);
+  await waitFor(() => cdp.evaluate(`document.querySelector('.conversation-scroll button.reasoning-disclosure')?.getAttribute('aria-expanded') === 'false' && !document.querySelector('.conversation-scroll .reasoning-detail')`), 'manual reasoning collapse');
+  const run = openCodeServer?.reasoningRuns.get(providerSessionId);
+  assert.ok(run, 'The OpenCode fixture did not retain the reasoning run controls.');
+  // This smoke has already exercised enough packaged surfaces to exceed one
+  // bounded sync page. Use the bridge's current high-water mark so the check
+  // below observes the newly emitted chunk instead of repeatedly rereading the
+  // first page from sequence zero.
+  const beforeSecond = await bridgeRequest('sync.since', { sequence: 0 });
+  const beforeSecondSequence = beforeSecond.latestSequence;
+  assert.equal(Number.isInteger(beforeSecondSequence), true, 'The Bridge did not report a replay high-water mark.');
+  run.emitSecond();
+  await waitFor(async () => {
+    const replay = await bridgeRequest('sync.since', { sequence: beforeSecondSequence });
+    return replay.events?.some((event) => event.sessionId === sessionId
+      && event.type === 'message.delta'
+      && event.payload?.partType === 'reasoning'
+      && event.payload?.text === 'reasoning stream.');
+  }, 'second OpenCode reasoning delta');
+  await delay(100);
+  const stayedClosed = await cdp.evaluate(`document.querySelector('.conversation-scroll button.reasoning-disclosure')?.getAttribute('aria-expanded') === 'false' && !document.querySelector('.conversation-scroll .reasoning-detail')`);
+  assert.equal(stayedClosed, true, 'Streaming output reopened reasoning after the reader closed it.');
+
+  await cdp.evaluate(`document.querySelector('.conversation-scroll button.reasoning-disclosure')?.click()`);
+  await waitFor(() => cdp.evaluate(`document.querySelector('.conversation-scroll button.reasoning-disclosure')?.getAttribute('aria-expanded') === 'true' && document.querySelector('.conversation-scroll .reasoning-thinking-segment .rich-text')?.textContent.trim() === 'Checking the reasoning stream.'`), 'manual reasoning reopen with streamed text');
+  run.finish();
+  const events = await eventBatches;
+  const reasoningEvents = events.filter((event) => event.sessionId === sessionId
+    && event.type === 'message.delta'
+    && event.payload?.partType === 'reasoning');
+  assert.deepEqual(reasoningEvents.map((event) => event.payload.text), ['Checking the ', 'reasoning stream.']);
+  assert.deepEqual([...new Set(reasoningEvents.map((event) => event.payload.partId))], [run.reasoningPartId]);
+  assert.deepEqual([...new Set(reasoningEvents.map((event) => event.payload.messageId))], [run.assistantMessageId]);
+  assert.equal(events.filter((event) => event.sessionId === sessionId && event.type === 'file.changed').length, 0);
+  assert.equal(events.filter((event) => event.sessionId === sessionId && event.type === 'agent.completed').length, 1);
+  assert.equal(events.filter((event) => event.sessionId === sessionId && event.type === 'agent.error').length, 0);
+
+  const reconciledReasoning = `${run.fullReasoning} Reconciled once.`;
+  run.setHistoryReasoning(reconciledReasoning);
+  const readsBefore = openCodeServer.messageReads.get(providerSessionId) ?? 0;
+  await cdp.evaluate(`document.querySelector(${JSON.stringify(`[data-session-id="${sessionId}"] > .session-row`)})?.click()`);
+  await waitFor(() => (openCodeServer.messageReads.get(providerSessionId) ?? 0) > readsBefore, 'OpenCode reasoning history refresh');
+  const reconciled = await waitFor(async () => {
+    const state = await cdp.evaluate(`(() => {
+      const root = document.querySelector('.conversation-scroll');
+      const buttons = [...(root?.querySelectorAll('button.reasoning-disclosure') ?? [])];
+      const controls = [...(root?.querySelectorAll('.reasoning-disclosure') ?? [])];
+      const bodies = [...(root?.querySelectorAll('.reasoning-thinking-segment .rich-text') ?? [])].map((node) => node.textContent.trim());
+      const transcript = root?.innerText ?? '';
+      return {
+        buttons: buttons.length,
+        controls: controls.length,
+        groups: root?.querySelectorAll('.reasoning-group').length ?? 0,
+        segments: root?.querySelectorAll('.reasoning-thinking-segment').length ?? 0,
+        expanded: buttons[0]?.getAttribute('aria-expanded'),
+        bodies,
+        baseOccurrences: transcript.split(${JSON.stringify(run.fullReasoning)}).length - 1,
+        fileChangedVisible: transcript.includes('File changed'),
+        agentErrorVisible: document.body.innerText.includes('Agent error'),
+      };
+    })()`);
+    return state.buttons === 1
+      && state.controls === 1
+      && state.groups === 1
+      && state.segments === 1
+      && state.expanded === 'true'
+      && state.bodies.length === 1
+      && state.bodies[0] === reconciledReasoning
+      ? state
+      : null;
+  }, 'reconciled OpenCode reasoning disclosure');
+  assert.equal(reconciled.baseOccurrences, 1, 'Reasoning reconciliation duplicated the streamed thought.');
+  assert.equal(reconciled.fileChangedVisible, false);
+  assert.equal(reconciled.agentErrorVisible, false);
+
+  await cdp.evaluate(`document.querySelector('.conversation-scroll button.reasoning-disclosure')?.click()`);
+  await waitFor(() => cdp.evaluate(`document.querySelector('.conversation-scroll button.reasoning-disclosure')?.getAttribute('aria-expanded') === 'false'`), 'settled reasoning collapse');
+  await cdp.evaluate(`document.querySelector('.conversation-scroll button.reasoning-disclosure')?.click()`);
+  await waitFor(() => cdp.evaluate(`document.querySelector('.conversation-scroll button.reasoning-disclosure')?.getAttribute('aria-expanded') === 'true'`), 'settled reasoning reopen');
+  return {
+    interactiveDisclosures: reconciled.buttons,
+    reasoningGroups: reconciled.groups,
+    reasoningSegments: reconciled.segments,
+    reasoningDeltaCount: reasoningEvents.length,
+    reasoningTextOccurrences: reconciled.baseOccurrences,
+    pathlessFileChangedVisible: reconciled.fileChangedVisible,
+    fileChangedEvents: 0,
+    providerErrors: 0,
+    completedEvents: 1,
+    statePreservedThroughStreamingAndRefresh: true,
+  };
+}
+
+async function exerciseOpenCodeRetryNotice() {
+  const retryMessage = 'Weekly usage limit reached. It will reset in 6 days. To continue using this model now, enable usage from your available balance.';
+  await waitFor(() => openCodeServer?.clients.size > 0, 'OpenCode fixture event subscription');
+  const created = await bridgeRequest('session.create', {
+    providerId: 'opencode',
+    workingDirectory: projectDirectory,
+    title: 'Retry status smoke',
+  });
+  const sessionId = created.session.id;
+  try {
+    await waitFor(() => cdp.evaluate(`Boolean(document.querySelector(${JSON.stringify(`[data-session-id="${sessionId}"]`)}))`), 'OpenCode retry smoke task row');
+  } catch (error) {
+    const listed = await bridgeRequest('sessions.list').catch(() => null);
+    const replay = await bridgeRequest('sync.since', { sequence: 0 }).catch(() => null);
+    const visibleRows = await cdp.evaluate(`[...document.querySelectorAll('[data-session-id]')].map((row) => row.getAttribute('data-session-id'))`);
+    const events = replay?.events?.filter((event) => event.sessionId === sessionId) ?? [];
+    throw new Error(`${error instanceof Error ? error.message : String(error)}; diagnostic=${JSON.stringify({ sessionId, listed, events, visibleRows })}`);
+  }
+  await cdp.evaluate(`document.querySelector(${JSON.stringify(`[data-session-id="${sessionId}"] > .session-row`)})?.click()`);
+  await waitFor(() => cdp.evaluate(`document.querySelector(${JSON.stringify(`[data-session-id="${sessionId}"] > .session-row`)})?.classList.contains('selected') === true`), 'OpenCode retry smoke task selection');
+
+  const eventBatches = cdp.evaluate(`new Promise((resolve) => {
+    const events = [];
+    const stop = window.tethoqDesktop.onEventBatch((batch) => {
+      events.push(...batch.events);
+      if (events.some((event) => event.type === 'agent.interrupted' && event.sessionId === ${JSON.stringify(sessionId)})) {
+        stop();
+        resolve(events);
+      }
+    });
+    setTimeout(() => { stop(); resolve(events); }, 10000);
+  })`);
+  const entered = await cdp.evaluate(`(() => {
+    const textarea = document.querySelector('textarea[aria-label="Message"]');
+    if (!(textarea instanceof HTMLTextAreaElement)) return false;
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+    setter?.call(textarea, 'hello from the retry smoke');
+    textarea.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: 'hello from the retry smoke' }));
+    return true;
+  })()`);
+  assert.equal(entered, true, 'The packaged retry smoke could not enter its message through the React textarea.');
+  await waitFor(() => cdp.evaluate(`document.querySelector('button[aria-label="Send instruction"]')?.disabled === false`), 'OpenCode retry smoke send control');
+  await cdp.evaluate(`document.querySelector('button[aria-label="Send instruction"]')?.click()`);
+
+  let visible;
+  try {
+    visible = await waitFor(async () => {
+      const state = await cdp.evaluate(`(() => {
+        const transcript = document.querySelector('.conversation-scroll')?.innerText ?? '';
+        return {
+          transcript,
+          retryCount: transcript.split(${JSON.stringify(retryMessage)}).length - 1,
+          hasGenericReasoning: /(^|\\n)Reasoning(?:…|\.\.\.)?(?:\\n|$)/u.test(transcript),
+          stopAvailable: Boolean(document.querySelector('button[aria-label="Stop task"]')),
+        };
+      })()`);
+      return state.retryCount === 1 && state.stopAvailable ? state : null;
+    }, 'OpenCode provider retry notice');
+  } catch (error) {
+    const dom = await cdp.evaluate(`(() => ({
+      transcript: document.querySelector('.conversation-scroll')?.innerText ?? '',
+      title: document.querySelector('.workspace-title h1')?.textContent ?? '',
+      textarea: document.querySelector('textarea[aria-label="Message"]')?.value ?? '',
+      sendDisabled: document.querySelector('button[aria-label="Send instruction"]')?.disabled,
+      stopAvailable: Boolean(document.querySelector('button[aria-label="Stop task"]')),
+    }))()`);
+    const listed = await bridgeRequest('sessions.list').catch(() => null);
+    const replay = await bridgeRequest('sync.since', { sequence: 0 }).catch(() => null);
+    const events = replay?.events?.filter((event) => event.sessionId === sessionId) ?? [];
+    const fixture = {
+      status: openCodeServer?.statuses.get(created.session.providerSessionId),
+      messages: openCodeServer?.messages.get(created.session.providerSessionId),
+    };
+    throw new Error(`${error instanceof Error ? error.message : String(error)}; diagnostic=${JSON.stringify({ dom, listed, events, fixture })}`);
+  }
+  assert.equal(visible.hasGenericReasoning, false, 'Provider retry was duplicated as a generic Reasoning row.');
+  assert.doesNotMatch(visible.transcript, /fixture\.invalid/u, 'Provider retry exposed a raw URL.');
+
+  const stopAttempts = await cdp.evaluate(`(() => {
+    const button = document.querySelector('button[aria-label="Stop task"]');
+    if (!(button instanceof HTMLButtonElement)) return 0;
+    button.click();
+    button.click();
+    return 2;
+  })()`);
+  assert.equal(stopAttempts, 2, 'The packaged Stop smoke did not attempt its same-tick double click.');
+  const events = await eventBatches;
+  const clean = await waitFor(async () => {
+    const state = await cdp.evaluate(`(() => {
+      const transcript = document.querySelector('.conversation-scroll')?.innerText ?? '';
+      return {
+        retryCount: transcript.split(${JSON.stringify(retryMessage)}).length - 1,
+        stopAvailable: Boolean(document.querySelector('button[aria-label="Stop task"]')),
+        agentErrorVisible: document.body.innerText.includes('Agent error'),
+      };
+    })()`);
+    return state.retryCount === 0 && !state.stopAvailable ? state : null;
+  }, 'clean OpenCode retry interruption');
+  assert.equal(events.filter((event) => event.type === 'agent.interrupted' && event.sessionId === sessionId).length, 1);
+  assert.equal(events.filter((event) => event.type === 'agent.error' && event.sessionId === sessionId).length, 0);
+  assert.equal(events.filter((event) => event.type === 'agent.completed' && event.sessionId === sessionId).length, 0);
+  assert.equal(clean.agentErrorVisible, false, 'Manual Stop rendered an Agent error despite a clean interruption.');
+  const abortRequests = openCodeServer?.abortCalls.get(created.session.providerSessionId) ?? 0;
+  assert.equal(abortRequests, 1, 'A same-tick double Stop issued more than one provider abort.');
+  return {
+    retryNoticeCount: visible.retryCount,
+    genericReasoning: visible.hasGenericReasoning,
+    interruptedEvents: 1,
+    providerErrors: 0,
+    completedEvents: 0,
+    agentErrorVisible: clean.agentErrorVisible,
+    abortRequests,
+  };
 }
 
 async function scanForbidden(root) {
@@ -481,20 +905,45 @@ async function gracefulQuit() {
 
 async function launchPackagedApp() {
   const unavailableProviderCommand = path.join(runRoot, 'intentionally-unavailable-provider.exe');
+  const isolatedHome = path.join(runRoot, 'home');
+  const isolatedCodexHome = path.join(isolatedHome, '.codex');
+  const isolatedEnvironment = { ...process.env };
+  for (const name of Object.keys(isolatedEnvironment)) {
+    const upperName = name.toUpperCase();
+    if (/(?:API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTHORIZATION)/u.test(upperName) || [
+      'OPENCODE_SERVER_USERNAME',
+      'TETHOQ_OPENCODE_USERNAME',
+      'UAR_OPENCODE_USERNAME',
+      'CODEX_HOME',
+    ].includes(upperName)) delete isolatedEnvironment[name];
+  }
+  await Promise.all([
+    isolatedHome,
+    isolatedCodexHome,
+    path.join(isolatedHome, 'Documents'),
+    path.join(isolatedHome, 'Downloads'),
+  ].map((directory) => mkdir(directory, { recursive: true })));
   appProcess = spawn(executable, [`--user-data-dir=${userData}`, `--remote-debugging-port=${debugPort}`], {
     cwd: projectDirectory,
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
-      ...process.env,
+      ...isolatedEnvironment,
+      HOME: isolatedHome,
+      USERPROFILE: isolatedHome,
+      CODEX_HOME: isolatedCodexHome,
       TETHOQ_PACKAGED_SMOKE: '1',
       TETHOQ_PACKAGED_SMOKE_BROWSER_URL: `http://127.0.0.1:${fixturePort}/browser-smoke/start`,
       TETHOQ_PACKAGED_SMOKE_WORKFLOW_ROOT: workflowRoot,
+      TETHOQ_PROJECT_DIRECTORY: projectDirectory,
+      TETHOQ_OPENCODE_URL: `http://127.0.0.1:${fixturePort}/`,
+      TETHOQ_OPENCODE_DB_PATH: path.join(runRoot, 'intentionally-unavailable-opencode.db'),
+      TETHOQ_OPENCODE_COMMAND: unavailableProviderCommand,
       UAR_PROJECT_DIRECTORY: projectDirectory,
       UAR_OPENCODE_URL: `http://127.0.0.1:${fixturePort}/`,
       // Keep packaged QA deterministic and guarantee it never initializes a
-      // real installed harness or consumes provider usage. OpenCode remains
-      // pointed at the local fixture above.
+      // real installed harness, reads the user's OpenCode database, or consumes
+      // provider usage. OpenCode remains pointed at the local fixture above.
       TETHOQ_CODEX_COMMAND: unavailableProviderCommand,
       TETHOQ_GROK_COMMAND: unavailableProviderCommand,
       TETHOQ_PI_COMMAND: unavailableProviderCommand,
@@ -531,7 +980,7 @@ async function quitPackagedApp() {
   appPid = undefined;
   await waitFor(async () => {
     try {
-      const response = await fetch(`http://127.0.0.1:${debugPort}/json/list`);
+      const response = await fetch(`http://127.0.0.1:${debugPort}/json/list`, { signal: AbortSignal.timeout(2_000) });
       return !response.ok;
     } catch {
       return true;
@@ -620,6 +1069,8 @@ async function main() {
   report.browserDownloadPopover = hasPersistedTaskComposer
     ? await exerciseBrowserDownloadPopover()
     : { skipped: 'The isolated smoke profile has no persisted task; browser workspace behavior is covered directly.' };
+  report.openCodeReasoning = await exerciseOpenCodeReasoningReconciliation();
+  report.openCodeRetry = await exerciseOpenCodeRetryNotice();
   await cdp.evaluate('document.querySelector(".new-task-button")?.click()');
   await waitFor(() => cdp.evaluate(`document.querySelector('.workspace-title h1')?.textContent === 'New task' && document.querySelector('textarea[aria-label="Message"]')?.placeholder.startsWith('Describe the task')`), 'approved connector local draft');
   await cdp.evaluate('document.querySelector(".model-picker-trigger")?.click()');
@@ -685,6 +1136,13 @@ async function main() {
     pickerModels: true,
     createSendRead: true,
     streaming: true,
+    openCodeReasoningStreaming: true,
+    openCodeReasoningReconciliation: true,
+    openCodeReasoningDisclosure: true,
+    openCodePathlessFileSuppression: true,
+    openCodeRetryNotice: true,
+    openCodeRetryStop: true,
+    openCodeStopIdempotence: true,
     forbiddenProviderScan: true,
     gracefulChildShutdown: true,
   };

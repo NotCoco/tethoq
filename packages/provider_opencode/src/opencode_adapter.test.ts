@@ -58,6 +58,73 @@ test("OpenCode detection explains the fixed default endpoint without starting an
   assert.match(detection.details.join(" "), /does not launch or discover/);
 });
 
+test("OpenCode detection gives a previously detected server one immediate second probe", async (t) => {
+  let healthCalls = 0;
+  const fetchLike: FetchLike = async () => {
+    healthCalls += 1;
+    if (healthCalls === 2) throw new Error("transient drop");
+    return jsonResponse({ version: "1.2.3" });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+  t.after(() => adapter.dispose());
+
+  const first = await adapter.detect();
+  assert.equal(first.available, true);
+
+  const second = await adapter.detect();
+
+  assert.equal(second.available, true);
+  assert.equal(healthCalls, 3, "one dropped probe must not disable detection");
+});
+
+test("OpenCode detection does not double-probe a server that never answered", async (t) => {
+  let healthCalls = 0;
+  const fetchLike: FetchLike = async () => {
+    healthCalls += 1;
+    throw new Error("connection refused");
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+  t.after(() => adapter.dispose());
+
+  const detection = await adapter.detect();
+
+  assert.equal(detection.available, false);
+  assert.equal(healthCalls, 1);
+});
+
+test("OpenCode detection reports the first failure when both probes fail", async (t) => {
+  let healthCalls = 0;
+  const fetchLike: FetchLike = async () => {
+    healthCalls += 1;
+    if (healthCalls === 1) return jsonResponse({ version: "1.0.0" });
+    throw new Error(healthCalls === 2 ? "first failure" : "second failure");
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+  t.after(() => adapter.dispose());
+
+  await adapter.detect();
+  const detection = await adapter.detect();
+
+  assert.equal(detection.available, false);
+  assert.equal(healthCalls, 3);
+  assert.match(detection.details.join(" "), /first failure/);
+});
+
 test("OpenCode lists only connected upstream models and preserves their route", async () => {
   const fetchLike: FetchLike = async (input) => {
     assert.equal(requestUrl(input).pathname, "/provider");
@@ -102,6 +169,7 @@ test("OpenCode async prompts use a native message ID separate from bridge dedupl
     requestId: "bridge_request_1",
     content: "Run the focused tests",
     modelId: "openai/gpt-5",
+    reasoningEffort: "high",
     attachments: [{ name: "phone.jpg", mimeType: "image/jpeg", dataBase64: "AQID", byteLength: 3 }],
   });
 
@@ -115,6 +183,7 @@ test("OpenCode async prompts use a native message ID separate from bridge dedupl
     { type: "file", mime: "image/jpeg", filename: "phone.jpg", url: "data:image/jpeg;base64,AQID" },
   ]);
   assert.deepEqual(requestBody.model, { providerID: "openai", modelID: "gpt-5" });
+  assert.equal(requestBody.variant, "high");
   assert.deepEqual(result, {
     accepted: true,
     providerTurnId: messageID,
@@ -351,6 +420,26 @@ test("OpenCode listing uses persisted work only when native status is unavailabl
   assert.equal(reader.closed, true);
 });
 
+test("OpenCode listing reports idle for sessions with no native status and no active turn", async () => {
+  const fetchLike: FetchLike = async (input) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/session") return jsonResponse([{ id: "quiet", title: "Quiet", time: { created: 1, updated: 2 } }]);
+    if (url.pathname === "/session/status") return jsonResponse({});
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+
+  const page = await adapter.listSessions();
+
+  assert.equal(page.sessions[0]?.state, "idle", "a session with no reported state and no in-flight turn is idle, not perpetually working");
+  await adapter.dispose();
+});
+
 test("OpenCode persisted activity watcher emits working and idle transitions", async () => {
   const fetchLike: FetchLike = async () => new Response("data: {\"payload\":{\"type\":\"server.connected\",\"properties\":{}}}\n\n", {
     status: 200,
@@ -374,6 +463,115 @@ test("OpenCode persisted activity watcher emits working and idle transitions", a
   assert.deepEqual(states.slice(0, 2), ["working", "idle"]);
   await adapter.dispose();
   assert.equal(reader.closed, true);
+});
+
+test("OpenCode does not settle an unproven turn when the server never emits session.idle", async (t) => {
+  const fetchLike: FetchLike = async (input) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/session/dispatched/prompt_async") return jsonResponse({});
+    if (url.pathname === "/session/dispatched/message") return jsonResponse([]);
+    return new Response("data: {\"payload\":{\"type\":\"server.connected\",\"properties\":{}}}\n\n", {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  };
+  const reader = new SequenceActivityReader(new Set(), new Set());
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: reader,
+    activityPollIntervalMs: 5,
+    activeTurnSettleMs: 50,
+  });
+  t.after(() => adapter.dispose());
+  const states: string[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "session.status_changed" && typeof event.payload.state === "string") states.push(event.payload.state);
+  });
+  await adapter.sendMessage("dispatched", { requestId: "req_1", content: "hello", attachments: [] });
+  assert.equal(adapter.hasActiveTurn("dispatched"), true, "a dispatched turn is active");
+  await new Promise((resolve) => setTimeout(resolve, 180));
+  assert.deepEqual(states, []);
+  assert.equal(adapter.hasActiveTurn("dispatched"), true, "activity timeout alone cannot invent a terminal response");
+});
+
+test("OpenCode exposes live steering and persists a second prompt while work is active", async (t) => {
+  const bodies: Record<string, unknown>[] = [];
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    assert.equal(url.pathname, "/session/ses_steer/prompt_async");
+    assert.equal(init?.method, "POST");
+    bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+    return new Response(null, { status: 204 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+  t.after(() => adapter.dispose());
+
+  assert.equal((await adapter.getCapabilities()).steering, true);
+  const first = await adapter.sendMessage("ses_steer", { requestId: "first", content: "Keep working" });
+  const steered = await adapter.steerMessage("ses_steer", { requestId: "steer", content: "Use DeepSeek V4 Flash subagents" });
+
+  assert.equal(bodies.length, 2);
+  assert.notEqual(bodies[0]?.messageID, bodies[1]?.messageID);
+  assert.deepEqual(bodies[1]?.parts, [{ type: "text", text: "Use DeepSeek V4 Flash subagents" }]);
+  assert.equal(steered.accepted, true);
+  assert.notEqual(steered.providerTurnId, first.providerTurnId);
+  assert.equal(adapter.hasActiveTurn("ses_steer"), true);
+});
+
+test("OpenCode clears the dispatch mark once activity disappearance confirms an exact terminal response", async (t) => {
+  let promptId: string | undefined;
+  let historyCalls = 0;
+  const fetchLike: FetchLike = async (input) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/session/dispatched/prompt_async") return jsonResponse({});
+    if (url.pathname === "/session/dispatched/message") {
+      historyCalls += 1;
+      return jsonResponse([{
+        info: {
+          id: "assistant_dispatched",
+          sessionID: "dispatched",
+          role: "assistant",
+          parentID: promptId,
+          finish: "stop",
+          time: { created: 1, completed: 2 },
+        },
+        parts: [{ id: "dispatched_text", type: "text", text: "Done" }],
+      }]);
+    }
+    return new Response("data: {\"payload\":{\"type\":\"server.connected\",\"properties\":{}}}\n\n", {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  };
+  const reader = new SequenceActivityReader(new Set(["dispatched"]), new Set());
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: reader,
+    activityPollIntervalMs: 5,
+    activeTurnSettleMs: 5_000,
+  });
+  t.after(() => adapter.dispose());
+  const states: string[] = [];
+  let completions = 0;
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "session.status_changed" && typeof event.payload.state === "string") states.push(event.payload.state);
+    if (event.type === "agent.completed") completions += 1;
+  });
+  const sent = await adapter.sendMessage("dispatched", { requestId: "req_2", content: "hello", attachments: [] });
+  promptId = sent.providerTurnId;
+  await waitFor(() => completions === 1, "two matching history reads must confirm the activity disappearance");
+  assert.deepEqual(states, ["working"]);
+  assert.ok(historyCalls >= 2);
+  assert.equal(adapter.hasActiveTurn("dispatched"), false, "the exact finished turn need not wait for the long settle grace");
 });
 
 test("OpenCode session updates emit flat canonical relationship and model metadata", async () => {
@@ -436,5 +634,2977 @@ test("OpenCode session updates emit flat canonical relationship and model metada
       state: "working",
     },
   ]);
+  await adapter.dispose();
+});
+
+test("OpenCode part snapshots stream as incremental deltas keyed by part", async () => {
+  const part = (text: string) => ({
+    id: "prt_1",
+    messageID: "msg_1",
+    sessionID: "ses_1",
+    type: "text",
+    text,
+  });
+  // OpenCode republishes the whole part on every update. Forwarding those
+  // snapshots as chunks made an accumulating consumer repeat the answer.
+  const nativeEvents = [
+    { payload: { type: "message.part.updated", properties: { part: part("Hello") } } },
+    { payload: { type: "message.part.updated", properties: { part: part("Hello world") } } },
+    { payload: { type: "message.part.updated", properties: { part: part("Hello world again") } } },
+  ];
+  let served = false;
+  const fetchLike: FetchLike = async (_input, init) => {
+    if (!served) {
+      served = true;
+      return new Response(nativeEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }
+    return await new Promise<Response>((_resolve, reject) => {
+      const abort = (): void => reject(new Error("aborted"));
+      if (init?.signal?.aborted === true) abort();
+      else init?.signal?.addEventListener("abort", abort, { once: true });
+    });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  const deltas: Array<Record<string, unknown>> = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "message.delta") deltas.push({ providerSessionId: event.providerSessionId, ...event.payload });
+  });
+  const deadline = Date.now() + 1_000;
+  while (deltas.length < 3 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+
+  assert.deepEqual(deltas, [
+    { providerSessionId: "ses_1", text: "Hello", partType: "text", partId: "prt_1", messageId: "msg_1" },
+    { providerSessionId: "ses_1", text: " world", partType: "text", partId: "prt_1", messageId: "msg_1" },
+    { providerSessionId: "ses_1", text: " again", partType: "text", partId: "prt_1", messageId: "msg_1" },
+  ]);
+  await adapter.dispose();
+});
+
+test("live OpenCode edit, write, and run events expose what changed and what ran", async () => {
+  const nativeEvents = [{
+    payload: { type: "message.part.updated", properties: { part: {
+      id: "edit_live", messageID: "assistant_tools", sessionID: "ses_tools", type: "tool", tool: "edit",
+      state: { status: "completed", input: { filePath: "C:\\work\\src\\app.ts", oldString: "old", newString: "new" }, output: "Edit applied successfully." },
+    } } },
+  }, {
+    payload: { type: "message.part.updated", properties: { part: {
+      id: "write_live", messageID: "assistant_tools", sessionID: "ses_tools", type: "tool", tool: "write",
+      state: { status: "completed", input: { filePath: "C:\\work\\notes.md", content: "Release ready" }, output: "Wrote file successfully." },
+    } } },
+  }, {
+    payload: { type: "message.part.updated", properties: { part: {
+      id: "run_live", messageID: "assistant_tools", sessionID: "ses_tools", type: "tool", tool: "bash",
+      state: { status: "completed", input: { command: "npm test", workdir: "C:\\work" }, output: "12 tests passed" },
+    } } },
+  }];
+  let served = false;
+  const fetchLike: FetchLike = async (_input, init) => {
+    if (!served) {
+      served = true;
+      return new Response(nativeEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }
+    return await new Promise<Response>((_resolve, reject) => {
+      const abort = (): void => reject(new Error("aborted"));
+      if (init?.signal?.aborted === true) abort();
+      else init?.signal?.addEventListener("abort", abort, { once: true });
+    });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  const payloads: Array<Record<string, unknown>> = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "tool.completed") payloads.push(event.payload);
+  });
+  const deadline = Date.now() + 1_000;
+  while (payloads.length < 3 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+
+  assert.deepEqual(payloads.map((payload) => ({ name: payload.name, output: payload.output })), [{
+    name: "Edit C:\\work\\src\\app.ts",
+    output: "File: C:\\work\\src\\app.ts\n\nReplaced:\nold\n\nWith:\nnew",
+  }, {
+    name: "Write C:\\work\\notes.md",
+    output: "File: C:\\work\\notes.md\n\nWritten content:\nRelease ready",
+  }, {
+    name: "Run npm test",
+    output: "Command: npm test\n\nWorking directory: C:\\work\n\nResult:\n12 tests passed",
+  }]);
+  await adapter.dispose();
+});
+
+test("live OpenCode thinking arrives as part deltas, not as the part announcement", async () => {
+  // OpenCode announces a part with an empty body and then streams the body itself as
+  // message.part.delta, appending each chunk to the named field - this is exactly what
+  // its own client does. Handling only the announcement built a reasoning row that
+  // stayed blank for the whole turn and filled in only when history reloaded, which is
+  // how live thinking came to read as a permanent "Thinking...".
+  const nativeEvents = [
+    { payload: { type: "message.part.updated", properties: { part: { id: "prt_r", messageID: "msg_r", sessionID: "ses_r", type: "reasoning", text: "" } } } },
+    { payload: { type: "message.part.delta", properties: { sessionID: "ses_r", messageID: "msg_r", partID: "prt_r", field: "text", delta: "Checking" } } },
+    { payload: { type: "message.part.delta", properties: { sessionID: "ses_r", messageID: "msg_r", partID: "prt_r", field: "text", delta: " the adapter" } } },
+    // A chunk for a part that was never announced has no row to belong to, and guessing
+    // would append a thought to an answer.
+    { payload: { type: "message.part.delta", properties: { sessionID: "ses_r", messageID: "msg_r", partID: "prt_unknown", field: "text", delta: "orphan" } } },
+    // Fields other than the body (a tool's own metadata) are not transcript text.
+    { payload: { type: "message.part.delta", properties: { sessionID: "ses_r", messageID: "msg_r", partID: "prt_r", field: "metadata", delta: "ignored" } } },
+    // The closing announcement repeats the whole part; it must diff to nothing rather
+    // than send the finished thought a second time.
+    { payload: { type: "message.part.updated", properties: { part: { id: "prt_r", messageID: "msg_r", sessionID: "ses_r", type: "reasoning", text: "Checking the adapter" } } } },
+  ];
+  let served = false;
+  const fetchLike: FetchLike = async (_input, init) => {
+    if (!served) {
+      served = true;
+      return new Response(nativeEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }
+    return await new Promise<Response>((_resolve, reject) => {
+      const abort = (): void => reject(new Error("aborted"));
+      if (init?.signal?.aborted === true) abort();
+      else init?.signal?.addEventListener("abort", abort, { once: true });
+    });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  const deltas: Array<Record<string, unknown>> = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "message.delta") deltas.push({ providerSessionId: event.providerSessionId, ...event.payload });
+  });
+  const deadline = Date.now() + 1_000;
+  while (deltas.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  assert.deepEqual(deltas, [
+    { providerSessionId: "ses_r", text: "Checking", partType: "reasoning", partId: "prt_r", messageId: "msg_r" },
+    { providerSessionId: "ses_r", text: " the adapter", partType: "reasoning", partId: "prt_r", messageId: "msg_r" },
+  ]);
+  await adapter.dispose();
+});
+
+test("a rewritten OpenCode part resends its text instead of appending a fragment", async () => {
+  const nativeEvents = [
+    { payload: { type: "message.part.updated", properties: { part: { id: "prt_2", messageID: "msg_2", sessionID: "ses_2", type: "reasoning", text: "First plan" } } } },
+    { payload: { type: "message.part.updated", properties: { part: { id: "prt_2", messageID: "msg_2", sessionID: "ses_2", type: "reasoning", text: "A different plan" } } } },
+    { payload: { type: "message.part.updated", properties: { part: { id: "prt_2", messageID: "msg_2", sessionID: "ses_2", type: "reasoning", text: "A different plan" } } } },
+  ];
+  let served = false;
+  const fetchLike: FetchLike = async (_input, init) => {
+    if (!served) {
+      served = true;
+      return new Response(nativeEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }
+    return await new Promise<Response>((_resolve, reject) => {
+      const abort = (): void => reject(new Error("aborted"));
+      if (init?.signal?.aborted === true) abort();
+      else init?.signal?.addEventListener("abort", abort, { once: true });
+    });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  const deltas: string[] = [];
+  const replaced: boolean[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type !== "message.delta") return;
+    deltas.push(String(event.payload.text));
+    replaced.push(event.payload.replace === true);
+  });
+  const deadline = Date.now() + 1_000;
+  while (deltas.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  // The replacement is sent whole and flagged, and an unchanged republish emits nothing.
+  assert.deepEqual(deltas, ["First plan", "A different plan"]);
+  assert.deepEqual(replaced, [false, true]);
+  await adapter.dispose();
+});
+
+test("the prompt's own part updates never stream back as assistant text", async () => {
+  const nativeEvents = [
+    { payload: { type: "message.updated", properties: { info: { id: "msg_user", sessionID: "ses_3", role: "user" } } } },
+    { payload: { type: "message.part.updated", properties: { part: { id: "prt_user", messageID: "msg_user", sessionID: "ses_3", type: "text", text: "Summarise the repository" } } } },
+    { payload: { type: "message.updated", properties: { info: { id: "msg_reply", sessionID: "ses_3", role: "assistant" } } } },
+    { payload: { type: "message.part.updated", properties: { part: { id: "prt_reply", messageID: "msg_reply", sessionID: "ses_3", type: "text", text: "It is a monorepo." } } } },
+  ];
+  let served = false;
+  const fetchLike: FetchLike = async (_input, init) => {
+    if (!served) {
+      served = true;
+      return new Response(nativeEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }
+    return await new Promise<Response>((_resolve, reject) => {
+      const abort = (): void => reject(new Error("aborted"));
+      if (init?.signal?.aborted === true) abort();
+      else init?.signal?.addEventListener("abort", abort, { once: true });
+    });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  const deltas: string[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "message.delta") deltas.push(String(event.payload.text));
+  });
+  const deadline = Date.now() + 1_000;
+  while (deltas.length < 1 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  await new Promise((resolve) => setTimeout(resolve, 40));
+
+  assert.deepEqual(deltas, ["It is a monorepo."]);
+  await adapter.dispose();
+});
+
+test("OpenCode emits file activity only for a named non-empty patch part", async () => {
+  const nativeEvents = [
+    // OpenCode uses session.diff as current diff/revert state and publishes an
+    // empty reset as soon as a turn starts. Neither shape is an edit action.
+    { payload: { type: "session.diff", properties: { sessionID: "ses_files", diff: [] } } },
+    { payload: { type: "session.diff", properties: { sessionID: "ses_files", diff: [{ file: "stale.ts", before: "", after: "" }] } } },
+    // These workspace-global notifications cannot be attributed to this chat.
+    { payload: { type: "file.watcher.updated", properties: { file: "watched.ts", event: "change" } } },
+    { payload: { type: "file.edited", properties: { file: "edited.ts" } } },
+    { payload: { type: "message.part.updated", properties: { part: {
+      id: "patch_empty", messageID: "assistant_files", sessionID: "ses_files", type: "patch", hash: "empty", files: [],
+    } } } },
+    { payload: { type: "message.part.updated", properties: { part: {
+      id: "patch_named", messageID: "assistant_files", sessionID: "ses_files", type: "patch", hash: "named", files: ["src/named.ts"],
+    } } } },
+  ];
+  let served = false;
+  const fetchLike: FetchLike = async (_input, init) => {
+    if (!served) {
+      served = true;
+      return new Response(nativeEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }
+    return await new Promise<Response>((_resolve, reject) => {
+      const abort = (): void => reject(new Error("aborted"));
+      if (init?.signal?.aborted === true) abort();
+      else init?.signal?.addEventListener("abort", abort, { once: true });
+    });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  const changes: Array<{ readonly sessionId?: string; readonly files: unknown }> = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "file.changed") changes.push({
+      ...(event.providerSessionId !== undefined ? { sessionId: event.providerSessionId } : {}),
+      files: event.payload.files,
+    });
+  });
+  const deadline = Date.now() + 1_000;
+  while (changes.length < 1 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  assert.deepEqual(changes, [{ sessionId: "ses_files", files: ["src/named.ts"] }]);
+  await adapter.dispose();
+});
+
+test("OpenCode session listing merges every project because an unscoped list only returns the global one", async () => {
+  const requested: (string | null)[] = [];
+  const fetchLike: FetchLike = async (input) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/project") {
+      return jsonResponse([
+        { id: "global", worktree: "/" },
+        { id: "37b4", worktree: "C:\cli_remote" },
+        { id: "0af1", worktree: "C:\ExampleProject" },
+      ]);
+    }
+    if (url.pathname === "/session") {
+      const directory = url.searchParams.get("directory");
+      requested.push(directory);
+      if (directory === "C:\cli_remote") {
+        return jsonResponse([{ id: "ses_cli", directory: "C:\cli_remote", title: "cli", time: { created: 3, updated: 3 } }]);
+      }
+      if (directory === "C:\ExampleProject") {
+        return jsonResponse([{ id: "ses_example", directory: "C:\ExampleProject", title: "example", time: { created: 2, updated: 2 } }]);
+      }
+      return jsonResponse([{ id: "ses_global", directory: "/", title: "global", time: { created: 1, updated: 1 } }]);
+    }
+    if (url.pathname === "/session/status") return jsonResponse({});
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({ hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", fetch: fetchLike, activityReader: new SequenceActivityReader(new Set()) });
+
+  const page = await adapter.listSessions();
+
+  const ids = page.sessions.map((session) => session.providerSessionId).sort();
+  assert.deepEqual(ids, ["ses_cli", "ses_example", "ses_global"]);
+  // The global project is the unscoped list; "/" is never sent as a directory.
+  assert.equal(requested.filter((entry) => entry === null).length, 1);
+  assert.ok(requested.includes("C:\cli_remote"));
+  assert.ok(!requested.includes("/"));
+  await adapter.dispose();
+});
+
+test("OpenCode session listing keeps other projects when one project cannot be read", async () => {
+  const fetchLike: FetchLike = async (input) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/project") {
+      return jsonResponse([{ id: "global", worktree: "/" }, { id: "37b4", worktree: "C:\cli_remote" }, { id: "bad", worktree: "C:\broken" }]);
+    }
+    if (url.pathname === "/session") {
+      const directory = url.searchParams.get("directory");
+      if (directory === "C:\broken") return new Response("boom", { status: 500 });
+      if (directory === "C:\cli_remote") {
+        return jsonResponse([{ id: "ses_cli", directory: "C:\cli_remote", title: "cli", time: { created: 3, updated: 3 } }]);
+      }
+      return jsonResponse([{ id: "ses_global", directory: "/", title: "global", time: { created: 1, updated: 1 } }]);
+    }
+    if (url.pathname === "/session/status") return jsonResponse({});
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({ hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", fetch: fetchLike, activityReader: new SequenceActivityReader(new Set()) });
+
+  const page = await adapter.listSessions();
+
+  assert.deepEqual(page.sessions.map((session) => session.providerSessionId).sort(), ["ses_cli", "ses_global"]);
+  await adapter.dispose();
+});
+
+test("OpenCode session listing still throws when the primary list fails so cached sessions survive", async () => {
+  const fetchLike: FetchLike = async (input) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/project") return jsonResponse([{ id: "global", worktree: "/" }]);
+    if (url.pathname === "/session") return new Response("down", { status: 503 });
+    if (url.pathname === "/session/status") return jsonResponse({});
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({ hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", fetch: fetchLike, activityReader: new SequenceActivityReader(new Set()) });
+
+  await assert.rejects(async () => await adapter.listSessions());
+  await adapter.dispose();
+});
+
+test("OpenCode session listing honours a pinned directory instead of walking projects", async () => {
+  const requested: (string | null)[] = [];
+  let projectCalls = 0;
+  const fetchLike: FetchLike = async (input) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/project") {
+      projectCalls += 1;
+      return jsonResponse([{ id: "global", worktree: "/" }, { id: "other", worktree: "C:\ExampleProject" }]);
+    }
+    if (url.pathname === "/session") {
+      requested.push(url.searchParams.get("directory"));
+      return jsonResponse([{ id: "ses_pinned", directory: "C:\cli_remote", title: "pinned", time: { created: 1, updated: 1 } }]);
+    }
+    if (url.pathname === "/session/status") return jsonResponse({});
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({ hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", directory: "C:\cli_remote", fetch: fetchLike, activityReader: new SequenceActivityReader(new Set()) });
+
+const page = await adapter.listSessions();
+
+  assert.equal(projectCalls, 0);
+  assert.deepEqual(requested, ["C:\cli_remote"]);
+  assert.equal(page.sessions.length, 1);
+  await adapter.dispose();
+});
+
+test("OpenCode explicit working-directory listing queries that directory even when project discovery omits it", async () => {
+  const hiddenDirectory = "C:\\Users\\test\\Documents\\hidden-global";
+  const requested: (string | null)[] = [];
+  let projectCalls = 0;
+  const fetchLike: FetchLike = async (input) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/project") {
+      projectCalls += 1;
+      return jsonResponse([{ id: "global", worktree: "/" }]);
+    }
+    if (url.pathname === "/session") {
+      const directory = url.searchParams.get("directory");
+      requested.push(directory);
+      return directory === hiddenDirectory
+        ? jsonResponse([{ id: "ses_hidden", directory: hiddenDirectory, title: "hidden", time: { created: 1, updated: 1 } }])
+        : jsonResponse([]);
+    }
+    if (url.pathname === "/session/status") return jsonResponse({});
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({ hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", fetch: fetchLike, activityReader: new SequenceActivityReader(new Set()) });
+
+  const page = await adapter.listSessions({ workingDirectory: hiddenDirectory });
+
+  assert.equal(projectCalls, 0);
+  assert.deepEqual(requested, [hiddenDirectory]);
+  assert.deepEqual(page.sessions.map((session) => session.providerSessionId), ["ses_hidden"]);
+  await adapter.dispose();
+});
+
+test("OpenCode list and get expose only the currently reported retry notice", async () => {
+  const retryAt = 1_760_000_030_000;
+  let statuses: Record<string, unknown> = {
+    ses_retry: {
+      type: "retry",
+      attempt: 1,
+      message: "Raw retry https://opencode.ai/workspace/private",
+      action: { message: "Go limit reached. Try again after reset. request_id=req_private trace_123456789 https://opencode.ai/workspace/private" },
+      next: retryAt,
+    },
+  };
+  const nativeSession = {
+    id: "ses_retry",
+    directory: "/workspace/project",
+    title: "Retrying",
+    time: { created: 1, updated: 2 },
+  };
+  const fetchLike: FetchLike = async (input) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/session/status") return jsonResponse(statuses);
+    if (url.pathname === "/session/ses_retry") return jsonResponse(nativeSession);
+    if (url.pathname === "/session") return jsonResponse([nativeSession]);
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    directory: "/workspace/project",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+
+  const page = await adapter.listSessions();
+  const session = await adapter.getSession("ses_retry");
+  const expected = {
+    kind: "retry",
+    message: "Go limit reached. Try again after reset.",
+    retryAt: new Date(retryAt).toISOString(),
+  };
+  assert.deepEqual(page.sessions[0]?.providerStatus, expected);
+  assert.deepEqual(session.providerStatus, expected);
+  assert.doesNotMatch(JSON.stringify(session.providerStatus), /opencode\.ai/u);
+  assert.doesNotMatch(JSON.stringify(session.providerStatus), /req_private|trace_123456789/u);
+
+  statuses = {};
+  const afterRestart = await adapter.getSession("ses_retry");
+  assert.equal(afterRestart.providerStatus, undefined, "a restarted server with no retry must not inherit stale status");
+  await adapter.dispose();
+});
+
+class SseFixture {
+  readonly #encoder = new TextEncoder();
+  #queue: Uint8Array[] = [];
+  #pendingPull: ((chunk: Uint8Array) => void) | undefined;
+
+  public response(signal?: AbortSignal): Response {
+    const stream = new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        signal?.addEventListener("abort", () => controller.close(), { once: true });
+      },
+      pull: (controller) => {
+        const chunk = this.#queue.shift();
+        if (chunk !== undefined) {
+          controller.enqueue(chunk);
+          return;
+        }
+        this.#pendingPull = (next) => controller.enqueue(next);
+      },
+    });
+    return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
+
+  public push(value: unknown): void {
+    const chunk = this.#encoder.encode(`data: ${JSON.stringify(value)}\n\n`);
+    const pending = this.#pendingPull;
+    if (pending !== undefined) {
+      this.#pendingPull = undefined;
+      pending(chunk);
+    } else {
+      this.#queue.push(chunk);
+    }
+  }
+}
+
+async function waitFor(condition: () => boolean, message: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (condition()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`timed out: ${message}`);
+}
+
+test("an active OpenCode steer becomes the owned follow-up and settles on its own final answer", async (t) => {
+  const events = new SseFixture();
+  const history: unknown[] = [];
+  let abortCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_live_steer/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_live_steer/message") return jsonResponse(history);
+    if (url.pathname === "/session/ses_live_steer/abort") {
+      abortCalls += 1;
+      return jsonResponse({});
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  let completions = 0;
+  await adapter.subscribe(null, (event) => { if (event.type === "agent.completed") completions += 1; });
+
+  const first = await adapter.sendMessage("ses_live_steer", { requestId: "first", content: "Keep working" });
+  const steered = await adapter.steerMessage("ses_live_steer", { requestId: "steer", content: "Use the faster subagent" });
+  assert.ok(first.providerTurnId);
+  assert.ok(steered.providerTurnId);
+
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: steered.providerTurnId,
+    sessionID: "ses_live_steer",
+    role: "user",
+    time: { created: 2 },
+  } } } });
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_before_steer",
+    sessionID: "ses_live_steer",
+    role: "assistant",
+    parentID: first.providerTurnId,
+    finish: "stop",
+    time: { created: 1, completed: 3 },
+  } } } });
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_after_steer",
+    sessionID: "ses_live_steer",
+    role: "assistant",
+    parentID: steered.providerTurnId,
+    finish: "stop",
+    time: { created: 4, completed: 5 },
+  } } } });
+  history.push(
+    { info: { id: "assistant_before_steer", sessionID: "ses_live_steer", role: "assistant", parentID: first.providerTurnId, finish: "stop", time: { created: 1, completed: 3 } }, parts: [{ id: "before", type: "text", text: "Finishing the current step" }] },
+    { info: { id: "assistant_after_steer", sessionID: "ses_live_steer", role: "assistant", parentID: steered.providerTurnId, finish: "stop", time: { created: 4, completed: 5 } }, parts: [{ id: "after", type: "text", text: "Applied the steering instruction" }] },
+  );
+  events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_live_steer" } } });
+
+  await waitFor(() => completions === 1, "the steered follow-up must complete from its own persisted final answer");
+  assert.equal(adapter.hasActiveTurn("ses_live_steer"), false);
+  assert.equal(abortCalls, 0, "live steering must not be mistaken for a runaway continuation");
+});
+
+test("cursorless OpenCode listing reloads once when live status invalidates its first fetch", async (t) => {
+  const events = new SseFixture();
+  const nativeSession = {
+    id: "ses_list_race",
+    directory: "/workspace/project",
+    title: "List race",
+    time: { created: 1, updated: 2 },
+  };
+  let sessionReads = 0;
+  let statusReads = 0;
+  let resolveFirstSession: ((response: Response) => void) | undefined;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/status") {
+      statusReads += 1;
+      return jsonResponse({
+        ses_list_race: statusReads === 1
+          ? { type: "retry", message: "Stale retry", next: 1_760_000_030_000 }
+          : { type: "idle" },
+      });
+    }
+    if (url.pathname === "/session") {
+      sessionReads += 1;
+      if (sessionReads === 1) {
+        return await new Promise<Response>((resolve) => { resolveFirstSession = resolve; });
+      }
+      return jsonResponse([nativeSession]);
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    directory: "/workspace/project",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => {
+    resolveFirstSession?.(jsonResponse([nativeSession]));
+    return adapter.dispose();
+  });
+  let clearSeen = false;
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "session.status_changed" && event.payload.providerStatus === null) clearSeen = true;
+  });
+
+  const listing = adapter.listSessions();
+  await waitFor(() => sessionReads === 1 && statusReads === 1, "the first list/status reads must both be in flight");
+  events.push({ payload: { type: "session.status", properties: {
+    sessionID: "ses_list_race",
+    status: { type: "idle" },
+  } } });
+  await waitFor(() => clearSeen, "the live clear must invalidate the first list generation");
+  assert.ok(resolveFirstSession);
+  resolveFirstSession(jsonResponse([nativeSession]));
+
+  const page = await listing;
+  assert.equal(sessionReads, 2, "the invalidated cursorless fetch is reloaded exactly once");
+  assert.equal(statusReads, 2);
+  assert.equal(page.sessions[0]?.state, "idle");
+  assert.equal(page.sessions[0]?.providerStatus, undefined);
+});
+
+test("OpenCode live retry status is sanitized and the next busy status clears it", async (t) => {
+  const events = new SseFixture();
+  let promptCalls = 0;
+  let abortCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname.endsWith("/prompt_async")) promptCalls += 1;
+    if (url.pathname.endsWith("/abort")) abortCalls += 1;
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const statuses: unknown[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "session.status_changed") statuses.push(event.payload);
+  });
+
+  events.push({ payload: { type: "session.status", properties: {
+    sessionID: "ses_retry_live",
+    status: {
+      type: "retry",
+      attempt: 2,
+      message: "Raw detail https://opencode.ai/workspace/private",
+      action: { message: "  Go limit reached\nRetrying shortly. https://opencode.ai/workspace/private " },
+      next: 1_760_000_030_000,
+    },
+  } } });
+  await waitFor(() => statuses.length === 1, "retry status must be forwarded");
+  events.push({ payload: { type: "session.status", properties: {
+    sessionID: "ses_retry_live",
+    status: { type: "busy" },
+  } } });
+  await waitFor(() => statuses.length === 2, "busy status must clear retry metadata");
+
+  assert.deepEqual(statuses, [{
+    state: "working",
+    providerStatus: {
+      kind: "retry",
+      message: "Go limit reached Retrying shortly.",
+      retryAt: "2025-10-09T08:53:50.000Z",
+    },
+  }, {
+    state: "working",
+    providerStatus: null,
+  }]);
+  assert.equal(promptCalls, 0, "retry lifecycle must never dispatch another prompt");
+  assert.equal(abortCalls, 0, "retry lifecycle must never abort the provider");
+});
+
+test("manual interrupt turns abort cleanup into one interruption and leaves the next prompt healthy", async (t) => {
+  const events = new SseFixture();
+  const history: unknown[] = [];
+  let promptCalls = 0;
+  let abortCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_manual_interrupt/prompt_async") {
+      promptCalls += 1;
+      return new Response(null, { status: 204 });
+    }
+    if (url.pathname === "/session/ses_manual_interrupt/message") return jsonResponse(history);
+    if (url.pathname === "/session/ses_manual_interrupt/abort") {
+      abortCalls += 1;
+      events.push({ payload: { type: "session.error", properties: {
+        sessionID: "ses_manual_interrupt",
+        error: { name: "MessageAbortedError", data: { message: "Aborted" } },
+      } } });
+      events.push({ payload: { type: "session.status", properties: {
+        sessionID: "ses_manual_interrupt",
+        status: { type: "idle" },
+      } } });
+      events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_manual_interrupt" } } });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return jsonResponse({});
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const interruptions: unknown[] = [];
+  const completions: unknown[] = [];
+  const errors: unknown[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "agent.interrupted") interruptions.push(event.payload);
+    if (event.type === "agent.completed") completions.push(event.payload);
+    if (event.type === "agent.error") errors.push(event.payload);
+  });
+
+  await adapter.sendMessage("ses_manual_interrupt", { requestId: "first", content: "First" });
+  await adapter.interrupt("ses_manual_interrupt");
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  assert.deepEqual(interruptions, [{ providerStatus: null }]);
+  assert.deepEqual(errors, []);
+  assert.deepEqual(completions, []);
+  assert.equal(promptCalls, 1);
+  assert.equal(abortCalls, 1);
+  assert.equal(adapter.hasActiveTurn("ses_manual_interrupt"), false);
+
+  const successor = await adapter.sendMessage("ses_manual_interrupt", { requestId: "second", content: "Second" });
+  assert.ok(successor.providerTurnId);
+  const terminal = {
+    info: {
+      id: "assistant_after_interrupt",
+      sessionID: "ses_manual_interrupt",
+      role: "assistant",
+      parentID: successor.providerTurnId,
+      finish: "stop",
+      time: { created: 3, completed: 4 },
+    },
+    parts: [{ id: "after_interrupt_text", type: "text", text: "Done" }],
+  };
+  history.push(terminal);
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: successor.providerTurnId,
+    sessionID: "ses_manual_interrupt",
+    role: "user",
+    time: { created: 2 },
+  } } } });
+  events.push({ payload: { type: "message.updated", properties: { info: terminal.info } } });
+  events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_manual_interrupt" } } });
+  await waitFor(() => completions.length === 1, "the prompt after an interruption must complete normally");
+
+  assert.equal(promptCalls, 2);
+  assert.equal(abortCalls, 1);
+  assert.equal(interruptions.length, 1);
+  assert.deepEqual(errors, []);
+  assert.deepEqual(completions, [{ providerStatus: null }]);
+  assert.equal(adapter.hasActiveTurn("ses_manual_interrupt"), false);
+});
+
+test("sequential duplicate stops share one abort while a genuine successor can still be stopped", async (t) => {
+  const events = new SseFixture();
+  let promptCalls = 0;
+  let abortCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_sequential_stop/prompt_async") {
+      promptCalls += 1;
+      return new Response(null, { status: 204 });
+    }
+    if (url.pathname === "/session/ses_sequential_stop/abort") {
+      abortCalls += 1;
+      return jsonResponse({});
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const interruptions: unknown[] = [];
+  const errors: unknown[] = [];
+  const completions: unknown[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "agent.interrupted") interruptions.push(event.payload);
+    if (event.type === "agent.error") errors.push(event.payload);
+    if (event.type === "agent.completed") completions.push(event.payload);
+  });
+
+  await adapter.sendMessage("ses_sequential_stop", { requestId: "first", content: "First" });
+  await adapter.interrupt("ses_sequential_stop");
+  await adapter.interrupt("ses_sequential_stop");
+
+  assert.equal(abortCalls, 1, "a completed Stop remains idempotent for the stopped generation");
+  assert.equal(interruptions.length, 1);
+  assert.equal(adapter.hasActiveTurn("ses_sequential_stop"), false);
+
+  await adapter.sendMessage("ses_sequential_stop", { requestId: "successor", content: "Second" });
+  assert.equal(adapter.hasActiveTurn("ses_sequential_stop"), true);
+  await adapter.interrupt("ses_sequential_stop");
+
+  assert.equal(promptCalls, 2);
+  assert.equal(abortCalls, 2, "a new active prompt is a distinct generation and remains stoppable");
+  assert.equal(interruptions.length, 2);
+  assert.deepEqual(errors, []);
+  assert.deepEqual(completions, []);
+  assert.equal(adapter.hasActiveTurn("ses_sequential_stop"), false);
+});
+
+test("a delayed abort cleanup confirms a manual stop whose HTTP response disconnected", async (t) => {
+  const events = new SseFixture();
+  let abortCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_delayed_manual_cleanup/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_delayed_manual_cleanup/abort") {
+      abortCalls += 1;
+      setTimeout(() => events.push({ payload: { type: "session.error", properties: {
+        sessionID: "ses_delayed_manual_cleanup",
+        error: { name: "MessageAbortedError", data: { message: "Aborted" } },
+      } } }), 30);
+      throw new TypeError("connection closed before the abort response");
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const interruptions: unknown[] = [];
+  const errors: unknown[] = [];
+  const completions: unknown[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "agent.interrupted") interruptions.push(event.payload);
+    if (event.type === "agent.error") errors.push(event.payload);
+    if (event.type === "agent.completed") completions.push(event.payload);
+  });
+
+  await adapter.sendMessage("ses_delayed_manual_cleanup", { requestId: "first", content: "First" });
+  await adapter.interrupt("ses_delayed_manual_cleanup");
+
+  assert.equal(abortCalls, 1);
+  assert.deepEqual(interruptions, [{ providerStatus: null }]);
+  assert.deepEqual(errors, []);
+  assert.deepEqual(completions, []);
+  assert.equal(adapter.hasActiveTurn("ses_delayed_manual_cleanup"), false);
+});
+
+test("a genuine manual abort failure rejects after its bounded cleanup grace and remains retryable", async (t) => {
+  const events = new SseFixture();
+  let abortCalls = 0;
+  let failuresRemaining = 1;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_manual_abort_failure/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_manual_abort_failure/abort") {
+      abortCalls += 1;
+      if (failuresRemaining > 0) {
+        failuresRemaining -= 1;
+        throw new TypeError("abort endpoint unavailable");
+      }
+      return jsonResponse({});
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const interruptions: unknown[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "agent.interrupted") interruptions.push(event.payload);
+  });
+  await adapter.sendMessage("ses_manual_abort_failure", { requestId: "first", content: "First" });
+
+  const startedAt = Date.now();
+  await assert.rejects(() => adapter.interrupt("ses_manual_abort_failure"), /abort endpoint unavailable/);
+  assert.ok(Date.now() - startedAt >= 200, "a rejected response must leave a bounded window for delayed native cleanup");
+  assert.equal(abortCalls, 1);
+  assert.deepEqual(interruptions, []);
+  assert.equal(adapter.hasActiveTurn("ses_manual_abort_failure"), true);
+
+  await adapter.interrupt("ses_manual_abort_failure");
+  assert.equal(abortCalls, 2, "retiring an unconfirmed generation must leave a real retry possible");
+  assert.equal(interruptions.length, 1);
+  assert.equal(adapter.hasActiveTurn("ses_manual_abort_failure"), false);
+});
+
+test("genuine provider error stays failed through trailing idle cleanup and the next prompt completes", async (t) => {
+  const events = new SseFixture();
+  const history: unknown[] = [];
+  let promptCalls = 0;
+  let abortCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_error_cleanup/prompt_async") {
+      promptCalls += 1;
+      return new Response(null, { status: 204 });
+    }
+    if (url.pathname === "/session/ses_error_cleanup/message") return jsonResponse(history);
+    if (url.pathname === "/session/ses_error_cleanup/abort") {
+      abortCalls += 1;
+      return jsonResponse({});
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const errors: unknown[] = [];
+  const completions: unknown[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "agent.error") errors.push(event.payload);
+    if (event.type === "agent.completed") completions.push(event.payload);
+  });
+
+  await adapter.sendMessage("ses_error_cleanup", { requestId: "first", content: "Fail" });
+  events.push({ payload: { type: "session.error", properties: {
+    sessionID: "ses_error_cleanup",
+    error: { name: "APIError", data: { message: "Provider failed", isRetryable: false } },
+  } } });
+  events.push({ payload: { type: "session.status", properties: {
+    sessionID: "ses_error_cleanup",
+    status: { type: "idle" },
+  } } });
+  events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_error_cleanup" } } });
+  await waitFor(() => errors.length === 1, "the genuine error must be emitted");
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  assert.equal((errors[0] as { providerStatus?: unknown }).providerStatus, null);
+  assert.deepEqual(completions, [], "idle cleanup must not turn failure into success");
+  assert.equal(adapter.hasActiveTurn("ses_error_cleanup"), false);
+
+  const successor = await adapter.sendMessage("ses_error_cleanup", { requestId: "second", content: "Recover" });
+  assert.ok(successor.providerTurnId);
+  const terminal = {
+    info: {
+      id: "assistant_after_error",
+      sessionID: "ses_error_cleanup",
+      role: "assistant",
+      parentID: successor.providerTurnId,
+      finish: "stop",
+      time: { created: 3, completed: 4 },
+    },
+    parts: [{ id: "after_error_text", type: "text", text: "Recovered" }],
+  };
+  history.push(terminal);
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: successor.providerTurnId,
+    sessionID: "ses_error_cleanup",
+    role: "user",
+    time: { created: 2 },
+  } } } });
+  events.push({ payload: { type: "message.updated", properties: { info: terminal.info } } });
+  events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_error_cleanup" } } });
+  await waitFor(() => completions.length === 1, "the prompt after a failure must complete normally");
+
+  assert.equal(promptCalls, 2);
+  assert.equal(abortCalls, 0);
+  assert.equal(errors.length, 1);
+  assert.deepEqual(completions, [{ providerStatus: null }]);
+  assert.equal(adapter.hasActiveTurn("ses_error_cleanup"), false);
+});
+
+test("an idle queued ahead of a continuing tool cannot finish the prompt", async (t) => {
+  const events = new SseFixture();
+  let promptId: string | undefined;
+  let toolObserved = false;
+  let finalVisible = false;
+  let historyCalls = 0;
+  let abortCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_idle_tool_race/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_idle_tool_race/message") {
+      historyCalls += 1;
+      const first = {
+        info: {
+          id: "assistant_tool_step",
+          sessionID: "ses_idle_tool_race",
+          role: "assistant",
+          parentID: promptId,
+          finish: "stop",
+          time: { created: 1, completed: 2 },
+        },
+        parts: toolObserved
+          ? [{ id: "queued_tool", type: "tool", tool: "bash", state: { status: "completed", output: "ok" } }]
+          : [{ id: "premature_text", type: "text", text: "Checking" }],
+      };
+      const final = {
+        info: {
+          id: "assistant_after_tool",
+          sessionID: "ses_idle_tool_race",
+          role: "assistant",
+          parentID: promptId,
+          finish: "stop",
+          time: { created: 3, completed: 4 },
+        },
+        parts: [{ id: "final_text", type: "text", text: "Done" }],
+      };
+      return jsonResponse(finalVisible ? [first, final] : [first]);
+    }
+    if (url.pathname === "/session/ses_idle_tool_race/abort") {
+      abortCalls += 1;
+      return jsonResponse({});
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const started: string[] = [];
+  let completions = 0;
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "message.started") {
+      const info = event.payload.info;
+      if (typeof info === "object" && info !== null && !Array.isArray(info) && typeof info.id === "string") started.push(info.id);
+    }
+    if (event.type === "tool.completed") toolObserved = true;
+    if (event.type === "agent.completed") completions += 1;
+  });
+
+  const sent = await adapter.sendMessage("ses_idle_tool_race", { requestId: "idle_tool_race", content: "Use the tool" });
+  promptId = sent.providerTurnId;
+  assert.ok(promptId);
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_tool_step",
+    sessionID: "ses_idle_tool_race",
+    role: "assistant",
+    parentID: promptId,
+    finish: "stop",
+    time: { created: 1, completed: 2 },
+  } } } });
+  // OpenCode can queue the idle before publishing the tool part that explains
+  // why this stop is only an intermediate step. One matching history read is
+  // therefore not enough terminal authority.
+  events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_idle_tool_race" } } });
+  events.push({ payload: { type: "message.part.updated", properties: { part: {
+    id: "queued_tool",
+    messageID: "assistant_tool_step",
+    sessionID: "ses_idle_tool_race",
+    type: "tool",
+    tool: "bash",
+    state: { status: "completed", output: "ok" },
+  } } } });
+
+  await waitFor(() => toolObserved, "the queued tool evidence must be processed");
+  await new Promise((resolve) => setTimeout(resolve, 180));
+  assert.equal(completions, 0, "the premature idle must not pump the next request");
+  assert.equal(adapter.hasActiveTurn("ses_idle_tool_race"), true);
+  assert.equal(abortCalls, 0);
+
+  finalVisible = true;
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_after_tool",
+    sessionID: "ses_idle_tool_race",
+    role: "assistant",
+    parentID: promptId,
+    finish: "stop",
+    time: { created: 3, completed: 4 },
+  } } } });
+  events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_idle_tool_race" } } });
+  await waitFor(() => completions === 1, "the later exact no-tool terminal must complete once");
+  await new Promise((resolve) => setTimeout(resolve, 120));
+
+  assert.deepEqual(started, ["assistant_tool_step", "assistant_after_tool"]);
+  assert.equal(completions, 1);
+  assert.equal(adapter.hasActiveTurn("ses_idle_tool_race"), false);
+  assert.equal(abortCalls, 0);
+  assert.ok(historyCalls >= 2, "terminality requires two matching history reads after the queued tool race");
+});
+
+test("activity disappearance and its timeout cannot settle incomplete owned prompts", async (t) => {
+  const events = new SseFixture();
+  const promptIds = new Map<string, string>();
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname.endsWith("/prompt_async")) return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_activity_drop/message") return jsonResponse([{
+      info: {
+        id: "assistant_tool_only",
+        sessionID: "ses_activity_drop",
+        role: "assistant",
+        parentID: promptIds.get("ses_activity_drop"),
+        finish: "stop",
+        time: { created: 1, completed: 2 },
+      },
+      parts: [{ id: "activity_tool", type: "tool", tool: "bash", state: { status: "completed", output: "ok" } }],
+    }]);
+    if (url.pathname === "/session/ses_activity_timeout/message") return jsonResponse([{
+      info: {
+        id: "assistant_incomplete",
+        sessionID: "ses_activity_timeout",
+        role: "assistant",
+        parentID: promptIds.get("ses_activity_timeout"),
+        time: { created: 3 },
+      },
+      parts: [{ id: "partial_reasoning", type: "reasoning", text: "Still working" }],
+    }]);
+    return new Response("not found", { status: 404 });
+  };
+  const reader = new SequenceActivityReader(
+    new Set(["ses_activity_drop"]),
+    new Set(["ses_activity_drop"]),
+    new Set(),
+  );
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: reader,
+    activityPollIntervalMs: 5,
+    activeTurnSettleMs: 30,
+  });
+  t.after(() => adapter.dispose());
+
+  const dropped = await adapter.sendMessage("ses_activity_drop", { requestId: "activity_drop", content: "Use a tool" });
+  const timed = await adapter.sendMessage("ses_activity_timeout", { requestId: "activity_timeout", content: "Take your time" });
+  assert.ok(dropped.providerTurnId);
+  assert.ok(timed.providerTurnId);
+  promptIds.set("ses_activity_drop", dropped.providerTurnId);
+  promptIds.set("ses_activity_timeout", timed.providerTurnId);
+
+  const idleStates: string[] = [];
+  let completions = 0;
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "session.status_changed" && event.payload.state === "idle" && event.providerSessionId !== undefined) {
+      idleStates.push(event.providerSessionId);
+    }
+    if (event.type === "agent.completed") completions += 1;
+  });
+  await waitFor(() => reader.reads >= 6, "the activity disappearance and settle timeout must both elapse");
+  await new Promise((resolve) => setTimeout(resolve, 80));
+
+  assert.deepEqual(idleStates, [], "activity alone cannot publish a pump-authoritative idle for an owned prompt");
+  assert.equal(completions, 0);
+  assert.equal(adapter.hasActiveTurn("ses_activity_drop"), true, "a tool-bearing step is still continuing");
+  assert.equal(adapter.hasActiveTurn("ses_activity_timeout"), true, "a fixed timeout cannot invent a terminal response");
+});
+
+test("a delayed guard abort cannot erase or complete a concurrently starting successor", async (t) => {
+  const events = new SseFixture();
+  const history: unknown[] = [];
+  const sequence: string[] = [];
+  let promptCalls = 0;
+  let abortCalls = 0;
+  let resolveAbort!: (response: Response) => void;
+  const abortResponse = new Promise<Response>((resolve) => { resolveAbort = resolve; });
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_abort_send_race/prompt_async") {
+      promptCalls += 1;
+      sequence.push(`prompt:${promptCalls}`);
+      return new Response(null, { status: 204 });
+    }
+    if (url.pathname === "/session/ses_abort_send_race/message") return jsonResponse(history);
+    if (url.pathname === "/session/ses_abort_send_race/abort") {
+      abortCalls += 1;
+      sequence.push("abort:start");
+      const response = await abortResponse;
+      sequence.push("abort:end");
+      return response;
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  let completions = 0;
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "agent.completed") {
+      completions += 1;
+      sequence.push("completed");
+    }
+  });
+
+  const first = await adapter.sendMessage("ses_abort_send_race", { requestId: "first", content: "First" });
+  assert.ok(first.providerTurnId);
+  history.push({
+    info: {
+      id: "assistant_first_terminal",
+      sessionID: "ses_abort_send_race",
+      role: "assistant",
+      parentID: first.providerTurnId,
+      finish: "stop",
+      time: { created: 1, completed: 2 },
+    },
+    parts: [{ id: "first_text", type: "text", text: "Done" }],
+  });
+  history.push({
+    info: {
+      id: "assistant_runaway",
+      sessionID: "ses_abort_send_race",
+      role: "assistant",
+      parentID: first.providerTurnId,
+      time: { created: 3 },
+    },
+    parts: [{ id: "runaway_text", type: "text", text: "Repeated" }],
+  });
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_first_terminal",
+    sessionID: "ses_abort_send_race",
+    role: "assistant",
+    parentID: first.providerTurnId,
+    finish: "stop",
+    time: { created: 1, completed: 2 },
+  } } } });
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_runaway",
+    sessionID: "ses_abort_send_race",
+    role: "assistant",
+    parentID: first.providerTurnId,
+    time: { created: 3 },
+  } } } });
+  await waitFor(() => abortCalls === 1, "the guard abort must be in flight");
+
+  const successorPromise = adapter.sendMessage("ses_abort_send_race", { requestId: "successor", content: "Second" });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  resolveAbort(jsonResponse({}));
+  const successor = await successorPromise;
+  assert.ok(successor.providerTurnId);
+  await waitFor(() => sequence.includes("abort:end"), "the guard abort must return");
+  await new Promise((resolve) => setTimeout(resolve, 40));
+
+  const successorDispatch = sequence.indexOf("prompt:2");
+  assert.notEqual(successorDispatch, -1);
+  for (let index = successorDispatch + 1; index < sequence.length; index += 1) {
+    assert.notEqual(sequence[index], "completed", "old guard completion must never land after the successor dispatch");
+  }
+  assert.equal(adapter.hasActiveTurn("ses_abort_send_race"), true, "the accepted successor must retain ownership");
+
+  const completionsBeforeSuccessor = completions;
+  history.push({
+    info: {
+      id: "assistant_successor",
+      sessionID: "ses_abort_send_race",
+      role: "assistant",
+      parentID: successor.providerTurnId,
+      finish: "stop",
+      time: { created: 4, completed: 5 },
+    },
+    parts: [{ id: "successor_text", type: "text", text: "Second done" }],
+  });
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_successor",
+    sessionID: "ses_abort_send_race",
+    role: "assistant",
+    parentID: successor.providerTurnId,
+    finish: "stop",
+    time: { created: 4, completed: 5 },
+  } } } });
+  // No cleanup arrived during the bounded barrier, so the successor's first
+  // exact terminal idle is genuine.
+  events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_abort_send_race" } } });
+  await waitFor(() => completions === completionsBeforeSuccessor + 1, "the successor must complete under its own terminal evidence");
+  assert.equal(adapter.hasActiveTurn("ses_abort_send_race"), false);
+});
+
+test("an ambiguous guard abort does not turn its later abort event into an agent error", async (t) => {
+  const events = new SseFixture();
+  let promptId: string | undefined;
+  let abortCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_ambiguous_abort/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_ambiguous_abort/message") return jsonResponse([
+      {
+        info: {
+          id: "assistant_terminal",
+          sessionID: "ses_ambiguous_abort",
+          role: "assistant",
+          parentID: promptId,
+          finish: "stop",
+          time: { created: 1, completed: 2 },
+        },
+        parts: [{ id: "terminal_text", type: "text", text: "Done" }],
+      },
+      {
+        info: {
+          id: "assistant_runaway",
+          sessionID: "ses_ambiguous_abort",
+          role: "assistant",
+          parentID: promptId,
+          time: { created: 3 },
+        },
+        parts: [{ id: "runaway_text", type: "text", text: "Repeated" }],
+      },
+    ]);
+    if (url.pathname === "/session/ses_ambiguous_abort/abort") {
+      abortCalls += 1;
+      throw new TypeError("connection closed before the abort response");
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const errors: string[] = [];
+  const completions: Array<string | undefined> = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "agent.error") {
+      const error = event.payload.error;
+      errors.push(typeof error === "object" && error !== null && !Array.isArray(error) && typeof error.name === "string" ? error.name : "unknown");
+    }
+    if (event.type === "agent.completed") {
+      completions.push(typeof event.payload.completionReason === "string" ? event.payload.completionReason : undefined);
+    }
+  });
+
+  const sent = await adapter.sendMessage("ses_ambiguous_abort", { requestId: "ambiguous_abort", content: "First" });
+  promptId = sent.providerTurnId;
+  assert.ok(promptId);
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_terminal",
+    sessionID: "ses_ambiguous_abort",
+    role: "assistant",
+    parentID: promptId,
+    finish: "stop",
+    time: { created: 1, completed: 2 },
+  } } } });
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_runaway",
+    sessionID: "ses_ambiguous_abort",
+    role: "assistant",
+    parentID: promptId,
+    time: { created: 3 },
+  } } } });
+  await waitFor(() => abortCalls === 1, "the ambiguous guard abort must be attempted");
+  events.push({ payload: { type: "session.error", properties: {
+    sessionID: "ses_ambiguous_abort",
+    error: { name: "MessageAbortedError", data: { message: "Aborted" } },
+  } } });
+  await waitFor(() => completions.length === 1, "the native abort error confirms that the ambiguous request acted");
+
+  assert.deepEqual(errors, [], "guard-induced abort cleanup is not a user-facing Agent error");
+  assert.deepEqual(completions, ["runaway_guard"]);
+  assert.equal(adapter.hasActiveTurn("ses_ambiguous_abort"), false);
+});
+
+test("post-attempt live output retires ambiguous abort-error suppression", async (t) => {
+  const events = new SseFixture();
+  let promptId: string | undefined;
+  let abortCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_ambiguous_live_output/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_ambiguous_live_output/message") return jsonResponse([
+      {
+        info: {
+          id: "assistant_terminal",
+          sessionID: "ses_ambiguous_live_output",
+          role: "assistant",
+          parentID: promptId,
+          finish: "stop",
+          time: { created: 1, completed: 2 },
+        },
+        parts: [{ id: "terminal_text", type: "text", text: "Done" }],
+      },
+      {
+        info: {
+          id: "assistant_continued",
+          sessionID: "ses_ambiguous_live_output",
+          role: "assistant",
+          parentID: promptId,
+          time: { created: 3 },
+        },
+        parts: [{ id: "continued_text", type: "text", text: "Still running" }],
+      },
+    ]);
+    if (url.pathname === "/session/ses_ambiguous_live_output/abort") {
+      abortCalls += 1;
+      throw new TypeError("connection closed before the abort response");
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const errors: string[] = [];
+  const deltas: string[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "agent.error") {
+      const error = event.payload.error;
+      errors.push(typeof error === "object" && error !== null && !Array.isArray(error) && typeof error.name === "string" ? error.name : "unknown");
+    }
+    if (event.type === "message.delta" && typeof event.payload.text === "string") deltas.push(event.payload.text);
+  });
+
+  const sent = await adapter.sendMessage("ses_ambiguous_live_output", { requestId: "ambiguous_live", content: "First" });
+  promptId = sent.providerTurnId;
+  assert.ok(promptId);
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_terminal",
+    sessionID: "ses_ambiguous_live_output",
+    role: "assistant",
+    parentID: promptId,
+    finish: "stop",
+    time: { created: 1, completed: 2 },
+  } } } });
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_continued",
+    sessionID: "ses_ambiguous_live_output",
+    role: "assistant",
+    parentID: promptId,
+    time: { created: 3 },
+  } } } });
+  events.push({ payload: { type: "message.part.updated", properties: { part: {
+    id: "continued_text",
+    messageID: "assistant_continued",
+    sessionID: "ses_ambiguous_live_output",
+    type: "text",
+    text: "Still running",
+  } } } });
+  await waitFor(() => abortCalls === 1 && deltas.includes("Still running"), "the failed abort must be followed by new live output");
+
+  events.push({ payload: { type: "session.error", properties: {
+    sessionID: "ses_ambiguous_live_output",
+    error: { name: "MessageAbortedError", data: { message: "later unrelated abort" } },
+  } } });
+  await waitFor(() => errors.length === 1, "post-attempt output makes the later abort-shaped error genuine");
+  assert.deepEqual(errors, ["MessageAbortedError"]);
+  assert.equal(adapter.hasActiveTurn("ses_ambiguous_live_output"), false);
+});
+
+test("a genuine session error releases the owned prompt", async (t) => {
+  const events = new SseFixture();
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_real_error/prompt_async") return new Response(null, { status: 204 });
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const errors: string[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type !== "agent.error") return;
+    const error = event.payload.error;
+    errors.push(typeof error === "object" && error !== null && !Array.isArray(error) && typeof error.name === "string" ? error.name : "unknown");
+  });
+
+  await adapter.sendMessage("ses_real_error", { requestId: "real_error", content: "Fail normally" });
+  assert.equal(adapter.hasActiveTurn("ses_real_error"), true);
+  events.push({ payload: { type: "session.error", properties: {
+    sessionID: "ses_real_error",
+    error: { name: "APIError", data: { message: "provider failed", isRetryable: false } },
+  } } });
+  await waitFor(() => errors.length === 1, "the genuine provider error must remain visible");
+
+  assert.deepEqual(errors, ["APIError"]);
+  assert.equal(adapter.hasActiveTurn("ses_real_error"), false, "a failed prompt cannot keep the queue held forever");
+});
+
+test("a successor message boundary preserves its genuine failed status", async (t) => {
+  const events = new SseFixture();
+  let firstPromptId: string | undefined;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_successor_failed/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_successor_failed/message") return jsonResponse([
+      {
+        info: {
+          id: "assistant_first",
+          sessionID: "ses_successor_failed",
+          role: "assistant",
+          parentID: firstPromptId,
+          finish: "stop",
+          time: { created: 1, completed: 2 },
+        },
+        parts: [{ id: "first_text", type: "text", text: "Done" }],
+      },
+      {
+        info: {
+          id: "assistant_runaway",
+          sessionID: "ses_successor_failed",
+          role: "assistant",
+          parentID: firstPromptId,
+          time: { created: 3 },
+        },
+        parts: [{ id: "runaway_text", type: "text", text: "Repeated" }],
+      },
+    ]);
+    if (url.pathname === "/session/ses_successor_failed/abort") return jsonResponse({});
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const states: string[] = [];
+  let completions = 0;
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "session.status_changed" && typeof event.payload.state === "string") states.push(event.payload.state);
+    if (event.type === "agent.completed") completions += 1;
+  });
+
+  const first = await adapter.sendMessage("ses_successor_failed", { requestId: "first", content: "First" });
+  firstPromptId = first.providerTurnId;
+  assert.ok(firstPromptId);
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_first",
+    sessionID: "ses_successor_failed",
+    role: "assistant",
+    parentID: firstPromptId,
+    finish: "stop",
+    time: { created: 1, completed: 2 },
+  } } } });
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_runaway",
+    sessionID: "ses_successor_failed",
+    role: "assistant",
+    parentID: firstPromptId,
+    time: { created: 3 },
+  } } } });
+  await waitFor(() => completions === 1, "the first prompt must establish the guard tombstone");
+
+  const successor = await adapter.sendMessage("ses_successor_failed", { requestId: "successor", content: "Second" });
+  assert.ok(successor.providerTurnId);
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: successor.providerTurnId,
+    sessionID: "ses_successor_failed",
+    role: "user",
+    time: { created: 4 },
+  } } } });
+  events.push({ payload: { type: "session.status", properties: {
+    sessionID: "ses_successor_failed",
+    status: { type: "busy" },
+  } } });
+  events.push({ payload: { type: "session.status", properties: {
+    sessionID: "ses_successor_failed",
+    status: { type: "error" },
+  } } });
+  await waitFor(() => states.includes("failed"), "the successor's genuine failed status must be forwarded");
+
+  assert.deepEqual(states.slice(-2), ["working", "failed"]);
+  assert.equal(completions, 1, "a failed successor is not a second successful completion");
+  assert.equal(adapter.hasActiveTurn("ses_successor_failed"), false);
+});
+
+test("activity becoming unavailable still asks exact history to finish the owned prompt", async (t) => {
+  const events = new SseFixture();
+  let activityReads = 0;
+  let historyCalls = 0;
+  let promptId: string | undefined;
+  const activityReader: OpenCodeActivityReader = {
+    async readWorkingSessionIds(): Promise<ReadonlySet<string>> {
+      activityReads += 1;
+      if (activityReads === 1) return new Set(["ses_activity_unavailable"]);
+      throw new Error("activity source temporarily unavailable");
+    },
+    close(): void {},
+  };
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_activity_unavailable/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_activity_unavailable/message") {
+      historyCalls += 1;
+      return jsonResponse([{
+        info: {
+          id: "assistant_activity_terminal",
+          sessionID: "ses_activity_unavailable",
+          role: "assistant",
+          parentID: promptId,
+          finish: "stop",
+          time: { created: 1, completed: 2 },
+        },
+        parts: [{ id: "activity_terminal_text", type: "text", text: "Done" }],
+      }]);
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader,
+    activityPollIntervalMs: 5,
+    activeTurnSettleMs: 25,
+  });
+  t.after(() => adapter.dispose());
+
+  const sent = await adapter.sendMessage("ses_activity_unavailable", { requestId: "activity_unavailable", content: "Finish normally" });
+  promptId = sent.providerTurnId;
+  assert.ok(promptId);
+  const states: string[] = [];
+  let completions = 0;
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "session.status_changed" && typeof event.payload.state === "string") states.push(event.payload.state);
+    if (event.type === "agent.completed") completions += 1;
+  });
+
+  await waitFor(() => completions === 1, "unavailable activity must still trigger exact-history confirmation");
+  assert.deepEqual(states, ["working"]);
+  assert.ok(activityReads >= 2);
+  assert.ok(historyCalls >= 2, "completion still requires two matching persisted reads");
+  assert.equal(adapter.hasActiveTurn("ses_activity_unavailable"), false);
+});
+
+test("after an empty guard barrier the successor's first idle is genuine", async (t) => {
+  const events = new SseFixture();
+  const history: unknown[] = [];
+  let abortCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_guard_idle_order/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_guard_idle_order/message") return jsonResponse(history);
+    if (url.pathname === "/session/ses_guard_idle_order/abort") {
+      abortCalls += 1;
+      return jsonResponse({});
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  let completions = 0;
+  await adapter.subscribe(null, (event) => { if (event.type === "agent.completed") completions += 1; });
+
+  const first = await adapter.sendMessage("ses_guard_idle_order", { requestId: "first", content: "First" });
+  assert.ok(first.providerTurnId);
+  history.push({
+    info: {
+      id: "assistant_first",
+      sessionID: "ses_guard_idle_order",
+      role: "assistant",
+      parentID: first.providerTurnId,
+      finish: "stop",
+      time: { created: 1, completed: 2 },
+    },
+    parts: [{ id: "first_text", type: "text", text: "Done" }],
+  });
+  history.push({
+    info: {
+      id: "assistant_runaway",
+      sessionID: "ses_guard_idle_order",
+      role: "assistant",
+      parentID: first.providerTurnId,
+      time: { created: 3 },
+    },
+    parts: [{ id: "runaway_text", type: "text", text: "Repeated" }],
+  });
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_first",
+    sessionID: "ses_guard_idle_order",
+    role: "assistant",
+    parentID: first.providerTurnId,
+    finish: "stop",
+    time: { created: 1, completed: 2 },
+  } } } });
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_runaway",
+    sessionID: "ses_guard_idle_order",
+    role: "assistant",
+    parentID: first.providerTurnId,
+    time: { created: 3 },
+  } } } });
+  await waitFor(() => abortCalls === 1 && completions === 1, "the first prompt must establish the successful guard");
+
+  const successor = await adapter.sendMessage("ses_guard_idle_order", { requestId: "successor", content: "Second" });
+  assert.ok(successor.providerTurnId);
+  history.push({
+    info: {
+      id: "assistant_successor",
+      sessionID: "ses_guard_idle_order",
+      role: "assistant",
+      parentID: successor.providerTurnId,
+      finish: "stop",
+      time: { created: 4, completed: 5 },
+    },
+    parts: [{ id: "successor_text", type: "text", text: "Second done" }],
+  });
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_successor",
+    sessionID: "ses_guard_idle_order",
+    role: "assistant",
+    parentID: successor.providerTurnId,
+    finish: "stop",
+    time: { created: 4, completed: 5 },
+  } } } });
+  events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_guard_idle_order" } } });
+  await waitFor(() => completions === 2, "the successor's first idle must complete after cleanup timed out empty");
+  assert.equal(adapter.hasActiveTurn("ses_guard_idle_order"), false);
+});
+
+test("guard abort errors stay quarantined only until the successor message boundary", async (t) => {
+  const events = new SseFixture();
+  let firstPromptId: string | undefined;
+  let abortCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_guard_error_once/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_guard_error_once/message") return jsonResponse([
+      {
+        info: {
+          id: "assistant_first",
+          sessionID: "ses_guard_error_once",
+          role: "assistant",
+          parentID: firstPromptId,
+          finish: "stop",
+          time: { created: 1, completed: 2 },
+        },
+        parts: [{ id: "first_text", type: "text", text: "Done" }],
+      },
+      {
+        info: {
+          id: "assistant_runaway",
+          sessionID: "ses_guard_error_once",
+          role: "assistant",
+          parentID: firstPromptId,
+          time: { created: 3 },
+        },
+        parts: [{ id: "runaway_text", type: "text", text: "Repeated" }],
+      },
+    ]);
+    if (url.pathname === "/session/ses_guard_error_once/abort") {
+      abortCalls += 1;
+      return jsonResponse({});
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const errors: string[] = [];
+  let completions = 0;
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "agent.error") {
+      const error = event.payload.error;
+      errors.push(typeof error === "object" && error !== null && !Array.isArray(error) && typeof error.name === "string" ? error.name : "unknown");
+    }
+    if (event.type === "agent.completed") completions += 1;
+  });
+
+  const first = await adapter.sendMessage("ses_guard_error_once", { requestId: "first", content: "First" });
+  firstPromptId = first.providerTurnId;
+  assert.ok(firstPromptId);
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_first",
+    sessionID: "ses_guard_error_once",
+    role: "assistant",
+    parentID: firstPromptId,
+    finish: "stop",
+    time: { created: 1, completed: 2 },
+  } } } });
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_runaway",
+    sessionID: "ses_guard_error_once",
+    role: "assistant",
+    parentID: firstPromptId,
+    time: { created: 3 },
+  } } } });
+  await waitFor(() => abortCalls === 1, "the guard must establish its cleanup barrier");
+
+  const successorPromise = adapter.sendMessage("ses_guard_error_once", { requestId: "successor", content: "Second" });
+  const aborted = { name: "MessageAbortedError", data: { message: "Aborted" } };
+  events.push({ payload: { type: "session.error", properties: { sessionID: "ses_guard_error_once", error: aborted } } });
+  const successor = await successorPromise;
+  assert.ok(successor.providerTurnId);
+  assert.deepEqual(errors, []);
+  assert.equal(adapter.hasActiveTurn("ses_guard_error_once"), true, "the one cleanup error cannot release the successor");
+
+  // Cleanup is not reliably one-shot. Every abort-shaped event before the
+  // provider acknowledges the new user message still belongs to the guard.
+  events.push({ payload: { type: "session.error", properties: { sessionID: "ses_guard_error_once", error: aborted } } });
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.deepEqual(errors, []);
+  assert.equal(adapter.hasActiveTurn("ses_guard_error_once"), true);
+
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: successor.providerTurnId,
+    sessionID: "ses_guard_error_once",
+    role: "user",
+    time: { created: 4 },
+  } } } });
+  events.push({ payload: { type: "session.error", properties: { sessionID: "ses_guard_error_once", error: aborted } } });
+  await waitFor(() => errors.length === 1, "an abort error after the exact successor boundary must remain visible");
+  assert.deepEqual(errors, ["MessageAbortedError"]);
+  assert.equal(adapter.hasActiveTurn("ses_guard_error_once"), false, "the visible error releases owned state");
+  assert.equal(completions, 1);
+});
+
+test("the runaway guard requires two history reads before suppressing a continuation", async (t) => {
+  const events = new SseFixture();
+  let promptId: string | undefined;
+  let historyCalls = 0;
+  let abortCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_guard_two_reads/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_guard_two_reads/message") {
+      historyCalls += 1;
+      return jsonResponse([{
+        info: {
+          id: "assistant_first",
+          sessionID: "ses_guard_two_reads",
+          role: "assistant",
+          parentID: promptId,
+          finish: "stop",
+          time: { created: 1, completed: 2 },
+        },
+        parts: historyCalls === 1
+          ? [{ id: "first_text", type: "text", text: "Checking" }]
+          : [{ id: "late_tool", type: "tool", tool: "bash", state: { status: "completed", output: "ok" } }],
+      }]);
+    }
+    if (url.pathname === "/session/ses_guard_two_reads/abort") {
+      abortCalls += 1;
+      return jsonResponse({});
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const started: string[] = [];
+  const deltas: string[] = [];
+  let completions = 0;
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "message.started") {
+      const info = event.payload.info;
+      if (typeof info === "object" && info !== null && !Array.isArray(info) && typeof info.id === "string") started.push(info.id);
+    }
+    if (event.type === "message.delta" && typeof event.payload.text === "string") deltas.push(event.payload.text);
+    if (event.type === "agent.completed") completions += 1;
+  });
+
+  const sent = await adapter.sendMessage("ses_guard_two_reads", { requestId: "two_reads", content: "Use the tool if needed" });
+  promptId = sent.providerTurnId;
+  assert.ok(promptId);
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_first",
+    sessionID: "ses_guard_two_reads",
+    role: "assistant",
+    parentID: promptId,
+    finish: "stop",
+    time: { created: 1, completed: 2 },
+  } } } });
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_legitimate_continuation",
+    sessionID: "ses_guard_two_reads",
+    role: "assistant",
+    parentID: promptId,
+    time: { created: 3 },
+  } } } });
+  events.push({ payload: { type: "message.part.updated", properties: { part: {
+    id: "continuation_text",
+    messageID: "assistant_legitimate_continuation",
+    sessionID: "ses_guard_two_reads",
+    type: "text",
+    text: "The tool finished.",
+  } } } });
+  await waitFor(() => deltas.includes("The tool finished."), "the legitimate continuation must remain visible");
+
+  assert.equal(historyCalls, 2, "the guard must re-read history after its quiet window");
+  assert.equal(abortCalls, 0);
+  assert.equal(completions, 0);
+  assert.deepEqual(started, ["assistant_first", "assistant_legitimate_continuation"]);
+  assert.equal(adapter.hasActiveTurn("ses_guard_two_reads"), true);
+});
+
+test("a guard with no cleanup signals lets the successor complete on one genuine idle", async (t) => {
+  const events = new SseFixture();
+  const history: unknown[] = [];
+  let abortCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_guard_no_cleanup/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_guard_no_cleanup/message") return jsonResponse(history);
+    if (url.pathname === "/session/ses_guard_no_cleanup/abort") {
+      abortCalls += 1;
+      return jsonResponse({});
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  let completions = 0;
+  const errors: string[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "agent.completed") completions += 1;
+    if (event.type === "agent.error") errors.push(event.type);
+  });
+
+  const first = await adapter.sendMessage("ses_guard_no_cleanup", { requestId: "first", content: "First" });
+  assert.ok(first.providerTurnId);
+  const firstTerminal = {
+    info: {
+      id: "assistant_first",
+      sessionID: "ses_guard_no_cleanup",
+      role: "assistant",
+      parentID: first.providerTurnId,
+      finish: "stop",
+      time: { created: 1, completed: 2 },
+    },
+    parts: [{ id: "first_text", type: "text", text: "Done" }],
+  };
+  const suspicious = {
+    info: {
+      id: "assistant_suspicious",
+      sessionID: "ses_guard_no_cleanup",
+      role: "assistant",
+      parentID: first.providerTurnId,
+      time: { created: 3 },
+    },
+    parts: [{ id: "suspicious_text", type: "text", text: "Repeated" }],
+  };
+  history.push(firstTerminal, suspicious);
+  events.push({ payload: { type: "message.updated", properties: { info: firstTerminal.info } } });
+  events.push({ payload: { type: "message.updated", properties: { info: suspicious.info } } });
+  await waitFor(() => abortCalls === 1, "the persisted suspicious response must trigger the guard");
+  await waitFor(() => completions === 1, "the bounded barrier must finish even when cleanup emits nothing");
+  // Some servers publish only the abort error after the 500ms empty-cleanup
+  // fallback. It still belongs to the guarded generation and is not a user-
+  // facing provider failure.
+  events.push({ payload: { type: "session.error", properties: {
+    sessionID: "ses_guard_no_cleanup",
+    error: { name: "MessageAbortedError", data: { message: "Aborted" } },
+  } } });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.deepEqual(errors, []);
+  assert.equal(completions, 1);
+
+  const successor = await adapter.sendMessage("ses_guard_no_cleanup", { requestId: "successor", content: "Second" });
+  assert.ok(successor.providerTurnId);
+  // A successor has a new generation but has not produced anything yet. A lone
+  // idle at this boundary is still delayed cleanup from the guarded runner; it
+  // must not settle the successor before its own output exists.
+  events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_guard_no_cleanup" } } });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(completions, 1);
+  assert.equal(adapter.hasActiveTurn("ses_guard_no_cleanup"), true);
+  const successorTerminal = {
+    info: {
+      id: "assistant_successor",
+      sessionID: "ses_guard_no_cleanup",
+      role: "assistant",
+      parentID: successor.providerTurnId,
+      finish: "stop",
+      time: { created: 4, completed: 5 },
+    },
+    parts: [{ id: "successor_text", type: "text", text: "Second done" }],
+  };
+  history.push(successorTerminal);
+  events.push({ payload: { type: "message.updated", properties: { info: successorTerminal.info } } });
+  events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_guard_no_cleanup" } } });
+  await waitFor(() => completions === 2, "the successor's sole idle must remain genuine after the empty cleanup barrier");
+
+  assert.deepEqual(errors, []);
+  assert.equal(adapter.hasActiveTurn("ses_guard_no_cleanup"), false);
+});
+
+test("an activity snapshot started before guard completion cannot resurrect the stopped turn", async (t) => {
+  const events = new SseFixture();
+  const history: unknown[] = [];
+  let activityReads = 0;
+  let resolveFirstRead!: (value: ReadonlySet<string>) => void;
+  let firstReadResolved = false;
+  const activityReader: OpenCodeActivityReader = {
+    async readWorkingSessionIds(): Promise<ReadonlySet<string>> {
+      activityReads += 1;
+      if (activityReads !== 1) return new Set();
+      return await new Promise<ReadonlySet<string>>((resolve) => {
+        resolveFirstRead = (value) => {
+          firstReadResolved = true;
+          resolve(value);
+        };
+      });
+    },
+    close(): void {},
+  };
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_guard_activity_epoch/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_guard_activity_epoch/message") return jsonResponse(history);
+    if (url.pathname === "/session/ses_guard_activity_epoch/abort") return jsonResponse({});
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader,
+    activityPollIntervalMs: 10,
+  });
+  t.after(() => {
+    if (!firstReadResolved) resolveFirstRead(new Set());
+    return adapter.dispose();
+  });
+  let completions = 0;
+  const states: string[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "agent.completed") completions += 1;
+    if (event.type === "session.status_changed" && typeof event.payload.state === "string") states.push(event.payload.state);
+  });
+  await waitFor(() => activityReads === 1, "the pre-guard activity read must be in flight");
+
+  const sent = await adapter.sendMessage("ses_guard_activity_epoch", { requestId: "guard_activity", content: "First" });
+  assert.ok(sent.providerTurnId);
+  const terminal = {
+    info: {
+      id: "assistant_first",
+      sessionID: "ses_guard_activity_epoch",
+      role: "assistant",
+      parentID: sent.providerTurnId,
+      finish: "stop",
+      time: { created: 1, completed: 2 },
+    },
+    parts: [{ id: "first_text", type: "text", text: "Done" }],
+  };
+  const suspicious = {
+    info: {
+      id: "assistant_suspicious",
+      sessionID: "ses_guard_activity_epoch",
+      role: "assistant",
+      parentID: sent.providerTurnId,
+      time: { created: 3 },
+    },
+    parts: [{ id: "suspicious_text", type: "text", text: "Repeated" }],
+  };
+  history.push(terminal, suspicious);
+  events.push({ payload: { type: "message.updated", properties: { info: terminal.info } } });
+  events.push({ payload: { type: "message.updated", properties: { info: suspicious.info } } });
+  await waitFor(() => completions === 1, "the guard must complete while the database read is still pending");
+  assert.equal(adapter.hasActiveTurn("ses_guard_activity_epoch"), false);
+
+  resolveFirstRead(new Set(["ses_guard_activity_epoch"]));
+  await waitFor(() => activityReads >= 2, "the stale activity result must be discarded and re-read");
+  await new Promise((resolve) => setTimeout(resolve, 40));
+
+  assert.equal(adapter.hasActiveTurn("ses_guard_activity_epoch"), false);
+  assert.deepEqual(states, [], "the stale working snapshot must not repaint the completed guard generation");
+});
+
+test("late guard cleanup is quarantined while the successor starts", async (t) => {
+  const events = new SseFixture();
+  const history: unknown[] = [];
+  let abortCalls = 0;
+  let promptCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_guard_late_cleanup/prompt_async") {
+      promptCalls += 1;
+      return new Response(null, { status: 204 });
+    }
+    if (url.pathname === "/session/ses_guard_late_cleanup/message") return jsonResponse(history);
+    if (url.pathname === "/session/ses_guard_late_cleanup/abort") {
+      abortCalls += 1;
+      return jsonResponse({});
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  let completions = 0;
+  const errors: string[] = [];
+  const started: string[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "agent.completed") completions += 1;
+    if (event.type === "agent.error") errors.push(event.type);
+    if (event.type === "message.started") {
+      const info = event.payload.info;
+      if (typeof info === "object" && info !== null && !Array.isArray(info) && typeof info.id === "string") started.push(info.id);
+    }
+  });
+
+  const first = await adapter.sendMessage("ses_guard_late_cleanup", { requestId: "first", content: "First" });
+  assert.ok(first.providerTurnId);
+  const firstTerminal = {
+    info: {
+      id: "assistant_first",
+      sessionID: "ses_guard_late_cleanup",
+      role: "assistant",
+      parentID: first.providerTurnId,
+      finish: "stop",
+      time: { created: 1, completed: 2 },
+    },
+    parts: [{ id: "first_text", type: "text", text: "Done" }],
+  };
+  const suspicious = {
+    info: {
+      id: "assistant_suspicious",
+      sessionID: "ses_guard_late_cleanup",
+      role: "assistant",
+      parentID: first.providerTurnId,
+      time: { created: 3 },
+    },
+    parts: [{ id: "suspicious_text", type: "text", text: "Repeated" }],
+  };
+  history.push(firstTerminal, suspicious);
+  events.push({ payload: { type: "message.updated", properties: { info: firstTerminal.info } } });
+  events.push({ payload: { type: "message.updated", properties: { info: suspicious.info } } });
+  await waitFor(() => abortCalls === 1, "the guard abort must finish before cleanup starts");
+
+  const successorPromise = adapter.sendMessage("ses_guard_late_cleanup", { requestId: "successor", content: "Second" });
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(promptCalls, 2, "the successor must not wait on an arbitrary cleanup timer");
+  events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_guard_late_cleanup" } } });
+  events.push({ payload: { type: "session.error", properties: {
+    sessionID: "ses_guard_late_cleanup",
+    error: { name: "MessageAbortedError", data: { message: "Aborted" } },
+  } } });
+  const successor = await successorPromise;
+  assert.ok(successor.providerTurnId);
+  assert.equal(promptCalls, 2);
+  assert.equal(completions, 1);
+  assert.deepEqual(errors, []);
+
+  const successorTerminal = {
+    info: {
+      id: "assistant_successor",
+      sessionID: "ses_guard_late_cleanup",
+      role: "assistant",
+      parentID: successor.providerTurnId,
+      finish: "stop",
+      time: { created: 4, completed: 5 },
+    },
+    parts: [{ id: "successor_text", type: "text", text: "Second done" }],
+  };
+  history.push(successorTerminal);
+  events.push({ payload: { type: "message.updated", properties: { info: successorTerminal.info } } });
+  events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_guard_late_cleanup" } } });
+  await waitFor(() => completions === 2, "cleanup must not settle or suppress the successor");
+
+  assert.ok(started.includes("assistant_successor"));
+  assert.deepEqual(errors, []);
+  assert.equal(adapter.hasActiveTurn("ses_guard_late_cleanup"), false);
+});
+
+test("the runaway guard requires the suspicious assistant to exist in persisted history", async (t) => {
+  const events = new SseFixture();
+  let promptId: string | undefined;
+  let historyCalls = 0;
+  let abortCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_guard_missing_suspicious/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_guard_missing_suspicious/message") {
+      historyCalls += 1;
+      return jsonResponse([{
+        info: {
+          id: "assistant_first",
+          sessionID: "ses_guard_missing_suspicious",
+          role: "assistant",
+          parentID: promptId,
+          finish: "stop",
+          time: { created: 1, completed: 2 },
+        },
+        parts: [{ id: "first_text", type: "text", text: "Done" }],
+      }]);
+    }
+    if (url.pathname === "/session/ses_guard_missing_suspicious/abort") {
+      abortCalls += 1;
+      return jsonResponse({});
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const started: string[] = [];
+  const deltas: string[] = [];
+  let completions = 0;
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "message.started") {
+      const info = event.payload.info;
+      if (typeof info === "object" && info !== null && !Array.isArray(info) && typeof info.id === "string") started.push(info.id);
+    }
+    if (event.type === "message.delta" && typeof event.payload.text === "string") deltas.push(event.payload.text);
+    if (event.type === "agent.completed") completions += 1;
+  });
+
+  const sent = await adapter.sendMessage("ses_guard_missing_suspicious", { requestId: "missing_suspicious", content: "First" });
+  promptId = sent.providerTurnId;
+  assert.ok(promptId);
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_first",
+    sessionID: "ses_guard_missing_suspicious",
+    role: "assistant",
+    parentID: promptId,
+    finish: "stop",
+    time: { created: 1, completed: 2 },
+  } } } });
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_unpersisted",
+    sessionID: "ses_guard_missing_suspicious",
+    role: "assistant",
+    parentID: promptId,
+    time: { created: 3 },
+  } } } });
+  events.push({ payload: { type: "message.part.updated", properties: { part: {
+    id: "unpersisted_text",
+    messageID: "assistant_unpersisted",
+    sessionID: "ses_guard_missing_suspicious",
+    type: "text",
+    text: "Still legitimate until persisted proof says otherwise.",
+  } } } });
+  await waitFor(() => deltas.length === 1, "an unpersisted suspicious response must fail open and remain visible");
+
+  assert.ok(historyCalls >= 2);
+  assert.equal(abortCalls, 0);
+  assert.equal(completions, 0);
+  assert.deepEqual(started, ["assistant_first", "assistant_unpersisted"]);
+  assert.equal(adapter.hasActiveTurn("ses_guard_missing_suspicious"), true);
+});
+
+test("OpenCode waits for an actual no-tool continuation before aborting a runaway prompt", async (t) => {
+  const events = new SseFixture();
+  let abortCalls = 0;
+  let promptId: string | undefined;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_loop/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_loop/message") return jsonResponse([
+      {
+        info: {
+          id: "assistant_first",
+          sessionID: "ses_loop",
+          role: "assistant",
+          parentID: promptId,
+          finish: "stop",
+          time: { created: 1, completed: 2 },
+        },
+        parts: [{ id: "part_first", type: "text", text: "What task?" }],
+      },
+      {
+        info: {
+          id: "assistant_runaway",
+          sessionID: "ses_loop",
+          role: "assistant",
+          parentID: promptId,
+          time: { created: 3 },
+        },
+        parts: [{ id: "part_runaway", type: "text", text: "What task, again?" }],
+      },
+    ]);
+    if (url.pathname === "/session/ses_loop/abort") {
+      abortCalls += 1;
+      return jsonResponse({});
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const started: string[] = [];
+  const completed: Array<string | undefined> = [];
+  const errors: string[] = [];
+  const states: string[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "message.started") {
+      const info = event.payload.info;
+      if (typeof info === "object" && info !== null && !Array.isArray(info) && typeof info.id === "string") started.push(info.id);
+    }
+    if (event.type === "agent.completed") completed.push(typeof event.payload.completionReason === "string" ? event.payload.completionReason : undefined);
+    if (event.type === "agent.error") {
+      const error = event.payload.error;
+      errors.push(typeof error === "object" && error !== null && !Array.isArray(error) && typeof error.name === "string" ? error.name : "unknown");
+    }
+    if (event.type === "session.status_changed" && typeof event.payload.state === "string") states.push(event.payload.state);
+  });
+  const sent = await adapter.sendMessage("ses_loop", { requestId: "bridge_1", content: "do this task" });
+  promptId = sent.providerTurnId;
+  assert.ok(promptId);
+
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_first",
+    sessionID: "ses_loop",
+    role: "assistant",
+    parentID: promptId,
+    finish: "stop",
+    time: { created: 1, completed: 2 },
+  } } } });
+  await waitFor(() => started.includes("assistant_first"), "the completed response must remain visible");
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(abortCalls, 0, "a healthy terminal response is never aborted preemptively");
+  assert.equal(completed.length, 0, "normal completion still belongs to session.idle");
+  assert.equal(adapter.hasActiveTurn("ses_loop"), true);
+
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_runaway",
+    sessionID: "ses_loop",
+    role: "assistant",
+    parentID: promptId,
+    time: { created: 3 },
+  } } } });
+  events.push({ payload: { type: "message.part.updated", properties: { part: {
+    id: "part_runaway",
+    messageID: "assistant_runaway",
+    sessionID: "ses_loop",
+    type: "text",
+    text: "What task, again?",
+  } } } });
+  await waitFor(() => abortCalls === 1, "the confirmed persisted runaway continuation must be stopped");
+  await waitFor(() => completed.length === 1, "a confirmed guard stop must complete cleanly without waiting for cleanup noise");
+
+  // `/abort` produces these native lifecycle events. They describe the guard's
+  // own cleanup, not a failed answer. The generation quarantine absorbs every
+  // one until a concrete newer prompt forms the provider-order boundary.
+  events.push({ payload: { type: "session.status", properties: { sessionID: "ses_loop", status: { type: "busy" } } } });
+  events.push({ payload: { type: "session.status", properties: { sessionID: "ses_loop", status: { type: "idle" } } } });
+  events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_loop" } } });
+  events.push({ payload: { type: "session.error", properties: {
+    sessionID: "ses_loop",
+    error: { name: "MessageAbortedError", data: { message: "Aborted" } },
+  } } });
+  // The quarantine is deliberately narrow: a structured non-abort provider
+  // failure after cleanup remains visible.
+  events.push({ payload: { type: "session.error", properties: {
+    sessionID: "ses_loop",
+    error: { name: "APIError", data: { message: "real provider failure", isRetryable: false } },
+  } } });
+  // More already-buffered output from the same bad parent is ignored without
+  // issuing another abort.
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_runaway_again",
+    sessionID: "ses_loop",
+    role: "assistant",
+    parentID: promptId,
+    time: { created: 4 },
+  } } } });
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
+  assert.deepEqual(started, ["assistant_first"]);
+  assert.deepEqual(errors, ["APIError"], "only the guard-induced abort error is suppressed");
+  assert.deepEqual(states, []);
+  assert.deepEqual(completed, ["runaway_guard"], "only the verified internal guard carries the authority marker");
+  assert.equal(adapter.hasActiveTurn("ses_loop"), false);
+  assert.equal(abortCalls, 1);
+});
+
+test("an early unlabelled idle cannot finish a slow Tethoq-owned prompt", async (t) => {
+  const events = new SseFixture();
+  const history: unknown[] = [];
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_slow_first/prompt_async") {
+      // This can arrive before prompt_async has even returned. The adapter must
+      // already know which exact Tethoq prompt owns the session.
+      events.push({ payload: { type: "session.status", properties: { sessionID: "ses_slow_first", status: { type: "idle" } } } });
+      events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_slow_first" } } });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return new Response(null, { status: 204 });
+    }
+    if (url.pathname === "/session/ses_slow_first/message") return jsonResponse(history);
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const states: string[] = [];
+  const completions: string[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "session.status_changed" && typeof event.payload.state === "string") states.push(event.payload.state);
+    if (event.type === "agent.completed") completions.push(event.type);
+  });
+
+  const sent = await adapter.sendMessage("ses_slow_first", { requestId: "slow", content: "Say hi" });
+  assert.ok(sent.providerTurnId);
+  await new Promise((resolve) => setTimeout(resolve, 2_100));
+  assert.deepEqual(states, [], "idle status is not allowed to pump the Bridge queue");
+  assert.deepEqual(completions, [], "a slow first token cannot be mistaken for a completed turn");
+  assert.equal(adapter.hasActiveTurn("ses_slow_first"), true);
+
+  const terminal = {
+    info: {
+      id: "assistant_slow",
+      sessionID: "ses_slow_first",
+      role: "assistant",
+      parentID: sent.providerTurnId,
+      finish: "stop",
+      time: { created: 1, completed: 2 },
+    },
+    parts: [{ id: "slow_text", type: "text", text: "Hi" }],
+  };
+  history.push(terminal);
+  events.push({ payload: { type: "message.updated", properties: { info: terminal.info } } });
+  events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_slow_first" } } });
+  await waitFor(() => completions.length === 1, "the exact persisted terminal response must complete normally");
+  assert.equal(adapter.hasActiveTurn("ses_slow_first"), false);
+});
+
+test("a transient stale history read cannot lose the prompt's sole idle", async (t) => {
+  const events = new SseFixture();
+  let historyCalls = 0;
+  let promptId: string | undefined;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_idle_retry/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_idle_retry/message") {
+      historyCalls += 1;
+      if (historyCalls === 1) return jsonResponse([]);
+      return jsonResponse([{
+        info: { id: "assistant_retry", sessionID: "ses_idle_retry", role: "assistant", parentID: promptId, finish: "stop", time: { created: 1, completed: 2 } },
+        parts: [{ id: "retry_text", type: "text", text: "Done" }],
+      }]);
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  let completions = 0;
+  await adapter.subscribe(null, (event) => { if (event.type === "agent.completed") completions += 1; });
+  const sent = await adapter.sendMessage("ses_idle_retry", { requestId: "retry", content: "Finish once" });
+  promptId = sent.providerTurnId;
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_retry", sessionID: "ses_idle_retry", role: "assistant", parentID: promptId,
+    finish: "stop", time: { created: 1, completed: 2 },
+  } } } });
+  events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_idle_retry" } } });
+
+  await waitFor(() => completions === 1, "the bounded history recheck must recover the sole idle");
+  assert.ok(historyCalls >= 3, "one stale read must be followed by two matching terminal confirmations");
+  assert.equal(adapter.hasActiveTurn("ses_idle_retry"), false);
+});
+
+test("delayed guard cleanup cannot fail or complete a newer prompt", async (t) => {
+  const events = new SseFixture();
+  let abortCalls = 0;
+  let firstPromptId: string | undefined;
+  let followupPromptId: string | undefined;
+  let followupTerminal = false;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_guard_followup/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_guard_followup/message") return jsonResponse([{
+      info: {
+        id: "assistant_terminal",
+        sessionID: "ses_guard_followup",
+        role: "assistant",
+        parentID: firstPromptId,
+        finish: "stop",
+        time: { created: 1, completed: 2 },
+      },
+      parts: [{ id: "terminal_text", type: "text", text: "Done" }],
+    }, {
+      info: {
+        id: "assistant_runaway",
+        sessionID: "ses_guard_followup",
+        role: "assistant",
+        parentID: firstPromptId,
+        time: { created: 3 },
+      },
+      parts: [{ id: "runaway_text", type: "text", text: "Repeated" }],
+    }, ...(followupTerminal ? [{
+      info: {
+        id: "assistant_followup",
+        sessionID: "ses_guard_followup",
+        role: "assistant",
+        parentID: followupPromptId,
+        finish: "stop",
+        time: { created: 4, completed: 5 },
+      },
+      parts: [{ id: "followup_text", type: "text", text: "Second done" }],
+    }] : [])]);
+    if (url.pathname === "/session/ses_guard_followup/abort") {
+      abortCalls += 1;
+      return jsonResponse({});
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const started: string[] = [];
+  const states: string[] = [];
+  const errors: string[] = [];
+  let completions = 0;
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "message.started") {
+      const info = event.payload.info;
+      if (typeof info === "object" && info !== null && !Array.isArray(info) && typeof info.id === "string") started.push(info.id);
+    }
+    if (event.type === "session.status_changed" && typeof event.payload.state === "string") states.push(event.payload.state);
+    if (event.type === "agent.error") {
+      const error = event.payload.error;
+      errors.push(typeof error === "object" && error !== null && !Array.isArray(error) && typeof error.name === "string" ? error.name : "unknown");
+    }
+    if (event.type === "agent.completed") completions += 1;
+  });
+
+  const first = await adapter.sendMessage("ses_guard_followup", { requestId: "first", content: "First" });
+  firstPromptId = first.providerTurnId;
+  assert.ok(firstPromptId);
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_terminal", sessionID: "ses_guard_followup", role: "assistant", parentID: firstPromptId,
+    finish: "stop", time: { created: 1, completed: 2 },
+  } } } });
+  await waitFor(() => started.includes("assistant_terminal"), "the terminal answer must be visible");
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_runaway", sessionID: "ses_guard_followup", role: "assistant", parentID: firstPromptId, time: { created: 3 },
+  } } } });
+  await waitFor(() => abortCalls === 1, "the runaway turn must enter its cleanup barrier");
+
+  const followupPromise = adapter.sendMessage("ses_guard_followup", { requestId: "followup", content: "Second" });
+  // Delayed cleanup arrives after the follow-up is requested, but before its
+  // dispatch is allowed to cross the guard barrier.
+  events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_guard_followup" } } });
+  events.push({ payload: { type: "session.error", properties: {
+    sessionID: "ses_guard_followup",
+    error: { name: "MessageAbortedError", data: { message: "Aborted" } },
+  } } });
+  const followup = await followupPromise;
+  assert.ok(followup.providerTurnId);
+  assert.equal(completions, 1);
+  assert.deepEqual(errors, []);
+  followupPromptId = followup.providerTurnId;
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_followup", sessionID: "ses_guard_followup", role: "assistant", parentID: followup.providerTurnId, time: { created: 4 },
+  } } } });
+  events.push({ payload: { type: "session.status", properties: { sessionID: "ses_guard_followup", status: { type: "busy" } } } });
+  await waitFor(() => started.includes("assistant_followup") && states.includes("working"), "the new parent must own a normal live lifecycle");
+
+  assert.equal(abortCalls, 1);
+  assert.equal(completions, 1);
+  assert.deepEqual(errors, []);
+  assert.equal(adapter.hasActiveTurn("ses_guard_followup"), true);
+
+  // Once the successor publishes its own terminal message, its idle is genuine
+  // and must still complete normally despite the retained abort tombstone.
+  followupTerminal = true;
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_followup", sessionID: "ses_guard_followup", role: "assistant", parentID: followup.providerTurnId,
+    finish: "stop", time: { created: 4, completed: 5 },
+  } } } });
+  events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_guard_followup" } } });
+  await waitFor(() => completions === 2, "the successor's own idle must complete it");
+  assert.equal(adapter.hasActiveTurn("ses_guard_followup"), false);
+});
+
+test("OpenCode preserves a stop response with a tool call and its same-prompt continuation", async (t) => {
+  const events = new SseFixture();
+  let abortCalls = 0;
+  let historyCalls = 0;
+  let promptId: string | undefined;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_tools/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_tools/message") {
+      historyCalls += 1;
+      return jsonResponse([{
+        info: {
+          id: "assistant_after_tool",
+          sessionID: "ses_tools",
+          role: "assistant",
+          parentID: promptId,
+          finish: "stop",
+          time: { created: 3, completed: 4 },
+        },
+        parts: [{ id: "final_text", type: "text", text: "The build passed." }],
+      }]);
+    }
+    if (url.pathname === "/session/ses_tools/abort") {
+      abortCalls += 1;
+      return jsonResponse({});
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const started: string[] = [];
+  const completed: string[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "message.started") {
+      const info = event.payload.info;
+      if (typeof info === "object" && info !== null && !Array.isArray(info) && typeof info.id === "string") started.push(info.id);
+    }
+    if (event.type === "agent.completed") completed.push(event.type);
+  });
+  const sent = await adapter.sendMessage("ses_tools", { requestId: "bridge_tools", content: "Check the build" });
+  promptId = sent.providerTurnId;
+  assert.ok(promptId);
+
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_tool",
+    sessionID: "ses_tools",
+    role: "assistant",
+    parentID: promptId,
+    finish: "stop",
+    time: { created: 1, completed: 2 },
+  } } } });
+  // The final message update can race ahead of its tool part. Learning about
+  // the tool afterwards must revoke the terminal candidate before the next
+  // assistant step starts.
+  events.push({ payload: { type: "message.part.updated", properties: { part: {
+    id: "tool_part",
+    messageID: "assistant_tool",
+    sessionID: "ses_tools",
+    type: "tool",
+    tool: "bash",
+    state: { status: "completed", output: "ok" },
+  } } } });
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_after_tool",
+    sessionID: "ses_tools",
+    role: "assistant",
+    parentID: promptId,
+    finish: "stop",
+    time: { created: 3, completed: 4 },
+  } } } });
+  await waitFor(() => started.includes("assistant_after_tool"), "the tool continuation must remain visible");
+
+  assert.deepEqual(started, ["assistant_tool", "assistant_after_tool"]);
+  assert.equal(abortCalls, 0);
+  assert.equal(historyCalls, 0, "known tool turns do not need suspicious-continuation confirmation before idle");
+  assert.equal(adapter.hasActiveTurn("ses_tools"), true);
+
+  events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_tools" } } });
+  await waitFor(() => completed.length === 1, "session.idle must complete the healthy tool turn");
+  assert.equal(adapter.hasActiveTurn("ses_tools"), false);
+  assert.equal(abortCalls, 0);
+  assert.ok(historyCalls >= 2, "the unlabelled idle requires two matching reads of the final no-tool response");
+});
+
+test("a normal completed prompt never suppresses the next user prompt in the same session", async (t) => {
+  const events = new SseFixture();
+  let abortCalls = 0;
+  let historyCalls = 0;
+  const history: unknown[] = [];
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_followup/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_followup/message") {
+      historyCalls += 1;
+      return jsonResponse(history);
+    }
+    if (url.pathname === "/session/ses_followup/abort") {
+      abortCalls += 1;
+      return jsonResponse({});
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const started: string[] = [];
+  let completions = 0;
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "message.started") {
+      const info = event.payload.info;
+      if (typeof info === "object" && info !== null && !Array.isArray(info) && typeof info.id === "string") started.push(info.id);
+    }
+    if (event.type === "agent.completed") completions += 1;
+  });
+
+  const first = await adapter.sendMessage("ses_followup", { requestId: "bridge_first", content: "First" });
+  assert.ok(first.providerTurnId);
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_first",
+    sessionID: "ses_followup",
+    role: "assistant",
+    parentID: first.providerTurnId,
+    finish: "stop",
+    time: { created: 1, completed: 2 },
+  } } } });
+  history.push({
+    info: { id: "assistant_first", sessionID: "ses_followup", role: "assistant", parentID: first.providerTurnId, finish: "stop", time: { created: 1, completed: 2 } },
+    parts: [{ id: "first_text", type: "text", text: "First done" }],
+  });
+  events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_followup" } } });
+  await waitFor(() => completions === 1, "the first prompt must complete normally");
+
+  const second = await adapter.sendMessage("ses_followup", { requestId: "bridge_second", content: "Second" });
+  assert.ok(second.providerTurnId);
+  assert.notEqual(second.providerTurnId, first.providerTurnId);
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_second",
+    sessionID: "ses_followup",
+    role: "assistant",
+    parentID: second.providerTurnId,
+    finish: "stop",
+    time: { created: 3, completed: 4 },
+  } } } });
+  history.push({
+    info: { id: "assistant_second", sessionID: "ses_followup", role: "assistant", parentID: second.providerTurnId, finish: "stop", time: { created: 3, completed: 4 } },
+    parts: [{ id: "second_text", type: "text", text: "Second done" }],
+  });
+  events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_followup" } } });
+  await waitFor(() => completions === 2, "the follow-up prompt must complete normally");
+
+  assert.deepEqual(started, ["assistant_first", "assistant_second"]);
+  assert.equal(abortCalls, 0);
+  assert.ok(historyCalls >= 4, "each native idle requires two matching reads against its exact persisted parent");
+  assert.equal(adapter.hasActiveTurn("ses_followup"), false);
+});
+
+test("a secondary feed streams the retired server's turn and reports busy until it drains", async (t) => {
+  const primary = new SseFixture();
+  const secondary = new SseFixture();
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/health") return jsonResponse({});
+    if (url.pathname === "/global/event") {
+      return url.port === "63791"
+        ? primary.response(init?.signal ?? undefined)
+        : secondary.response(init?.signal ?? undefined);
+    }
+    return jsonResponse({});
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:63791/",
+    secondaryBaseUrl: "http://127.0.0.1:4096/",
+    secondaryActiveSessionIds: ["ses_already_busy"],
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+  const received: string[] = [];
+  await adapter.subscribe(null, (event) => { received.push(event.type); });
+  t.after(() => adapter.dispose());
+
+  // A turn that was already in flight when the feed attached counts as busy.
+  assert.equal(adapter.isSecondaryBusy(), true, "seeded in-flight sessions keep the feed busy");
+  assert.deepEqual(adapter.activeSessionIds(), [], "the seeded session is not a primary prompt");
+
+  // The secondary feed forwards a new turn and marks it busy.
+  secondary.push({
+    payload: {
+      type: "message.updated",
+      properties: { sessionID: "ses_busy", info: { id: "msg_1", role: "assistant" } },
+    },
+  });
+  await waitFor(() => received.includes("message.started"), "the secondary feed must forward session events");
+  assert.equal(adapter.isSecondaryBusy(), true, "a turn streaming through the secondary feed counts as busy");
+
+  // Its own connection handshake must not leak into the provider connection state.
+  secondary.push({ payload: { type: "server.connected", properties: {} } });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(received.includes("provider.connected"), false, "the secondary feed never reports connection state");
+
+  // Draining the turns clears the busy signal.
+  secondary.push({ payload: { type: "session.idle", properties: { sessionID: "ses_busy" } } });
+  secondary.push({ payload: { type: "session.idle", properties: { sessionID: "ses_already_busy" } } });
+  await waitFor(() => received.includes("agent.completed"), "session.idle must forward through the secondary feed");
+  await waitFor(() => adapter.isSecondaryBusy() === false, "idle turns must drain the secondary feed");
+
+  // Detaching the feed clears everything, including the seeded session.
+  adapter.setSecondaryBaseUrl(undefined);
+  assert.equal(adapter.isSecondaryBusy(), false);
+  await adapter.dispose();
+});
+
+test("OpenCode context occupancy survives a trailing turn that recorded no usage", async () => {
+  const assistant = (tokens: unknown) => ({ info: { role: "assistant", providerID: "crofai", modelID: "deepseek-v4-pro", ...(tokens === null ? {} : { tokens }), cost: 0.1 } });
+  const fetchLike: FetchLike = async (input) => {
+    const path = requestUrl(input).pathname;
+    if (path === "/provider") {
+      return jsonResponse({
+        connected: ["crofai"],
+        all: [{ id: "crofai", name: "Crof", models: { "deepseek-v4-pro": { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro", limit: { context: 1_000_000 } } } }],
+      });
+    }
+    return jsonResponse([
+      { info: { role: "user" } },
+      assistant({ input: 40_000, output: 1_000, cache: { read: 100_000, write: 0 } }),
+      // The turn that ends the session was interrupted, so it states no tokens at
+      // all. Reading only this entry called a 141k conversation zero tokens in
+      // context and drew a full-width empty gauge at 0% over a real transcript.
+      assistant(null),
+    ]);
+  };
+  const adapter = new OpenCodeAdapter({ hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", fetch: fetchLike, activityReader: new SequenceActivityReader(new Set()) });
+
+  const context = await adapter.getSessionContext("ses_1");
+
+  assert.equal(context.usedTokens, 141_000);
+  assert.equal(context.contextWindowTokens, 1_000_000);
+  assert.equal(Math.round((context.usedPercent ?? 0) * 100) / 100, 14.1);
+  await adapter.dispose();
+});
+
+test("OpenCode reports an unknown occupancy rather than claiming an empty context", async () => {
+  const fetchLike: FetchLike = async (input) => {
+    const path = requestUrl(input).pathname;
+    if (path === "/provider") {
+      return jsonResponse({
+        connected: ["crofai"],
+        all: [{ id: "crofai", name: "Crof", models: { "deepseek-v4-pro": { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro", limit: { context: 1_000_000 } } } }],
+      });
+    }
+    // No turn in the session ever stated a usage. Unknown is not the same claim as
+    // empty, and only one of the two can be drawn as a gauge honestly.
+    return jsonResponse([{ info: { role: "user" } }, { info: { role: "assistant", providerID: "crofai", modelID: "deepseek-v4-pro" } }]);
+  };
+  const adapter = new OpenCodeAdapter({ hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", fetch: fetchLike, activityReader: new SequenceActivityReader(new Set()) });
+
+  const context = await adapter.getSessionContext("ses_1");
+
+  assert.equal(context.usedTokens, null);
+  assert.equal(context.usedPercent, null);
   await adapter.dispose();
 });

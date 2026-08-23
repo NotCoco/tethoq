@@ -1,5 +1,17 @@
 import type { TaskOverride } from "@shared/desktop_api";
-import type { Session } from "./types";
+import type { ProviderFilterSelection, ProviderId, Session } from "./types";
+
+/**
+ * Explicit provider filters are ORed together. Available agents is a separate
+ * capability qualifier, so selecting it narrows the explicit provider set.
+ */
+export function matchesProviderFilters(providerId: ProviderId, selection: ProviderFilterSelection, availableProviderIds: ReadonlySet<ProviderId>): boolean {
+  const filters = selection === "all" ? [] : Array.isArray(selection) ? selection : [selection];
+  const explicitProviders = filters.filter((filter) => filter !== "available");
+  const requiresAvailable = filters.includes("available");
+  return (!explicitProviders.length || explicitProviders.includes(providerId))
+    && (!requiresAvailable || availableProviderIds.has(providerId));
+}
 
 /**
  * Applies the user's own task organisation on top of what a provider reports.
@@ -27,10 +39,10 @@ export function compareOrganizedSessions(left: Session, right: Session): number 
 }
 
 /**
- * Archived tasks stay out of every default surface. They remain visible while the
- * user is deliberately looking at them, or while one is the open task, so archiving
- * the task you are reading never yanks it out from under you.
+ * Archived tasks stay out of every default surface. They remain visible only while
+ * the user deliberately enables the archived-task view. The open conversation may
+ * remain on screen, but archiving it must remove its row from the ordinary task list.
  */
-export function isHiddenByArchive(session: Session, showArchived: boolean, selectedSessionId: string | null): boolean {
-  return Boolean(session.archived) && !showArchived && session.id !== selectedSessionId;
+export function isHiddenByArchive(session: Session, showArchived: boolean): boolean {
+  return Boolean(session.archived) && !showArchived;
 }

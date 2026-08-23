@@ -151,6 +151,7 @@ export function persistableBranchMessages(messages: readonly RemoteMessage[]): r
           ...(part.workflow.applications !== undefined ? { applications: part.workflow.applications } : {}),
         },
       }];
+      if (part.type === "audio") return [];
       return [{
         ...part,
         ...(part.prompt !== undefined ? { prompt: safeTranscriptText(part.prompt) } : {}),
@@ -204,6 +205,7 @@ function summarizeActivity(part: ContentPart): string | undefined {
   if (part.type === "file_change") return `File ${part.change}: ${cleanText(part.path)}`;
   if (part.type === "error") return `Error: ${clipWords(cleanText(part.message), 45)}`;
   if (part.type === "image") return `Image attachment recorded: ${part.name ?? part.mimeType ?? "unnamed image"}.`;
+  if (part.type === "audio") return `Audio recording attached: ${part.name}.`;
   if (part.type === "file") return `File attachment recorded: ${part.name}.`;
   if (part.type === "subagent") return `Subagent ${part.action} via ${part.tool} ended with status ${part.status}${part.summary ? `: ${clipWords(cleanText(part.summary), 35)}` : "."}`;
   return undefined;
@@ -252,6 +254,7 @@ function transcriptPart(part: ContentPart): JsonObject {
       ...(part.workflow.applications !== undefined ? { applications: [...part.workflow.applications] } : {}),
     },
   };
+  if (part.type === "audio") return { type: part.type, name: part.name, mimeType: part.mimeType, payloadOmitted: true };
   return {
     type: part.type,
     tool: part.tool,

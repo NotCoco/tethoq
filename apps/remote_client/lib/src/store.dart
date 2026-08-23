@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 
 import 'desktop_wake.dart';
+import 'ears.dart';
 import 'json.dart';
 import 'models.dart';
 import 'security.dart';
@@ -220,6 +221,10 @@ class RemoteAppStore extends ChangeNotifier {
   String reasoningDisplayMode = 'compact';
   bool showSideChats = false;
   String? preferredDictationSourceId;
+  EarsSettings ears = const EarsSettings();
+  String? _earsRequestId;
+
+  bool get earsBusy => _earsRequestId != null;
 
   bool get hasHosts => hosts.isNotEmpty;
 
@@ -468,7 +473,7 @@ class RemoteAppStore extends ChangeNotifier {
       if (session.sessionKind == 'side_chat') return false;
       final hostId = activeHost?.hostId;
       if (hostId != null && session.hostId != hostId) return false;
-      if (session.parentSessionId != null) return false;
+      if (session.relationship?.kind == 'subagent') return false;
       if (_providerFilters.isNotEmpty &&
           !_providerFilters.any((providerId) =>
               providerId == availableAgentsTaskFilter
@@ -583,6 +588,7 @@ class RemoteAppStore extends ChangeNotifier {
         ..clear()
         ..addEntries((await security.readAgentDefaults()).entries.where(
             (entry) => _isMobileProviderEnabled(entry.value.providerId)));
+      ears = await security.readEarsSettings();
       hosts
         ..clear()
         ..addAll(await security.readHosts());
@@ -819,6 +825,21 @@ class RemoteAppStore extends ChangeNotifier {
     preferredDictationSourceId = source.id;
     notifyListeners();
     await security.saveDictationSourcePreferences(dictationSourcePreferences);
+  }
+
+  Future<void> setEars(EarsSettings value) async {
+    ears = value;
+    notifyListeners();
+    await security.saveEarsSettings(value);
+  }
+
+  Future<void> cancelEars() async {
+    final requestId = _earsRequestId;
+    if (requestId == null) return;
+    await _requireTransport().request(
+      'ears.cancel',
+      <String, Object?>{'requestId': requestId},
+    );
   }
 
   Future<void> configureDictationSource(String sourceId,
@@ -1692,6 +1713,89 @@ class RemoteAppStore extends ChangeNotifier {
     return value.toInt();
   }
 
+  bool _destinationAcceptsAudio(String sessionId, String? modelId) {
+    final session = sessions.where((item) => item.id == sessionId).firstOrNull;
+    if (session == null || !providerDeliversNativeAudio(session.providerId)) {
+      return false;
+    }
+    final resolvedId = modelId ?? session.modelId;
+    final models =
+        modelsByProvider[session.providerId] ?? const <RemoteModel>[];
+    final model = models.where((item) => item.id == resolvedId).firstOrNull;
+    return model?.supportsAudioInput == true;
+  }
+
+  Future<({String content, List<RemoteAttachment> attachments})>
+      _prepareOutgoing(
+    String sessionId,
+    String content,
+    List<RemoteAttachment> attachments, {
+    String? modelId,
+  }) async {
+    final clips =
+        attachments.where(isDictationAudioAttachment).toList(growable: false);
+    if (clips.isEmpty) {
+      return (content: content, attachments: attachments);
+    }
+    if (!ears.enabled) {
+      if (_destinationAcceptsAudio(sessionId, modelId)) {
+        return (content: content, attachments: attachments);
+      }
+      throw StateError(
+          'This model does not accept direct audio. Enable EARS or choose an audio-capable model.');
+    }
+    if (ears.providerId == null || ears.modelId == null) {
+      throw StateError('Choose an EARS model before sending dictation.');
+    }
+    final requestId = randomId('ears');
+    _earsRequestId = requestId;
+    notifyListeners();
+    final uploaded = <String>[];
+    try {
+      uploaded.addAll(await _uploadAttachments(clips));
+      final result = await _requireTransport().request(
+        'ears.process',
+        <String, Object?>{
+          'providerId': ears.providerId,
+          'modelId': ears.modelId,
+          'mode': ears.mode,
+          'attachmentIds': uploaded,
+          if (!_preparedSessionIds.contains(sessionId)) 'sessionId': sessionId,
+          'requestId': requestId,
+        },
+        requestId: requestId,
+        timeout: const Duration(minutes: 3),
+      );
+      final texts =
+          jsonList(result['texts']).whereType<String>().toList(growable: false);
+      if (texts.length != clips.length) {
+        throw StateError(
+            'EARS did not return text for every dictation recording.');
+      }
+      final composed = composeEarsDestinationText(content, texts);
+      if (composed.trim().isEmpty) {
+        throw StateError('EARS did not hear any speech.');
+      }
+      return (
+        content: composed,
+        attachments: attachments
+            .where((attachment) => !isDictationAudioAttachment(attachment))
+            .toList(growable: false),
+      );
+    } catch (error) {
+      for (final uploadId in uploaded) {
+        unawaited(_requireTransport().request(
+          'attachment.upload.cancel',
+          <String, Object?>{'uploadId': uploadId},
+        ).catchError((Object _) => <String, Object?>{}));
+      }
+      rethrow;
+    } finally {
+      _earsRequestId = null;
+      notifyListeners();
+    }
+  }
+
   Future<void> sendMessage(
     String sessionId,
     String content, {
@@ -1701,12 +1805,20 @@ class RemoteAppStore extends ChangeNotifier {
     SimplifySettings? simplify,
   }) async {
     final trimmed = content.trim();
-    if (trimmed.isEmpty) return;
-    final visibleContent = simplifyVisibleContent(trimmed);
-    final requestId = randomId('send');
+    if (trimmed.isEmpty && !attachments.any(isDictationAudioAttachment)) {
+      return;
+    }
     drafts[sessionId] = content;
     setDraftAttachments(sessionId, attachments);
     if (simplify != null) draftSimplifySettings[sessionId] = simplify;
+    final prepared = await _prepareOutgoing(
+      sessionId,
+      trimmed,
+      attachments,
+      modelId: modelId,
+    );
+    final visibleContent = simplifyVisibleContent(prepared.content);
+    final requestId = randomId('send');
     final optimisticMessage = RemoteMessage(
       id: requestId,
       sessionId: sessionId,
@@ -1715,11 +1827,13 @@ class RemoteAppStore extends ChangeNotifier {
       parts: <ContentPart>[
         ContentPart(
             type: 'text', data: <String, Object?>{'text': visibleContent}),
-        ...attachments.map((attachment) => ContentPart(
-              type: 'image',
+        ...prepared.attachments.map((attachment) => ContentPart(
+              type:
+                  attachment.mimeType.startsWith('audio/') ? 'audio' : 'image',
               data: <String, Object?>{
                 'uri': attachment.dataUri,
                 'mimeType': attachment.mimeType,
+                'name': attachment.name,
               },
             )),
       ],
@@ -1729,17 +1843,25 @@ class RemoteAppStore extends ChangeNotifier {
         .putIfAbsent(sessionId, () => <RemoteMessage>[])
         .add(optimisticMessage);
     notifyListeners();
+    final attachmentIds = <String>[];
     try {
+      final hasAudio = prepared.attachments
+          .any((attachment) => attachment.mimeType.startsWith('audio/'));
+      if (hasAudio) {
+        attachmentIds.addAll(await _uploadAttachments(prepared.attachments));
+      }
       await _requireTransport().request(
         'session.send_message',
         <String, Object?>{
           'sessionId': sessionId,
-          'content': trimmed,
+          'content': prepared.content,
           if (modelId != null && modelId.isNotEmpty) 'modelId': modelId,
           if (reasoningEffort != null && reasoningEffort.isNotEmpty)
             'reasoningEffort': reasoningEffort,
-          if (attachments.isNotEmpty)
-            'attachments': attachments
+          if (attachmentIds.isNotEmpty)
+            'attachmentIds': attachmentIds
+          else if (prepared.attachments.isNotEmpty)
+            'attachments': prepared.attachments
                 .map((attachment) => attachment.toJson())
                 .toList(growable: false),
           if (simplify != null) 'simplify': simplify.toJson(),
@@ -1751,6 +1873,12 @@ class RemoteAppStore extends ChangeNotifier {
       draftSimplifySettings.remove(sessionId);
       notifyListeners();
     } catch (_) {
+      for (final attachmentId in attachmentIds) {
+        unawaited(_requireTransport().request(
+          'attachment.upload.cancel',
+          <String, Object?>{'uploadId': attachmentId},
+        ).catchError((Object _) => <String, Object?>{}));
+      }
       messages[sessionId]?.removeWhere((message) => message.id == requestId);
       notifyListeners();
       rethrow;
@@ -1767,7 +1895,9 @@ class RemoteAppStore extends ChangeNotifier {
     SimplifySettings? simplify,
   }) async {
     final trimmed = content.trim();
-    if (trimmed.isEmpty) return null;
+    if (trimmed.isEmpty && !attachments.any(isDictationAudioAttachment)) {
+      return null;
+    }
     final session = sessions.where((item) => item.id == sessionId).firstOrNull;
     if (session == null) throw StateError('Session is no longer available');
     if (!_isMobileProviderEnabled(session.providerId)) {
@@ -1817,13 +1947,21 @@ class RemoteAppStore extends ChangeNotifier {
     setDraftAttachments(sessionId, attachments);
     if (simplify != null) draftSimplifySettings[sessionId] = simplify;
     notifyListeners();
-    final attachmentIds = await _uploadAttachments(attachments);
+    final prepared = await _prepareOutgoing(
+      sessionId,
+      trimmed,
+      attachments,
+      modelId: modelId,
+    );
+    final attachmentIds = prepared.attachments.isEmpty
+        ? <String>[]
+        : await _uploadAttachments(prepared.attachments);
     try {
       final result = await _requireTransport().request(
         mode == 'steer' ? 'session.steer_message' : 'message_queue.enqueue',
         <String, Object?>{
           'sessionId': sessionId,
-          'content': trimmed,
+          'content': prepared.content,
           if (modelId != null && modelId.isNotEmpty) 'modelId': modelId,
           if (reasoningEffort != null && reasoningEffort.isNotEmpty)
             'reasoningEffort': reasoningEffort,
@@ -1835,7 +1973,7 @@ class RemoteAppStore extends ChangeNotifier {
       if (mode == 'queue' && result['message'] != null) {
         final queued = _retainQueuedAttachmentPreviews(
           RemoteQueuedMessage.fromJson(result['message']),
-          attachments.map((attachment) => RemoteQueuedAttachment(
+          prepared.attachments.map((attachment) => RemoteQueuedAttachment(
                 name: attachment.name,
                 mimeType: attachment.mimeType,
                 byteLength: attachment.byteLength,
@@ -2233,8 +2371,33 @@ class RemoteAppStore extends ChangeNotifier {
   }
 
   Future<void> interrupt(String sessionId) async {
-    await _requireTransport().request(
-        'session.interrupt', <String, Object?>{'sessionId': sessionId});
+    try {
+      await _requireTransport().request(
+          'session.interrupt', <String, Object?>{'sessionId': sessionId});
+    } on Object catch (caught) {
+      // A delegating parent stays marked working after its hand-off turn ends,
+      // which left a stop button on a task with nothing to stop. The harness
+      // reporting no turn is proof the task is not running, so settle the
+      // state instead of surfacing an error about a turn the user never
+      // started.
+      if (RegExp(r'no active .* turn', caseSensitive: false)
+          .hasMatch(caught.toString())) {
+        _settleSessionIdle(sessionId);
+        return;
+      }
+      rethrow;
+    }
+  }
+
+  void _settleSessionIdle(String sessionId) {
+    final index = sessions.indexWhere((session) => session.id == sessionId);
+    if (index < 0 || sessions[index].state != 'working') return;
+    sessions[index] = sessions[index].copyWith(state: 'idle');
+    if (selectedSession?.id == sessionId) {
+      selectedSession = sessions[index];
+    }
+    notifyListeners();
+    unawaited(_syncVisibleSessionHistory(sessionId));
   }
 
   Future<void> respondToApproval(
@@ -2732,7 +2895,11 @@ class RemoteAppStore extends ChangeNotifier {
           'agent.error' => 'failed',
           'agent.completed' => 'completed',
           'agent.interrupted' => 'idle',
-          'message.started' || 'tool.started' || 'command.started' => 'working',
+          'message.started' ||
+          'message.delta' ||
+          'tool.started' ||
+          'command.started' =>
+            'working',
           _ => current.state,
         };
         sessions[index] = current.copyWith(
@@ -2775,7 +2942,6 @@ class RemoteAppStore extends ChangeNotifier {
             event.type == 'context.compaction_completed')) {
       final sessionId = event.sessionId!;
       if (event.type == 'context.compaction_completed') {
-        final automatic = event.payload['kind'] == 'automatic';
         final message = RemoteMessage(
           id: 'compaction-${event.eventId}',
           sessionId: sessionId,
@@ -2783,9 +2949,7 @@ class RemoteAppStore extends ChangeNotifier {
           createdAt: event.occurredAt,
           parts: <ContentPart>[
             ContentPart(type: 'text', data: <String, Object?>{
-              'text': automatic
-                  ? 'Context automatically compacted'
-                  : 'Context compacted',
+              'text': 'Session compacted',
             }),
           ],
           status: 'completed',
@@ -2855,8 +3019,7 @@ class RemoteAppStore extends ChangeNotifier {
     }
     if (text.isNotEmpty) {
       _liveAssistantStartedAt.putIfAbsent(sessionId, () => event.occurredAt);
-      final reasoning = event.payload['partType'] == 'reasoning' ||
-          event.payload.containsKey('reasoning') ||
+      final reasoning = _payloadLooksLikeReasoning(event.payload) ||
           event.payload['phase'] == 'commentary';
       final target = reasoning ? _liveAssistantReasoning : _liveAssistantText;
       target[sessionId] = _mergeStreamText(target[sessionId] ?? '', text);
@@ -3214,7 +3377,14 @@ String? _subagentEventIdentity(AgentEvent event, ContentPart part) {
 }
 
 String _messageEventText(Map<String, Object?> payload) {
-  for (final key in const <String>['text', 'delta', 'output', 'message']) {
+  for (final key in const <String>[
+    'text',
+    'thought',
+    'thinking',
+    'delta',
+    'output',
+    'message'
+  ]) {
     final value = payload[key];
     if (value is String && value.isNotEmpty) return value;
   }
@@ -3223,6 +3393,47 @@ String _messageEventText(Map<String, Object?> payload) {
     if (text.isNotEmpty) return text;
   }
   return '';
+}
+
+bool _payloadLooksLikeReasoning(Map<String, Object?> payload) {
+  final partType = optionalString(payload, 'partType')?.toLowerCase();
+  if (partType == 'reasoning' ||
+      partType == 'thought' ||
+      partType == 'thinking') {
+    return true;
+  }
+  if (payload.containsKey('reasoning')) return true;
+  if (payload['thought'] == true ||
+      payload['isThought'] == true ||
+      payload['isThinking'] == true) {
+    return true;
+  }
+  for (final key in const <String>['thought', 'thinking']) {
+    final value = payload[key];
+    if (value is String && value.isNotEmpty) return true;
+  }
+  final content = payload['content'];
+  if (content is! Map<Object?, Object?>) return false;
+  for (final key in const <String>['sessionUpdate', 'session_update', 'type']) {
+    final value = content[key];
+    if (value is String &&
+        (value.toLowerCase().contains('thought') ||
+            value.toLowerCase().contains('thinking') ||
+            value.toLowerCase().contains('reason'))) {
+      return true;
+    }
+  }
+  final nested = content['content'];
+  if (nested is Map<Object?, Object?>) {
+    final nestedType = nested['type'];
+    if (nestedType is String) {
+      final type = nestedType.toLowerCase();
+      if (type == 'thought' || type == 'thinking' || type == 'reasoning') {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 String _messageEventRole(Map<String, Object?> payload) {
@@ -3270,7 +3481,14 @@ String _nestedMessageText(Object? value, [int depth = 0]) {
         .join();
   }
   if (value is Map<Object?, Object?>) {
-    for (final key in const <String>['text', 'delta', 'output', 'message']) {
+    for (final key in const <String>[
+      'text',
+      'thought',
+      'thinking',
+      'delta',
+      'output',
+      'message'
+    ]) {
       final nested = value[key];
       if (nested is String && nested.isNotEmpty) return nested;
     }

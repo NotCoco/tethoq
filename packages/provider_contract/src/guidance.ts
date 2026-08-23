@@ -4,6 +4,8 @@ import type { SendMessageRequest } from "./types.js";
 
 const guidanceStart = "<tethoq_response_guidance>";
 const guidanceEnd = "</tethoq_response_guidance>";
+const hiddenControlStart = "<tethoq_hidden_control_turn>";
+const hiddenControlEnd = "</tethoq_hidden_control_turn>";
 const workflowsStart = "<tethoq_workflow_attachments>";
 const workflowsEnd = "</tethoq_workflow_attachments>";
 
@@ -37,13 +39,23 @@ export function providerPromptContent(request: Pick<SendMessageRequest, "content
   return `${guidanceStart}\n${guidance}\n${guidanceEnd}\n\n${request.content}`;
 }
 
+/** Provider turns sometimes need a non-empty user part even when all content is private orchestration. */
+export function hiddenProviderControlContent(id: string): string {
+  const safe = id.replace(/[^a-z0-9._:-]/giu, "").slice(0, 200) || "control";
+  return `${hiddenControlStart}${safe}${hiddenControlEnd}`;
+}
+
 /** Keeps fallback control guidance out of normalized user-visible history. */
 export function stripProviderPromptGuidance(value: string): string {
   const trimmed = value.trimStart();
-  if (!trimmed.startsWith(guidanceStart)) return value;
-  const end = trimmed.indexOf(guidanceEnd);
-  if (end < 0) return value;
-  return trimmed.slice(end + guidanceEnd.length).trimStart();
+  const visible = trimmed.startsWith(guidanceStart)
+    ? (() => {
+        const end = trimmed.indexOf(guidanceEnd);
+        return end < 0 ? value : trimmed.slice(end + guidanceEnd.length).trimStart();
+      })()
+    : value;
+  const control = visible.trim();
+  return control.startsWith(hiddenControlStart) && control.endsWith(hiddenControlEnd) ? "" : visible;
 }
 
 /** Recovers Tethoq's structured workflow chips before the private prompt envelope is removed. */

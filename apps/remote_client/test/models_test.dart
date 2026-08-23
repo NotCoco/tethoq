@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:universal_agent_remote/src/ears.dart';
 import 'package:universal_agent_remote/src/models.dart';
 
 void main() {
@@ -48,6 +49,63 @@ void main() {
         'Please explain the result');
     expect(simplifyVisibleContent('/simplified is not a command'),
         '/simplified is not a command');
+  });
+
+  test('EARS helpers keep only explicit dictation origin', () {
+    const dictation = RemoteAttachment(
+      name: 'clip.wav',
+      mimeType: 'audio/wav',
+      origin: 'dictation',
+      dataBase64: 'AA==',
+      byteLength: 1,
+    );
+    const dropped = RemoteAttachment(
+      name: 'clip.wav',
+      mimeType: 'audio/wav',
+      origin: 'drag-drop',
+      dataBase64: 'AA==',
+      byteLength: 1,
+    );
+    expect(isDictationAudioAttachment(dictation), isTrue);
+    expect(isDictationAudioAttachment(dropped), isFalse);
+    expect(composeEarsDestinationText('typed', const <String>['spoken']),
+        'typed\n\nspoken');
+    expect(
+      EarsSettings.fromJson(<String, Object?>{
+        'enabled': true,
+        'providerId': 'direct',
+        'modelId': 'gpt-5.6-sol',
+        'mode': 'verbatim',
+      }).mode,
+      'verbatim',
+    );
+  });
+
+  test('EARS transport and MIME checks match the bridge contract', () {
+    expect(providerDeliversNativeAudio('direct'), isTrue);
+    expect(providerDeliversNativeAudio('codex'), isTrue);
+    expect(providerDeliversNativeAudio('opencode'), isTrue);
+    expect(providerDeliversNativeAudio('grok'), isFalse);
+
+    RemoteAttachment dictation(String mimeType) => RemoteAttachment(
+          name: 'voice',
+          mimeType: mimeType,
+          origin: 'dictation',
+          dataBase64: 'AA==',
+          byteLength: 1,
+        );
+    for (final mimeType in <String>[
+      'audio/mpeg',
+      'audio/mp3',
+      'audio/wav',
+      'audio/x-wav',
+      'audio/wave',
+    ]) {
+      expect(isDictationAudioAttachment(dictation(mimeType)), isTrue,
+          reason: mimeType);
+    }
+    expect(isDictationAudioAttachment(dictation('audio/webm')), isFalse);
+    expect(isDictationAudioAttachment(dictation('audio/mp4')), isFalse);
   });
 
   test('session model preserves provider-neutral fields', () {
@@ -314,6 +372,84 @@ void main() {
 
     expect(
         model.reasoningEfforts.map((effort) => effort.id), <String>['medium']);
+  });
+
+  test('queued messages keep a concrete session and state', () {
+    final message = RemoteQueuedMessage.fromJson(<String, Object?>{
+      'id': 'provider_queue/grok/session-one/native-q1',
+      'sessionId': 'host/grok/session-one',
+      'content': 'Queued from the Grok CLI',
+      'state': 'queued',
+      'createdAt': '2026-08-17T12:00:00.000Z',
+      'attachments': <Object?>[],
+    });
+    expect(message.sessionId, 'host/grok/session-one');
+    expect(message.content, 'Queued from the Grok CLI');
+    expect(message.state, 'queued');
+  });
+
+  test('Grok 4.6 documents selectable efforts including xhigh', () {
+    final model = RemoteModel.fromJson(<String, Object?>{
+      'id': 'grok-4.6',
+      'providerId': 'grok',
+      'displayName': 'Grok 4.6',
+      'isDefault': true,
+      'nativeMetadata': <String, Object?>{},
+    });
+
+    expect(model.reasoningEfforts.map((effort) => effort.id),
+        <String>['low', 'medium', 'high', 'xhigh']);
+    expect(model.defaultReasoningEffort, 'high');
+    expect(
+        reasoningDisplayLabel('low',
+            providerId: 'grok', modelId: 'grok-4.6', displayName: 'Grok 4.6'),
+        'Low');
+    expect(
+        reasoningDisplayLabel('xhigh',
+            providerId: 'grok', modelId: 'grok-4.6'),
+        'Extra high');
+    expect(
+        reasoningDisplayLabel('low',
+            providerId: 'codex',
+            modelId: 'gpt-5.6-sol',
+            displayName: 'GPT-5.6 Sol'),
+        'Light');
+    expect(
+        RemoteModel.fromJson(<String, Object?>{
+          'id': 'grok-code',
+          'providerId': 'grok',
+          'displayName': 'Grok Code',
+          'isDefault': false,
+          'nativeMetadata': <String, Object?>{},
+        }).reasoningEfforts,
+        isEmpty);
+  });
+
+  test('OpenCode model route metadata exposes the upstream provider', () {
+    final routed = RemoteModel.fromJson(<String, Object?>{
+      'id': 'synthetic/deepseek-v4',
+      'providerId': 'opencode',
+      'displayName': 'DeepSeek V4',
+      'isDefault': false,
+      'nativeMetadata': <String, Object?>{
+        'sourceProviderId': 'synthetic',
+        'sourceProviderName': 'Synthetic',
+      },
+    });
+    final fallback = RemoteModel.fromJson(<String, Object?>{
+      'id': 'local-model',
+      'providerId': 'opencode',
+      'displayName': 'Local model',
+      'isDefault': false,
+      'nativeMetadata': <String, Object?>{},
+    });
+
+    expect(routed.sourceProviderId, 'synthetic');
+    expect(routed.routeProviderName, 'Synthetic');
+    expect(routed.routeCarrierName, 'OpenCode');
+    expect(routed.routeProviderLabel, 'Synthetic via OpenCode');
+    expect(fallback.routeProviderName, 'OpenCode');
+    expect(fallback.routeCarrierName, isNull);
   });
 
   test('content parts expose normalized attachment fields without host paths',

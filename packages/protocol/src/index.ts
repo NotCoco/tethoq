@@ -8,3 +8,5 @@ export * from "./pairing.js";
 export * from "./secure_transport.js";
 export * from "./relay_attach.js";
 export * from "./simplify.js";
+export * from "./ears.js";
+export * from "./reasoning.js";

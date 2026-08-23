@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:universal_agent_remote/src/ears.dart';
 import 'package:universal_agent_remote/src/json.dart';
 import 'package:universal_agent_remote/src/models.dart';
 import 'package:universal_agent_remote/src/security.dart';
@@ -751,8 +752,7 @@ void main() {
     final records = store.messages[_sessionId]!;
     expect(records, hasLength(1));
     expect(records.single.role, 'system');
-    expect(
-        records.single.parts.single.summary, 'Context automatically compacted');
+    expect(records.single.parts.single.summary, 'Session compacted');
   });
 
   test('session metadata events update live truth without dropping relations',
@@ -811,6 +811,11 @@ void main() {
           'parentSessionId': _sessionId,
           'agentNickname': 'UI reviewer',
           'agentRole': 'reviewer',
+          'relationship': <String, Object?>{
+            'kind': 'subagent',
+            'sourceSessionId': _sessionId,
+            'strategy': 'native',
+          },
         }
       ];
     final store = RemoteAppStore(
@@ -1091,6 +1096,68 @@ void main() {
     expect(store.unreadSessionIds, isEmpty);
   });
 
+  test('a Grok-style reasoning delta marks the session working', () async {
+    FlutterSecureStorage.setMockInitialValues(<String, String>{});
+    final security = DeviceSecurity();
+    final transport = _FakeTransport(security: security);
+    final store = RemoteAppStore(
+      security: security,
+      transportFactory: (_, __) => transport,
+    );
+    addTearDown(store.dispose);
+    await store.connectHost(_host);
+
+    store.applyEventForTesting(
+        _eventWithPayload('message.delta', 1, const <String, Object?>{
+      'partType': 'reasoning',
+      'content': <String, Object?>{
+        'sessionUpdate': 'agent_thought_chunk',
+        'content': <String, Object?>{
+          'type': 'text',
+          'text': 'Inspecting the parser',
+        },
+      },
+    }));
+
+    expect(store.sessions.single.state, 'working');
+    expect(store.liveAssistantMessageFor(_sessionId)?.parts.single.type,
+        'reasoning');
+    expect(store.liveAssistantMessageFor(_sessionId)?.parts.single.summary,
+        'Inspecting the parser');
+  });
+
+  test('native Grok queue events appear on the mobile queued-instruction strip',
+      () async {
+    FlutterSecureStorage.setMockInitialValues(<String, String>{});
+    final security = DeviceSecurity();
+    final transport = _FakeTransport(security: security);
+    final store = RemoteAppStore(
+      security: security,
+      transportFactory: (_, __) => transport,
+    );
+    addTearDown(store.dispose);
+    await store.connectHost(_host);
+
+    store.applyEventForTesting(
+        _eventWithPayload('message.queued', 1, <String, Object?>{
+      'id': 'provider_queue/grok/session-one/native-q1',
+      'sessionId': _sessionId,
+      'content': 'Queued from the Grok CLI',
+      'state': 'queued',
+      'createdAt': '2026-08-17T12:00:00.000Z',
+      'attachments': <Object?>[],
+    }));
+
+    expect(store.queuedMessagesFor(_sessionId).single.content,
+        'Queued from the Grok CLI');
+
+    store.applyEventForTesting(
+        _eventWithPayload('message.queue_removed', 2, const <String, Object?>{
+      'messageId': 'provider_queue/grok/session-one/native-q1',
+    }));
+    expect(store.queuedMessagesFor(_sessionId), isEmpty);
+  });
+
   test('newer idle refresh remains read without a final state', () async {
     FlutterSecureStorage.setMockInitialValues(<String, String>{});
     final security = DeviceSecurity();
@@ -1140,6 +1207,50 @@ void main() {
     await refreshed.connectHost(_host);
 
     expect(refreshed.isSessionUnread(_sessionId), isFalse);
+  });
+
+  test('interrupt settles a stuck working session when the harness has no turn',
+      () async {
+    FlutterSecureStorage.setMockInitialValues(<String, String>{});
+    final security = DeviceSecurity();
+    final transport = _FakeTransport(security: security)
+      ..sessionState = 'working'
+      ..interruptError = const BridgeRequestException(
+          'NO_ACTIVE_TURN', 'No active Codex turn is known for this thread',
+          retryable: false);
+    final store = RemoteAppStore(
+      security: security,
+      transportFactory: (_, __) => transport,
+    );
+    addTearDown(store.dispose);
+    await store.connectHost(_host);
+
+    expect(store.sessions.single.state, 'working');
+    await store.interrupt(_sessionId);
+
+    expect(transport.interruptCalls, 1);
+    expect(store.sessions.single.state, 'idle');
+  });
+
+  test('interrupt rethrows failures that are not a missing turn', () async {
+    FlutterSecureStorage.setMockInitialValues(<String, String>{});
+    final security = DeviceSecurity();
+    final transport = _FakeTransport(security: security)
+      ..sessionState = 'working'
+      ..interruptError = const BridgeRequestException(
+          'BUSY', 'The harness is busy with another turn',
+          retryable: false);
+    final store = RemoteAppStore(
+      security: security,
+      transportFactory: (_, __) => transport,
+    );
+    addTearDown(store.dispose);
+    await store.connectHost(_host);
+
+    await expectLater(
+        store.interrupt(_sessionId), throwsA(isA<BridgeRequestException>()));
+    expect(transport.interruptCalls, 1);
+    expect(store.sessions.single.state, 'working');
   });
 
   test('send appends one optimistic user message and removes it on failure',
@@ -1271,6 +1382,113 @@ void main() {
       'maxWords': 300,
     });
     expect(store.simplifySettingsFor(_sessionId), isNull);
+  });
+
+  test('EARS transcribes dictation-only send and keeps the draft on cancel',
+      () async {
+    FlutterSecureStorage.setMockInitialValues(<String, String>{});
+    final security = DeviceSecurity();
+    final transport = _FakeTransport(security: security);
+    final store = RemoteAppStore(
+      security: security,
+      transportFactory: (_, __) => transport,
+    );
+    addTearDown(store.dispose);
+    await store.connectHost(_host);
+    await store.setEars(const EarsSettings(
+      enabled: true,
+      providerId: 'direct',
+      modelId: 'gpt-5.6-sol',
+      mode: 'cleaned',
+    ));
+
+    const clip = RemoteAttachment(
+      name: 'dictation.wav',
+      mimeType: 'audio/wav',
+      origin: 'dictation',
+      dataBase64: 'AQID',
+      byteLength: 3,
+    );
+    const image = RemoteAttachment(
+      name: 'shot.png',
+      mimeType: 'image/png',
+      origin: 'file-picker',
+      dataBase64: 'BAUG',
+      byteLength: 3,
+    );
+
+    await store.sendMessage(_sessionId, 'Also look at this',
+        attachments: const <RemoteAttachment>[clip, image]);
+
+    expect(transport.lastEarsPayload?['mode'], 'cleaned');
+    expect(transport.lastEarsPayload?['attachmentIds'], <Object?>['upload-1']);
+    expect(transport.lastSendPayload?['content'],
+        'Also look at this\n\nTranscribed phone instruction');
+    expect(transport.lastSendPayload?['attachments'], <Object?>[
+      <String, Object?>{
+        'name': 'shot.png',
+        'mimeType': 'image/png',
+        'dataBase64': 'BAUG',
+        'byteLength': 3,
+        'origin': 'file-picker',
+      }
+    ]);
+    expect(store.drafts[_sessionId], '');
+
+    transport.earsGate = Completer<void>();
+    transport.earsCancelled = false;
+    transport.lastEarsPayload = null;
+    transport.lastSendPayload = null;
+    final pending = store.sendMessage(_sessionId, 'Keep this draft',
+        attachments: const <RemoteAttachment>[clip]);
+    await _waitFor(() => store.earsBusy);
+    await store.cancelEars();
+    await expectLater(pending, throwsA(predicate((Object error) {
+      return error.toString().contains('EARS transcription was cancelled.');
+    })));
+    expect(transport.lastEarsCancelPayload?['requestId'], isNotNull);
+    expect(transport.lastSendPayload, isNull);
+    expect(store.drafts[_sessionId], 'Keep this draft');
+    expect(store.draftAttachmentsFor(_sessionId).single.origin, 'dictation');
+    expect(
+        store.messages[_sessionId]!
+            .expand((message) => message.parts)
+            .map((part) => part.summary),
+        isNot(contains('Keep this draft')));
+  });
+
+  test('disabled EARS rejects dictation for a text-only destination', () async {
+    FlutterSecureStorage.setMockInitialValues(<String, String>{});
+    final security = DeviceSecurity();
+    final transport = _FakeTransport(security: security);
+    final store = RemoteAppStore(
+      security: security,
+      transportFactory: (_, __) => transport,
+    );
+    addTearDown(store.dispose);
+    await store.connectHost(_host);
+    await expectLater(
+      store.sendMessage(
+        _sessionId,
+        '',
+        attachments: const <RemoteAttachment>[
+          RemoteAttachment(
+            name: 'dictation.wav',
+            mimeType: 'audio/wav',
+            origin: 'dictation',
+            dataBase64: 'AQID',
+            byteLength: 3,
+          ),
+        ],
+      ),
+      throwsA(predicate((Object error) {
+        return error
+            .toString()
+            .contains('Enable EARS or choose an audio-capable model');
+      })),
+    );
+    expect(transport.lastSendPayload, isNull);
+    expect(transport.lastEarsPayload, isNull);
   });
 
   test('prepared first turn creates the session before sending the message',
@@ -1871,11 +2089,27 @@ void main() {
     store.hosts.addAll(<PairedHost>[_host, _otherHost]);
     store.activeHost = _host;
     final firstRoot = _sessionForHost('host', 'host/root');
-    final firstChild =
-        _sessionForHost('host', 'host/child', parentSessionId: firstRoot.id);
+    final firstChild = _sessionForHost(
+      'host',
+      'host/child',
+      parentSessionId: firstRoot.id,
+      relationship: SessionRelationship(
+        kind: 'subagent',
+        sourceSessionId: firstRoot.id,
+        strategy: 'native',
+      ),
+    );
     final secondRoot = _sessionForHost('other-host', 'other/root');
-    final secondChild = _sessionForHost('other-host', 'other/child',
-        parentSessionId: secondRoot.id);
+    final secondChild = _sessionForHost(
+      'other-host',
+      'other/child',
+      parentSessionId: secondRoot.id,
+      relationship: SessionRelationship(
+        kind: 'subagent',
+        sourceSessionId: secondRoot.id,
+        strategy: 'native',
+      ),
+    );
     store.sessions.addAll(
         <RemoteSession>[firstRoot, firstChild, secondRoot, secondChild]);
 
@@ -1890,6 +2124,24 @@ void main() {
     expect(store.childSessionsFor(firstRoot.id), isEmpty);
     store.openSessionForView(firstRoot);
     expect(store.selectedSession, isNull);
+  });
+
+  test('parented user chats stay visible when they are not explicit subagents',
+      () {
+    final store = RemoteAppStore();
+    addTearDown(store.dispose);
+    store.hosts.add(_host);
+    store.activeHost = _host;
+    final workspace = _sessionForHost('host', 'host/opencode/workspace');
+    final chat = _sessionForHost(
+      'host',
+      'host/opencode/chat',
+      parentSessionId: workspace.id,
+    );
+    store.sessions.addAll(<RemoteSession>[workspace, chat]);
+
+    expect(store.visibleSessions.map((session) => session.id).toList(),
+        containsAll(<String>[workspace.id, chat.id]));
   });
 
   test('connect lists providers once and concurrent model loads are deduped',
@@ -2015,7 +2267,7 @@ final _otherHost = PairedHost(
 );
 
 RemoteSession _sessionForHost(String hostId, String id,
-        {String? parentSessionId}) =>
+        {String? parentSessionId, SessionRelationship? relationship}) =>
     RemoteSession(
       id: id,
       hostId: hostId,
@@ -2027,6 +2279,7 @@ RemoteSession _sessionForHost(String hostId, String id,
       needsApproval: false,
       stale: false,
       parentSessionId: parentSessionId,
+      relationship: relationship,
     );
 
 AgentEvent _event(String type, int sequence) => AgentEvent(
@@ -2223,6 +2476,10 @@ class _FakeTransport extends BridgeTransport {
   Map<String, Object?>? lastQueueEditPayload;
   Map<String, Object?>? lastQueueDeliverPayload;
   Map<String, Object?>? lastQueueNewTaskPayload;
+  Map<String, Object?>? lastEarsPayload;
+  Map<String, Object?>? lastEarsCancelPayload;
+  Completer<void>? earsGate;
+  bool earsCancelled = false;
   Map<String, Object?>? lastSideChatCreatePayload;
   Map<String, Object?>? lastAttachmentUploadPayload;
   final List<int> uploadChunkSizes = <int>[];
@@ -2262,6 +2519,8 @@ class _FakeTransport extends BridgeTransport {
   Completer<void>? openGate;
   Completer<void>? modelGate;
   Completer<void>? syncGate;
+  int interruptCalls = 0;
+  Object? interruptError;
 
   @override
   Future<void> connect() async {
@@ -2475,6 +2734,10 @@ class _FakeTransport extends BridgeTransport {
           'strategy': 'transcript_bootstrap',
           'copiedMessageCount': 7,
         };
+      case 'session.interrupt':
+        interruptCalls += 1;
+        if (interruptError != null) throw interruptError!;
+        return <String, Object?>{};
       case 'wallet.get':
         lastWalletGetPayload = payload;
         final endpointId = payload['endpointId'] as String? ?? 'openai';
@@ -2654,6 +2917,20 @@ class _FakeTransport extends BridgeTransport {
       case 'dictation.transcribe':
         lastDictationPayload = payload;
         return <String, Object?>{'text': 'Transcribed phone instruction'};
+      case 'ears.process':
+        lastEarsPayload = payload;
+        await earsGate?.future;
+        if (earsCancelled) {
+          throw StateError('EARS transcription was cancelled.');
+        }
+        return <String, Object?>{
+          'texts': <Object?>['Transcribed phone instruction']
+        };
+      case 'ears.cancel':
+        lastEarsCancelPayload = payload;
+        earsCancelled = true;
+        earsGate?.complete();
+        return <String, Object?>{'cancelled': true};
       case 'message_queue.enqueue':
         lastQueuePayload = payload;
         final uploaded = lastAttachmentUploadPayload;

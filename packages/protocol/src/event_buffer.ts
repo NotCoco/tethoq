@@ -37,6 +37,7 @@ export class EventDeduper {
 
 export class EventReplayBuffer {
   readonly #events: AgentEvent[] = [];
+  readonly #listeners = new Set<() => void>();
   #sequence = 0;
 
   public constructor(
@@ -69,7 +70,13 @@ export class EventReplayBuffer {
     };
     this.#events.push(event);
     if (this.#events.length > this.capacity) this.#events.splice(0, this.#events.length - this.capacity);
+    for (const listener of this.#listeners) listener();
     return event;
+  }
+
+  public subscribe(listener: () => void): () => void {
+    this.#listeners.add(listener);
+    return () => { this.#listeners.delete(listener); };
   }
 
   public since(sequence: number): readonly AgentEvent[] {

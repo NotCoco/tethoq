@@ -21,7 +21,7 @@ function session(state: RemoteSession["state"], overrides: Partial<RemoteSession
 
 test("refresh reconciliation preserves a known cached state when the provider reports unknown", () => {
   const cache = new SessionCache();
-  cache.upsert(session("working"));
+  cache.upsert(session("needs_approval"));
 
   cache.reconcileProvider("fake", [session("unknown", {
     title: "Refreshed title",
@@ -30,9 +30,43 @@ test("refresh reconciliation preserves a known cached state when the provider re
   })]);
 
   const reconciled = cache.get("host/fake/session-one");
-  assert.equal(reconciled?.state, "working");
+  assert.equal(reconciled?.state, "needs_approval");
   assert.equal(reconciled?.title, "Refreshed title");
   assert.equal(reconciled?.stale, false);
+});
+
+test("a working session settles through an unknown listing once its turn is no longer in flight", () => {
+  const cache = new SessionCache();
+  cache.upsert(session("working"));
+  cache.reconcileProvider("fake", [session("unknown", { lastActivityAt: "2026-08-10T11:00:00.000Z" })]);
+  assert.equal(cache.get("host/fake/session-one")?.state, "unknown", "stale working must not survive a listing that cannot report state");
+
+  const busy = new SessionCache({ preserveWorking: () => true });
+  busy.upsert(session("working"));
+  busy.reconcileProvider("fake", [session("unknown", { lastActivityAt: "2026-08-10T11:00:00.000Z" })]);
+  assert.equal(busy.get("host/fake/session-one")?.state, "working", "an in-flight turn must not be downgraded");
+});
+
+test("provider status follows canonical refreshes and supports an explicit clear", () => {
+  const cache = new SessionCache();
+  const retry = {
+    kind: "retry" as const,
+    message: "The provider is temporarily rate limited.",
+    retryAt: "2026-08-10T10:00:05.000Z",
+  };
+  cache.upsert(session("working", { providerStatus: retry }));
+  assert.deepEqual(cache.get("host/fake/session-one")?.providerStatus, retry);
+
+  cache.updateProviderStatus("host/fake/session-one", null);
+  assert.equal(cache.get("host/fake/session-one")?.providerStatus, undefined);
+
+  cache.updateProviderStatus("host/fake/session-one", retry);
+  cache.reconcileProvider("fake", [session("working")]);
+  assert.equal(
+    cache.get("host/fake/session-one")?.providerStatus,
+    undefined,
+    "a provider refresh that omits a transient status must clear the cached copy",
+  );
 });
 
 test("runtime metadata survives a sparse refresh and cached child sessions survive root reconciliation", () => {
@@ -70,7 +104,21 @@ test("runtime metadata survives a sparse refresh and cached child sessions survi
   assert.equal(cache.get(parent.id)?.nativeMetadata.tethoqHandoffPending, false);
   assert.equal(cache.get(child.id)?.parentSessionId, parent.id);
   assert.equal(cache.get(child.id)?.agentNickname, "Curie");
-  assert.deepEqual(cache.get(child.id)?.relationship, {
+  assert.equal(cache.get(child.id)?.relationship, undefined);
+});
+
+test("only explicit helper roles infer a hidden subagent relationship", () => {
+  const cache = new SessionCache();
+  const parent = session("idle", { id: "host/fake/parent", providerSessionId: "parent" });
+  const helper = session("working", {
+    id: "host/fake/helper",
+    providerSessionId: "helper",
+    parentSessionId: parent.id,
+    agentRole: "cross_harness_delegate",
+  });
+  cache.upsert(parent);
+  cache.upsert(helper);
+  assert.deepEqual(cache.get(helper.id)?.relationship, {
     kind: "subagent",
     sourceSessionId: parent.id,
     strategy: "native",
@@ -107,4 +155,90 @@ test("child reconciliation is scoped to one parent and handles reparenting and r
   cache.reconcileChildren(parentB.id, [unrelated]);
   assert.equal(cache.get(child.id), undefined);
   assert.equal(cache.get(unrelated.id)?.parentSessionId, parentB.id);
+});
+
+test("what the harness reports it is running outranks anything remembered locally", () => {
+  const cache = new SessionCache();
+  cache.upsert(session("idle", { modelId: "grok-4.6" }));
+
+  // Until the harness says otherwise, the dispatched choice stands in for it.
+  cache.rememberRequestedSelection("host/fake/session-one", { modelId: "grok-4.6", reasoningEffort: "xhigh" });
+  assert.equal(cache.get("host/fake/session-one")?.reasoningEffort, "xhigh");
+
+  // The harness then reports the level it is actually running, which wins. A
+  // remembered value that outranked this is how a level changed inside the
+  // harness stayed invisible in Tethoq forever.
+  cache.reconcileProvider("fake", [session("working", { modelId: "grok-4.6", reasoningEffort: "medium" })]);
+  assert.equal(cache.get("host/fake/session-one")?.reasoningEffort, "medium");
+});
+
+test("a remembered effort fills the gap only while the harness reports none", () => {
+  const cache = new SessionCache();
+  cache.upsert(session("idle", { modelId: "grok-4.6" }));
+  cache.rememberRequestedSelection("host/fake/session-one", { reasoningEffort: "xhigh" });
+
+  cache.reconcileProvider("fake", [session("working", { modelId: "grok-4.6" })]);
+
+  assert.equal(cache.get("host/fake/session-one")?.reasoningEffort, "xhigh");
+});
+
+test("switching model drops an effort chosen for the previous model", () => {
+  const cache = new SessionCache();
+  cache.upsert(session("idle"));
+
+  cache.rememberRequestedSelection("host/fake/session-one", { modelId: "grok-4.6", reasoningEffort: "xhigh" });
+  cache.rememberRequestedSelection("host/fake/session-one", { modelId: "grok-4.5" });
+
+  const current = cache.get("host/fake/session-one");
+  assert.equal(current?.modelId, "grok-4.5");
+  assert.equal(current?.reasoningEffort, undefined);
+});
+
+test("a remembered selection is forgotten once the session leaves the provider listing", () => {
+  const cache = new SessionCache();
+  cache.upsert(session("idle"));
+  cache.rememberRequestedSelection("host/fake/session-one", { reasoningEffort: "xhigh" });
+
+  cache.reconcileProvider("fake", []);
+  cache.upsert(session("idle", { reasoningEffort: "high" }));
+
+  assert.equal(cache.get("host/fake/session-one")?.reasoningEffort, "high");
+});
+
+test("a level learned from the harness is kept so the next start is not blind", () => {
+  const written: Array<Readonly<Record<string, unknown>>> = [];
+  const cache = new SessionCache({ onSelectionsChange: (selections) => written.push(selections) });
+
+  // Opening the chat is when a harness like Grok finally reveals the level.
+  cache.upsert(session("idle", { modelId: "grok-4.6", reasoningEffort: "xhigh" }));
+
+  assert.equal(cache.knownSelections()["host/fake/session-one"]?.reasoningEffort, "xhigh");
+  assert.equal(cache.knownSelections()["host/fake/session-one"]?.source, "reported");
+  assert.ok(written.length > 0);
+});
+
+test("a restart shows the last level the harness reported, before any chat is opened", () => {
+  const learned = new SessionCache();
+  learned.upsert(session("idle", { modelId: "grok-4.6", reasoningEffort: "xhigh" }));
+  const persisted = learned.knownSelections();
+
+  // Next run: the listing carries no level at all, which is exactly what Grok's
+  // session/list returns. Without this the composer fell back to the default.
+  const restarted = new SessionCache();
+  restarted.restoreSelections(persisted);
+  restarted.reconcileProvider("fake", [session("idle")]);
+
+  assert.equal(restarted.get("host/fake/session-one")?.reasoningEffort, "xhigh");
+  assert.equal(restarted.get("host/fake/session-one")?.modelId, "grok-4.6");
+});
+
+test("a level changed inside the harness replaces the remembered one", () => {
+  const cache = new SessionCache();
+  cache.upsert(session("idle", { modelId: "grok-4.6", reasoningEffort: "xhigh" }));
+
+  // The user switches to low in Grok's own interface; it reports that next time.
+  cache.reconcileProvider("fake", [session("idle", { modelId: "grok-4.6", reasoningEffort: "low" })]);
+
+  assert.equal(cache.get("host/fake/session-one")?.reasoningEffort, "low");
+  assert.equal(cache.knownSelections()["host/fake/session-one"]?.reasoningEffort, "low");
 });

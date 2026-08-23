@@ -2,7 +2,7 @@
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { parseGlobalSessionId } from "../../protocol/src/index.js";
-import { messagesFromCodexThread, normalizeCodexThread } from "./normalize.js";
+import { codexUserContentParts, messagesFromCodexThread, normalizeCodexThread } from "./normalize.js";
 import type { CodexThread, ThreadListResponse } from "./wire.js";
 
 test("Codex fixture normalizes a generated-schema thread without losing native identity", async () => {
@@ -20,6 +20,33 @@ test("Codex fixture normalizes a generated-schema thread without losing native i
     providerId: "codex",
     providerSessionId: thread.id,
   });
+});
+
+test("Codex preserves native audio and audio-only user messages", () => {
+  const audio = { type: "audio", url: "data:audio/mpeg;base64,AQID" };
+  assert.deepEqual(codexUserContentParts([audio]), [{
+    type: "audio",
+    uri: audio.url,
+    mimeType: "audio/mpeg",
+    name: "Recording.mp3",
+  }]);
+
+  const messages = messagesFromCodexThread("host-audio", {
+    id: "thread-audio",
+    sessionId: "thread-audio",
+    preview: "",
+    modelProvider: "openai",
+    createdAt: 1_760_000_000,
+    updatedAt: 1_760_000_001,
+    recencyAt: 1_760_000_001,
+    status: { type: "idle" },
+    cwd: "/workspace",
+    cliVersion: "fixture",
+    turns: [{ id: "turn-audio", items: [{ id: "user-audio", type: "userMessage", content: [audio] }] }],
+  });
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0]?.role, "user");
+  assert.equal(messages[0]?.parts[0]?.type, "audio");
 });
 test("Codex session status distinguishes unavailable, idle, working, and failed states", () => {
   const thread = {
@@ -208,7 +235,7 @@ test("Codex history never flattens unknown structured traces into assistant pros
 
   assert.equal(messages.length, 1);
   assert.equal(messages[0]?.providerMessageId, "compact-1");
-  assert.deepEqual(messages[0]?.parts, [{ type: "text", text: "Context compacted" }]);
+  assert.deepEqual(messages[0]?.parts, [{ type: "text", text: "Session compacted" }]);
   assert.equal(JSON.stringify(messages).includes("full raw DOM trace"), false);
   assert.equal(JSON.stringify(messages).includes("secret metadata"), false);
 });

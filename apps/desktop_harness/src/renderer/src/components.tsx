@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState, type ButtonHTMLAttributes, type ReactNode } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type ButtonHTMLAttributes, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import {
   AgentIcon,
   AlertIcon,
@@ -63,13 +63,13 @@ function ProviderGlyph({ providerId }: { providerId: ProviderId }) {
   }
 }
 
-export function ProviderLogo({ providerId, provider, size = 28 }: { providerId: ProviderFilter; provider?: Pick<Provider, "id" | "name" | "iconDataUrl"> | undefined; size?: number }) {
-  if (providerId === "all") return <span className="provider-logo provider-logo-all" data-tooltip="All agents" style={{ width: size, height: size }}><GridIcon /></span>;
+export function ProviderLogo({ providerId, provider, size = 28, tooltip }: { providerId: ProviderFilter; provider?: Pick<Provider, "id" | "name" | "iconDataUrl"> | undefined; size?: number; tooltip?: string | false }) {
+  if (providerId === "all") return <span className="provider-logo provider-logo-all" {...(tooltip === false ? {} : { "data-tooltip": tooltip ?? "All agents" })} style={{ width: size, height: size }}><GridIcon /></span>;
   const name = providerDisplayName(providerId, provider);
   const icon = provider?.iconDataUrl;
   const accessibleName = providerId === "codex" ? "OpenAI Codex" : name;
   const glyph = ProviderGlyph({ providerId });
-  return <span className="provider-logo" data-provider-id={providerId} data-tooltip={accessibleName} style={{ width: size, height: size }} aria-label={`${accessibleName} provider`}>{icon ? <img src={icon} alt="" /> : glyph ?? <span>{providerInitials(name)}</span>}</span>;
+  return <span className="provider-logo" data-provider-id={providerId} {...(tooltip === false ? {} : { "data-tooltip": tooltip ?? accessibleName })} style={{ width: size, height: size }} aria-label={`${accessibleName} provider`}>{icon ? <img src={icon} alt="" /> : glyph ?? <span>{providerInitials(name)}</span>}</span>;
 }
 
 export function ProviderLabel({ providerId, provider, secondary }: { providerId: ProviderFilter; provider?: Pick<Provider, "id" | "name" | "iconDataUrl"> | undefined; secondary?: string }) {
@@ -162,13 +162,51 @@ export function ErrorBanner({ title, message, onRetry }: { title: string; messag
   return <div className="error-banner" role="alert"><AlertIcon /><div><strong>{title}</strong><p>{message}</p></div>{onRetry ? <Button onClick={onRetry}>Try again</Button> : null}</div>;
 }
 
-export function Modal({ title, eyebrow, children, onClose, wide = false }: { title: string; eyebrow?: string; children: ReactNode; onClose: () => void; wide?: boolean }) {
-  useEffect(() => {
-    const close = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
-    window.addEventListener("keydown", close);
-    return () => window.removeEventListener("keydown", close);
-  }, [onClose]);
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) onClose(); }}><section className={`modal ${wide ? "modal-wide" : ""}`} role="dialog" aria-modal="true" aria-label={title}>{eyebrow ? <p className="eyebrow">{eyebrow}</p> : null}<h2>{title}</h2>{children}</section></div>;
+const focusableSelector = "a[href], area[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex=\"-1\"])";
+
+export function Modal({ title, label, eyebrow, children, onClose, wide = false }: { title: string; label?: string; eyebrow?: string; children: ReactNode; onClose: () => void; wide?: boolean }) {
+  const dialog = useRef<HTMLElement>(null);
+  const opener = useRef<HTMLElement | null>(null);
+  const closeRef = useRef(onClose);
+  const titleId = useId();
+  closeRef.current = onClose;
+
+  useLayoutEffect(() => {
+    opener.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const first = dialog.current?.querySelector<HTMLElement>(focusableSelector);
+    (first ?? dialog.current)?.focus();
+    return () => {
+      const target = opener.current;
+      if (target && target.isConnected) target.focus();
+    };
+  }, []);
+
+  const handleKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeRef.current();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const items = [...(dialog.current?.querySelectorAll<HTMLElement>(focusableSelector) ?? [])]
+      .filter((item) => item.offsetParent !== null || item === document.activeElement);
+    if (!items.length) {
+      event.preventDefault();
+      dialog.current?.focus();
+      return;
+    }
+    const first = items[0]!;
+    const last = items[items.length - 1]!;
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) closeRef.current(); }}><section ref={dialog} className={`modal ${wide ? "modal-wide" : ""}`} role="dialog" aria-modal="true" {...(label ? { "aria-label": label } : title ? { "aria-labelledby": titleId } : {})} tabIndex={-1} onKeyDown={handleKeyDown}>{eyebrow ? <p className="eyebrow">{eyebrow}</p> : null}{title ? <h2 id={titleId}>{title}</h2> : null}{children}</section></div>;
 }
 
 export function Toast({ message, tone = "normal" }: { message: string; tone?: "normal" | "error" }) {

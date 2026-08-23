@@ -1,13 +1,22 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { makeGlobalSessionId, type ProviderCapabilities, type RemoteSession } from "../../protocol/src/index.js";
-import { collectAllSessionPages, providerPromptContent, providerPromptWorkflows, stripProviderPromptGuidance, type AgentProviderAdapter, type PaginatedSessions } from "./index.js";
+import { collectAllSessionPages, hiddenProviderControlContent, providerPromptContent, providerPromptWorkflows, stripProviderPromptGuidance, type AgentProviderAdapter, type PaginatedSessions } from "./index.js";
 
 test("provider prompt fallback keeps developer guidance separable from visible history", () => {
   const prompt = providerPromptContent({ content: "Visible request", developerInstructions: "Hidden response guidance" });
   assert.match(prompt, /Hidden response guidance/u);
   assert.equal(stripProviderPromptGuidance(prompt), "Visible request");
   assert.equal(stripProviderPromptGuidance("Ordinary request"), "Ordinary request");
+});
+
+test("private control turns give providers a non-empty prompt but normalize to no visible text", () => {
+  const prompt = providerPromptContent({
+    content: hiddenProviderControlContent("mesh-result:delegation-1"),
+    developerInstructions: "Private mesh result metadata.",
+  });
+  assert.match(prompt, /Private mesh result metadata/u);
+  assert.equal(stripProviderPromptGuidance(prompt), "");
 });
 
 test("workflow guidance stays hidden while its display reference survives normalization", () => {

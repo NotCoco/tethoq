@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import type { TaskOverride } from "@shared/desktop_api";
 import { MAX_TASK_TITLE_CHARACTERS } from "@shared/desktop_api";
 import { EmptyState, ProviderLogo, providerDisplayName, relativeTime } from "./components";
-import { ArchiveIcon, BranchIcon, ChatIcon, CheckIcon, ChevronDownIcon, FolderIcon, GridIcon, InfoIcon, PinIcon, PlusIcon, RenameIcon, SearchIcon, SettingsIcon, SlidersIcon, XIcon } from "./icons";
+import { listChildSessions } from "./bridge";
+import { ArchiveIcon, BranchIcon, ChatIcon, CheckIcon, ChevronDownIcon, ChevronRightIcon, FolderIcon, GridIcon, InfoIcon, PinIcon, PlusIcon, RenameIcon, SearchIcon, SettingsIcon, SlidersIcon, XIcon } from "./icons";
 import { maximumUiSearchCharacters } from "./search_helpers";
 import type { Provider, ProviderFilter, ProviderFilterSelection, ProviderId, Session, SessionState } from "./types";
 
@@ -69,10 +71,13 @@ export interface SidebarProps {
   view: NavigationView;
   connected: boolean;
   hostName: string;
+  /** Shown in the runtime indicator's own info box rather than stamped on the rail. */
+  appVersion?: string | undefined;
   onQuery: (value: string) => void;
   onFilter: (value: SessionFilter) => void;
   onProvider: (value: ProviderFilterSelection) => void;
   onOpen: (id: string) => void;
+  onOpenChild: (session: Session) => void;
   onBranch: (id: string) => void;
   onOpenDirectory: (path: string) => void;
   onView: (view: NavigationView) => void;
@@ -92,7 +97,7 @@ export interface SidebarProps {
 
 export interface SideChatAnchor { readonly x: number; readonly y: number }
 
-export function Sidebar({ sessions, allSessions, providers, selected, selectedProvider, query, stateFilter, view, connected, hostName, onQuery, onFilter, onProvider, onOpen, onBranch, onOpenDirectory, onView, onNewTask, onCommandSearch, showSideChats, activeSideChatIds, onShowSideChats, onCreateSideChat, onOpenSideChat, onSideChatAnchor, showArchived, archivedCount, onShowArchived, onTaskOverride }: SidebarProps) {
+export function Sidebar({ sessions, allSessions, providers, selected, selectedProvider, query, stateFilter, view, connected, hostName, appVersion, onQuery, onFilter, onProvider, onOpen, onOpenChild, onBranch, onOpenDirectory, onView, onNewTask, onCommandSearch, showSideChats, activeSideChatIds, onShowSideChats, onCreateSideChat, onOpenSideChat, onSideChatAnchor, showArchived, archivedCount, onShowArchived, onTaskOverride }: SidebarProps) {
   const [searchOpen, setSearchOpen] = useState(false);
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [sessionMenu, setSessionMenu] = useState<{ sessionId: string; title: string; workingDirectory: string; x: number; y: number } | null>(null);
@@ -234,11 +239,13 @@ export function Sidebar({ sessions, allSessions, providers, selected, selectedPr
   };
   return <aside className={`sidebar sidebar-view-${view}`}>
     <div className="new-task-row">
-      <button className="new-task-button" onClick={onNewTask} aria-label="New task"><PlusIcon /><span>New task</span></button>
+      <button className="new-task-button" onClick={onNewTask} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); onNewTask(); } }} aria-label="New task"><PlusIcon /><span>New task</span></button>
       <button className="sidebar-command-search" type="button" onClick={onCommandSearch} aria-label="Search tasks or run a command" data-tooltip="Commands · Ctrl K"><SearchIcon /></button>
     </div>
     <nav className="primary-nav" aria-label="Primary">
-      <button className={view === "dashboard" ? "active" : ""} onClick={() => onView("dashboard")}><GridIcon /><span>Dashboard</span></button>
+      {/* Highlight follows the pointer, matching Settings. The current view stays
+          announced for assistive tech without a permanent lit-up chip. */}
+      <button {...(view === "dashboard" ? { "aria-current": "page" as const } : {})} onClick={() => onView("dashboard")}><GridIcon /><span>Dashboard</span></button>
     </nav>
 
     <section className="sidebar-tasks" aria-label="Tasks">
@@ -255,7 +262,8 @@ export function Sidebar({ sessions, allSessions, providers, selected, selectedPr
             <section><header><strong>Agent</strong>{selectedProviderKeys.length ? <button onClick={() => chooseProvider("all")}>Clear</button> : null}</header><div className="task-filter-options provider-options" role="group" aria-label="Agent filters">{providerOptions.map((option) => {
               const isSingleSelection = !Array.isArray(selectedProvider) && selectedProvider === option.id;
               const isIncluded = selectedProviderKeys.includes(option.id);
-              const unavailable = option.kind === "provider" && !option.available;
+              const hasSessions = allSessions.some((session) => session.providerId === option.id);
+              const unavailable = option.kind === "provider" && !option.available && !hasSessions;
               return <div key={option.id} className={`provider-filter-option ${option.available ? "available" : "unavailable"} ${isSingleSelection ? "selected" : ""} ${isIncluded ? "included" : ""}`}>
                 <button className="provider-filter-primary" type="button" disabled={unavailable} aria-pressed={isSingleSelection} onClick={() => chooseProvider(option.id)}>
                   {option.kind === "available" ? <AvailableAgentsIcon /> : <ProviderLogo providerId={option.id} {...(option.provider ? { provider: option.provider } : {})} size={22}/>}<span>{option.label}</span>
@@ -271,7 +279,7 @@ export function Sidebar({ sessions, allSessions, providers, selected, selectedPr
             <footer>{sessions.length} matching {sessions.length === 1 ? "task" : "tasks"}</footer>
           </div> : null}
         </div>
-        <button type="button" onClick={onNewTask} aria-label="New task" data-tooltip="New task"><PlusIcon /></button>
+        <button type="button" onClick={onNewTask} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); onNewTask(); } }} aria-label="New task" data-tooltip="New task"><PlusIcon /></button>
       </header>
       <div className="session-list-scroll" ref={sessionList}>
         {sessions.length ? sessions.map((session) => {
@@ -279,7 +287,7 @@ export function Sidebar({ sessions, allSessions, providers, selected, selectedPr
           const expanded = expandedSideChatParents.has(session.id);
           const visibleSideChats = showSideChats ? (expanded ? allSideChats : allSideChats.slice(0, 2)) : [];
           return <div className={`session-row-group ${visibleSideChats.length ? "has-side-chats" : ""}`} key={session.id}>
-          <SessionRow session={session} provider={providerFor(providers, session.providerId)} selected={session.id === selected} renaming={renamingSessionId === session.id} onRename={(title) => { setRenamingSessionId(null); onTaskOverride(session.id, { title }); }} onCancelRename={() => setRenamingSessionId(null)} onOpen={() => { setSessionMenu(null); onOpen(session.id); }} onContextMenu={(event) => {
+          <SessionRow session={session} provider={providerFor(providers, session.providerId)} providers={providers} selected={session.id === selected} renaming={renamingSessionId === session.id} onOpenChild={onOpenChild} onRename={(title) => { setRenamingSessionId(null); onTaskOverride(session.id, { title }); }} onCancelRename={() => setRenamingSessionId(null)} onOpen={() => { setSessionMenu(null); onOpen(session.id); }} onContextMenu={(event) => {
           event.preventDefault();
           const bounds = event.currentTarget.getBoundingClientRect();
           const x = event.clientX || bounds.left + 24;
@@ -324,7 +332,7 @@ export function Sidebar({ sessions, allSessions, providers, selected, selectedPr
           setSessionMenu(null);
           if (path) onOpenDirectory(path);
         }}><FolderIcon /><span>Open in File Explorer</span></button>
-        <button type="button" role="menuitem" disabled={!menuSession || menuSession.draft === true} onClick={() => {
+        <button type="button" role="menuitem" disabled={!menuSession} onClick={() => {
           const sessionId = sessionMenu.sessionId;
           const archived = menuSession?.archived === true;
           setSessionMenu(null);
@@ -335,7 +343,11 @@ export function Sidebar({ sessions, allSessions, providers, selected, selectedPr
 
     <div className="sidebar-footer">
       <button className="sidebar-settings" type="button" aria-label={view === "settings" ? "Close settings" : "Open settings"} onClick={() => onView("settings")}><SettingsIcon /><span>Settings</span></button>
-      <span className={`sidebar-runtime-indicator ${connected ? "connected" : "offline"}`} role="status" aria-label={`${hostName}. Runtime ${connected ? "online" : "offline"}`} data-tooltip={`${hostName} · Runtime ${connected ? "online" : "offline"}`} />
+      {/* The version belongs with the thing it describes. Stamped on the rail it was
+          a number floating in the corner of every screen for the one moment a year
+          anybody needs it; here it is a line in the box that already answers "what is
+          this dot telling me". */}
+      <span className={`sidebar-runtime-indicator ${connected ? "connected" : "offline"}`} role="status" aria-label={`${hostName}. Runtime ${connected ? "online" : "offline"}${appVersion ? `. Tethoq version ${appVersion}` : ""}`} data-tooltip={`${hostName} · Runtime ${connected ? "online" : "offline"}${appVersion ? ` · Tethoq v${appVersion}` : ""}`} />
     </div>
   </aside>;
 }
@@ -373,7 +385,139 @@ function TaskNameField({ value, onCommit, onCancel }: { value: string; onCommit:
   />;
 }
 
-function SessionRow({ session, provider, selected, renaming, onRename, onCancelRename, onOpen, onContextMenu }: { session: Session; provider?: Provider | undefined; selected: boolean; renaming: boolean; onRename: (title: string) => void; onCancelRename: () => void; onOpen: () => void; onContextMenu: (event: ReactMouseEvent<HTMLElement>) => void }) {
+function sidebarChildStateLabel(state: Session["state"]): string {
+  if (state === "working") return "Working";
+  if (state === "needs_approval") return "Needs approval";
+  if (state === "needs_input") return "Needs input";
+  if (state === "failed") return "Stopped with an issue";
+  if (state === "offline") return "Offline";
+  return state === "completed" ? "Completed" : "Idle";
+}
+
+function SessionSubagentControl({ session, providers, onOpenChild }: { session: Session; providers: readonly Provider[]; onOpenChild: (session: Session) => void }) {
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [children, setChildren] = useState<readonly Session[]>([]);
+  const [childrenLoaded, setChildrenLoaded] = useState(false);
+  const [popoverStyle, setPopoverStyle] = useState<CSSProperties>({});
+  const [tooltipActive, setTooltipActive] = useState(false);
+  const [tooltipStyle, setTooltipStyle] = useState<CSSProperties>({});
+  const root = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const popoverId = `session-subagents-${session.id}`;
+  const close = () => {
+    setOpen(false);
+    requestAnimationFrame(() => trigger.current?.focus());
+  };
+  const closeFromOutside = () => setOpen(false);
+  const providerId = session.childProviderIds?.[0] ?? "opencode";
+  const provider = providers.find((candidate) => candidate.id === providerId);
+  const displayedChildCount = childrenLoaded ? children.length : session.childCount;
+  const countLabel = `${displayedChildCount} sub-agent${displayedChildCount === 1 ? "" : "s"}`;
+  const positionTooltip = () => {
+    const bounds = trigger.current?.getBoundingClientRect();
+    if (!bounds) return;
+    const right = Math.max(8, window.innerWidth - bounds.right);
+    if (bounds.bottom + 40 <= window.innerHeight - 8) {
+      setTooltipStyle({ right, top: bounds.bottom + 8 });
+    } else {
+      setTooltipStyle({ right, bottom: window.innerHeight - bounds.top + 8 });
+    }
+  };
+  useEffect(() => {
+    if (!tooltipActive) return;
+    positionTooltip();
+    window.addEventListener("resize", positionTooltip);
+    document.addEventListener("scroll", positionTooltip, true);
+    return () => {
+      window.removeEventListener("resize", positionTooltip);
+      document.removeEventListener("scroll", positionTooltip, true);
+    };
+  }, [tooltipActive]);
+  useEffect(() => {
+    if (!open) return;
+    const position = () => {
+      const bounds = root.current?.getBoundingClientRect();
+      if (!bounds) return;
+      const gap = 6;
+      const viewportInset = 8;
+      const popoverWidth = 270;
+      const availableAbove = Math.max(0, bounds.top - viewportInset - gap);
+      const availableBelow = Math.max(0, window.innerHeight - bounds.bottom - viewportInset - gap);
+      const openAbove = availableAbove >= Math.min(260, availableBelow);
+      const maxHeight = Math.max(80, Math.min(260, openAbove ? availableAbove : availableBelow));
+      setPopoverStyle({
+        left: Math.max(viewportInset, Math.min(window.innerWidth - popoverWidth - viewportInset, bounds.right + gap)),
+        maxHeight,
+        ...(openAbove
+          ? { top: "auto", bottom: window.innerHeight - bounds.top + gap }
+          : { top: bounds.bottom + gap, bottom: "auto" }),
+      });
+    };
+    const closeOutside = (event: PointerEvent) => { if (!root.current?.contains(event.target as Node)) closeFromOutside(); };
+    const closeEscape = (event: KeyboardEvent) => { if (event.key === "Escape") close(); };
+    position();
+    document.addEventListener("pointerdown", closeOutside);
+    document.addEventListener("keydown", closeEscape);
+    window.addEventListener("resize", position);
+    document.addEventListener("scroll", position, true);
+    return () => {
+      document.removeEventListener("pointerdown", closeOutside);
+      document.removeEventListener("keydown", closeEscape);
+      window.removeEventListener("resize", position);
+      document.removeEventListener("scroll", position, true);
+    };
+  }, [open]);
+  useEffect(() => {
+    if (!open) return;
+    let disposed = false;
+    let inFlight = false;
+    const refreshChildren = async (initial: boolean) => {
+      if (inFlight) return;
+      inFlight = true;
+      if (initial) setLoading(true);
+      try {
+        const next = await listChildSessions(session.id);
+        if (!disposed) {
+          setChildren(next);
+          setChildrenLoaded(true);
+        }
+      } catch {
+        if (!disposed && initial) setChildren([]);
+      } finally {
+        inFlight = false;
+        if (!disposed && initial) setLoading(false);
+      }
+    };
+    void refreshChildren(true);
+    // Child state can change in a provider other than the parent's provider.
+    // Refresh only while this small live view is open, and never overlap reads.
+    const timer = window.setInterval(() => { void refreshChildren(false); }, 1_500);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [open, session.id]);
+  if (!displayedChildCount) return null;
+  return <div className={`session-subagents ${open ? "open" : ""}`} ref={root}>
+    <button ref={trigger} type="button" className="session-subagents-trigger" aria-label={countLabel} aria-haspopup="dialog" aria-expanded={open} aria-controls={popoverId} aria-describedby={tooltipActive && !open ? `session-subagents-tooltip-${session.id}` : undefined} onPointerEnter={() => { positionTooltip(); setTooltipActive(true); }} onPointerLeave={() => setTooltipActive(false)} onFocus={() => { positionTooltip(); setTooltipActive(true); }} onBlur={() => setTooltipActive(false)} onClick={(event) => { event.stopPropagation(); if (open) close(); else setOpen(true); }}>
+      <ProviderLogo providerId={providerId} {...(provider ? { provider } : {})} size={18} tooltip={false}/><span>{displayedChildCount}</span><ChevronDownIcon />
+    </button>
+    {tooltipActive && !open ? createPortal(<span id={`session-subagents-tooltip-${session.id}`} className="session-subagents-tooltip visible" role="tooltip" style={tooltipStyle}>{countLabel}</span>, document.body) : null}
+    {open ? <section id={popoverId} className="session-subagents-popover" style={popoverStyle} role="dialog" aria-modal="false" aria-label={`Sub-agents for ${session.title}`}>
+      {loading ? <p><span className="spinner" /> Loading sub-agents…</p> : children.map((child) => {
+        const childProvider = providers.find((candidate) => candidate.id === child.providerId);
+        return <button type="button" key={child.id} onClick={() => { close(); onOpenChild(child); }}>
+          <ProviderLogo providerId={child.providerId} {...(childProvider ? { provider: childProvider } : {})} size={20}/>
+          <span><strong>{child.agentNickname || child.title}</strong><small>{child.model} · {sidebarChildStateLabel(child.state)}</small></span>
+          {child.state === "working" ? <span className="spinner" aria-hidden="true" /> : null}<ChevronRightIcon />
+        </button>;
+      })}{!loading && children.length === 0 ? <p>No sub-agents available.</p> : null}
+    </section> : null}
+  </div>;
+}
+
+function SessionRow({ session, provider, providers, selected, renaming, onRename, onCancelRename, onOpen, onOpenChild, onContextMenu }: { session: Session; provider?: Provider | undefined; providers: readonly Provider[]; selected: boolean; renaming: boolean; onRename: (title: string) => void; onCancelRename: () => void; onOpen: () => void; onOpenChild: (session: Session) => void; onContextMenu: (event: ReactMouseEvent<HTMLElement>) => void }) {
   const location = session.workingDirectory || session.project;
   const content = <>
     <div className="session-row-top">
@@ -388,6 +532,10 @@ function SessionRow({ session, provider, selected, renaming, onRename, onCancelR
     <div className="session-row-meta"><span className="session-location" title={location} aria-label={`${session.project}. Working directory: ${location}`}><FolderIcon />{session.project}</span>{session.pinned ? <span>Pinned</span> : null}{session.archived ? <span>Archived</span> : null}{session.unread ? <b className="unread-count">{session.unread}</b> : null}</div>
   </>;
   const className = `session-row ${selected ? "selected" : ""} ${session.archived ? "archived" : ""} ${renaming ? "renaming" : ""}`;
-  if (renaming) return <div data-session-id={session.id} className={className} onContextMenu={onContextMenu}>{content}</div>;
-  return <button type="button" data-session-id={session.id} className={className} aria-current={selected ? "page" : undefined} onClick={onOpen} onContextMenu={onContextMenu}>{content}</button>;
+  return <div className="session-row-shell" data-session-id={session.id} onContextMenu={onContextMenu}>
+    {renaming
+      ? <div className={className}>{content}</div>
+      : <button type="button" className={className} aria-current={selected ? "page" : undefined} onClick={onOpen}>{content}</button>}
+    <SessionSubagentControl session={session} providers={providers} onOpenChild={onOpenChild}/>
+  </div>;
 }

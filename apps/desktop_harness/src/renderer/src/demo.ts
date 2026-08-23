@@ -25,7 +25,7 @@ export const providers: Provider[] = [
     detected: true,
     authenticated: true,
     executable: "opencode.exe",
-    capabilities: ["List Sessions", "Session History", "Create Session", "Send Message", "Models", "Approvals", "Sub-agents", "Interrupt"],
+    capabilities: ["List Sessions", "Session History", "Create Session", "Send Message", "Models", "Approvals", "Steering", "Sub-agents", "Interrupt"],
     supportsAttachments: true,
   },
   {
@@ -111,7 +111,7 @@ export const demoBootstrap: DesktopBootstrap = {
     lastSeenAt: new Date(now).toISOString(),
     relayConnected: false,
   },
-  providers: providers.map((provider) => demoConnection(provider, provider.id === "tethoq-example" ? { steering: true } : {})),
+  providers: providers.map((provider) => demoConnection(provider, provider.id === "tethoq-example" || provider.id === "opencode" ? { steering: true } : {})),
   allowedProviders: providers.map((provider) => provider.id),
   connectors: {
     directory: "C:\\Tethoq\\connectors",
@@ -222,6 +222,18 @@ export const sessions: Session[] = [
     model: "Grok Code",
     effort: "Default",
   },
+  {
+    id: "voice-notes",
+    providerId: "direct",
+    title: "Listen to my recording",
+    state: "completed",
+    project: "Voice notes",
+    workingDirectory: "C:\\Projects\\voice-notes",
+    preview: "The model heard the recording and answered in context.",
+    updatedAt: ago(70),
+    model: "openai::gpt-5.6-sol",
+    effort: "High",
+  },
 ];
 
 const desktopTimeline: TimelineItem[] = [
@@ -322,6 +334,21 @@ export const demoSnapshot: DesktopSnapshot = {
     ],
     cache: [],
     checkout: [],
+    "voice-notes": [
+      {
+        id: "voice-user",
+        kind: "user",
+        body: "",
+        audio: [{ name: "dictation-2026-08-17.mp3", mimeType: "audio/mpeg", dataUrl: "data:audio/wav;base64,UklGRiRLAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQBLAAAAAAAA", durationSeconds: 0.6, dictation: true }],
+        timestamp: ago(72),
+      },
+      {
+        id: "voice-assistant",
+        kind: "assistant",
+        body: "I listened to your recording. The plan is to ship the direct-audio dictate option only for models whose input modalities include audio, and to keep the MP3 out of the visible message text.",
+        timestamp: ago(70),
+      },
+    ],
     release: [
       {
         id: "release-error",
@@ -360,13 +387,20 @@ export const demoSnapshot: DesktopSnapshot = {
   ],
   models: {
     codex: [
-      { id: "gpt-5.6-sol", name: "GPT-5.6 Sol", efforts: ["Low", "Medium", "High", "Ultra"] },
+      { id: "gpt-5.6-sol", name: "GPT-5.6 Sol", efforts: ["Low", "Medium", "High", "Ultra"], inputModalities: ["text", "image"] },
       { id: "gpt-5.6-terra", name: "GPT-5.6 Terra", efforts: ["Low", "Medium", "High", "Ultra"] },
     ],
-    opencode: [{ id: "openai/gpt-5.5", name: "GPT-5.5", efforts: [], endpointId: "openai", endpointName: "OpenAI", source: "OpenCode" }],
-    grok: [{ id: "grok-code", name: "Grok Code", efforts: [] }],
+    opencode: [
+      { id: "opencode/big-pickle", name: "Big Pickle", efforts: [], sourceProviderId: "opencode", sourceProviderName: "OpenCode", source: "OpenCode" },
+      { id: "opencode-go/deepseek-v4", name: "DeepSeek V4", efforts: ["high", "max"], sourceProviderId: "opencode-go", sourceProviderName: "OpenCode Go", source: "OpenCode" },
+      { id: "deepseek/deepseek-v4", name: "DeepSeek V4", efforts: ["high", "max"], sourceProviderId: "deepseek", sourceProviderName: "DeepSeek", source: "OpenCode" },
+    ],
+    grok: [
+      { id: "grok-4.6", name: "Grok 4.6", efforts: ["low", "medium", "high", "xhigh"], defaultEffort: "high" },
+      { id: "grok-code", name: "Grok Code", efforts: [] },
+    ],
     direct: [
-      { id: "openai::gpt-5.6-sol", name: "GPT-5.6 Sol", efforts: ["Low", "Medium", "High"], inputModalities: ["text", "image"], endpointId: "openai", endpointName: "OpenAI API", source: "Direct API", walletKind: "user_api", apiKeyConfigured: true },
+      { id: "google::gemini-3.6-flash", name: "Gemini 3.6 Flash", efforts: ["Low", "Medium", "High"], inputModalities: ["text", "image", "audio"], endpointId: "google", endpointName: "Google Gemini API", source: "Direct API", walletKind: "user_api", apiKeyConfigured: true },
       { id: "vercel::zai/glm-5.2", name: "GLM-5.2 via Vercel", efforts: ["Default"], endpointId: "vercel", endpointName: "Vercel AI Gateway", source: "Direct API", walletKind: "user_api", apiKeyConfigured: false },
     ],
     "tethoq-example": [

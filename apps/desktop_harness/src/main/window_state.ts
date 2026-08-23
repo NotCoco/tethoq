@@ -20,6 +20,31 @@ function isFiniteInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && Number.isFinite(value);
 }
 
+export interface DisplayWorkArea {
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+}
+
+/** Keep a restored window on a real display so launch cannot strand it off-screen. */
+export function clampWindowStateToDisplay(state: WindowState, workArea: DisplayWorkArea): WindowState {
+  const width = Math.min(Math.max(state.width, 760), Math.max(760, workArea.width));
+  const height = Math.min(Math.max(state.height, 480), Math.max(480, workArea.height));
+  if (state.x === undefined || state.y === undefined) {
+    return { width, height, maximized: state.maximized };
+  }
+  const maxX = workArea.x + Math.max(0, workArea.width - width);
+  const maxY = workArea.y + Math.max(0, workArea.height - height);
+  return {
+    width,
+    height,
+    x: Math.min(Math.max(state.x, workArea.x), maxX),
+    y: Math.min(Math.max(state.y, workArea.y), maxY),
+    maximized: state.maximized,
+  };
+}
+
 export function parseWindowState(value: unknown): WindowState {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return DEFAULT_WINDOW_STATE;
   const input = value as Record<string, unknown>;

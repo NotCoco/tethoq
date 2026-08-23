@@ -251,7 +251,7 @@ test("preferences persist experimental, reasoning-display, and concrete agent de
   assert.equal(reloaded.value().reasoningDisplay, "expanded");
   assert.equal(reloaded.value().localOpenHandlerId, "vscode");
   assert.deepEqual(reloaded.value().agentDefaults, { codex: { modelId: "gpt-5.6-sol", reasoningEffort: "medium" } });
-  assert.deepEqual(preferencesModule.validateDesktopPreferences({ version: 9, experimentalFeatures: "yes", reasoningDisplay: "verbose", localOpenHandlerId: "unknown", agentDefaults: { codex: { modelId: "  gpt-5.6-sol  ", reasoningEffort: " high " }, bad: { modelId: "" } }, extra: 1 }), { version: 1, experimentalFeatures: false, reasoningDisplay: "compact", localOpenHandlerId: "system", closeAction: "tray", launchAtLogin: "off", alerts: "all", agentDefaults: { codex: { modelId: "gpt-5.6-sol", reasoningEffort: "high" } }, globalAgentsPath: null, taskOverrides: {} });
+  assert.deepEqual(preferencesModule.validateDesktopPreferences({ version: 9, experimentalFeatures: "yes", reasoningDisplay: "verbose", localOpenHandlerId: "unknown", agentDefaults: { codex: { modelId: "  gpt-5.6-sol  ", reasoningEffort: " high " }, bad: { modelId: "" } }, extra: 1 }), { version: 1, experimentalFeatures: false, reasoningDisplay: "compact", localOpenHandlerId: "system", closeAction: "tray", launchAtLogin: "off", alerts: "all", agentDefaults: { codex: { modelId: "gpt-5.6-sol", reasoningEffort: "high" } }, globalAgentsPath: null, taskOverrides: {}, allowForeignSubagents: false, foreignSubagentOverrides: {}, ears: { enabled: false, providerId: null, modelId: null, mode: "cleaned" } });
 
   const agentsPath = join(outputDirectory, "AGENTS.md");
   await writeFile(agentsPath, "Keep answers calm and concise.\n", "utf8");
@@ -279,7 +279,7 @@ test("every instant-session entry point is gated and the backend rejects while d
   // Settings toggle drives the master preference; the panel cannot start while off.
   assert.match(app, /set-experimental-features/);
   assert.match(app, /set-reasoning-display/);
-  assert.match(app, /Controls how reasoning opens\. It does not change model effort\./);
+  assert.match(app, /Expanded streams every thought in full as it is written and shows tool calls as their own expandable rows\. It does not change model effort\./);
   assert.match(app, /role="switch"/);
   assert.match(app, /aria-checked=\{preferences\.experimentalFeatures\}/);
   assert.match(livePanel, /disabled=\{!experimental\}/);

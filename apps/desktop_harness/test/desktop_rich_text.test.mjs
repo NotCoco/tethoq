@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, readFile, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -56,7 +56,8 @@ test("rich transcript text renders GFM structure and ordinary line breaks", () =
   assert.match(markup, /<a href="https:\/\/example\.test\/docs">Documentation<\/a>/);
   assert.doesNotMatch(markup, /target="_blank"/);
   assert.match(markup, /<pre><code class="language-ts">/);
-  assert.match(markup, /class="rich-code-copy" aria-label="Copy code"/);
+  assert.match(markup, /class="rich-code-copy"[^>]*aria-label="Copy code"/);
+  assert.doesNotMatch(markup, />Copy<\/span>/);
   assert.match(markup, /class="rich-code-copy-status" role="status" aria-live="polite"/);
   assert.equal(codeBlockText(React.createElement("code", { className: "language-ts" }, "const ready = true;\n")), "const ready = true;");
   assert.match(markup, /line one<br\/>\nline two/);
@@ -75,6 +76,34 @@ test("rich transcript text drops raw HTML and unsafe URL protocols", () => {
   assert.equal(safeMarkdownUrl("file:///C:/cli_remote/package.json", "href"), "file:///C:/cli_remote/package.json");
   assert.equal(safeMarkdownUrl("file:///C:/secret.png", "src"), "");
   assert.equal(safeMarkdownUrl("https://example.test/image.png", "src"), "https://example.test/image.png");
+});
+
+test("local transcript videos render as bounded playable media with an open action", () => {
+  const markdown = [
+    "![Demo 20-second sequence](<C:\\Users\\test\\Documents\\demo_sequence_review.mp4>)",
+    "",
+    "[Open alternate](C:/cli_remote/outputs/alternate.webm)",
+  ].join("\n");
+  const markup = renderToStaticMarkup(React.createElement(RichText, null, markdown));
+  assert.equal((markup.match(/class="rich-local-video"/g) ?? []).length, 2);
+  assert.match(markup, /<video src="tethoq-media:\/\/local\/C%3A%5CUsers%5Ctest%5CDocuments%5Cdemo_sequence_review\.mp4" controls="" preload="metadata" playsInline=""/);
+  assert.match(markup, /aria-label="Demo 20-second sequence"/);
+  assert.match(markup, /class="rich-local-video-open">Demo 20-second sequence<\/a>/);
+  assert.match(markup, /aria-label="Open alternate"/);
+  assert.doesNotMatch(markup, /autoplay/iu);
+  assert.match(safeMarkdownUrl("file:///C:/clips/review.mp4", "src"), /^tethoq-media:\/\/local\//u);
+  assert.equal(safeMarkdownUrl("file:///C:/secret.png", "src"), "");
+});
+
+test("local transcript videos keep their intrinsic aspect ratio instead of filling the message width", async () => {
+  const [styles, richText] = await Promise.all([
+    readFile(join(appRoot, "src", "renderer", "src", "styles.css"), "utf8"),
+    readFile(join(appRoot, "src", "renderer", "src", "RichText.tsx"), "utf8"),
+  ]);
+  assert.match(styles, /\.rich-local-video \{[^}]*width: fit-content;[^}]*display: inline-flex;[^}]*flex-direction: column;/su);
+  assert.match(styles, /\.rich-local-video video \{[^}]*width: auto;[^}]*height: auto;[^}]*max-width: 100%;[^}]*max-height: 420px;/su);
+  assert.match(richText, /const components = useMemo<Components>\(\(\) => \(\{/u, "unrelated task refreshes must not remount video renderers");
+  assert.match(richText, /export const RichText = memo\(function RichText/u);
 });
 
 test("local Windows paths and file URIs become safe open actions without touching fenced code", () => {

@@ -11,6 +11,7 @@ import 'package:universal_agent_remote/src/app_shell.dart';
 import 'package:universal_agent_remote/src/app_theme.dart';
 import 'package:universal_agent_remote/src/demo_store.dart';
 import 'package:universal_agent_remote/src/dictation.dart';
+import 'package:universal_agent_remote/src/ears.dart';
 import 'package:universal_agent_remote/src/models.dart';
 import 'package:universal_agent_remote/src/screens.dart';
 import 'package:universal_agent_remote/src/store.dart';
@@ -1459,11 +1460,12 @@ const aVeryLongIdentifierForHorizontalScrolling = 'safe';
       RemoteMessage(
         id: 'compacted-context',
         sessionId: sessionId,
-        role: 'system',
+        role: 'assistant',
         createdAt: DateTime.utc(2026, 8, 14, 12),
         parts: const <ContentPart>[
           ContentPart(type: 'text', data: <String, Object?>{
-            'text': 'Earlier conversation summary:\nPrivate raw summary',
+            'text':
+                'Another language model started to solve this problem and produced a summary of its thinking process.\n\n## Current task progress\n\nPrivate raw summary',
           }),
         ],
         status: 'completed',
@@ -1492,9 +1494,12 @@ const aVeryLongIdentifierForHorizontalScrolling = 'safe';
         find.byKey(
             const ValueKey<String>('conversation-boundary-compacted-context')),
         findsOneWidget);
-    expect(find.text('Context compacted'), findsOneWidget);
-    expect(find.text('Automatically compacted context'), findsOneWidget);
+    expect(find.text('Session compacted'), findsNWidgets(2));
     expect(find.textContaining('Private raw summary'), findsNothing);
+    await tester.tap(find.byKey(
+        const ValueKey<String>('conversation-boundary-compacted-context')));
+    await tester.pump();
+    expect(find.textContaining('Private raw summary'), findsOneWidget);
   });
 
   testWidgets('working directory stays in task details and is scrollable',
@@ -1729,6 +1734,9 @@ const aVeryLongIdentifierForHorizontalScrolling = 'safe';
     await tester.tap(find.byKey(const Key('dictation-menu-badge')));
     await tester.pump(const Duration(milliseconds: 400));
     expect(find.text('Dictation source'), findsOneWidget);
+    expect(find.text('MP3'), findsNothing);
+    expect(find.byKey(const Key('dictation-source-option-direct-audio')),
+        findsNothing);
     expect(
         find.descendant(
           of: find.byKey(const Key('dictation-source-option-openai-stt')),
@@ -1749,6 +1757,50 @@ const aVeryLongIdentifierForHorizontalScrolling = 'safe';
 
     expect(store.preferredDictationSourceIdForHarness('codex'), 'openai-stt');
     expect(recorder.started, isFalse);
+  });
+
+  testWidgets('GPT-5.6 Sol offers MP3 only after EARS is configured',
+      (tester) async {
+    FlutterSecureStorage.setMockInitialValues(<String, String>{});
+    tester.view.physicalSize = const Size(430, 780);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final store = DemoRemoteAppStore();
+    addTearDown(store.dispose);
+    await store.initialize();
+    store.modelsByProvider['direct'] = const <RemoteModel>[
+      RemoteModel(
+        id: 'direct/audio-helper',
+        providerId: 'direct',
+        displayName: 'Audio helper',
+        isDefault: true,
+        inputModalities: <String>['text', 'audio'],
+        nativeMetadata: <String, Object?>{},
+      ),
+    ];
+    await store.setEars(const EarsSettings(
+      enabled: true,
+      providerId: 'direct',
+      modelId: 'direct/audio-helper',
+    ));
+
+    await tester.pumpWidget(StoreScope(
+      store: store,
+      child: MaterialApp(
+        home: SessionScreen(
+          sessionId: 'demo-working',
+          dictationRecorder: _FakeDictationRecorder(),
+        ),
+      ),
+    ));
+    await tester.tap(find.byKey(const Key('dictation-menu-badge')));
+    await tester.pump(const Duration(milliseconds: 400));
+
+    expect(find.text('MP3'), findsOneWidget);
+    expect(find.text('EARS turns your recording into text'), findsOneWidget);
+    expect(find.byKey(const Key('dictation-source-option-direct-audio')),
+        findsOneWidget);
   });
 
   testWidgets('Grok tap uses a ready xAI default without opening the picker',
@@ -2224,6 +2276,92 @@ const aVeryLongIdentifierForHorizontalScrolling = 'safe';
     expect(reopenedComposer.controller?.text, 'Keep this draft');
   });
 
+  testWidgets('side chat hides copied parent context behind a brief note',
+      (tester) async {
+    tester.view.physicalSize = const Size(430, 780);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final store = DemoRemoteAppStore();
+    await store.initialize();
+    const sessionId = 'demo-codex-api';
+    store.showSideChats = true;
+    final sideChat = await store.createSideChat(sessionId);
+    store.messages[sideChat.id] = <RemoteMessage>[
+      RemoteMessage(
+        id: '${sideChat.id}:copied:1',
+        sessionId: sideChat.id,
+        providerMessageId: 'copied:parent-message:1',
+        role: 'user',
+        createdAt: DateTime.utc(2026, 8, 11, 10),
+        parts: const <ContentPart>[
+          ContentPart(
+              type: 'text',
+              data: <String, Object?>{'text': 'Inherited parent context'}),
+        ],
+        status: 'completed',
+      ),
+      RemoteMessage(
+        id: 'real-side-chat-message',
+        sessionId: sideChat.id,
+        role: 'assistant',
+        createdAt: DateTime.utc(2026, 8, 11, 11),
+        parts: const <ContentPart>[
+          ContentPart(
+              type: 'text',
+              data: <String, Object?>{'text': 'A real side chat answer'}),
+        ],
+        status: 'completed',
+      ),
+    ];
+
+    await tester.pumpWidget(StoreScope(
+      store: store,
+      child: const MaterialApp(home: SessionsScreen()),
+    ));
+    await tester.pump();
+    final preview =
+        find.byKey(ValueKey<String>('side-chat-preview-${sideChat.id}'));
+    expect(preview, findsOneWidget);
+    await tester.tap(preview);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+
+    expect(find.byKey(const Key('side-chat-composer')), findsOneWidget);
+    expect(find.text('Inherited parent context'), findsNothing);
+    expect(find.text('A real side chat answer'), findsOneWidget);
+    expect(
+        find.text('This side chat already carries the parent task\'s context.'),
+        findsNothing);
+
+    store.messages[sideChat.id] = <RemoteMessage>[
+      RemoteMessage(
+        id: '${sideChat.id}:copied:1',
+        sessionId: sideChat.id,
+        providerMessageId: 'copied:parent-message:1',
+        role: 'user',
+        createdAt: DateTime.utc(2026, 8, 11, 10),
+        parts: const <ContentPart>[
+          ContentPart(
+              type: 'text',
+              data: <String, Object?>{'text': 'Inherited parent context'}),
+        ],
+        status: 'completed',
+      ),
+    ];
+    await tester.tap(find.byTooltip('Close side chat'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.tap(preview);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+
+    expect(find.text('Inherited parent context'), findsNothing);
+    expect(
+        find.text('This side chat already carries the parent task\'s context.'),
+        findsOneWidget);
+  });
+
   testWidgets('stopped Codex text keeps copy and edit in its long-press menu',
       (tester) async {
     tester.view.physicalSize = const Size(430, 780);
@@ -2331,6 +2469,7 @@ const aVeryLongIdentifierForHorizontalScrolling = 'safe';
     expect(
         find.byKey(const Key('simplify-command-suggestion')), findsOneWidget);
     expect(find.byKey(const Key('mesh-command-suggestion')), findsOneWidget);
+    expect(find.byKey(const Key('ears-command-suggestion')), findsOneWidget);
     expect(tester.widget<TextField>(composer).controller!.text, '/');
 
     await tester.enterText(composer, '/si');
@@ -2570,6 +2709,9 @@ RemoteMessage _historyMessage({
 
 class _FakeDictationRecorder implements DictationRecorder {
   bool started = false;
+
+  @override
+  Stream<double> get levelStream => const Stream<double>.empty();
 
   @override
   Future<bool> start() async {

@@ -108,7 +108,7 @@
 .sidebar-task-header h2 {
   margin: 0;
   color: #aeb3ae;
-  font-size: 12px;
+  font-size: 12.5px;
   font-weight: 700;
   letter-spacing: .055em;
   text-transform: uppercase;
@@ -255,19 +255,19 @@
 
 .task-filter-popover section + section { margin-top: 10px; padding-top: 10px; border-top: 1px solid #30302d; }
 .task-filter-popover header { min-height: 25px; display: flex; align-items: center; justify-content: space-between; padding: 0 3px 5px; }
-.task-filter-popover header strong { color: #9fa49f; font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; }
-.task-filter-popover header button { padding: 4px 6px; color: #9ba09b; border-radius: 4px; background: transparent; font-size: 10.5px; }
+.task-filter-popover header strong { color: #9fa49f; font-size: 12.5px; letter-spacing: .08em; text-transform: uppercase; }
+.task-filter-popover header button { padding: 4px 6px; color: #9ba09b; border-radius: 4px; background: transparent; font-size: 12.5px; }
 .task-filter-popover header button:hover { color: var(--text); background: #292926; }
 .task-filter-options { display: grid; gap: 3px; }
-.task-filter-options > button { min-width: 0; min-height: 35px; display: grid; align-items: center; gap: 7px; padding: 4px 6px; color: #b8bcb8; border-radius: 6px; background: transparent; text-align: left; font-size: 11.5px; }
+.task-filter-options > button { min-width: 0; min-height: 35px; display: grid; align-items: center; gap: 7px; padding: 4px 6px; color: #b8bcb8; border-radius: 6px; background: transparent; text-align: left; font-size: 12.5px; }
 .provider-filter-option { min-width: 0; min-height: 38px; display: grid; grid-template-columns: minmax(0, 1fr) 32px; align-items: center; border-radius: 6px; background: transparent; }
-.provider-filter-primary { min-width: 0; min-height: 38px; display: grid; grid-template-columns: 22px minmax(0, 1fr); align-items: center; gap: 8px; padding: 4px 6px; color: #d9ddd8; background: transparent; text-align: left; font-size: 12px; }
+.provider-filter-primary { min-width: 0; min-height: 38px; display: grid; grid-template-columns: 22px minmax(0, 1fr); align-items: center; gap: 8px; padding: 4px 6px; color: #d9ddd8; background: transparent; text-align: left; font-size: 12.5px; }
 .provider-options .provider-logo { border: 0; background-color: transparent; box-shadow: none; }
 .provider-filter-primary > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .available-agents-icon { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
 .provider-filter-option.unavailable { opacity: .3; }
 .provider-filter-option.unavailable .provider-filter-primary,
-.provider-filter-option.unavailable .provider-filter-checkbox { cursor: not-allowed; }
+.provider-filter-option.unavailable .provider-filter-checkbox { cursor: default; }
 .provider-filter-option.available .provider-filter-primary { color: #e4e8e3; }
 .provider-filter-option:hover,
 .provider-filter-option:focus-within,
@@ -284,8 +284,8 @@
 .task-filter-options > button.selected { color: var(--text); background: #292926; }
 .state-options { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .state-options > button { grid-template-columns: 1fr; min-height: 34px; text-align: center; }
-.task-filter-popover footer { margin: 9px -2px -2px; padding: 9px 5px 2px; color: #8f948f; border-top: 1px solid #30302d; font-size: 10.5px; }
-.side-chat-filter > button { width: 100%; min-height: 36px; display: grid; grid-template-columns: 20px minmax(0,1fr) 18px; align-items: center; gap: 8px; padding: 4px 6px; color: #b8bcb8; border-radius: 6px; background: transparent; text-align: left; font-size: 11.5px; }
+.task-filter-popover footer { margin: 9px -2px -2px; padding: 9px 5px 2px; color: #8f948f; border-top: 1px solid #30302d; font-size: 12.5px; }
+.side-chat-filter > button { width: 100%; min-height: 36px; display: grid; grid-template-columns: 20px minmax(0,1fr) 18px; align-items: center; gap: 8px; padding: 4px 6px; color: #b8bcb8; border-radius: 6px; background: transparent; text-align: left; font-size: 12.5px; }
 .side-chat-filter > button:hover, .side-chat-filter > button:focus-visible { color: #f0f2ef; background: #292927; }
 .side-chat-filter > button svg { width: 16px; height: 16px; }
 .side-chat-filter > button > svg:last-child { opacity: 0; }
@@ -360,7 +360,7 @@
 .session-row-rename:focus { outline: 1px solid #6d6d65; outline-offset: 0; }
 .session-row-top time {
   color: #aeb3ae;
-  font-size: 11.5px;
+  font-size: 12.5px;
   font-weight: 520;
   text-align: right;
   font-variant-numeric: tabular-nums;
@@ -374,7 +374,7 @@
 .session-row-working-spinner { position: relative; width: 12px; height: 12px; grid-column: 1; grid-row: 2; align-self: end; justify-self: center; translate: -5px 0; border: 2px solid #7fd39b; border-right-color: transparent; border-radius: 50%; animation: spin .8s linear infinite; }
 .session-row-working-spinner::after { right: -4px; left: auto; }
 @media (prefers-reduced-motion: reduce) { .session-row-working-spinner { border-color: #7fd39b; animation: none; } }
-.session-row-preview { height: 28px; grid-column: 2 / -1; grid-row: 2; margin-right: 4px; margin-left: -6px; color: #858a85; font-size: 10.5px; line-height: 1.35; }
+.session-row-preview { height: 34px; grid-column: 2 / -1; grid-row: 2; margin-right: 4px; margin-left: -6px; color: #858a85; font-size: 12.5px; line-height: 1.35; }
 .session-row-preview > span { width: 100%; display: block; white-space: normal; }
 .overflow-reveal { min-width: 0; overflow: hidden; }
 .overflow-reveal > span { min-width: 0; display: block; transform: translate(0,0); }
@@ -390,14 +390,14 @@
 .session-side-chats > button { min-width: 0; height: 27px; display: block; overflow: hidden; padding: 0 37px 0 9px; color: #b7bcb7; border: 0; border-radius: 0 0 7px 7px; background: #292927; text-align: left; }
 .session-side-chats > button + button { margin-top: 1px; border-radius: 0 0 7px 7px; }
 .session-side-chats > button:hover, .session-side-chats > button:focus-visible, .session-side-chats > button.active { color: #f0f2ef; background: #333330; }
-.side-chat-preview { width: 100%; font-size: 10.5px; line-height: 27px; white-space: nowrap; }
+.side-chat-preview { width: 100%; font-size: 12.5px; line-height: 27px; white-space: nowrap; }
 .side-chat-controls { position: absolute; z-index: 4; right: 3px; bottom: 1px; display: flex; align-items: center; gap: 1px; opacity: 0; pointer-events: none; }
 .session-row-group:hover .side-chat-controls, .session-row-group:focus-within .side-chat-controls { opacity: 1; pointer-events: auto; }
 .side-chat-controls > button { width: 25px; height: 25px; display: grid; place-items: center; padding: 0; color: #8e938e; border: 0; border-radius: 5px; background: transparent; }
 .side-chat-controls > button:hover, .side-chat-controls > button:focus-visible { color: #f0f2ef; background: #3a3a37; }
 .side-chat-controls > button svg { width: 13px; height: 13px; }
 .side-chat-controls > button svg.expanded { transform: rotate(180deg); }
-.side-chat-info { position: absolute; right: 0; bottom: 30px; width: max-content; max-width: 180px; margin: 0; padding: 7px 9px; color: #c9cdc9; border: 1px solid #41413d; border-radius: 7px; background: #20201e; box-shadow: 0 10px 30px rgba(0,0,0,.42); font-size: 10.5px; line-height: 1.35; }
+.side-chat-info { position: absolute; right: 0; bottom: 30px; width: max-content; max-width: 180px; margin: 0; padding: 7px 9px; color: #c9cdc9; border: 1px solid #41413d; border-radius: 7px; background: #20201e; box-shadow: 0 10px 30px rgba(0,0,0,.42); font-size: 12.5px; line-height: 1.35; }
 .session-row-meta {
   position: absolute;
   width: 1px;
@@ -436,7 +436,7 @@
 
 .session-context-menu button:hover,
 .session-context-menu button:focus-visible { background: #30302d; }
-.session-context-menu button:disabled { color: #696d69; cursor: not-allowed; }
+.session-context-menu button:disabled { color: #696d69; cursor: default; }
 .session-context-menu button svg { width: 17px; height: 17px; }
 
 .sidebar-footer {

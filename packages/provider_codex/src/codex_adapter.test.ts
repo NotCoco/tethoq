@@ -3,13 +3,14 @@ import test from "node:test";
 import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CodexAdapter } from "./codex_adapter.js";
+import { CodexAdapter, mergeCodexMessageHistory } from "./codex_adapter.js";
 import type { JsonRpcTransport, ProviderClientTooling, ProviderEvent } from "../../provider_contract/src/index.js";
 
 class FakeTransport implements JsonRpcTransport {
   readonly sent: unknown[] = [];
   readonly listeners = new Set<(message: unknown) => void>();
   readonly methodResults = new Map<string, unknown>();
+  readonly methodResponses = new Map<string, Array<{ readonly result?: unknown; readonly error?: { readonly code: number; readonly message: string } }>>();
   readonly blockedMethods = new Set<string>();
   public closeCalls = 0;
   public async send(message: unknown): Promise<void> {
@@ -21,7 +22,12 @@ class FakeTransport implements JsonRpcTransport {
         if (typeof record.method === "string" && !("result" in record) && !("error" in record)) {
           if (this.blockedMethods.has(record.method)) return;
           const id = record.id;
-          const result = this.methodResults.has(record.method)
+          const queued = this.methodResponses.get(record.method)?.shift();
+          if (queued?.error !== undefined) {
+            setTimeout(() => this.push({ id, error: queued.error }), 1);
+            return;
+          }
+          const result = queued !== undefined && "result" in queued ? queued.result : this.methodResults.has(record.method)
             ? this.methodResults.get(record.method)
             : record.method === "account/read" ? { account: null, requiresOpenaiAuth: false } : {};
           setTimeout(() => this.push({ id, result }), 1);
@@ -131,6 +137,98 @@ test("Codex dispose closes a peer whose initialize request is still pending", as
   assert.ok(await initialization instanceof Error);
 });
 
+test("Codex forwards audio recordings separately from images", async () => {
+  const { adapter, transport } = await adapterWithPeer();
+
+  await adapter.sendMessage("thread-audio", {
+    requestId: "audio-turn-1",
+    content: "Listen to this",
+    attachments: [{ name: "dictation.mp3", mimeType: "audio/mpeg", dataBase64: "aGVsbG8=", byteLength: 5 }],
+  });
+
+  const request = transport.sent.find((message) =>
+    typeof message === "object" && message !== null && (message as Record<string, unknown>).method === "turn/start"
+  ) as Record<string, unknown> | undefined;
+  assert.ok(request);
+  assert.deepEqual((request.params as { input: unknown }).input, [
+    { type: "text", text: "Listen to this", text_elements: [] },
+    { type: "audio", url: "data:audio/mpeg;base64,aGVsbG8=" },
+  ]);
+});
+
+test("Codex canonical history is not replaced by a stale rollout tail", () => {
+  const base = {
+    sessionId: "host_1/codex/thread-audio",
+    role: "assistant" as const,
+    createdAt: "2026-08-23T10:00:00.000Z",
+    completedAt: "2026-08-23T10:00:01.000Z",
+    status: "completed" as const,
+    nativeMetadata: {},
+  };
+  const canonical = [
+    { ...base, id: "canonical-user", providerMessageId: "fresh-audio-user", role: "user" as const, parts: [{ type: "audio" as const, uri: "data:audio/mpeg;base64,AQID", mimeType: "audio/mpeg", name: "Recording.mp3" }] },
+    { ...base, id: "canonical-answer", providerMessageId: "fresh-answer", createdAt: "2026-08-23T10:00:02.000Z", parts: [{ type: "text" as const, text: "Fresh answer" }] },
+  ];
+  const observed = [{ ...base, id: "old-rollout-answer", providerMessageId: "old-answer", createdAt: "2026-08-23T09:00:00.000Z", parts: [{ type: "text" as const, text: "Previous answer" }] }];
+
+  const merged = mergeCodexMessageHistory(canonical, observed);
+  assert.deepEqual(merged.map((message) => message.providerMessageId), ["old-answer", "fresh-audio-user", "fresh-answer"]);
+});
+
+test("Codex advertises native MP3 input for GPT-5.6 Sol", async () => {
+  const { adapter, transport } = await adapterWithPeer();
+  transport.methodResults.set("model/list", {
+    data: [{ id: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", inputModalities: ["text", "image"] }],
+    nextCursor: null,
+  });
+
+  const models = await adapter.listModels();
+
+  assert.deepEqual(models[0]?.inputModalities, ["text", "image", "audio"]);
+  await adapter.dispose();
+});
+
+test("Codex compaction uses the native app-server thread command", async () => {
+  const { adapter, transport } = await adapterWithPeer();
+
+  await adapter.compactSession("thread-context-limit");
+
+  const request = transport.sent.find((message) =>
+    typeof message === "object" && message !== null && (message as Record<string, unknown>).method === "thread/compact/start"
+  ) as Record<string, unknown> | undefined;
+  assert.ok(request);
+  assert.deepEqual(request.params, { threadId: "thread-context-limit" });
+  await adapter.dispose();
+});
+
+test("Codex context occupancy uses the current window rather than lifetime token totals after compaction", async () => {
+  const { adapter, transport } = await adapterWithPeer();
+
+  transport.push({
+    method: "thread/tokenUsage/updated",
+    params: {
+      threadId: "thread-context-limit",
+      tokenUsage: {
+        total: { inputTokens: 90_282_122, cachedInputTokens: 86_824_832, outputTokens: 278_111, totalTokens: 90_560_233 },
+        last: { inputTokens: 27_900, cachedInputTokens: 25_600, outputTokens: 34, totalTokens: 27_934 },
+        modelContextWindow: 258_400,
+      },
+    },
+  });
+  await delay(5);
+
+  const context = await adapter.getSessionContext("thread-context-limit");
+  assert.equal(context.usedTokens, 27_934);
+  assert.equal(context.usedPercent, 27_934 / 258_400 * 100);
+  assert.deepEqual(context.usage, {
+    inputTokens: 27_900,
+    outputTokens: 34,
+    cacheReadTokens: 25_600,
+    totalTokens: 27_934,
+  });
+  await adapter.dispose();
+});
+
 test("Codex forwards next-turn model, effort, and phone image data", async () => {
   const { adapter, transport, events } = await adapterWithPeer();
 
@@ -169,6 +267,53 @@ test("Codex forwards next-turn model, effort, and phone image data", async () =>
   const metadataEvents = events.filter((event) => event.type === "session.updated");
   assert.deepEqual(metadataEvents.map((event) => event.payload), [{ modelId: "gpt-5.6", reasoningEffort: "high" }]);
 
+  await adapter.dispose();
+});
+
+test("Codex resumes a persisted thread and retries once when turn start cannot find it", async () => {
+  const { adapter, transport } = await adapterWithPeer();
+  transport.methodResponses.set("turn/start", [
+    { error: { code: -32600, message: "thread not found: thread-persisted" } },
+    { result: { turn: { id: "turn-after-resume" } } },
+  ]);
+  transport.methodResults.set("thread/resume", { thread: { id: "thread-persisted" } });
+
+  const result = await adapter.sendMessage("thread-persisted", {
+    requestId: "persisted-send-1",
+    content: "Continue this task",
+    modelId: "gpt-5.6-sol",
+    reasoningEffort: "high",
+  });
+
+  const calls = transport.sent.filter((message) =>
+    typeof message === "object" && message !== null &&
+    ["turn/start", "thread/resume"].includes(String((message as Record<string, unknown>).method))
+  ) as Record<string, unknown>[];
+  assert.deepEqual(calls.map((call) => call.method), ["turn/start", "thread/resume", "turn/start"]);
+  assert.deepEqual(calls[0]?.params, calls[2]?.params, "the retry must preserve the original request id and content");
+  assert.deepEqual(calls[1]?.params, { threadId: "thread-persisted" });
+  assert.deepEqual(result, { accepted: true, providerTurnId: "turn-after-resume", details: [] });
+  await adapter.dispose();
+});
+
+test("Codex preserves a genuine missing-thread failure after the single resume attempt", async () => {
+  const { adapter, transport } = await adapterWithPeer();
+  transport.methodResponses.set("turn/start", [
+    { error: { code: -32600, message: "thread not found: thread-deleted" } },
+  ]);
+  transport.methodResponses.set("thread/resume", [
+    { error: { code: -32600, message: "thread not found: thread-deleted" } },
+  ]);
+
+  await assert.rejects(
+    adapter.sendMessage("thread-deleted", { requestId: "deleted-send-1", content: "Continue this task" }),
+    /thread not found: thread-deleted/iu,
+  );
+  const calls = transport.sent.filter((message) =>
+    typeof message === "object" && message !== null &&
+    ["turn/start", "thread/resume"].includes(String((message as Record<string, unknown>).method))
+  ) as Record<string, unknown>[];
+  assert.deepEqual(calls.map((call) => call.method), ["turn/start", "thread/resume"]);
   await adapter.dispose();
 });
 test("Codex exposes scoped client tools on new sessions and routes calls through the bridge tooling", async () => {
@@ -407,7 +552,7 @@ test("Codex includes an externally active locked thread even when thread list om
     createdAt: 1,
     updatedAt: 2,
     recencyAt: 2,
-    status: { type: "notLoaded" },
+    status: { type: "active" },
     path: rollout,
     cwd: directory,
     cliVersion: "0.147.0",
@@ -422,8 +567,87 @@ test("Codex includes an externally active locked thread even when thread list om
   assert.equal(page.sessions.length, 1);
   assert.equal(page.sessions[0]?.providerSessionId, activeId);
   assert.equal(page.sessions[0]?.state, "working");
+  assert.equal(page.sessions[0]?.externalWriter, true);
   assert.equal(page.sessions[0]?.preview, "Also, this chat itself is not showing up in that session list.");
   assert.equal(page.sessions[0]?.lastActivityAt, "2026-08-15T13:52:33.000Z");
+});
+
+test("Codex marks an idle not-loaded thread as externally owned only while its writer lock exists", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "uar-codex-idle-writer-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const threadId = "019ffeab-3a74-7140-87f2-cd348d5ee856";
+  const rollout = join(directory, "rollout.jsonl");
+  const lockDirectory = join(directory, "thread-writer-locks");
+  const lockPath = join(lockDirectory, `${threadId}.lock`);
+  await mkdir(lockDirectory, { recursive: true });
+  await writeFile(lockPath, "");
+  await writeFile(rollout, `${JSON.stringify({ type: "event_msg", payload: { type: "task_complete" } })}\n`, "utf8");
+  const transport = new FakeTransport();
+  transport.methodResults.set("thread/list", {
+    data: [{
+      id: threadId,
+      sessionId: threadId,
+      preview: "Idle Desktop task",
+      modelProvider: "openai",
+      createdAt: 1,
+      updatedAt: 2,
+      recencyAt: 2,
+      status: { type: "notLoaded" },
+      path: rollout,
+      cwd: directory,
+      cliVersion: "0.147.0",
+    }],
+    nextCursor: null,
+  });
+  const adapter = new CodexAdapter({ hostId: "host_1", transportFactory: () => transport, localActivity: { codexHome: directory } });
+  t.after(() => adapter.dispose());
+
+  const locked = (await adapter.listSessions()).sessions[0];
+  assert.equal(locked?.state, "idle", "writer ownership must not make an idle task look busy");
+  assert.equal(locked?.externalWriter, true);
+
+  await rm(lockPath);
+  const unlocked = (await adapter.listSessions()).sessions[0];
+  assert.equal(unlocked?.state, "idle");
+  assert.equal(unlocked?.externalWriter, undefined);
+});
+
+test("Codex does not mistake its own loaded writer for an external Desktop owner", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "uar-codex-owned-writer-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const threadId = "019ffeab-3a74-7140-87f2-cd348d5ee856";
+  const rollout = join(directory, "rollout.jsonl");
+  await writeFile(rollout, `${JSON.stringify({ type: "event_msg", payload: { type: "task_complete" } })}\n`, "utf8");
+  const thread = {
+    id: threadId,
+    sessionId: threadId,
+    preview: "Locally resumed task",
+    modelProvider: "openai",
+    createdAt: 1,
+    updatedAt: 2,
+    recencyAt: 2,
+    status: { type: "idle" },
+    path: rollout,
+    cwd: directory,
+    cliVersion: "0.147.0",
+  };
+  const transport = new FakeTransport();
+  transport.methodResults.set("thread/resume", { thread });
+  transport.methodResults.set("thread/list", { data: [thread], nextCursor: null });
+  const adapter = new CodexAdapter({
+    hostId: "host_1",
+    transportFactory: () => transport,
+    idleReleaseMs: 5,
+    localActivity: { codexHome: directory, isLockHeld: async () => true },
+  });
+  t.after(() => adapter.dispose());
+
+  await adapter.resumeSession(threadId);
+  assert.equal((await adapter.listSessions()).sessions[0]?.externalWriter, undefined);
+
+  await adapter.releaseIdleResources();
+  await delay(15);
+  assert.equal((await adapter.listSessions()).sessions[0]?.externalWriter, true, "ownership clears when Tethoq releases its App Server");
 });
 
 test("Codex approval responses match each server request kind", async () => {
@@ -528,12 +752,14 @@ test("Codex live notifications type known activity and ignore unknown structured
   transport.push({ method: "item/completed", params: { threadId: "t1", item: { id: "reason-1", type: "reasoning", summary: "Checking the current state" } } });
   transport.push({ method: "item/completed", params: { threadId: "t1", item: { id: "file-1", type: "fileChange", changes: [{ path: "README.md" }] } } });
   transport.push({ method: "item/completed", params: { threadId: "t1", item: { id: "compact-1", type: "contextCompaction", summary: { raw: "provider envelope" } } } });
+  transport.push({ method: "warning", params: { threadId: "t1", message: "Long threads may be less accurate." } });
   await delay(25);
 
   assert.equal(events.some((event) => JSON.stringify(event.payload).includes("full raw DOM trace")), false);
   assert.equal(events.some((event) => event.type === "message.completed" && event.payload.partType === "reasoning"), true);
   assert.equal(events.some((event) => event.type === "file.changed"), true);
-  assert.equal(events.some((event) => event.type === "message.completed" && event.payload.text === "Context compacted"), true);
+  assert.equal(events.some((event) => event.type === "message.completed" && event.payload.text === "Session compacted"), true);
+  assert.equal(events.some((event) => event.type === "agent.error"), false, "an informational warning must not fail a successful compaction");
   await adapter.dispose();
 });
 
@@ -604,21 +830,22 @@ test("foreign rollout messages flow through canonical provider events without hi
       content: [{ type: "output_text", text: "live text" }],
     },
   });
-  await appendFile(rollout, `${appended}\n`, "utf8");
+  const toolCall = JSON.stringify({
+    type: "response_item",
+    payload: { type: "custom_tool_call", id: "tool-item", call_id: "tool-call", name: "view_image", status: "completed", input: "preview.png" },
+  });
+  const toolResult = JSON.stringify({
+    type: "response_item",
+    payload: { type: "custom_tool_call_output", id: "tool-result", call_id: "tool-call", output: "image opened" },
+  });
+  await appendFile(rollout, `${appended}\n${toolCall}\n${toolResult}\n`, "utf8");
   const deadline = Date.now() + 500;
-  while (events.filter((event) => event.type.startsWith("message.")).length < 3 && Date.now() < deadline) await delay(10);
+  while ((events.filter((event) => event.type.startsWith("message.")).length < 1 || events.every((event) => event.type !== "tool.completed")) && Date.now() < deadline) await delay(10);
 
   const messages = events.filter((event) => event.type.startsWith("message."));
-  assert.deepEqual(messages.map((event) => event.type), ["message.started", "message.delta", "message.completed"]);
-  assert.deepEqual(messages.map((event) => event.providerSessionId), ["foreign-thread", "foreign-thread", "foreign-thread"]);
+  assert.deepEqual(messages.map((event) => event.type), ["message.completed"]);
+  assert.deepEqual(messages.map((event) => event.providerSessionId), ["foreign-thread"]);
   assert.deepEqual(messages[0]?.payload, {
-    messageId: "assistant-new",
-    role: "assistant",
-    partType: "text",
-    source: "codex-local-rollout",
-    phase: "commentary",
-  });
-  assert.deepEqual(messages[1]?.payload, {
     messageId: "assistant-new",
     role: "assistant",
     partType: "text",
@@ -626,6 +853,20 @@ test("foreign rollout messages flow through canonical provider events without hi
     phase: "commentary",
     text: "live text",
   });
-  assert.deepEqual(messages[2]?.payload, messages[0]?.payload);
+  const toolEvents = events.filter((event) => event.type.startsWith("tool."));
+  assert.deepEqual(toolEvents.map((event) => event.type), ["tool.completed", "tool.completed"]);
+  assert.deepEqual(toolEvents[0]?.payload, {
+    callId: "tool-call",
+    name: "view_image",
+    input: "preview.png",
+    source: "codex-local-rollout",
+  });
+  assert.deepEqual(toolEvents[1]?.payload, {
+    callId: "tool-call",
+    name: "view_image",
+    input: "preview.png",
+    output: "image opened",
+    source: "codex-local-rollout",
+  });
   assert.equal(messages.some((event) => event.nativeEvent !== undefined), false, "raw rollout records must not be exposed");
 });

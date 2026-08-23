@@ -186,6 +186,7 @@ this public repository.
 | Session history | DOCUMENTED | Session message endpoints return message info and parts. Implemented. |
 | New session | DOCUMENTED | `POST /session`. Implemented. |
 | Resume/continue | DOCUMENTED | Existing session IDs accept further asynchronous prompts. Adapter resume validates the session; send uses `prompt_async`. |
+| Steering | DOCUMENTED | OpenCode accepts another asynchronous prompt while the session runner is active. The adapter exposes that native in-turn follow-up path instead of downgrading the action to a blocked normal send. |
 | Streaming events | DOCUMENTED | Global SSE emits session/message/part/status/permission/file events. Implemented with reconnect backoff. |
 | Tools/commands/files | DOCUMENTED | Generated event/message-part types identify tool, shell/command, patch, and file changes. Normalized. |
 | Approvals | DOCUMENTED | Permission reply accepts `once`, `always`, or `reject`. The MVP intentionally maps only approve-once and reject. |

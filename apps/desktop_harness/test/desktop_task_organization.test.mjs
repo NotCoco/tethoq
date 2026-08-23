@@ -110,6 +110,50 @@ test("task overrides merge, clear, and stay bounded", async (t) => {
   assert.equal(Object.keys(persisted.taskOverrides).length, 500);
 });
 
+test("foreign subagent spawning stays gated, session-scoped, and bounded", async (t) => {
+  const path = join(outputDirectory, `foreign-subagents-${Date.now()}.json`);
+  t.after(() => rm(path, { force: true }));
+  const store = await preferences.DesktopPreferencesStore.load(path);
+
+  // The gate is off by default, so the control is hidden and every session is denied.
+  assert.equal(store.value().allowForeignSubagents, false);
+  assert.equal(store.foreignSubagentControlVisible(), false);
+  assert.equal(store.sessionMaySpawnForeignSubagents("host/codex/one"), false);
+
+  // Opening the gate opts new sessions in by default.
+  await store.setAllowForeignSubagents(true);
+  assert.equal(store.foreignSubagentControlVisible(), true);
+  assert.equal(store.sessionMaySpawnForeignSubagents("host/codex/one"), true);
+
+  // An explicit per-session opt-out is honoured while the gate is on.
+  await store.setSessionForeignSubagents("host/codex/two", false);
+  assert.equal(store.sessionMaySpawnForeignSubagents("host/codex/two"), false);
+  await store.setSessionForeignSubagents("host/codex/one", true);
+
+  // Closing the gate denies every session but preserves the stored choices.
+  await store.setAllowForeignSubagents(false);
+  assert.equal(store.sessionMaySpawnForeignSubagents("host/codex/one"), false);
+  assert.equal(store.sessionMaySpawnForeignSubagents("host/codex/two"), false);
+  assert.deepEqual(store.value().foreignSubagentOverrides, { "host/codex/one": false, "host/codex/two": false });
+
+  // The previously-allowed session is flipped in storage, so reopening the
+  // gate cannot resurrect it; only never-judged sessions default to allowed.
+  await store.setAllowForeignSubagents(true);
+  assert.equal(store.sessionMaySpawnForeignSubagents("host/codex/one"), false);
+  assert.equal(store.sessionMaySpawnForeignSubagents("host/codex/two"), false);
+  assert.equal(store.sessionMaySpawnForeignSubagents("host/codex/three"), true);
+  // Reopening the gate never rewrites stored values.
+  assert.deepEqual(store.value().foreignSubagentOverrides, { "host/codex/one": false, "host/codex/two": false });
+
+  // The record shares the task override bound so it cannot grow without limit.
+  for (let index = 0; index < 505; index += 1) await store.setSessionForeignSubagents(`host/codex/${index}`, true);
+  assert.equal(Object.keys(store.value().foreignSubagentOverrides).length, 500);
+  assert.equal(store.value().foreignSubagentOverrides["host/codex/504"], true);
+  const persisted = JSON.parse(await readFile(path, "utf8"));
+  assert.equal(Object.keys(persisted.foreignSubagentOverrides).length, 500);
+  assert.equal(persisted.allowForeignSubagents, true);
+});
+
 test("organized tasks take the user's name, float pins, and keep archives out of the way", () => {
   const sessions = [
     task("recent", "2026-08-15T12:00:00.000Z"),
@@ -132,11 +176,46 @@ test("organized tasks take the user's name, float pins, and keep archives out of
   assert.deepEqual([...organized].sort(organization.compareOrganizedSessions).map((session) => session.id), ["older", "recent", "done"]);
 
   const archived = organized.find((session) => session.id === "done");
-  assert.equal(organization.isHiddenByArchive(archived, false, null), true);
-  assert.equal(organization.isHiddenByArchive(archived, true, null), false);
-  // Archiving the task you are reading must not yank it out of the list.
-  assert.equal(organization.isHiddenByArchive(archived, false, "done"), false);
-  assert.equal(organization.isHiddenByArchive(organized[0], false, null), false);
+  assert.equal(organization.isHiddenByArchive(archived, false), true);
+  assert.equal(organization.isHiddenByArchive(archived, true), false);
+  assert.equal(organization.isHiddenByArchive(organized[0], false), false);
+});
+
+test("task provider filters OR explicit agents and AND available agents", () => {
+  const available = new Set(["codex", "opencode"]);
+
+  assert.equal(organization.matchesProviderFilters("codex", ["codex", "opencode"], available), true);
+  assert.equal(organization.matchesProviderFilters("opencode", ["codex", "opencode"], available), true);
+  assert.equal(organization.matchesProviderFilters("direct", ["codex", "opencode"], available), false);
+
+  assert.equal(organization.matchesProviderFilters("codex", ["codex", "available"], available), true);
+  assert.equal(organization.matchesProviderFilters("codex", ["codex", "available"], new Set(["opencode"])), false);
+  assert.equal(organization.matchesProviderFilters("opencode", ["codex", "available"], available), false);
+  assert.equal(organization.matchesProviderFilters("direct", ["available"], available), false);
+  assert.equal(organization.matchesProviderFilters("direct", "all", new Set()), true);
+});
+
+test("archiving the open task persists and removes its row from the default list", async (t) => {
+  const path = join(outputDirectory, `archive-open-${Date.now()}.json`);
+  t.after(() => rm(path, { force: true }));
+  const store = await preferences.DesktopPreferencesStore.load(path);
+  const open = task("open-task", "2026-08-22T12:00:00.000Z", { pinned: true });
+
+  await store.setTaskOverride(open.id, { archived: true, pinned: false });
+  const organized = organization.organizeSessions([open], store.value().taskOverrides);
+  const defaultRows = organized.filter((session) => !organization.isHiddenByArchive(session, false));
+
+  assert.deepEqual(store.value().taskOverrides[open.id], { archived: true });
+  assert.deepEqual(defaultRows, [], "the selected conversation may stay open, but its archived rail row must disappear");
+  assert.equal(organization.isHiddenByArchive(organized[0], true), false, "Show archived is the only way to reveal the row");
+});
+
+test("an accidentally opened draft task can be archived like any other task", () => {
+  const draft = task("draft-new", "2026-08-15T10:00:00.000Z", { draft: true });
+  const organized = organization.organizeSessions([draft], { "draft-new": { archived: true } });
+  assert.equal(organized[0].archived, true, "a draft must accept an archived override");
+  assert.equal(organization.isHiddenByArchive(organized[0], false), true, "an archived draft stays out of the default list even while its conversation is open");
+  assert.equal(organization.isHiddenByArchive(organized[0], true), false, "Show archived reveals it");
 });
 
 test("the desktop behavior settings rows are real controls bound to stored preferences", async () => {
@@ -180,6 +259,10 @@ test("the task rail exposes rename, pin, and archive without new permanent chrom
   // Renaming happens in the row, so the task never moves into a modal.
   assert.match(navigation, /className="session-row-rename"/);
   assert.match(navigation, /aria-label="Task name"/);
+  // An accidentally opened draft is ordinary work too: the Archive action must
+  // not be disabled for it, unlike rename and pin which drafts do not support.
+  assert.match(navigation, /disabled=\{!menuSession\}[\s\S]{0,400}<ArchiveIcon \/>/u);
+  assert.match(navigation, /disabled=\{!menuSession \|\| menuSession\.draft === true\}[\s\S]{0,400}<RenameIcon \/>/u);
 
   const css = await source(join("src", "renderer", "src", "navigation.css"));
   // Pin and time share the one reserved trailing cell so a pinned row never shifts.

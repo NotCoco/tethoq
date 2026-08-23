@@ -3,6 +3,7 @@ import { basename, extname, isAbsolute, normalize, resolve } from "node:path";
 import {
   app,
   BrowserWindow,
+  clipboard,
   desktopCapturer,
   dialog,
   ipcMain,
@@ -45,6 +46,8 @@ const MAX_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_SELECTED_FILES = 4;
 const MAX_SELECTED_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_CAPTURE_EDGE = 4_096;
+/** A whole long answer copies comfortably; an unbounded renderer string does not. */
+const MAX_CLIPBOARD_CHARACTERS = 2_000_000;
 const EXECUTABLE_FILE_EXTENSIONS = new Set([
   ".apk", ".app", ".appx", ".appxbundle", ".com", ".cpl", ".deb", ".dll", ".dmg",
   ".exe", ".iso", ".jar", ".lnk", ".msi", ".msp", ".msix", ".msixbundle", ".node",
@@ -62,6 +65,8 @@ const ALLOWED_REQUESTS = new Set([
   "sessions.refresh",
   "sessions.list",
   "session.open",
+  "session.watch",
+  "session.unwatch",
   "session.image.get",
   "session.children",
   "session.context.get",
@@ -95,6 +100,8 @@ const ALLOWED_REQUESTS = new Set([
   "dictation.source.list",
   "dictation.source.configure",
   "dictation.transcribe",
+  "ears.process",
+  "ears.cancel",
   "approval.list",
   "approval.respond",
   "user_input.list",
@@ -235,6 +242,14 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
     const error = await shell.openPath(path);
     return error === "";
   });
+  handle(IPC_CHANNELS.copyText, async (_event, value: unknown) => {
+    const text = record(value, "clipboard text").text;
+    if (typeof text !== "string") throw new Error("Clipboard text must be a string");
+    const trimmed = text.slice(0, MAX_CLIPBOARD_CHARACTERS);
+    if (trimmed === "") return false;
+    clipboard.writeText(trimmed);
+    return true;
+  });
   handle(IPC_CHANNELS.localOpenHandlers, async () => await localOpenState());
   handle(IPC_CHANNELS.openLocalTarget, async (_event, value: unknown) => {
     const input = record(value, "local open target");
@@ -344,6 +359,9 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
         modelId: action.modelId,
         ...(action.reasoningEffort ? { reasoningEffort: action.reasoningEffort } : {}),
       });
+      case "set-allow-foreign-subagents": return await options.preferences.setAllowForeignSubagents(action.enabled);
+      case "set-session-foreign-subagents": return await options.preferences.setSessionForeignSubagents(action.sessionId, action.allowed);
+      case "set-ears": return await options.preferences.setEars(action.ears);
     }
   });
   handle(IPC_CHANNELS.liveSessionGetState, () => {
@@ -469,6 +487,26 @@ function validatePreferencesAction(value: unknown): PreferencesAction {
     const modelId = nonEmptyString(input.modelId, "model ID", 320).trim();
     const reasoningEffort = input.reasoningEffort === undefined ? undefined : nonEmptyString(input.reasoningEffort, "reasoning effort", 80).trim();
     return { type: "set-agent-default", providerId, modelId, ...(reasoningEffort ? { reasoningEffort } : {}) };
+  }
+  if (input.type === "set-allow-foreign-subagents") {
+    if (typeof input.enabled !== "boolean") throw new Error("The foreign sub-agent setting must be true or false");
+    return { type: "set-allow-foreign-subagents", enabled: input.enabled };
+  }
+  if (input.type === "set-session-foreign-subagents") {
+    const sessionId = nonEmptyString(input.sessionId, "task ID", 400).trim();
+    if (typeof input.allowed !== "boolean") throw new Error("The foreign sub-agent choice must be true or false");
+    return { type: "set-session-foreign-subagents", sessionId, allowed: input.allowed };
+  }
+  if (input.type === "set-ears") {
+    const ears = record(input.ears, "EARS settings");
+    const providerId = ears.providerId === null || ears.providerId === undefined || ears.providerId === ""
+      ? null
+      : nonEmptyString(ears.providerId, "EARS provider", 160).trim();
+    const modelId = ears.modelId === null || ears.modelId === undefined || ears.modelId === ""
+      ? null
+      : nonEmptyString(ears.modelId, "EARS model", 320).trim();
+    const mode = ears.mode === "verbatim" ? "verbatim" : "cleaned";
+    return { type: "set-ears", ears: { enabled: ears.enabled === true, providerId, modelId, mode } };
   }
   throw new Error("Unknown preferences action");
 }

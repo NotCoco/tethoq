@@ -141,9 +141,20 @@ export interface ProviderQueuedMessage {
   readonly content: string;
   readonly state: "queued" | "sending" | "failed";
   readonly createdAt: string;
+  /** Safe display metadata retained from a provider-owned composer queue. */
+  readonly attachments?: readonly ProviderQueuedMessageAttachment[];
   /** Private response guidance retained with a provider-owned queue item. */
   readonly developerInstructions?: string;
   readonly error?: string;
+}
+
+export interface ProviderQueuedMessageAttachment {
+  readonly name: string;
+  readonly mimeType: string;
+  readonly byteLength: number;
+  /** Bounded image/audio data URL suitable for a queue preview. */
+  readonly dataUrl?: string;
+  readonly durationSeconds?: number;
 }
 
 export interface EnqueueProviderMessageRequest extends SendMessageRequest {
@@ -200,6 +211,19 @@ export interface ProviderEvent {
   readonly approval?: ProviderApprovalRequest;
 }
 
+/**
+ * A provider-owned task launch observed in another provider's durable activity.
+ * This is evidence, not a relationship by itself: the bridge still requires an
+ * unambiguous target-session match before nesting anything in the UI.
+ */
+export interface ObservedExternalSessionLaunch {
+  readonly targetProviderId: string;
+  readonly title: string;
+  readonly observedAt: string;
+  readonly workingDirectory?: string;
+  readonly modelId?: string;
+}
+
 export type ProviderEventSink = (event: ProviderEvent) => void | Promise<void>;
 
 export interface Subscription {
@@ -232,12 +256,24 @@ export interface AgentProviderAdapter {
   listSessions(options?: ListSessionsOptions): Promise<PaginatedSessions>;
   getSession(providerSessionId: string): Promise<RemoteSession>;
   getMessages(providerSessionId: string): Promise<readonly RemoteMessage[]>;
+  /** Reads durable provider activity for explicit launches of another provider. */
+  getExternalSessionLaunches?(providerSessionId: string, since: string): Promise<readonly ObservedExternalSessionLaunch[]>;
 
   createSession(options: CreateSessionOptions): Promise<RemoteSession>;
   /** Copies provider-native conversation history into a new session without starting a model turn. */
   branchSession?(providerSessionId: string): Promise<RemoteSession>;
   resumeSession(providerSessionId: string): Promise<void>;
   sendMessage(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult>;
+  /** Sends through the process that currently owns an externally-written task. */
+  sendMessageToExternalOwner?(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult>;
+  /** True while a model turn is still in flight, even if listed session status is stale. */
+  hasActiveTurn?(providerSessionId: string): boolean;
+  /** Provider-native session ids that currently have a model turn in flight. */
+  activeSessionIds?(): readonly string[];
+  /** True while any session streams through the adapter's secondary server feed. */
+  isSecondaryBusy?(): boolean;
+  /** Attaches (url) or detaches (undefined) the secondary server feed. */
+  setSecondaryBaseUrl?(url: string | undefined): void;
   listQueuedMessages?(): Promise<readonly ProviderQueuedMessage[]>;
   enqueueQueuedMessage?(providerSessionId: string, request: EnqueueProviderMessageRequest): Promise<ProviderQueuedMessage>;
   /** Restores the original identity, time, and position after a failed move out of the provider queue. */
@@ -245,6 +281,8 @@ export interface AgentProviderAdapter {
   /** Replaces one queued message in place without changing its order or identity. */
   updateQueuedMessage?(providerSessionId: string, messageId: string, content: string): Promise<ProviderQueuedMessage | null>;
   cancelQueuedMessage?(providerSessionId: string, messageId: string): Promise<boolean>;
+  /** Atomically removes and steers a provider-owned queue item through its external owner. */
+  steerQueuedMessage?(providerSessionId: string, messageId: string, request: SendMessageRequest): Promise<SendMessageResult>;
   steerMessage?(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult>;
   editMessage?(providerSessionId: string, request: EditMessageRequest): Promise<SendMessageResult>;
   interrupt?(providerSessionId: string): Promise<void>;
@@ -252,6 +290,9 @@ export interface AgentProviderAdapter {
   subscribe(providerSessionId: string | null, sink: ProviderEventSink): Promise<Subscription>;
   respondToApproval?(response: ProviderApprovalResponse): Promise<void>;
   respondToUserInput?(response: ProviderUserInputResponse): Promise<void>;
+  /** Keeps the provider transport attached so live session/update notifications continue. */
+  watchSession?(providerSessionId: string): Promise<void>;
+  unwatchSession?(providerSessionId: string): void;
   /** Releases a restartable provider transport while preserving cached session and event state. */
   releaseIdleResources?(): Promise<void>;
   dispose(): Promise<void>;

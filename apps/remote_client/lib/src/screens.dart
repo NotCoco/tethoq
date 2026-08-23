@@ -11,13 +11,17 @@ import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'app_theme.dart';
+import 'audio_message.dart';
 import 'desktop_wake_dialog.dart';
 import 'dictation.dart';
+import 'ears.dart';
 import 'json.dart';
 import 'models.dart';
 import 'security.dart';
 import 'store.dart';
 import 'transport.dart';
+
+const String directAudioDictationSourceId = 'direct-audio';
 
 class StoreScope extends InheritedNotifier<RemoteAppStore> {
   const StoreScope(
@@ -1132,6 +1136,13 @@ String _sideChatPreviewText(RemoteSession session) {
       : title;
 }
 
+// Side chats are seeded by copying the parent transcript so the provider has
+// the task's context; the bridge marks those copies with a `:copied:` id. The
+// sheet keeps that context out of sight so the chat reads as fresh.
+bool _isVisibleSideChatMessage(RemoteMessage message) =>
+    !message.id.contains(':copied:') &&
+    (message.providerMessageId?.startsWith('copied:') != true);
+
 void _showCompactError(BuildContext context, String label, Object error) {
   final detail =
       error.toString().replaceFirst(RegExp(r'^(Exception|StateError):\s*'), '');
@@ -1235,6 +1246,7 @@ class _SideChatSheetState extends State<_SideChatSheet> {
         _attachments.add(RemoteAttachment(
           name: file.name,
           mimeType: _genericMimeType(file.name),
+          origin: 'file-picker',
           dataBase64: encoded,
           byteLength: bytes.length,
         ));
@@ -1375,7 +1387,7 @@ class _SideChatSheetState extends State<_SideChatSheet> {
     final displayMessages = <RemoteMessage>[
       ...history,
       if (live != null) live,
-    ];
+    ].where(_isVisibleSideChatMessage).toList(growable: false);
     return Material(
       color: visual.surface,
       borderRadius: const BorderRadius.vertical(top: Radius.circular(16)),
@@ -1416,7 +1428,10 @@ class _SideChatSheetState extends State<_SideChatSheet> {
               Expanded(
                 child: displayMessages.isEmpty
                     ? Center(
-                        child: Text('Ask about this task',
+                        child: Text(
+                            history.isEmpty
+                                ? 'Ask about this task'
+                                : 'This side chat already carries the parent task\'s context.',
                             style: TextStyle(
                               color: Theme.of(context)
                                   .colorScheme
@@ -1591,6 +1606,9 @@ class _SessionScreenState extends State<SessionScreen>
   Duration _dictationElapsed = Duration.zero;
   bool _recordingDictation = false;
   bool _transcribingDictation = false;
+  bool _directAudioDictation = false;
+  double _dictationLevel = 0;
+  StreamSubscription<double>? _dictationLevelSubscription;
   String? _activeDictationSourceId;
   final List<RemoteAttachment> _attachments = <RemoteAttachment>[];
   final List<DelegationSelection> _meshTargets = <DelegationSelection>[];
@@ -1711,6 +1729,7 @@ class _SessionScreenState extends State<SessionScreen>
     _childSessionPollTimer?.cancel();
     _liveSessionPollTimer?.cancel();
     _dictationTimer?.cancel();
+    unawaited(_dictationLevelSubscription?.cancel());
     if (_recordingDictation) unawaited(_dictationRecorder.cancel());
     unawaited(_dictationRecorder.dispose());
     _store?.setVisibleSession(null);
@@ -1797,19 +1816,39 @@ class _SessionScreenState extends State<SessionScreen>
     }
     final store = StoreScope.of(context);
     final harnessId = _dictationHarnessId(store);
-    var source = store.dictationSourceForHarness(harnessId);
-    if (source == null) {
-      source = await _showDictationSourcePicker(store, harnessId);
-      if (source == null) return;
+    var sourceId = store.preferredDictationSourceIdForHarness(harnessId);
+    if (sourceId == null && _directAudioAvailable(store, harnessId)) {
+      sourceId = directAudioDictationSourceId;
+    }
+    sourceId ??= store.dictationSourceForHarness(harnessId)?.id;
+    if (sourceId == null ||
+        (sourceId == directAudioDictationSourceId &&
+            !_directAudioAvailable(store, harnessId))) {
+      sourceId = await _showDictationSourcePicker(store, harnessId);
+      if (sourceId == null) return;
     } else if (store.preferredDictationSourceIdForHarness(harnessId) == null) {
       try {
-        await store.setDictationSourceForHarness(harnessId, source.id);
+        await store.setDictationSourceForHarness(harnessId, sourceId);
       } on Object catch (caught) {
         if (mounted) _showDictationError(caught);
         return;
       }
     }
+    if (sourceId == directAudioDictationSourceId) {
+      await _startDirectAudio();
+      return;
+    }
+    final source =
+        store.dictationSources.where((item) => item.id == sourceId).firstOrNull;
+    if (source == null) {
+      if (mounted) {
+        _showDictationError(StateError(
+            'Choose a ready dictation service from the microphone menu.'));
+      }
+      return;
+    }
     _activeDictationSourceId = source.id;
+    _directAudioDictation = false;
     try {
       final permitted = await _dictationRecorder.start();
       if (!mounted) return;
@@ -1840,6 +1879,78 @@ class _SessionScreenState extends State<SessionScreen>
     }
   }
 
+  bool _destinationAcceptsDirectAudio(RemoteAppStore store, String harnessId) {
+    final session =
+        store.sessions.where((item) => item.id == widget.sessionId).firstOrNull;
+    final providerId = session?.providerId ?? harnessId;
+    if (providerId != 'direct' && providerId != 'codex') return false;
+    final model = session == null
+        ? null
+        : (store.modelsByProvider[providerId] ?? const <RemoteModel>[])
+                .where((item) => item.id == _selectedModelId)
+                .firstOrNull ??
+            (store.modelsByProvider[providerId] ?? const <RemoteModel>[])
+                .where((item) => item.id == session.modelId)
+                .firstOrNull;
+    return model?.supportsAudioInput == true;
+  }
+
+  bool _earsCanCarryAudio(RemoteAppStore store) {
+    final settings = store.ears;
+    if (!settings.enabled ||
+        settings.providerId == null ||
+        settings.modelId == null) {
+      return false;
+    }
+    final models =
+        store.modelsByProvider[settings.providerId] ?? const <RemoteModel>[];
+    final model =
+        models.where((item) => item.id == settings.modelId).firstOrNull;
+    return model != null && routeAcceptsEarsAudio(model);
+  }
+
+  bool _directAudioAvailable(RemoteAppStore store, String harnessId) =>
+      _destinationAcceptsDirectAudio(store, harnessId) ||
+      _earsCanCarryAudio(store);
+
+  Future<void> _startDirectAudio() async {
+    _activeDictationSourceId = directAudioDictationSourceId;
+    try {
+      final permitted = await _dictationRecorder.start();
+      if (!mounted) return;
+      if (!permitted) {
+        _activeDictationSourceId = null;
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Microphone permission is needed for dictation.'),
+        ));
+        return;
+      }
+      _directAudioDictation = true;
+      _dictationLevelSubscription = _dictationRecorder.levelStream.listen(
+        (level) {
+          if (mounted) setState(() => _dictationLevel = level);
+        },
+      );
+      _dictationStartedAt = DateTime.now();
+      setState(() {
+        _dictationElapsed = Duration.zero;
+        _recordingDictation = true;
+      });
+      _dictationTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (!mounted || !_recordingDictation) return;
+        final elapsed = DateTime.now().difference(_dictationStartedAt!);
+        if (elapsed >= const Duration(minutes: 10)) {
+          unawaited(_finishDictation());
+        } else {
+          setState(() => _dictationElapsed = elapsed);
+        }
+      });
+    } on Object catch (caught) {
+      _activeDictationSourceId = null;
+      if (mounted) _showDictationError(caught);
+    }
+  }
+
   String _dictationHarnessId(RemoteAppStore store) =>
       store.sessions
           .where((item) => item.id == widget.sessionId)
@@ -1856,12 +1967,16 @@ class _SessionScreenState extends State<SessionScreen>
     return 'all';
   }
 
-  Future<TranscriptionSource?> _showDictationSourcePicker(
+  Future<String?> _showDictationSourcePicker(
       RemoteAppStore store, String harnessId) async {
+    final directAudioAvailable = _directAudioAvailable(store, harnessId);
+    final directToModel = _destinationAcceptsDirectAudio(store, harnessId);
     final preferredId = store.preferredDictationSourceIdForHarness(harnessId) ??
-        store.dictationSourceForHarness(harnessId)?.id;
+        (directAudioAvailable
+            ? directAudioDictationSourceId
+            : store.dictationSourceForHarness(harnessId)?.id);
     final harnessName = providerVisualThemeFor(harnessId).displayName;
-    final hasReadySource =
+    final hasReadySource = directAudioAvailable ||
         store.dictationSources.any(store.isDictationSourceReady);
     final sourceId = await showModalBottomSheet<String>(
       context: context,
@@ -1906,6 +2021,99 @@ class _SessionScreenState extends State<SessionScreen>
                           : 'No dictation source is enabled. Set one up in Settings to start speaking here.',
                     ),
                   ),
+                if (directAudioAvailable) ...<Widget>[
+                  const SizedBox(height: 8),
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Material(
+                      color: preferredId == directAudioDictationSourceId
+                          ? Theme.of(sheetContext)
+                              .colorScheme
+                              .primary
+                              .withValues(alpha: 0.1)
+                          : Theme.of(sheetContext)
+                              .colorScheme
+                              .surfaceContainerHighest
+                              .withValues(alpha: 0.35),
+                      borderRadius: BorderRadius.circular(12),
+                      child: InkWell(
+                        key: const Key('dictation-source-option-direct-audio'),
+                        borderRadius: BorderRadius.circular(12),
+                        onTap: () => Navigator.pop(
+                            sheetContext, directAudioDictationSourceId),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 12, vertical: 10),
+                          child: Row(
+                            children: <Widget>[
+                              ClipOval(
+                                child: Container(
+                                  width: 38,
+                                  height: 38,
+                                  alignment: Alignment.center,
+                                  color: Theme.of(sheetContext)
+                                      .colorScheme
+                                      .surface,
+                                  child: Icon(
+                                    Icons.graphic_eq_rounded,
+                                    size: 22,
+                                    color: Theme.of(sheetContext)
+                                        .colorScheme
+                                        .primary,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 11),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: <Widget>[
+                                    Text(
+                                      'MP3',
+                                      style: Theme.of(sheetContext)
+                                          .textTheme
+                                          .bodyLarge
+                                          ?.copyWith(
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      directToModel
+                                          ? 'The model hears your recording'
+                                          : 'EARS turns your recording into text',
+                                      style: Theme.of(sheetContext)
+                                          .textTheme
+                                          .bodySmall
+                                          ?.copyWith(
+                                            color: Theme.of(sheetContext)
+                                                .colorScheme
+                                                .onSurfaceVariant,
+                                          ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Icon(
+                                preferredId == directAudioDictationSourceId
+                                    ? Icons.check_circle_rounded
+                                    : Icons.circle_outlined,
+                                size: 21,
+                                color: preferredId ==
+                                        directAudioDictationSourceId
+                                    ? Theme.of(sheetContext).colorScheme.primary
+                                    : Theme.of(sheetContext)
+                                        .colorScheme
+                                        .onSurfaceVariant,
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
                 if (store.dictationSources.isNotEmpty) ...<Widget>[
                   const SizedBox(height: 8),
                   ...store.dictationSources.map((source) {
@@ -2030,9 +2238,7 @@ class _SessionScreenState extends State<SessionScreen>
       if (mounted) _showDictationError(caught);
       return null;
     }
-    return store.dictationSources
-        .where((source) => source.id == sourceId)
-        .firstOrNull;
+    return sourceId;
   }
 
   Future<void> _openDictationSourcePicker() async {
@@ -2045,13 +2251,42 @@ class _SessionScreenState extends State<SessionScreen>
     if (!_recordingDictation || _transcribingDictation) return;
     _dictationTimer?.cancel();
     _dictationTimer = null;
+    final directAudio = _directAudioDictation;
+    await _dictationLevelSubscription?.cancel();
+    _dictationLevelSubscription = null;
     setState(() {
       _recordingDictation = false;
-      _transcribingDictation = true;
+      _dictationLevel = 0;
+      if (!directAudio) _transcribingDictation = true;
     });
     try {
       final waveBytes = await _dictationRecorder.stop();
       if (!mounted) return;
+      if (directAudio) {
+        if (waveBytes.length > 25 * 1024 * 1024) {
+          throw StateError('Audio recordings can be up to 25 MiB.');
+        }
+        final stamp = DateTime.now()
+            .toIso8601String()
+            .replaceAll(':', '-')
+            .replaceAll(RegExp(r'\.\d+'), '');
+        setState(() {
+          _attachments.add(RemoteAttachment(
+            name: 'dictation-$stamp.wav',
+            mimeType: 'audio/wav',
+            origin: 'dictation',
+            dataBase64: base64Encode(waveBytes),
+            byteLength: waveBytes.length,
+          ));
+        });
+        final store = StoreScope.of(context);
+        store.setDraftAttachments(widget.sessionId, _attachments);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Recording attached')));
+        }
+        return;
+      }
       final transcript = await StoreScope.of(context).transcribeDictation(
         waveBytes,
         sourceId: _activeDictationSourceId,
@@ -2062,7 +2297,13 @@ class _SessionScreenState extends State<SessionScreen>
       if (mounted) _showDictationError(caught);
     } finally {
       _activeDictationSourceId = null;
-      if (mounted) setState(() => _transcribingDictation = false);
+      _directAudioDictation = false;
+      if (mounted) {
+        setState(() {
+          _transcribingDictation = false;
+          _directAudioDictation = false;
+        });
+      }
     }
   }
 
@@ -2111,7 +2352,9 @@ class _SessionScreenState extends State<SessionScreen>
           : 'Continue this task…';
     }
     final seconds = _dictationElapsed.inSeconds;
-    return 'Listening… 0:${seconds.toString().padLeft(2, '0')}';
+    return _directAudioDictation
+        ? 'Recording… 0:${seconds.toString().padLeft(2, '0')}'
+        : 'Listening… 0:${seconds.toString().padLeft(2, '0')}';
   }
 
   void _onComposerChanged(RemoteAppStore store, String value) {
@@ -2132,6 +2375,11 @@ class _SessionScreenState extends State<SessionScreen>
     if (_meshTargets.isEmpty && value.toLowerCase() == '/mesh ') {
       unawaited(_activateMesh());
     }
+    if (RegExp(r'^/ears\s*$', caseSensitive: false).hasMatch(value)) {
+      _composer.value = TextEditingValue.empty;
+      store.setDraft(widget.sessionId, '');
+      unawaited(_openEarsSettings());
+    }
   }
 
   List<_SlashCommandDefinition>? get _slashCommandSuggestions =>
@@ -2143,6 +2391,12 @@ class _SessionScreenState extends State<SessionScreen>
   void _activateSlashCommand(_SlashCommandDefinition command) {
     if (command.id == 'mesh') {
       unawaited(_activateMesh());
+      return;
+    }
+    if (command.id == 'ears') {
+      _composer.value = TextEditingValue.empty;
+      _onComposerChanged(StoreScope.of(context), '');
+      unawaited(_openEarsSettings());
       return;
     }
     _activateSimplify();
@@ -2197,6 +2451,23 @@ class _SessionScreenState extends State<SessionScreen>
       selection: TextSelection.collapsed(offset: text.length),
     );
     _onComposerChanged(StoreScope.of(context), text);
+  }
+
+  Future<void> _openEarsSettings() async {
+    final store = StoreScope.of(context);
+    for (final provider in store.providers.where((item) =>
+        providerDeliversNativeAudio(item.providerId) &&
+        item.state.toLowerCase() == 'online')) {
+      unawaited(store.loadModels(provider.providerId));
+    }
+    if (!mounted) return;
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      constraints: const BoxConstraints(maxWidth: 640),
+      builder: (sheetContext) => _EarsSettingsSheet(store: store),
+    );
   }
 
   Future<void> _openSimplifySettings() async {
@@ -2391,9 +2662,7 @@ class _SessionScreenState extends State<SessionScreen>
                           : Text(model.description!, maxLines: 2),
                       trailing: model.id == target.modelId
                           ? const Icon(Icons.check_rounded)
-                          : model.isDefault
-                              ? const Text('Default')
-                              : null,
+                          : null,
                       onTap: () => Navigator.pop(sheetContext, model.id),
                     )),
             ],
@@ -2421,7 +2690,8 @@ class _SessionScreenState extends State<SessionScreen>
               ),
               ...efforts.map((option) => ListTile(
                     selected: option.id == target.reasoningEffort,
-                    title: Text(_effortDisplayLabel(option.id, model?.id)),
+                    title: Text(_effortDisplayLabel(
+                        option.id, model?.id, target.providerId)),
                     onTap: () => Navigator.pop(sheetContext, option.id),
                   )),
             ],
@@ -2548,6 +2818,7 @@ class _SessionScreenState extends State<SessionScreen>
         name:
             converted ? '${stem.isEmpty ? 'attachment' : stem}.jpg' : file.name,
         mimeType: converted ? 'image/jpeg' : _imageMimeType(file.name),
+        origin: 'file-picker',
         dataBase64: dataBase64,
         byteLength: prepared.length,
       ));
@@ -2583,6 +2854,7 @@ class _SessionScreenState extends State<SessionScreen>
       _setPendingAttachment(RemoteAttachment(
         name: file.name,
         mimeType: _genericMimeType(file.name),
+        origin: 'file-picker',
         dataBase64: dataBase64,
         byteLength: bytes.length,
       ));
@@ -2861,7 +3133,8 @@ class _SessionScreenState extends State<SessionScreen>
   }
 
   Future<void> _chooseReasoningEffort(
-      List<ReasoningEffortOption> efforts, String? modelId) async {
+      List<ReasoningEffortOption> efforts, String? modelId,
+      [String? providerId]) async {
     if (efforts.isEmpty) return;
     final selected = await showModalBottomSheet<String>(
       context: context,
@@ -2881,7 +3154,8 @@ class _SessionScreenState extends State<SessionScreen>
             ),
             ...efforts.map((effort) => ListTile(
                   selected: effort.id == _selectedReasoningEffort,
-                  title: Text(_effortDisplayLabel(effort.id, modelId)),
+                  title:
+                      Text(_effortDisplayLabel(effort.id, modelId, providerId)),
                   subtitle: effort.description == null
                       ? null
                       : Text(effort.description!),
@@ -2989,8 +3263,8 @@ class _SessionScreenState extends State<SessionScreen>
                 ...efforts.map((option) => ListTile(
                       key: ValueKey<String>('vision-effort-${option.id}'),
                       selected: option.id == currentEffort,
-                      title:
-                          Text(_effortDisplayLabel(option.id, choice.model.id)),
+                      title: Text(_effortDisplayLabel(option.id,
+                          choice.model.id, choice.target.providerId)),
                       onTap: () => Navigator.pop(sheetContext, option.id),
                     )),
               ],
@@ -3716,6 +3990,15 @@ class _SessionScreenState extends State<SessionScreen>
     }
   }
 
+  Future<void> _interruptCurrentWork(
+      RemoteAppStore store, String sessionId) async {
+    try {
+      await store.interrupt(sessionId);
+    } on Object catch (caught) {
+      if (mounted) _showCompactError(context, 'Could not interrupt', caught);
+    }
+  }
+
   Future<void> _openWallet(
     RemoteAppStore store,
     RemoteSession session,
@@ -3771,16 +4054,21 @@ class _SessionScreenState extends State<SessionScreen>
         ? null
         : store.dictationSourceForHarness(session.providerId);
     final dictationTooltip = _recordingDictation
-        ? 'Stop and transcribe'
+        ? (_directAudioDictation ? 'Stop recording' : 'Stop and transcribe')
         : _transcribingDictation
             ? 'Transcribing voice input'
-            : dictationSource == null
-                ? 'Choose a dictation service. Hold for voice options.'
-                : 'Tap to dictate with ${dictationSource.label}. Hold to choose a different service.';
+            : store.preferredDictationSourceIdForHarness(
+                        session?.providerId ?? store.selectedProviderId) ==
+                    directAudioDictationSourceId
+                ? 'Tap to record audio for the model. Hold to choose a different service.'
+                : dictationSource == null
+                    ? 'Choose a dictation service. Hold for voice options.'
+                    : 'Tap to dictate with ${dictationSource.label}. Hold to choose a different service.';
     final modelOptions = session == null
         ? const <RemoteModel>[]
         : store.modelsByProvider[session.providerId] ?? const <RemoteModel>[];
-    final sessionWorking = session?.state == 'working';
+    final sessionWorking = session?.state == 'working' ||
+        store.liveAssistantMessageFor(widget.sessionId) != null;
     final compactConversationHeader = MediaQuery.sizeOf(context).height < 520;
     final configuredModel =
         modelOptions.where((model) => model.id == _selectedModelId).firstOrNull;
@@ -3811,7 +4099,8 @@ class _SessionScreenState extends State<SessionScreen>
     );
     final displayedReasoningLabel = displayedReasoningEffort == null
         ? ''
-        : _effortDisplayLabel(displayedReasoningEffort, displayedModelId);
+        : _effortDisplayLabel(
+            displayedReasoningEffort, displayedModelId, session?.providerId);
     final contextCompacting = sessionContext?.isCompacting == true;
     final wallet = session == null
         ? null
@@ -3936,7 +4225,8 @@ class _SessionScreenState extends State<SessionScreen>
                 IconButton(
                   key: const Key('interrupt-current-work'),
                   tooltip: 'Interrupt current work',
-                  onPressed: () => unawaited(store.interrupt(session!.id)),
+                  onPressed: () =>
+                      unawaited(_interruptCurrentWork(store, session!.id)),
                   icon: const Icon(Icons.stop_rounded, size: 19),
                 ),
                 const SizedBox(width: 2),
@@ -3961,6 +4251,9 @@ class _SessionScreenState extends State<SessionScreen>
                         break;
                       case 'open-desktop':
                         unawaited(showDesktopWakeDialog(context, store));
+                        break;
+                      case 'ears-settings':
+                        unawaited(_openEarsSettings());
                         break;
                     }
                   },
@@ -4004,6 +4297,17 @@ class _SessionScreenState extends State<SessionScreen>
                       ),
                     ),
                     const PopupMenuDivider(),
+                    const PopupMenuItem<String>(
+                      key: Key('session-ears-settings'),
+                      value: 'ears-settings',
+                      child: Row(
+                        children: <Widget>[
+                          Icon(Icons.graphic_eq_rounded, size: 19),
+                          SizedBox(width: 10),
+                          Expanded(child: Text('EARS settings')),
+                        ],
+                      ),
+                    ),
                     PopupMenuItem<String>(
                       key: const Key('session-open-desktop'),
                       value: 'open-desktop',
@@ -4318,7 +4622,9 @@ class _SessionScreenState extends State<SessionScreen>
                                 reasoningEfforts.isNotEmpty,
                             effortIsUltra: displayedReasoningEffort == 'ultra',
                             onReasoningTap: () => _chooseReasoningEffort(
-                                reasoningEfforts, displayedModelId),
+                                reasoningEfforts,
+                                displayedModelId,
+                                session?.providerId),
                             visionLabel: _visionProxySelection == null
                                 ? 'Add eyes'
                                 : 'Eyes: ${_visionProxySelection!.modelId}',
@@ -4366,27 +4672,37 @@ class _SessionScreenState extends State<SessionScreen>
                                 itemBuilder: (context, index) {
                                   final file = _attachments[index];
                                   return InputChip(
-                                    avatar: file.mimeType.startsWith('image/')
-                                        ? ClipRRect(
+                                    avatar: file.mimeType.startsWith('audio/')
+                                        ? AudioChipPlayToggle(
                                             key: ValueKey<String>(
-                                                'pending-image-${file.name}'),
-                                            borderRadius:
-                                                BorderRadius.circular(3),
-                                            child: _ExpandableMessageImage(
-                                              imageUri: file.dataUri,
-                                              name: file.name,
-                                              width: 24,
-                                              height: 24,
-                                              fit: BoxFit.cover,
-                                              cacheWidth: 48,
-                                              fallback: const Icon(
-                                                  Icons.broken_image_outlined,
-                                                  size: 18),
-                                            ),
+                                                'pending-audio-${file.name}'),
+                                            uri: file.dataUri,
+                                            mimeType: file.mimeType,
+                                            accent: visual.accent,
                                           )
-                                        : const Icon(
-                                            Icons.insert_drive_file_outlined,
-                                            size: 18),
+                                        : file.mimeType.startsWith('image/')
+                                            ? ClipRRect(
+                                                key: ValueKey<String>(
+                                                    'pending-image-${file.name}'),
+                                                borderRadius:
+                                                    BorderRadius.circular(3),
+                                                child: _ExpandableMessageImage(
+                                                  imageUri: file.dataUri,
+                                                  name: file.name,
+                                                  width: 24,
+                                                  height: 24,
+                                                  fit: BoxFit.cover,
+                                                  cacheWidth: 48,
+                                                  fallback: const Icon(
+                                                      Icons
+                                                          .broken_image_outlined,
+                                                      size: 18),
+                                                ),
+                                              )
+                                            : const Icon(
+                                                Icons
+                                                    .insert_drive_file_outlined,
+                                                size: 18),
                                     label: Text(file.name,
                                         overflow: TextOverflow.ellipsis),
                                     onDeleted: () => setState(() {
@@ -4437,6 +4753,38 @@ class _SessionScreenState extends State<SessionScreen>
                               onPressed: () =>
                                   unawaited(_openSimplifySettings()),
                               onDeleted: _removeSimplify,
+                            ),
+                          if (store.earsBusy)
+                            Padding(
+                              padding: const EdgeInsets.fromLTRB(12, 4, 8, 2),
+                              child: Row(
+                                children: <Widget>[
+                                  Expanded(
+                                    child: Text(
+                                      'Transcribing dictation…',
+                                      key: const Key('ears-progress'),
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .bodySmall
+                                          ?.copyWith(
+                                            color: visual.accent,
+                                          ),
+                                    ),
+                                  ),
+                                  TextButton(
+                                    key: const Key('cancel-ears-transcription'),
+                                    onPressed: () =>
+                                        unawaited(store.cancelEars()),
+                                    child: const Text('Cancel transcription'),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          if (_recordingDictation && _directAudioDictation)
+                            _DictationLiveTrace(
+                              level: _dictationLevel,
+                              elapsed: _dictationElapsed,
+                              visual: visual,
                             ),
                           Padding(
                             padding: const EdgeInsets.fromLTRB(8, 7, 8, 9),
@@ -4550,9 +4898,11 @@ class _SessionScreenState extends State<SessionScreen>
                                           valueListenable: _composer,
                                           builder: (context, composerValue, _) {
                                             final composerEmpty = composerValue
-                                                .text
-                                                .trim()
-                                                .isEmpty;
+                                                    .text
+                                                    .trim()
+                                                    .isEmpty &&
+                                                !_attachments.any(
+                                                    isDictationAudioAttachment);
                                             return SizedBox.square(
                                               dimension: 48,
                                               child: IconButton(
@@ -4756,7 +5106,10 @@ class _DictationComposerControl extends StatelessWidget {
                 left: 4,
                 right: 4,
                 bottom: 0,
-                height: 19,
+                // Keep the normal microphone tap at the icon's centre. The
+                // crescent is painted in the same place with a 24px band, but
+                // no longer steals that primary hit from the control above.
+                height: 24,
                 child: Semantics(
                   button: true,
                   label: 'Choose dictation provider',
@@ -4800,19 +5153,129 @@ class _DictationCrescentPainter extends CustomPainter {
       ..strokeWidth = 1.8
       ..strokeCap = StrokeCap.round;
     final crescent = Path()
-      ..moveTo(3, 2)
-      ..quadraticBezierTo(size.width / 2, size.height - 2, size.width - 3, 2);
+      ..moveTo(3, size.height - 16)
+      ..quadraticBezierTo(
+          size.width / 2, size.height - 3, size.width - 3, size.height - 16);
     canvas.drawPath(crescent, stroke);
     final center = size.width / 2;
-    canvas.drawLine(Offset(center - 3.5, size.height - 7),
-        Offset(center, size.height - 3.5), stroke);
-    canvas.drawLine(Offset(center, size.height - 3.5),
-        Offset(center + 3.5, size.height - 7), stroke);
+    canvas.drawLine(Offset(center - 4.5, size.height - 10),
+        Offset(center, size.height - 5), stroke);
+    canvas.drawLine(Offset(center, size.height - 5),
+        Offset(center + 4.5, size.height - 10), stroke);
   }
 
   @override
   bool shouldRepaint(covariant _DictationCrescentPainter oldDelegate) =>
       oldDelegate.color != color;
+}
+
+class _DictationLiveTrace extends StatefulWidget {
+  const _DictationLiveTrace({
+    required this.level,
+    required this.elapsed,
+    required this.visual,
+  });
+
+  final double level;
+  final Duration elapsed;
+  final ProviderVisualTheme visual;
+
+  @override
+  State<_DictationLiveTrace> createState() => _DictationLiveTraceState();
+}
+
+class _DictationLiveTraceState extends State<_DictationLiveTrace> {
+  final List<double> _levels = <double>[];
+  static const int _maximumSamples = 240;
+
+  @override
+  void didUpdateWidget(covariant _DictationLiveTrace oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.level != oldWidget.level ||
+        widget.elapsed != oldWidget.elapsed) {
+      _levels.add(widget.level.clamp(0.0, 1.0));
+      if (_levels.length > _maximumSamples) _levels.removeAt(0);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final seconds = widget.elapsed.inSeconds;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 0, 8, 7),
+      child: Container(
+        height: 36,
+        padding: const EdgeInsets.symmetric(horizontal: 10),
+        decoration: BoxDecoration(
+          color: widget.visual.accent.withValues(alpha: 0.08),
+          borderRadius: BorderRadius.circular(10),
+          border:
+              Border.all(color: widget.visual.accent.withValues(alpha: 0.35)),
+        ),
+        child: Row(
+          children: <Widget>[
+            Expanded(
+              child: CustomPaint(
+                size: const Size(double.infinity, 26),
+                painter: _LiveTracePainter(
+                  levels: List<double>.of(_levels),
+                  accent: widget.visual.accent,
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              '0:${seconds.toString().padLeft(2, '0')}',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: widget.visual.accent,
+                fontFeatures: const <FontFeature>[
+                  FontFeature.tabularFigures(),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _LiveTracePainter extends CustomPainter {
+  const _LiveTracePainter({required this.levels, required this.accent});
+
+  final List<double> levels;
+  final Color accent;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final mid = size.height / 2;
+    final line = Paint()
+      ..color = accent
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.6
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+    if (levels.isEmpty) {
+      canvas.drawLine(Offset(2, mid), Offset(size.width - 2, mid), line);
+      return;
+    }
+    final step = size.width / _DictationLiveTraceState._maximumSamples;
+    final path = Path();
+    for (var index = 0; index < levels.length; index += 1) {
+      final x = size.width - (levels.length - index) * step;
+      final y = mid - levels[index].clamp(0.0, 1.0) * (mid - 2);
+      if (index == 0) {
+        path.moveTo(x, y);
+      } else {
+        path.lineTo(x, y);
+      }
+    }
+    canvas.drawPath(path, line);
+  }
+
+  @override
+  bool shouldRepaint(covariant _LiveTracePainter oldDelegate) =>
+      oldDelegate.levels != levels;
 }
 
 enum _SourceSessionAction { handoff, branch }
@@ -5170,6 +5633,8 @@ class _QueuedNewTaskSheetState extends State<_QueuedNewTaskSheet> {
       model.displayName,
       model.id,
       model.providerId,
+      model.sourceProviderId ?? '',
+      model.sourceProviderName ?? '',
       model.description ?? '',
       providerVisualThemeFor(model.providerId).displayName,
     ].join(' ').toLowerCase().contains(query);
@@ -5316,8 +5781,8 @@ class _QueuedNewTaskSheetState extends State<_QueuedNewTaskSheet> {
                   items: efforts
                       .map((option) => DropdownMenuItem<String>(
                             value: option.id,
-                            child: Text(_effortDisplayLabel(
-                                option.id, _selectedModel.id)),
+                            child: Text(_effortDisplayLabel(option.id,
+                                _selectedModel.id, _selectedModel.providerId)),
                           ))
                       .toList(growable: false),
                   onChanged: (value) =>
@@ -5375,6 +5840,8 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
       model.displayName,
       model.id,
       model.providerId,
+      model.sourceProviderId ?? '',
+      model.sourceProviderName ?? '',
       model.description ?? '',
     ].join(' ').toLowerCase().contains(query);
   }
@@ -5394,6 +5861,10 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
           : null,
       title: Text(model.displayName,
           style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
+      subtitle: keyPrefix == 'recent' && model.providerId == 'opencode'
+          ? Text(model.routeProviderLabel,
+              maxLines: 1, overflow: TextOverflow.ellipsis)
+          : null,
       trailing: selected
           ? const Icon(Icons.check_rounded)
           : Icon(Icons.account_balance_wallet_outlined,
@@ -5412,15 +5883,26 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
     final groups = <String, List<RemoteModel>>{};
     for (final model in matches.where((model) =>
         !recentKeys.contains('${model.providerId}\u0000${model.id}'))) {
-      groups.putIfAbsent(model.providerId, () => <RemoteModel>[]).add(model);
+      final routeKey = model.providerId == 'opencode'
+          ? '${model.providerId}\u0000${model.sourceProviderId ?? model.sourceProviderName ?? 'opencode'}'
+          : model.providerId;
+      groups.putIfAbsent(routeKey, () => <RemoteModel>[]).add(model);
     }
     final providerIds = groups.keys.toList()
       ..sort((left, right) {
-        if (left == widget.currentProviderId) return -1;
-        if (right == widget.currentProviderId) return 1;
-        return providerVisualThemeFor(left)
-            .displayName
-            .compareTo(providerVisualThemeFor(right).displayName);
+        final leftProviderId = left.split('\u0000').first;
+        final rightProviderId = right.split('\u0000').first;
+        if (leftProviderId != rightProviderId) {
+          if (leftProviderId == widget.currentProviderId) return -1;
+          if (rightProviderId == widget.currentProviderId) return 1;
+          return providerVisualThemeFor(leftProviderId)
+              .displayName
+              .compareTo(providerVisualThemeFor(rightProviderId).displayName);
+        }
+        return groups[left]!
+            .first
+            .routeProviderName
+            .compareTo(groups[right]!.first.routeProviderName);
       });
     return Column(
       key: const Key('searchable-model-picker'),
@@ -5466,15 +5948,26 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
                           (model) => _modelTile(model, keyPrefix: 'recent')),
                       const Divider(height: 18),
                     ],
-                    ...providerIds.expand((providerId) => <Widget>[
-                          _ModelGroupHeader(
-                            title:
-                                providerVisualThemeFor(providerId).displayName,
-                            providerId: providerId,
-                          ),
-                          ...groups[providerId]!.map((model) =>
-                              _modelTile(model, keyPrefix: 'catalog')),
-                        ]),
+                    ...providerIds.expand((groupKey) {
+                      final groupModels = groups[groupKey]!;
+                      final providerId = groupModels.first.providerId;
+                      final openCodeRoute = providerId == 'opencode';
+                      return <Widget>[
+                        _ModelGroupHeader(
+                          title: openCodeRoute
+                              ? groupModels.first.routeProviderName
+                              : providerVisualThemeFor(providerId).displayName,
+                          providerId: providerId,
+                          subtitle: openCodeRoute
+                              ? groupModels.first.routeCarrierName == null
+                                  ? null
+                                  : 'via ${groupModels.first.routeCarrierName}'
+                              : null,
+                        ),
+                        ...groupModels.map(
+                            (model) => _modelTile(model, keyPrefix: 'catalog')),
+                      ];
+                    }),
                     const SizedBox(height: 16),
                   ],
                 ),
@@ -5489,12 +5982,14 @@ class _ModelGroupHeader extends StatelessWidget {
     required this.title,
     this.providerId,
     this.icon,
+    this.subtitle,
     super.key,
   });
 
   final String title;
   final String? providerId;
   final IconData? icon;
+  final String? subtitle;
 
   @override
   Widget build(BuildContext context) => Padding(
@@ -5506,11 +6001,26 @@ class _ModelGroupHeader extends StatelessWidget {
             else
               Icon(icon, size: 18),
             const SizedBox(width: 8),
-            Text(title,
-                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      fontSize: 14,
-                      fontWeight: FontWeight.w600,
-                    )),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  Text(title,
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                          )),
+                  if (subtitle != null)
+                    Text(subtitle!,
+                        style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .onSurface
+                                  .withValues(alpha: .55),
+                            )),
+                ],
+              ),
+            ),
           ],
         ),
       );
@@ -6005,6 +6515,12 @@ const List<_SlashCommandDefinition> _slashCommands = <_SlashCommandDefinition>[
     description: 'Delegate to another connected harness',
     icon: Icons.hub_outlined,
   ),
+  _SlashCommandDefinition(
+    id: 'ears',
+    command: '/ears',
+    description: 'Configure dictation preprocessing',
+    icon: Icons.graphic_eq_rounded,
+  ),
 ];
 
 List<_SlashCommandDefinition>? _filteredSlashCommands(String value) {
@@ -6033,7 +6549,7 @@ class _SlashCommandPalette extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Container(
         key: const Key('slash-command-palette'),
-        constraints: const BoxConstraints(maxHeight: 132),
+        constraints: const BoxConstraints(maxHeight: 156),
         margin: const EdgeInsets.fromLTRB(8, 3, 8, 2),
         padding: const EdgeInsets.all(3),
         decoration: BoxDecoration(
@@ -6103,6 +6619,106 @@ class _SlashCommandPalette extends StatelessWidget {
                 },
               ),
       );
+}
+
+class _EarsSettingsSheet extends StatelessWidget {
+  const _EarsSettingsSheet({required this.store});
+
+  final RemoteAppStore store;
+
+  List<RemoteModel> get _routes {
+    final routes = <RemoteModel>[];
+    for (final models in store.modelsByProvider.values) {
+      for (final model in models) {
+        if (routeAcceptsEarsAudio(model)) routes.add(model);
+      }
+    }
+    return routes;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: store,
+      builder: (context, _) {
+        final settings = store.ears;
+        final routes = _routes;
+        final selected = routes
+            .where((model) =>
+                model.providerId == settings.providerId &&
+                model.id == settings.modelId)
+            .firstOrNull;
+        return SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(18, 0, 18, 18),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text('EARS', style: Theme.of(context).textTheme.titleLarge),
+                const SizedBox(height: 4),
+                Text(
+                  'Dictation audio is sent to this model first. The destination agent receives only the resulting text.',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+                SwitchListTile(
+                  key: const Key('ears-enabled-toggle'),
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Preprocess dictation before send'),
+                  value: settings.enabled,
+                  onChanged: (value) => unawaited(
+                      store.setEars(settings.copyWith(enabled: value))),
+                ),
+                DropdownButtonFormField<String>(
+                  key: const Key('ears-model-picker'),
+                  initialValue: selected == null
+                      ? null
+                      : '${selected.providerId}:${selected.id}',
+                  decoration: const InputDecoration(labelText: 'Model'),
+                  items: <DropdownMenuItem<String>>[
+                    ...routes.map((model) => DropdownMenuItem<String>(
+                          value: '${model.providerId}:${model.id}',
+                          child: Text(model.displayName),
+                        )),
+                  ],
+                  onChanged: (value) {
+                    if (value == null) return;
+                    final separator = value.indexOf(':');
+                    unawaited(store.setEars(settings.copyWith(
+                      enabled: true,
+                      providerId: value.substring(0, separator),
+                      modelId: value.substring(separator + 1),
+                    )));
+                  },
+                ),
+                ListTile(
+                  key: const Key('ears-mode-cleaned'),
+                  contentPadding: EdgeInsets.zero,
+                  selected: settings.mode == 'cleaned',
+                  title: const Text('Cleaned'),
+                  subtitle: const Text(
+                      'Turn the recording into a clear written prompt.'),
+                  onTap: () => unawaited(
+                      store.setEars(settings.copyWith(mode: 'cleaned'))),
+                ),
+                ListTile(
+                  key: const Key('ears-mode-verbatim'),
+                  contentPadding: EdgeInsets.zero,
+                  selected: settings.mode == 'verbatim',
+                  title: const Text('Verbatim'),
+                  subtitle: const Text(
+                      'Transcribe the recording as faithfully as possible.'),
+                  onTap: () => unawaited(
+                      store.setEars(settings.copyWith(mode: 'verbatim'))),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
 }
 
 class _SimplifyComposerChip extends StatelessWidget {
@@ -6362,7 +6978,8 @@ class _MeshComposerPanel extends StatelessWidget {
             final details = <String>[
               modelLabel,
               if (targetEffort != null)
-                _effortDisplayLabel(targetEffort, target.modelId),
+                _effortDisplayLabel(
+                    targetEffort, target.modelId, target.providerId),
             ];
             return Padding(
               padding: const EdgeInsets.only(bottom: 4),
@@ -6480,7 +7097,7 @@ class _DelegationTaskCard extends StatelessWidget {
               _ => task.error ?? 'Delegation failed',
             },
             style: TextStyle(
-                fontSize: 10,
+                fontSize: 11,
                 color: Theme.of(context)
                     .colorScheme
                     .onSurface
@@ -6514,7 +7131,8 @@ class _DelegationTaskCard extends StatelessWidget {
                             <String>[
                               if (modelLabel != null) modelLabel,
                               if (childEffort != null)
-                                _effortDisplayLabel(childEffort, child.modelId),
+                                _effortDisplayLabel(childEffort, child.modelId,
+                                    child.providerId),
                               _titleCase(child.state),
                             ].join(' · '),
                             maxLines: 1,
@@ -6776,7 +7394,7 @@ class _ImageModelNotice extends StatelessWidget {
               maxLines: 2,
               overflow: TextOverflow.ellipsis,
               style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                    fontSize: 10,
+                    fontSize: 11,
                     fontWeight: FontWeight.w400,
                     height: 1.25,
                     color: Theme.of(context)
@@ -6901,6 +7519,14 @@ bool _finalFollowsAssistantArtifacts(List<RemoteMessage> messages, int index) {
 
 bool _isConversationBoundary(RemoteMessage message) {
   if (message.role.toLowerCase() == 'system') return true;
+  final text = message.parts.map(_messagePartText).join(' ').trim();
+  if (text.toLowerCase().startsWith(
+          'another language model started to solve this problem and produced a summary of its thinking process.') ||
+      RegExp(r'^(?:(?:context|conversation|session)\s+(?:was\s+|has\s+been\s+|automatically\s+)?compacted(?:\s+successfully)?|(?:automatic\s+|context\s+|session\s+)?compaction\s+(?:complete|completed))[.!]?$',
+              caseSensitive: false)
+          .hasMatch(text)) {
+    return true;
+  }
   return message.parts.any((part) {
     final metadata = <Object?>[
       part.type,
@@ -6927,14 +7553,23 @@ String _conversationBoundaryLabel(RemoteMessage message) {
       .join(' ')
       .toLowerCase();
   final isCompaction = text.contains('earlier conversation summary') ||
+      text.startsWith(
+          'another language model started to solve this problem and produced a summary of its thinking process.') ||
       text.contains('compact') ||
       metadata.contains('compact');
   if (!isCompaction) return 'System context';
-  return text.contains('automatically compacted') ||
-          text.contains('automatic compaction') ||
-          metadata.contains('automatic compaction')
-      ? 'Automatically compacted context'
-      : 'Context compacted';
+  return 'Session compacted';
+}
+
+String _conversationBoundaryDetail(RemoteMessage message) {
+  final detail = message.parts.map(_messagePartText).join('\n\n').trim();
+  if (RegExp(
+          r'^(?:(?:context|conversation|session)\s+(?:was\s+|has\s+been\s+|automatically\s+)?compacted(?:\s+successfully)?|(?:automatic\s+|context\s+|session\s+)?compaction\s+(?:complete|completed))[.!]?$',
+          caseSensitive: false)
+      .hasMatch(detail)) {
+    return 'Earlier conversation context was summarized so this task could continue within the model context window.';
+  }
+  return detail;
 }
 
 enum _AssistantTextTone { finalAnswer, commentary, privateReasoning }
@@ -7579,7 +8214,7 @@ class _WorkflowMessageAttachment extends StatelessWidget {
                             fontSize: 12, fontWeight: FontWeight.w600)),
                     Text('$_events events · $_screenshots screenshots',
                         style: TextStyle(
-                            fontSize: 10,
+                            fontSize: 11,
                             color: Theme.of(context)
                                 .colorScheme
                                 .onSurface
@@ -7611,7 +8246,7 @@ class _WorkflowMetric extends StatelessWidget {
             children: <Widget>[
               Text(label.toUpperCase(),
                   style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                      fontSize: 9,
+                      fontSize: 11,
                       color: Theme.of(context)
                           .colorScheme
                           .onSurface
@@ -7655,6 +8290,7 @@ class _MessageCard extends StatelessWidget {
       return _ConversationBoundary(
         messageId: message.id,
         label: _conversationBoundaryLabel(message),
+        detail: _conversationBoundaryDetail(message),
       );
     }
     final meshEnvelope = isUser
@@ -7839,30 +8475,45 @@ class _MessageCard extends StatelessWidget {
                                                 displayedAttachments.length - 1
                                         ? 8
                                         : 0),
-                                child: entry.$2.imageUri == null
-                                    ? _AttachmentFileLabel(
+                                child: entry.$2.audioUri != null
+                                    ? ConstrainedBox(
                                         key: ValueKey<String>(
-                                            'message-file-${message.id}-${entry.$1}'),
-                                        attachment: entry.$2,
-                                        visual: visual,
-                                      )
-                                    : ClipRRect(
-                                        key: ValueKey<String>(
-                                            'message-image-${message.id}-${entry.$1}'),
-                                        borderRadius: BorderRadius.circular(5),
-                                        child: _ExpandableMessageImage(
-                                          imageUri: entry.$2.imageUri!,
+                                            'message-audio-${message.id}-${entry.$1}'),
+                                        constraints:
+                                            const BoxConstraints(maxWidth: 250),
+                                        child: AudioMessageWidget(
+                                          uri: entry.$2.audioUri!,
                                           name: entry.$2.name,
-                                          fit: BoxFit.cover,
-                                          width: 260,
-                                          height: 170,
-                                          cacheWidth: 520,
-                                          fallback: _AttachmentFileLabel(
+                                          mimeType: entry.$2.audioMimeType ??
+                                              'audio/mpeg',
+                                          accent: visual.accent,
+                                        ),
+                                      )
+                                    : entry.$2.imageUri == null
+                                        ? _AttachmentFileLabel(
+                                            key: ValueKey<String>(
+                                                'message-file-${message.id}-${entry.$1}'),
                                             attachment: entry.$2,
                                             visual: visual,
+                                          )
+                                        : ClipRRect(
+                                            key: ValueKey<String>(
+                                                'message-image-${message.id}-${entry.$1}'),
+                                            borderRadius:
+                                                BorderRadius.circular(5),
+                                            child: _ExpandableMessageImage(
+                                              imageUri: entry.$2.imageUri!,
+                                              name: entry.$2.name,
+                                              fit: BoxFit.cover,
+                                              width: 260,
+                                              height: 170,
+                                              cacheWidth: 520,
+                                              fallback: _AttachmentFileLabel(
+                                                attachment: entry.$2,
+                                                visual: visual,
+                                              ),
+                                            ),
                                           ),
-                                        ),
-                                      ),
                               )),
                           if (subagentParts.isNotEmpty)
                             Padding(
@@ -7972,53 +8623,100 @@ class _MessageCard extends StatelessWidget {
   }
 }
 
-class _ConversationBoundary extends StatelessWidget {
+class _ConversationBoundary extends StatefulWidget {
   const _ConversationBoundary({
     required this.messageId,
     required this.label,
+    required this.detail,
   });
 
   final String messageId;
   final String label;
+  final String detail;
+
+  @override
+  State<_ConversationBoundary> createState() => _ConversationBoundaryState();
+}
+
+class _ConversationBoundaryState extends State<_ConversationBoundary> {
+  bool _expanded = false;
 
   @override
   Widget build(BuildContext context) {
     final color =
         Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.42);
-    final isCompaction = label == 'Context compacted' ||
-        label == 'Automatically compacted context';
+    final isCompaction = widget.label == 'Session compacted';
     return Semantics(
-      key: ValueKey<String>('conversation-boundary-$messageId'),
+      key: ValueKey<String>('conversation-boundary-${widget.messageId}'),
       container: true,
-      label: label,
+      label: widget.label,
+      button: isCompaction,
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 34, vertical: 10),
-        child: Row(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: <Widget>[
-            if (!isCompaction) ...<Widget>[
-              Expanded(
-                  child:
-                      Divider(height: 1, color: color.withValues(alpha: .5))),
-              const SizedBox(width: 8),
-            ],
-            Icon(Icons.compress_rounded, size: 14, color: color),
-            const SizedBox(width: 5),
-            ExcludeSemantics(
-              child: Text(
-                label,
-                style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                      color: color,
-                      fontSize: 11.5,
-                      fontWeight: FontWeight.w500,
+            InkWell(
+              onTap: isCompaction
+                  ? () => setState(() => _expanded = !_expanded)
+                  : null,
+              borderRadius: BorderRadius.circular(6),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: Row(
+                  children: <Widget>[
+                    if (!isCompaction) ...<Widget>[
+                      Expanded(
+                          child: Divider(
+                              height: 1, color: color.withValues(alpha: .5))),
+                      const SizedBox(width: 8),
+                    ],
+                    Icon(Icons.compress_rounded, size: 14, color: color),
+                    const SizedBox(width: 5),
+                    ExcludeSemantics(
+                      child: Text(
+                        widget.label,
+                        style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                              color: color,
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w500,
+                            ),
+                      ),
                     ),
+                    if (isCompaction) ...<Widget>[
+                      const SizedBox(width: 3),
+                      Icon(
+                        _expanded
+                            ? Icons.keyboard_arrow_up_rounded
+                            : Icons.keyboard_arrow_down_rounded,
+                        size: 14,
+                        color: color,
+                      ),
+                    ],
+                    if (!isCompaction) ...<Widget>[
+                      const SizedBox(width: 8),
+                      Expanded(
+                          child: Divider(
+                              height: 1, color: color.withValues(alpha: .5))),
+                    ],
+                  ],
+                ),
               ),
             ),
-            if (!isCompaction) ...<Widget>[
-              const SizedBox(width: 8),
-              Expanded(
-                  child:
-                      Divider(height: 1, color: color.withValues(alpha: .5))),
-            ],
+            if (isCompaction && _expanded && widget.detail.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(left: 19, top: 5, right: 8),
+                child: Text(
+                  widget.detail,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: Theme.of(context)
+                            .colorScheme
+                            .onSurface
+                            .withValues(alpha: .62),
+                        height: 1.45,
+                      ),
+                ),
+              ),
           ],
         ),
       ),
@@ -8413,7 +9111,7 @@ class _MemoryContextIndicator extends StatelessWidget {
             'Used saved context',
             style: Theme.of(context).textTheme.labelSmall?.copyWith(
                   color: color,
-                  fontSize: 10.5,
+                  fontSize: 11,
                   fontWeight: FontWeight.w500,
                   letterSpacing: 0.1,
                 ),
@@ -10802,7 +11500,8 @@ class HostsScreen extends StatelessWidget {
             ...efforts.map((effort) => ListTile(
                   key: Key('agent-default-reasoning-${effort.id}'),
                   selected: effort.id == initialEffort,
-                  title: Text(_effortDisplayLabel(effort.id, model.id)),
+                  title: Text(_effortDisplayLabel(
+                      effort.id, model.id, provider.providerId)),
                   trailing: effort.id == initialEffort
                       ? const Icon(Icons.check_rounded)
                       : null,
@@ -10924,7 +11623,9 @@ class HostsScreen extends StatelessWidget {
                                   model.displayName,
                                   if (defaults?.reasoningEffort != null)
                                     _effortDisplayLabel(
-                                        defaults!.reasoningEffort!, model.id),
+                                        defaults!.reasoningEffort!,
+                                        model.id,
+                                        agent.providerId),
                                 ].join(' · ');
                       return Column(
                         children: <Widget>[
@@ -11640,17 +12341,22 @@ class _MessageAttachmentView {
     required this.name,
     required this.isImage,
     this.imageUri,
+    this.audioUri,
+    this.audioMimeType,
   });
 
   factory _MessageAttachmentView.fromPart(ContentPart part,
       {String? fallbackName}) {
     final isImage = part.isImageAttachment;
+    final isAudio = part.isAudioAttachment;
     return _MessageAttachmentView(
       name: _safeAttachmentName(part.attachmentName ??
           fallbackName ??
           (isImage ? 'Image' : 'Attachment')),
       isImage: isImage,
       imageUri: isImage ? _messageImageUri(part) : null,
+      audioUri: isAudio ? _messageAudioUri(part) : null,
+      audioMimeType: isAudio ? (part.attachmentMimeType ?? 'audio/mpeg') : null,
     );
   }
 
@@ -11663,6 +12369,8 @@ class _MessageAttachmentView {
   final String name;
   final bool isImage;
   final String? imageUri;
+  final String? audioUri;
+  final String? audioMimeType;
 }
 
 String? _messageImageUri(ContentPart part) {
@@ -11676,6 +12384,14 @@ String? _messageImageUri(ContentPart part) {
   final parsed = Uri.tryParse(uri);
   if (parsed?.scheme == 'https' || parsed?.scheme == 'http') return uri;
   return null;
+}
+
+String? _messageAudioUri(ContentPart part) {
+  final uri = part.attachmentUri;
+  if (uri == null || !uri.startsWith('data:audio/')) return null;
+  final comma = uri.indexOf(',');
+  if (comma < 0 || !uri.substring(0, comma).endsWith(';base64')) return null;
+  return uri;
 }
 
 class _ExpandableMessageImage extends StatelessWidget {
@@ -11834,9 +12550,13 @@ String _titleCase(String value) {
   return '${normalized[0].toUpperCase()}${normalized.substring(1)}';
 }
 
-String _effortDisplayLabel(String effort, String? modelId) {
-  if (modelId == 'gpt-5.6-sol' && effort == 'low') return 'Light';
-  return _titleCase(effort);
+String _effortDisplayLabel(String effort, String? modelId,
+    [String? providerId]) {
+  return reasoningDisplayLabel(
+    effort,
+    providerId: providerId,
+    modelId: modelId,
+  );
 }
 
 String? _concreteReasoningEffort(String? value) {

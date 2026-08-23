@@ -8,8 +8,17 @@ import {
   isSessionState,
   makeGlobalSessionId,
   parseGlobalSessionId,
+  earsCancelledMessage,
+  earsInstruction,
+  earsModelKey,
+  earsUserPrompt,
+  isEarsAudioMimeType,
+  isEarsMode,
+  lowestReasoningEffort,
   normalizeSimplifySettings,
+  parseEarsModelKey,
   parseSimplifyCommand,
+  routeAcceptsEarsAudio,
   simplifyDeveloperInstructions,
   type AgentEvent,
   type EventReplaySlice,
@@ -45,12 +54,14 @@ import {
   ProviderAdapterError,
   providerErrorFromUnknown,
   collectAllSessionPages,
+  hiddenProviderControlContent,
   type AgentProviderAdapter,
   type AuthRequest,
   type AuthResult,
   type CreateSessionOptions,
   type EditMessageRequest,
   type ProviderEvent,
+  type ObservedExternalSessionLaunch,
   type ProviderDetection,
   type ProviderQueuedMessage,
   type ProviderClientTooling,
@@ -71,6 +82,7 @@ import {
 } from "./dictation.js";
 import { RefreshCoordinator } from "./refresh.js";
 import { SessionCache } from "./session_cache.js";
+import type { SessionSelection } from "./session_selection_store.js";
 import { UserInputRegistry } from "./user_inputs.js";
 import {
   branchBootstrap,
@@ -81,6 +93,7 @@ import {
   handoffSummary,
   persistableBranchMessages,
 } from "./context_transfer.js";
+import { maximumCompactionThresholds } from "./compaction_threshold_store.js";
 import type { SessionTransferRecord } from "./session_transfer_store.js";
 import {
   maxCrossSessionContentLength,
@@ -105,6 +118,15 @@ interface QueuedMessageRecord {
 export interface SideChatResult {
   readonly session: RemoteSession;
   readonly copiedMessageCount: number;
+}
+
+export interface SideChatListItem {
+  readonly id: string;
+  readonly title: string;
+  readonly providerId: string;
+  readonly state: RemoteSession["state"];
+  readonly updatedAt: string;
+  readonly preview?: string;
 }
 
 export interface QueuedTaskSelection {
@@ -148,9 +170,35 @@ interface PendingBranchBootstrap {
   readonly relationship: SessionRelationship;
 }
 
+interface ParentObservedExternalLaunch extends ObservedExternalSessionLaunch {
+  readonly parentSessionId: string;
+}
+
 const messageSnapshotTtlMs = 2_000;
 const maxMessageSnapshots = 32;
 const maxPersistedSessionTransfers = 1_000;
+const maximumPendingExternalLaunches = 100;
+const externalLaunchHistoryWindowMs = 7 * 24 * 60 * 60_000;
+
+function firstUserPromptPreview(messages: readonly RemoteMessage[]): string | undefined {
+  for (const message of messages) {
+    if (message.role !== "user") continue;
+    const text = message.parts
+      .flatMap((part) => part.type === "text" ? [part.text.trim()] : [])
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+    if (text) return text.slice(0, 240);
+  }
+  return undefined;
+}
+
+function previewRepeatsTitle(session: RemoteSession): boolean {
+  const preview = session.preview?.trim();
+  return preview === undefined || preview === "" || preview.toLocaleLowerCase() === session.title.trim().toLocaleLowerCase();
+}
+const externalLaunchMatchWindowMs = 5 * 60_000;
+const externalLaunchHistoryScanCooldownMs = 15_000;
 export const visionProxyDeveloperInstructions = "You are acting as visual support for another model. Answer only the visual question you receive using the attached image or images. Report what is visible accurately and concisely, including relevant text, layout, states, positions, and uncertainty. Do not take actions, make unrelated plans, or continue the parent task. Do not claim details you cannot see. Return a self-contained observation that the requesting model can use directly.";
 
 export function messagePage(
@@ -193,16 +241,29 @@ function minimumCompactionThreshold(contextWindowTokens: number): number {
   return Math.min(contextWindowTokens, Math.max(1_000, fivePercentRoundedUp));
 }
 
+const resubscribeCooldownMs = 3_000;
+const maximumResubscribeCooldownMs = 120_000;
+
 export class AgentBridge {
   readonly #adapters = new Map<string, AgentProviderAdapter>();
   readonly #messageSnapshots = new Map<string, MessageSnapshotRecord>();
   readonly #messageSnapshotGenerations = new Map<string, number>();
   readonly #openSessionLoads = new Map<string, OpenSessionLoad>();
-  readonly #cache = new SessionCache();
+  readonly #cache = new SessionCache({
+    preserveWorking: (sessionId) => this.delegatedChildTurnInFlight(sessionId),
+    onSelectionsChange: (selections) => this.#onSessionSelectionsChange?.(selections),
+  });
   readonly #events: EventReplayBuffer;
   readonly #deduper = new EventDeduper();
   readonly #subscriptions: Subscription[] = [];
   readonly #subscribedProviders = new Set<string>();
+  /** Providers that have answered a detection probe at least once this run. */
+  readonly #everDetected = new Set<string>();
+  readonly #lastGoodCapabilities = new Map<string, ProviderConnection["capabilities"]>();
+  readonly #connectPromises = new Map<string, Promise<void>>();
+  readonly #resubscribeTimers = new Map<string, NodeJS.Timeout>();
+  readonly #resubscribeAttempts = new Map<string, number>();
+  readonly #watchedSessionIds = new Set<string>();
   readonly #providerConnectionErrors = new Map<string, ReturnType<typeof providerErrorFromUnknown>>();
   readonly #approvals = new ApprovalRegistry();
   readonly #userInputs = new UserInputRegistry();
@@ -225,17 +286,30 @@ export class AgentBridge {
   readonly #crossSessionPumps = new Set<string>();
   readonly #delegations = new Map<string, DelegationRuntime>();
   readonly #visionProxies = new Map<string, VisionProxyRuntime>();
+  readonly #earsHelpers = new Map<string, string>();
+  readonly #earsHelperCreations = new Map<string, Promise<RemoteSession>>();
+  readonly #earsTranscriptionTails = new Map<string, Promise<void>>();
+  readonly #earsJobs = new Map<string, { cancelled: boolean }>();
+  readonly #onEarsHelpersChange: ((helpers: Readonly<Record<string, string>>) => void) | undefined;
+  readonly #internalHelperWorkingDirectory: string;
   readonly #compactionThresholds = new Map<string, number>();
+  readonly #onCompactionThresholdsChange: ((thresholds: Readonly<Record<string, number>>) => void | Promise<void>) | undefined;
   readonly #compactingSessions = new Set<string>();
   readonly #compactionKinds = new Map<string, "automatic" | "manual">();
+  readonly #pendingExternalLaunches: ParentObservedExternalLaunch[] = [];
+  #lastExternalLaunchHistoryScanAt = 0;
+  #externalLaunchHistoryScan: Promise<void> | null = null;
   readonly #lastCompactionUsage = new Map<string, number>();
+  readonly #interruptions = new Map<string, Promise<void>>();
   readonly #internalSessionIds = new Set<string>();
   readonly #internalSessionCreations = new Map<string, { depth: number; readonly events: ProviderEvent[] }>();
   readonly #delegationPumps = new Set<string>();
   readonly #onDelegationsChange: ((tasks: readonly DelegationTask[]) => void) | undefined;
+  #onSessionSelectionsChange: ((selections: Readonly<Record<string, SessionSelection>>) => void) | undefined;
   readonly #onSessionTransfersChange: ((transfers: readonly SessionTransferRecord[]) => void) | undefined;
   readonly #onCrossSessionMessagesChange: ((messages: readonly CrossSessionMessage[]) => void | Promise<void>) | undefined;
   readonly #globalAgentInstructions: (() => Promise<string | undefined>) | undefined;
+  readonly #sessionMaySpawnForeignSubagents: ((sessionId: string) => boolean) | undefined;
   readonly #onPairingConfirmed: (() => void) | undefined;
   #delegationTimer: NodeJS.Timeout | undefined;
   #refresh: RefreshCoordinator;
@@ -262,6 +336,14 @@ export class AgentBridge {
       readonly crossSessionMessages?: readonly CrossSessionMessage[];
       readonly onCrossSessionMessagesChange?: (messages: readonly CrossSessionMessage[]) => void | Promise<void>;
       readonly globalAgentInstructions?: () => Promise<string | undefined>;
+      readonly sessionMaySpawnForeignSubagents?: (sessionId: string) => boolean;
+      readonly sessionSelections?: Readonly<Record<string, SessionSelection>>;
+      readonly onSessionSelectionsChange?: (selections: Readonly<Record<string, SessionSelection>>) => void;
+      readonly earsHelpers?: Readonly<Record<string, string>>;
+      readonly onEarsHelpersChange?: (helpers: Readonly<Record<string, string>>) => void;
+      readonly internalHelperWorkingDirectory?: string;
+      readonly compactionThresholds?: Readonly<Record<string, number>>;
+      readonly onCompactionThresholdsChange?: (thresholds: Readonly<Record<string, number>>) => void | Promise<void>;
     } = {},
   ) {
     this.#events = new EventReplayBuffer(config.hostId);
@@ -278,6 +360,32 @@ export class AgentBridge {
     this.#onSessionTransfersChange = pairingOptions.onSessionTransfersChange;
     this.#onCrossSessionMessagesChange = pairingOptions.onCrossSessionMessagesChange;
     this.#globalAgentInstructions = pairingOptions.globalAgentInstructions;
+    this.#sessionMaySpawnForeignSubagents = pairingOptions.sessionMaySpawnForeignSubagents;
+    this.#onSessionSelectionsChange = pairingOptions.onSessionSelectionsChange;
+    this.#onEarsHelpersChange = pairingOptions.onEarsHelpersChange;
+    this.#internalHelperWorkingDirectory = pairingOptions.internalHelperWorkingDirectory ?? process.cwd();
+    this.#onCompactionThresholdsChange = pairingOptions.onCompactionThresholdsChange;
+    for (const [sessionId, threshold] of Object.entries(pairingOptions.compactionThresholds ?? {})) {
+      try {
+        const parsed = parseGlobalSessionId(sessionId);
+        if (parsed.hostId !== this.config.hostId || !Number.isSafeInteger(threshold) || threshold <= 0) continue;
+        this.rememberCompactionThreshold(sessionId, threshold);
+      } catch {
+        // Malformed local settings are ignored instead of being attached to another task.
+      }
+    }
+    this.#cache.restoreSelections(pairingOptions.sessionSelections ?? {});
+    for (const [key, helperId] of Object.entries(pairingOptions.earsHelpers ?? {})) {
+      try {
+        const model = parseEarsModelKey(key);
+        const helper = parseGlobalSessionId(helperId);
+        if (model === undefined || model.providerId !== helper.providerId || helper.hostId !== this.config.hostId) continue;
+        this.#earsHelpers.set(key, helperId);
+        this.#internalSessionIds.add(helperId);
+      } catch {
+        // A malformed local helper record is ignored rather than hiding an unrelated task.
+      }
+    }
     for (const task of pairingOptions.delegations ?? []) {
       this.#delegations.set(task.id, {
         task,
@@ -304,6 +412,26 @@ export class AgentBridge {
     this.#refresh = new RefreshCoordinator(this.#adapters, this.#cache);
   }
 
+  /**
+   * Swaps a registered provider for a fresh adapter to the same provider id -
+   * used when the desktop repoints at a different OpenCode server. The new
+   * adapter is registered even when its connection attempt fails so the
+   * resubscribe loop retries against the new server.
+   */
+  public async replaceProviderAdapter(adapter: AgentProviderAdapter): Promise<void> {
+    this.assertActive();
+    const existing = this.#adapters.get(adapter.providerId);
+    if (existing === undefined) throw new Error(`Provider ${adapter.providerId} is not registered`);
+    if (existing === adapter) return;
+    await existing.dispose();
+    this.#subscribedProviders.delete(adapter.providerId);
+    this.#adapters.set(adapter.providerId, adapter);
+    if (this.#clientTooling !== undefined) adapter.configureClientTooling?.(this.#clientTooling);
+    this.#refresh = new RefreshCoordinator(this.#adapters, this.#cache);
+    await this.connectProvider(adapter);
+    await this.#refresh.refreshProvider(adapter.providerId);
+  }
+
   public configureClientTooling(tooling: ProviderClientTooling): void {
     if (this.#started) throw new Error("Configure provider tools before starting the bridge");
     this.#clientTooling = tooling;
@@ -319,9 +447,46 @@ export class AgentBridge {
     this.reconcileDelegationTimer();
   }
 
+  /** Re-lists one provider without touching the others. */
+  public async refreshProvider(providerId: string): Promise<void> {
+    this.assertActive();
+    await this.#refresh.refreshProvider(providerId);
+    this.restoreSessionTransferLinks();
+    this.linkObservedExternalSessions(this.#pendingExternalLaunches);
+    await this.maybeDiscoverHistoricalExternalSessionLinks();
+  }
+
+  /**
+   * Whether the provider's live event subscription is up. This governs streaming,
+   * not the ability to send: a detected provider answers requests either way.
+   */
+  public isProviderConnected(providerId: string): boolean {
+    return this.#subscribedProviders.has(providerId);
+  }
+
   public async reconnectProvider(providerId: string): Promise<void> {
     const adapter = this.requireAdapter(providerId);
     await this.connectProvider(adapter);
+    // Subscribing starts the live feed and nothing more. Sessions that already
+    // existed on the provider are only ever learned by listing, so a provider
+    // that comes up after the startup refresh has to be re-listed here or its
+    // history stays missing from the cache.
+    await this.#refresh.refreshProvider(providerId);
+  }
+
+  /** Provider-native session ids that currently have a model turn in flight. */
+  public providerActiveSessions(providerId: string): readonly string[] {
+    return this.#adapters.get(providerId)?.activeSessionIds?.() ?? [];
+  }
+
+  /** True while any session still streams through the provider's secondary feed. */
+  public isProviderSecondaryBusy(providerId: string): boolean {
+    return this.#adapters.get(providerId)?.isSecondaryBusy?.() === true;
+  }
+
+  /** Attaches or detaches the provider's secondary server feed. */
+  public setProviderSecondaryUrl(providerId: string, url: string | undefined): void {
+    this.#adapters.get(providerId)?.setSecondaryBaseUrl?.(url);
   }
 
   public host(): Host {
@@ -393,7 +558,10 @@ export class AgentBridge {
     const threshold = storedThreshold === undefined || contextWindowTokens === null || minimumThresholdTokens === null
       ? null
       : Math.max(minimumThresholdTokens, Math.min(contextWindowTokens, storedThreshold));
-    if (threshold !== null && threshold !== storedThreshold) this.#compactionThresholds.set(globalSessionId, threshold);
+    if (threshold !== null && threshold !== storedThreshold) {
+      this.rememberCompactionThreshold(globalSessionId, threshold);
+      await this.persistCompactionThresholds();
+    }
     const supportsManualCompaction = adapter.compactSession !== undefined && reported?.supportsManualCompaction === true;
     return {
       sessionId: globalSessionId,
@@ -431,15 +599,16 @@ export class AgentBridge {
     if (context.usedTokens !== null && thresholdTokens <= context.usedTokens && !compactNow) {
       throw new Error("This conversation is already above that threshold. Confirm immediate compaction or choose a higher value.");
     }
-    const previousThreshold = this.#compactionThresholds.get(globalSessionId);
+    const previousThresholds = new Map(this.#compactionThresholds);
     const previousCompactionUsage = this.#lastCompactionUsage.get(globalSessionId);
-    this.#compactionThresholds.set(globalSessionId, thresholdTokens);
+    this.rememberCompactionThreshold(globalSessionId, thresholdTokens);
     this.#lastCompactionUsage.delete(globalSessionId);
     try {
       if (context.usedTokens !== null && thresholdTokens <= context.usedTokens) await this.compactSession(globalSessionId, "manual");
+      await this.persistCompactionThresholds();
     } catch (error) {
-      if (previousThreshold === undefined) this.#compactionThresholds.delete(globalSessionId);
-      else this.#compactionThresholds.set(globalSessionId, previousThreshold);
+      this.#compactionThresholds.clear();
+      for (const [sessionId, threshold] of previousThresholds) this.#compactionThresholds.set(sessionId, threshold);
       if (previousCompactionUsage === undefined) this.#lastCompactionUsage.delete(globalSessionId);
       else this.#lastCompactionUsage.set(globalSessionId, previousCompactionUsage);
       throw error;
@@ -485,21 +654,24 @@ export class AgentBridge {
     return await Promise.all([...this.#adapters.values()].map(async (adapter): Promise<ProviderConnection> => {
       return await this.withIdleRelease(adapter, async () => {
         try {
-          const detection = await adapter.detect();
+          let detection = await adapter.detect();
+          // Detection is a single unretried probe, and a provider that reads
+          // unavailable loses every capability - which is what takes the send
+          // control away from the user. A provider that has answered before has
+          // earned a second ask, so one dropped probe cannot do that. Providers
+          // that never answered are not re-probed, so a genuinely missing tool
+          // costs the same as before.
+          if (!detection.available && this.#everDetected.has(adapter.providerId)) {
+            detection = await adapter.detect();
+          }
+          if (detection.available) this.#everDetected.add(adapter.providerId);
           if (!detection.available) {
-            const error = this.providerUnavailableError(adapter, detection);
-            return {
-              providerId: adapter.providerId,
-              displayName: adapter.displayName,
-              state: "offline",
-              detected: false,
-              authenticated: null,
-              capabilities: this.unavailableProviderCapabilities(),
-              lastError: providerErrorFromUnknown(adapter.providerId, error),
-            };
+            return this.unreachableProvider(adapter, this.providerUnavailableError(adapter, detection));
           }
           const [auth, capabilities] = await Promise.all([adapter.getAuthStatus(), adapter.getCapabilities()]);
+          this.#lastGoodCapabilities.set(adapter.providerId, capabilities);
           const connected = this.#subscribedProviders.has(adapter.providerId);
+          if (!connected) this.scheduleProviderResubscribe(adapter.providerId);
           const connectionError = this.#providerConnectionErrors.get(adapter.providerId);
           return {
             providerId: adapter.providerId,
@@ -519,15 +691,7 @@ export class AgentBridge {
             } : {}),
           };
         } catch (error) {
-          return {
-            providerId: adapter.providerId,
-            displayName: adapter.displayName,
-            state: "offline",
-            detected: false,
-            authenticated: null,
-            capabilities: this.unavailableProviderCapabilities(),
-            lastError: providerErrorFromUnknown(adapter.providerId, error),
-          };
+          return this.unreachableProvider(adapter, error);
         }
       });
     }));
@@ -538,7 +702,10 @@ export class AgentBridge {
     await Promise.allSettled([...this.#adapters.values()].map((adapter) => this.connectProvider(adapter)));
     const result = await this.#refresh.refresh();
     this.restoreDelegationLinks();
+    await this.restorePersistedSubagentSessions();
     this.restoreSessionTransferLinks();
+    this.linkObservedExternalSessions(this.#pendingExternalLaunches);
+    await this.maybeDiscoverHistoricalExternalSessionLinks();
     this.reconcileDelegationTimer();
     await this.reconcileCrossSessionDeliveries();
     for (const targetSessionId of new Set([...this.#crossSessionMessages.values()]
@@ -559,7 +726,7 @@ export class AgentBridge {
     const targets = await Promise.all([...this.#adapters.values()].map(async (adapter): Promise<VisionProxyTarget | null> => {
       return await this.withIdleRelease(adapter, async () => {
         try {
-          if (adapter.sessionCreationFeatures?.hiddenDeveloperInstructions !== true || adapter.listModels === undefined) return null;
+          if (adapter.listModels === undefined) return null;
           const capabilities = await adapter.getCapabilities();
           if (!capabilities.createSession || !capabilities.sendMessage || !capabilities.modelEnumeration) return null;
           const models = (await adapter.listModels()).filter((model) => model.inputModalities?.includes("image") === true);
@@ -621,11 +788,106 @@ export class AgentBridge {
       content: trimmedQuestion,
       modelId: runtime.selection.modelId,
       ...(runtime.selection.reasoningEffort !== undefined ? { reasoningEffort: runtime.selection.reasoningEffort } : {}),
+      developerInstructions: visionProxyDeveloperInstructions,
       attachments: images,
       metadata: { internalPurpose: "vision_proxy", parentSessionId: sessionId },
     });
     const observation = await this.waitForVisionObservation(runtime.selection.providerId, helper.providerSessionId, before);
     return { observation, helperSessionId: helper.id };
+  }
+
+  /**
+   * One-shot audio-to-text for dictation clips. Creates a hidden helper session
+   * and never records a user-visible destination turn.
+   */
+  public cancelEars(requestId: string): { readonly cancelled: boolean } {
+    const job = this.#earsJobs.get(requestId);
+    if (job === undefined) return { cancelled: false };
+    job.cancelled = true;
+    return { cancelled: true };
+  }
+
+  public async processEars(input: {
+    readonly providerId: string;
+    readonly modelId: string;
+    readonly mode: string;
+    readonly attachmentIds: readonly string[];
+    readonly sessionId?: string;
+    readonly requestId?: string;
+  }): Promise<{ readonly texts: readonly string[] }> {
+    this.assertActive();
+    const mode = input.mode;
+    if (!isEarsMode(mode)) throw new Error("EARS mode must be verbatim or cleaned");
+    if (input.attachmentIds.length === 0) throw new Error("EARS needs at least one dictation recording");
+    const jobId = input.requestId ?? `ears_${randomUUID()}`;
+    if (this.#earsJobs.has(jobId)) throw new Error("That EARS transcription request is already running");
+    const job = { cancelled: false };
+    this.#earsJobs.set(jobId, job);
+    try {
+      const adapter = this.requireAdapter(input.providerId);
+      if (adapter.listModels === undefined) throw new Error("The configured EARS model is no longer available for audio. Choose another model.");
+      const models = await adapter.listModels();
+      const model = models.find((candidate) => candidate.id === input.modelId);
+      if (model === undefined || !routeAcceptsEarsAudio({
+        providerId: input.providerId,
+        ...(model.inputModalities !== undefined ? { inputModalities: model.inputModalities } : {}),
+      })) {
+        throw new Error("The configured EARS model is no longer available for audio. Choose another model.");
+      }
+      const reasoningEffort = lowestReasoningEffort(earsEffortsFromModel(model));
+      const consumption = this.#attachmentUploads.consume(input.attachmentIds);
+      try {
+        for (const attachment of consumption.attachments) {
+          if (!isEarsAudioMimeType(attachment.mimeType)) throw new Error("EARS only accepts dictation audio recordings");
+        }
+        this.assertAttachmentProvider(input.providerId, consumption.attachments);
+        const cancelled = () => this.#earsJobs.get(jobId)?.cancelled === true;
+        if (cancelled()) throw new Error(earsCancelledMessage);
+        const helperInput = {
+          providerId: input.providerId,
+          modelId: input.modelId,
+          ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+        };
+        const texts = await this.withEarsTranscriptionLock(earsModelKey(input.providerId, input.modelId), async () => {
+          if (cancelled()) throw new Error(earsCancelledMessage);
+          let helper = await this.ensureEarsHelperSession(helperInput);
+          let recreatedMissingHelper = false;
+          const results: string[] = [];
+          for (const [index, attachment] of consumption.attachments.entries()) {
+            if (cancelled()) throw new Error(earsCancelledMessage);
+            for (;;) {
+              try {
+                const before = await adapter.getMessages(helper.providerSessionId);
+                await adapter.sendMessage(helper.providerSessionId, {
+                  requestId: `ears_${randomUUID()}`,
+                  content: earsUserPrompt(index + 1),
+                  developerInstructions: earsInstruction(mode),
+                  modelId: input.modelId,
+                  ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+                  attachments: [attachment],
+                  metadata: { internalPurpose: "ears" },
+                });
+                results.push(await this.waitForVisionObservation(input.providerId, helper.providerSessionId, before, "EARS", cancelled));
+                break;
+              } catch (error) {
+                if (recreatedMissingHelper || !isMissingProviderSessionError(error)) throw error;
+                recreatedMissingHelper = true;
+                helper = await this.ensureEarsHelperSession(helperInput, helper.id);
+              }
+            }
+          }
+          return results;
+        });
+        if (this.#earsJobs.get(jobId)?.cancelled === true) throw new Error(earsCancelledMessage);
+        consumption.commit();
+        return { texts };
+      } catch (error) {
+        consumption.release();
+        throw error;
+      }
+    } finally {
+      if (this.#earsJobs.get(jobId) === job) this.#earsJobs.delete(jobId);
+    }
   }
 
   public async openSession(globalSessionId: string, cursor?: string, limit = 40, refresh = false): Promise<OpenSessionResult> {
@@ -680,8 +942,18 @@ export class AgentBridge {
     ]);
     if (cached === undefined) this.#cache.upsert(session);
     this.restoreSessionTransferLinks();
-    const resolvedSession = this.#cache.get(globalSessionId) ?? session;
+    let resolvedSession = this.#cache.get(globalSessionId) ?? session;
     const providerVisible = clientVisibleBranchMessages(clientVisibleHandoffMessages(providerMessages));
+    const firstPrompt = firstUserPromptPreview(providerVisible);
+    if (firstPrompt !== undefined && previewRepeatsTitle(resolvedSession)) {
+      const hydrated = {
+        ...resolvedSession,
+        preview: firstPrompt,
+        nativeMetadata: { ...resolvedSession.nativeMetadata, tethoqClientPreview: firstPrompt },
+      };
+      this.#cache.upsert(hydrated);
+      resolvedSession = this.#cache.get(globalSessionId) ?? hydrated;
+    }
     const copied = (resolvedSession.relationship?.kind === "branch" || resolvedSession.relationship?.kind === "side_chat") && resolvedSession.relationship.strategy === "transcript_bootstrap"
       ? this.#branchCopies.get(globalSessionId)
       : undefined;
@@ -726,6 +998,12 @@ export class AgentBridge {
     if (hostId !== this.config.hostId) throw new Error("Session belongs to a different host");
     const adapter = this.requireAdapter(providerId);
     const capabilities = await adapter.getCapabilities();
+    // OpenCode's normal listing cannot enumerate sessions stored under its
+    // catch-all `global` project, even though direct reads by session ID still
+    // work. A persisted positive sub-agent relationship gives us the exact IDs
+    // to recover without guessing from titles, paths, or timestamps. Missing or
+    // deleted provider sessions simply stay absent.
+    await this.restorePersistedSubagentSessions(parentGlobalSessionId);
     const delegatedChildren = [...this.#delegations.values()]
       .filter((runtime) => runtime.task.parentSessionId === parentGlobalSessionId)
       .flatMap((runtime) => runtime.task.children)
@@ -735,16 +1013,198 @@ export class AgentBridge {
     const visionHelpers = visionHelperId === undefined
       ? []
       : [this.#cache.get(visionHelperId)].filter((session): session is RemoteSession => session !== undefined);
-    if (!capabilities.sessionRelationships && delegatedChildren.length === 0 && visionHelpers.length === 0) {
+    const observedBeforeRefresh = this.#cache.all().filter((session) =>
+      session.relationship?.kind === "subagent" && session.relationship.sourceSessionId === parentGlobalSessionId);
+    if (!capabilities.sessionRelationships && delegatedChildren.length === 0 && visionHelpers.length === 0 && observedBeforeRefresh.length === 0) {
       throw new Error(`${providerId} does not support child-session relationships`);
     }
+    // Cross-provider children are not covered by the parent's native child query.
+    // Re-list only their known providers when the user opens/keeps open the child
+    // view so working/completed state is current without refreshing the whole app.
+    const observedProviderIds = new Set(observedBeforeRefresh.map((session) => session.providerId).filter((childProviderId) => childProviderId !== providerId));
+    await Promise.all([...observedProviderIds].map(async (childProviderId) => { await this.#refresh.refreshProvider(childProviderId); }));
+    const observedChildren = this.#cache.all().filter((session) =>
+      session.relationship?.kind === "subagent" && session.relationship.sourceSessionId === parentGlobalSessionId);
     const nativeChildren = capabilities.sessionRelationships
       ? (await collectAllSessionPages(adapter, { parentProviderSessionId: providerSessionId, limit: 100 })).sessions
           .filter((session) => session.parentSessionId === parentGlobalSessionId)
       : [];
-    const children = [...new Map([...nativeChildren, ...delegatedChildren, ...visionHelpers].map((session) => [session.id, session])).values()];
+    const children = [...new Map([...nativeChildren, ...delegatedChildren, ...visionHelpers, ...observedChildren].map((session) => [session.id, session])).values()];
     this.#cache.reconcileChildren(parentGlobalSessionId, children);
     return children.map((session) => this.#cache.get(session.id) ?? session);
+  }
+
+  private async restorePersistedSubagentSessions(parentSessionId?: string): Promise<void> {
+    const missing = [...this.#sessionTransfers.values()].filter((record) =>
+      record.relationship.kind === "subagent"
+      && (parentSessionId === undefined || record.relationship.sourceSessionId === parentSessionId)
+      && this.#cache.get(record.sessionId) === undefined);
+    if (missing.length === 0) return;
+    await Promise.all(missing.map(async (record) => {
+      try {
+        const child = parseGlobalSessionId(record.sessionId);
+        const source = parseGlobalSessionId(record.relationship.sourceSessionId);
+        if (child.hostId !== this.config.hostId || source.hostId !== this.config.hostId) return;
+        const childAdapter = this.#adapters.get(child.providerId);
+        if (childAdapter === undefined) return;
+        const session = await childAdapter.getSession(child.providerSessionId);
+        if (session.id !== record.sessionId) return;
+        this.#cache.upsert(session);
+      } catch {
+        // Persisted provenance is not proof that the provider session still
+        // exists. Do not fabricate a placeholder for a deleted session.
+      }
+    }));
+    this.restoreSessionTransferLinks();
+  }
+
+  private rememberExternalLaunches(parentSessionId: string, launches: readonly ObservedExternalSessionLaunch[]): void {
+    for (const launch of launches) {
+      if (launch.targetProviderId === parseGlobalSessionId(parentSessionId).providerId) continue;
+      const duplicate = this.#pendingExternalLaunches.some((entry) => entry.parentSessionId === parentSessionId
+        && externalLaunchSignature(entry) === externalLaunchSignature(launch));
+      if (!duplicate) this.#pendingExternalLaunches.push({ ...launch, parentSessionId });
+    }
+    while (this.#pendingExternalLaunches.length > maximumPendingExternalLaunches) this.#pendingExternalLaunches.shift();
+  }
+
+  private linkObservedExternalSessions(launches: readonly ParentObservedExternalLaunch[]): number {
+    let linked = 0;
+    const candidates = this.#cache.all().filter((session) =>
+      session.parentSessionId === undefined && session.relationship === undefined && session.createdAt !== undefined);
+    for (const session of candidates) {
+      const matchingLaunches = launches.filter((launch) => externalLaunchMatchesSession(launch, session));
+      const matchingParents = new Set(matchingLaunches
+        .map((launch) => launch.parentSessionId));
+      if (matchingParents.size !== 1) continue;
+      const launcherSessionId = [...matchingParents][0]!;
+      if (this.#cache.get(launcherSessionId) === undefined) continue;
+      const parentSessionId = this.externalLaunchGroupParent(launcherSessionId);
+      const matchingSessions = candidates.filter((candidate) => matchingLaunches
+        .some((launch) => externalLaunchMatchesSession(launch, candidate)));
+      if (matchingSessions.length !== 1) continue;
+      const relationship: SessionRelationship = { kind: "subagent", sourceSessionId: parentSessionId, strategy: "native" };
+      this.#cache.upsert({
+        ...session,
+        parentSessionId,
+        relationship,
+        agentRole: session.agentRole ?? "external_subagent",
+        nativeMetadata: {
+          ...session.nativeMetadata,
+          ...transferMetadata(relationship),
+          tethoqObservedExternalLaunch: true,
+          tethoqObservedExternalLauncherSessionId: launcherSessionId,
+        },
+      });
+      if (!this.#sessionTransfers.has(session.id)) this.rememberSessionTransfer({ sessionId: session.id, relationship, pending: false });
+      linked += 1;
+    }
+    return linked;
+  }
+
+  /** Put externally launched grandchildren on the nearest rail-visible owner. */
+  private externalLaunchGroupParent(launcherSessionId: string): string {
+    let currentId = launcherSessionId;
+    const visited = new Set<string>();
+    while (!visited.has(currentId)) {
+      visited.add(currentId);
+      const current = this.#cache.get(currentId);
+      const sourceSessionId = current?.relationship?.kind === "subagent"
+        ? current.relationship.sourceSessionId
+        : undefined;
+      if (sourceSessionId === undefined || this.#cache.get(sourceSessionId) === undefined) break;
+      currentId = sourceSessionId;
+    }
+    return currentId;
+  }
+
+  private async maybeDiscoverHistoricalExternalSessionLinks(): Promise<void> {
+    if (this.#externalLaunchHistoryScan !== null) return await this.#externalLaunchHistoryScan;
+    const now = Date.now();
+    if (now - this.#lastExternalLaunchHistoryScanAt < externalLaunchHistoryScanCooldownMs) return;
+    this.#lastExternalLaunchHistoryScanAt = now;
+    const scan = this.discoverHistoricalExternalSessionLinks();
+    this.#externalLaunchHistoryScan = scan;
+    try {
+      await scan;
+    } finally {
+      if (this.#externalLaunchHistoryScan === scan) this.#externalLaunchHistoryScan = null;
+    }
+  }
+
+  private async discoverHistoricalExternalSessionLinks(): Promise<void> {
+    const now = Date.now();
+    const candidates = this.#cache.all().filter((session) => session.createdAt !== undefined
+      && session.parentSessionId === undefined && session.relationship === undefined
+      && now - Date.parse(session.createdAt) <= externalLaunchHistoryWindowMs);
+    const oldest = candidates.length > 0
+      ? Math.min(...candidates.map((session) => Date.parse(session.createdAt!)))
+      : now - externalLaunchHistoryWindowMs;
+    const newest = candidates.length > 0
+      ? Math.max(...candidates.map((session) => Date.parse(session.createdAt!)))
+      : now;
+    const since = new Date(Math.max(now - externalLaunchHistoryWindowMs, oldest - externalLaunchMatchWindowMs)).toISOString();
+    const candidateDirectories = new Set(candidates.map((session) => normalizedLaunchPath(session.workingDirectory)).filter(Boolean));
+    const knownParentIds = new Set([...this.#sessionTransfers.values()]
+      .filter((record) => record.relationship.kind === "subagent")
+      .map((record) => record.relationship.sourceSessionId));
+    const parents = this.#cache.all().filter((session) => {
+      const adapter = this.#adapters.get(session.providerId);
+      if (adapter?.getExternalSessionLaunches === undefined) return false;
+      const created = session.createdAt === undefined ? Number.NEGATIVE_INFINITY : Date.parse(session.createdAt);
+      const updated = Date.parse(session.lastActivityAt);
+      return created <= newest + externalLaunchMatchWindowMs && updated >= oldest - externalLaunchMatchWindowMs;
+    }).sort((left, right) => {
+      const leftKnown = knownParentIds.has(left.id);
+      const rightKnown = knownParentIds.has(right.id);
+      const leftMatch = candidateDirectories.has(normalizedLaunchPath(left.workingDirectory));
+      const rightMatch = candidateDirectories.has(normalizedLaunchPath(right.workingDirectory));
+      return Number(rightKnown) - Number(leftKnown)
+        || Number(rightMatch) - Number(leftMatch)
+        || right.lastActivityAt.localeCompare(left.lastActivityAt);
+    }).slice(0, 12);
+    if (parents.length === 0) return;
+    const discovered = (await Promise.all(parents.map(async (parent) => {
+      const adapter = this.#adapters.get(parent.providerId);
+      if (adapter?.getExternalSessionLaunches === undefined) return [];
+      try {
+        const launches = await adapter.getExternalSessionLaunches(parent.providerSessionId, since);
+        return launches.map((launch): ParentObservedExternalLaunch => ({ ...launch, parentSessionId: parent.id }));
+      } catch {
+        return [];
+      }
+    }))).flat();
+    for (const launch of discovered) this.rememberExternalLaunches(launch.parentSessionId, [launch]);
+    if (discovered.length === 0) return;
+
+    // OpenCode's ordinary listing can omit its catch-all project entirely. An
+    // explicit launch directory is enough to ask that provider for the exact
+    // workspace, but not enough to hide anything: only sessions that still pass
+    // the title, time, directory, model, unique-child and unique-parent checks
+    // below are added and linked.
+    const directories = new Map<string, { providerId: string; directory: string; launches: ParentObservedExternalLaunch[] }>();
+    for (const launch of discovered) {
+      if (launch.workingDirectory === undefined) continue;
+      const key = `${launch.targetProviderId}\u0000${normalizedLaunchPath(launch.workingDirectory)}`;
+      const group = directories.get(key) ?? { providerId: launch.targetProviderId, directory: launch.workingDirectory, launches: [] };
+      group.launches.push(launch);
+      directories.set(key, group);
+    }
+    await Promise.all([...directories.values()].map(async ({ providerId, directory, launches }) => {
+      const adapter = this.#adapters.get(providerId);
+      if (adapter === undefined) return;
+      try {
+        const listed = await collectAllSessionPages(adapter, { workingDirectory: directory, limit: 100 });
+        for (const session of listed.sessions) {
+          if (launches.some((launch) => externalLaunchMatchesSession(launch, session))) this.#cache.upsert(session);
+        }
+      } catch {
+        // Historical grouping is optional. A provider that cannot list this
+        // directory must leave its sessions visible/ungrouped rather than fail
+        // the whole task catalogue.
+      }
+    }));
+    this.linkObservedExternalSessions(this.#pendingExternalLaunches);
   }
 
   public delegations(parentSessionId?: string): readonly DelegationTask[] {
@@ -763,7 +1223,6 @@ export class AgentBridge {
     const parent = this.#cache.get(parentSessionId);
     if (parent === undefined) throw new Error("Parent session is not loaded on this bridge");
     const trimmedPrompt = prompt.trim();
-    if (trimmedPrompt.length === 0) throw new Error("Delegation prompt must not be empty");
     if (targets.length === 0 || targets.length > 4) throw new Error("Choose between one and four delegated harnesses");
     const unique = new Set(targets.map((target) => `${target.providerId}\u0000${target.modelId ?? ""}\u0000${target.reasoningEffort ?? ""}`));
     if (unique.size !== targets.length) throw new Error("Delegated harness selections must be unique");
@@ -775,6 +1234,17 @@ export class AgentBridge {
       const capabilities = await adapter.getCapabilities();
       if (!capabilities.createSession || !capabilities.sendMessage) {
         throw new Error(`${target.providerId} cannot create delegated sessions`);
+      }
+      if (target.modelId !== undefined) {
+        if (adapter.listModels === undefined) throw new Error(`${target.providerId} cannot validate the selected delegated model`);
+        const selectedModel = (await adapter.listModels()).find((model) => model.id === target.modelId);
+        if (selectedModel === undefined) throw new Error(`The selected ${target.providerId} delegated model is unavailable`);
+        const supportedEfforts = earsEffortsFromModel(selectedModel);
+        if (target.reasoningEffort !== undefined && supportedEfforts.length > 0 && !supportedEfforts.includes(target.reasoningEffort)) {
+          throw new Error(`${target.reasoningEffort} is not an advertised reasoning level for ${target.modelId}`);
+        }
+      } else if (target.reasoningEffort !== undefined) {
+        throw new Error("A delegated reasoning level requires an explicit model");
       }
     }
 
@@ -801,18 +1271,20 @@ export class AgentBridge {
       const childId = `${id}_child_${index + 1}`;
       try {
         const adapter = this.requireAdapter(target.providerId);
-        const instruction = delegatedWorkerInstruction(trimmedPrompt, parent, adapter.displayName);
-        const created = await adapter.createSession({
+        const workerInstruction = trimmedPrompt || hiddenProviderControlContent(`mesh-worker:${id}:${index + 1}`);
+        const created = await this.createSession(target.providerId, {
           workingDirectory: parent.workingDirectory ?? parent.project ?? process.cwd(),
-          title: `Delegated: ${trimmedPrompt.slice(0, 72)}`,
+          title: trimmedPrompt ? `Delegated: ${trimmedPrompt.slice(0, 72)}` : "Delegated worker",
           ...(target.modelId !== undefined ? { modelId: target.modelId } : {}),
           ...(target.reasoningEffort !== undefined ? { reasoningEffort: target.reasoningEffort } : {}),
-          firstInstruction: instruction,
+          firstInstruction: workerInstruction,
+          firstInstructionDeveloperInstructions: delegatedWorkerInstruction(parent, adapter.displayName),
           metadata: { delegationId: id, parentSessionId, role: "cross_harness_delegate" },
         });
         const linked: RemoteSession = {
           ...created,
           state: "working",
+          preview: trimmedPrompt || "Awaiting instruction from the parent task",
           lastActivityAt: new Date().toISOString(),
           parentSessionId,
           agentNickname: `${adapter.displayName} delegate`,
@@ -980,7 +1452,8 @@ export class AgentBridge {
   private async startParentDelegationTurn(task: DelegationTask, parent: RemoteSession): Promise<void> {
     const request = {
       requestId: `delegation_started_${task.id}`,
-      content: delegationStartedInstruction(task, this.#clientTooling !== undefined),
+      content: hiddenProviderControlContent(`mesh-started:${task.id}`),
+      developerInstructions: delegationStartedInstruction(task, this.#clientTooling !== undefined),
       metadata: { delegationId: task.id, kind: "delegation_started" },
     } as const;
     const currentState = this.#cache.get(parent.id)?.state ?? parent.state;
@@ -993,9 +1466,11 @@ export class AgentBridge {
   }
 
   private hasQueuedParentDelegationTurn(task: DelegationTask): boolean {
-    const marker = `[[UAR_MESH_STARTED:${task.id}]]`;
-    return [...this.#queuedMessages.values()].some(({ view }) =>
-      view.sessionId === task.parentSessionId && view.state !== "failed" && view.content.startsWith(marker));
+    return [...this.#queuedMessages.values()].some(({ request, view }) =>
+      view.sessionId === task.parentSessionId
+      && view.state !== "failed"
+      && request?.metadata?.delegationId === task.id
+      && request.metadata.kind === "delegation_started");
   }
 
   public async createSession(providerId: string, options: CreateSessionOptions): Promise<RemoteSession> {
@@ -1104,7 +1579,8 @@ export class AgentBridge {
       try {
         const current = parseGlobalSessionId(record.sessionId);
         const source = parseGlobalSessionId(record.relationship.sourceSessionId);
-        if (current.hostId !== this.config.hostId || source.hostId !== this.config.hostId || current.providerId !== source.providerId) continue;
+        if (current.hostId !== this.config.hostId || source.hostId !== this.config.hostId
+          || (record.relationship.kind !== "subagent" && current.providerId !== source.providerId)) continue;
       } catch {
         continue;
       }
@@ -1112,10 +1588,10 @@ export class AgentBridge {
         ...(record.summary !== undefined ? { tethoqHandoffSummary: record.summary } : {}),
         ...(record.prompt !== undefined ? { tethoqHandoffPrompt: record.prompt } : {}),
         tethoqHandoffPending: record.pending,
-      } : {
+      } : record.relationship.kind === "branch" || record.relationship.kind === "side_chat" ? {
         ...(record.bootstrap !== undefined ? { tethoqBranchBootstrap: record.bootstrap } : {}),
         tethoqBranchPending: record.pending,
-      };
+      } : { tethoqObservedExternalLaunch: true };
       this.#cache.upsert({
         ...session,
         relationship: record.relationship,
@@ -1123,7 +1599,7 @@ export class AgentBridge {
           sessionKind: "side_chat" as const,
           parentSessionId: record.relationship.sourceSessionId,
           ...(record.sideChatPreview !== undefined ? { preview: record.sideChatPreview } : {}),
-        } : {}),
+        } : record.relationship.kind === "subagent" ? { parentSessionId: record.relationship.sourceSessionId } : {}),
         ...(record.summary !== undefined ? { contextHandoffSummary: record.summary } : {}),
         nativeMetadata: {
           ...session.nativeMetadata,
@@ -1236,6 +1712,81 @@ export class AgentBridge {
       .filter((session) => session.sessionKind === "side_chat")
       .filter((session) => parentSessionId === undefined || session.parentSessionId === parentSessionId)
       .sort((left, right) => right.lastActivityAt.localeCompare(left.lastActivityAt));
+  }
+
+  public async listSideChatSessions(parentGlobalSessionId: string): Promise<readonly SideChatListItem[]> {
+    this.assertActive();
+    const { providerId, providerSessionId, hostId } = parseGlobalSessionId(parentGlobalSessionId);
+    if (hostId !== this.config.hostId) throw new Error("Session belongs to a different host");
+    const adapter = this.requireAdapter(providerId);
+    const capabilities = await adapter.getCapabilities();
+    // Re-attach persisted side-chat identity first so freshly listed sessions
+    // are recognised even before the parent has been opened this run.
+    this.restoreSessionTransferLinks();
+    const nativeChildren = capabilities.sessionRelationships
+      ? (await collectAllSessionPages(adapter, { parentProviderSessionId: providerSessionId, limit: 100 })).sessions
+          .filter((session) => session.parentSessionId === parentGlobalSessionId)
+      : [];
+    const items = new Map<string, SideChatListItem>();
+    for (const session of [...nativeChildren, ...this.sideChats(parentGlobalSessionId)]) {
+      const item = this.sideChatItem(session, parentGlobalSessionId);
+      if (item === undefined) continue;
+      const existing = items.get(item.id);
+      items.set(item.id, existing === undefined || item.preview !== undefined || existing.preview === undefined
+        ? { ...existing, ...item }
+        : { ...item, preview: existing.preview });
+    }
+    // Persisted transfer records keep finished side chats visible even after a
+    // provider stops listing the session, so the task keeps its full history.
+    for (const record of this.#sessionTransfers.values()) {
+      if (record.relationship.kind !== "side_chat" || record.relationship.sourceSessionId !== parentGlobalSessionId) continue;
+      if (items.has(record.sessionId)) continue;
+      const item = this.sideChatTransferItem(record);
+      if (item !== undefined) items.set(item.id, item);
+    }
+    return [...items.values()].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+
+  private sideChatItem(session: RemoteSession, parentGlobalSessionId: string): SideChatListItem | undefined {
+    const record = this.sideChatTransferFor(session.id, parentGlobalSessionId);
+    if (session.sessionKind !== "side_chat"
+      && session.relationship?.kind !== "side_chat"
+      && session.nativeMetadata.tethoqSessionKind !== "side_chat"
+      && record === undefined) return undefined;
+    return {
+      id: session.id,
+      title: session.title,
+      providerId: session.providerId,
+      state: session.state,
+      updatedAt: session.lastActivityAt,
+      ...(session.preview?.trim()
+        ? { preview: session.preview.trim().slice(0, 240) }
+        : record?.sideChatPreview !== undefined
+          ? { preview: record.sideChatPreview.slice(0, 240) }
+          : {}),
+    };
+  }
+
+  private sideChatTransferFor(sessionId: string, parentGlobalSessionId: string): SessionTransferRecord | undefined {
+    const record = this.#sessionTransfers.get(sessionId);
+    if (record?.relationship.kind === "side_chat" && record.relationship.sourceSessionId === parentGlobalSessionId) return record;
+    return undefined;
+  }
+
+  private sideChatTransferItem(record: SessionTransferRecord): SideChatListItem | undefined {
+    try {
+      const { providerId } = parseGlobalSessionId(record.sessionId);
+      return {
+        id: record.sessionId,
+        title: "Side chat",
+        providerId,
+        state: "unknown",
+        updatedAt: "",
+        ...(record.sideChatPreview !== undefined ? { preview: record.sideChatPreview.slice(0, 240) } : {}),
+      };
+    } catch {
+      return undefined;
+    }
   }
 
   public async createSideChat(parentSessionId: string, prompt?: string, queuedMessageId?: string): Promise<SideChatResult> {
@@ -1367,7 +1918,7 @@ export class AgentBridge {
 
   public async sendMessage(globalSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
     this.assertActive();
-    const prepared = withSimplifyResponseGuidance(await this.withGlobalAgentInstructions(request));
+    const prepared = withSimplifyResponseGuidance(await this.withGlobalAgentInstructions(globalSessionId, request));
     if (this.pendingContextHandoff(globalSessionId) !== undefined || this.pendingBranchBootstrap(globalSessionId) !== undefined) {
       return await this.withPendingHandoffSendLock(globalSessionId, async () =>
         await this.dispatchMessage(globalSessionId, prepared));
@@ -1375,18 +1926,27 @@ export class AgentBridge {
     return await this.dispatchMessage(globalSessionId, prepared);
   }
 
-  private async withGlobalAgentInstructions(request: SendMessageRequest): Promise<SendMessageRequest> {
+  private async withGlobalAgentInstructions(globalSessionId: string, request: SendMessageRequest): Promise<SendMessageRequest> {
     const selected = await this.#globalAgentInstructions?.();
-    if (selected === undefined) return request;
-    const globalHeader = "Use these user-selected global AGENTS.md instructions for this Tethoq turn:";
-    if (request.developerInstructions?.startsWith(`${globalHeader}\n\n`) === true) return request;
-    const globalInstructions = `${globalHeader}\n\n${selected}`;
-    return {
-      ...request,
-      developerInstructions: request.developerInstructions === undefined
-        ? globalInstructions
-        : `${globalInstructions}\n\n${request.developerInstructions}`,
-    };
+    let developerInstructions = request.developerInstructions;
+    if (selected !== undefined) {
+      const globalHeader = "Use these user-selected global AGENTS.md instructions for this Tethoq turn:";
+      if (developerInstructions?.startsWith(`${globalHeader}\n\n`) !== true) {
+        developerInstructions = developerInstructions === undefined
+          ? `${globalHeader}\n\n${selected}`
+          : `${globalHeader}\n\n${selected}\n\n${developerInstructions}`;
+      }
+    }
+    if (this.#clientTooling !== undefined
+      && this.#sessionMaySpawnForeignSubagents?.(globalSessionId) === true
+      && developerInstructions?.includes(foreignSubagentMarker) !== true) {
+      developerInstructions = developerInstructions === undefined
+        ? foreignSubagentInstruction()
+        : `${foreignSubagentInstruction()}\n\n${developerInstructions}`;
+    }
+    return developerInstructions === undefined || developerInstructions === request.developerInstructions
+      ? request
+      : { ...request, developerInstructions };
   }
 
   public async sendUploadedMessage(
@@ -1438,7 +1998,17 @@ export class AgentBridge {
         : request;
     this.assertAttachmentProvider(providerId, contextualRequest.attachments);
     const routedRequest = await this.routeVisionAttachments(globalSessionId, contextualRequest);
-    const result = await this.requireAdapter(providerId).sendMessage(providerSessionId, routedRequest);
+    const adapter = this.requireAdapter(providerId);
+    const session = this.#cache.get(globalSessionId);
+    let result: SendMessageResult;
+    if (session?.externalWriter === true && (routedRequest.attachments?.length ?? 0) > 0) {
+      if (adapter.sendMessageToExternalOwner === undefined) {
+        throw new Error(`${adapter.displayName} cannot deliver attachments to an externally owned task`);
+      }
+      result = await adapter.sendMessageToExternalOwner(providerSessionId, routedRequest);
+    } else {
+      result = await adapter.sendMessage(providerSessionId, routedRequest);
+    }
     this.#sendLedger.set(request.requestId, result);
     if (pending !== undefined && result.accepted) {
       this.#pendingContextHandoffs.delete(globalSessionId);
@@ -1450,7 +2020,13 @@ export class AgentBridge {
       this.#cache.updateNativeMetadata(globalSessionId, { tethoqBranchPending: false });
       this.completeSessionTransferBootstrap(globalSessionId);
     }
-    if (result.accepted) this.rememberSideChatPreview(globalSessionId, request.content);
+    if (result.accepted) {
+      this.rememberSideChatPreview(globalSessionId, request.content);
+      this.#cache.rememberRequestedSelection(globalSessionId, {
+        ...(routedRequest.modelId !== undefined ? { modelId: routedRequest.modelId } : {}),
+        ...(routedRequest.reasoningEffort !== undefined ? { reasoningEffort: routedRequest.reasoningEffort } : {}),
+      });
+    }
     this.invalidateMessageSnapshot(globalSessionId);
     return result;
   }
@@ -1688,7 +2264,7 @@ export class AgentBridge {
     if (session === undefined) throw new Error("Session is not loaded on this bridge");
     const adapter = this.requireAdapter(providerId);
     if (adapter.enqueueQueuedMessage !== undefined && (input.attachmentIds?.length ?? 0) === 0 && (prepared.workflows?.length ?? 0) === 0) {
-      const providerPrepared = await this.withGlobalAgentInstructions(prepared);
+      const providerPrepared = await this.withGlobalAgentInstructions(globalSessionId, prepared);
       if (session.workingDirectory === undefined) throw new Error("This session does not expose a working directory for its desktop queue");
       const message = await adapter.enqueueQueuedMessage(providerSessionId, {
         requestId: providerPrepared.requestId,
@@ -1836,9 +2412,13 @@ export class AgentBridge {
       if (mode === "steer" && session.state !== "working") throw new Error("This task is not currently working, so there is nothing to steer");
       if (mode === "send" && active) throw new Error("Wait for the active turn to finish, or steer this instruction instead");
       if (mode === "steer" && adapter.steerMessage === undefined) {
-        throw new Error(`${adapter.displayName} does not support steering active work`);
+        if (!record.providerOwned || adapter.steerQueuedMessage === undefined) {
+          throw new Error(`${adapter.displayName} does not support steering active work`);
+        }
       }
-      if (record.providerOwned && (adapter.cancelQueuedMessage === undefined || adapter.restoreQueuedMessage === undefined)) {
+      const providerOwnedSteer = mode === "steer" && record.providerOwned && adapter.steerQueuedMessage !== undefined;
+      if (record.providerOwned && !providerOwnedSteer
+        && (adapter.cancelQueuedMessage === undefined || adapter.restoreQueuedMessage === undefined)) {
         throw new Error(`${adapter.displayName} cannot safely move this queued instruction`);
       }
 
@@ -1870,7 +2450,7 @@ export class AgentBridge {
         ...(record.view.reasoningEffort !== undefined ? { reasoningEffort: record.view.reasoningEffort } : {}),
       };
       let providerQueueRemoved = false;
-      if (record.providerOwned) {
+      if (record.providerOwned && !providerOwnedSteer) {
         providerQueueRemoved = await adapter.cancelQueuedMessage!(providerSessionId, record.providerMessageId ?? messageId);
         if (!providerQueueRemoved) throw new Error("That queued instruction is no longer available");
         if (this.#queuedMessages.has(messageId)) {
@@ -1888,8 +2468,10 @@ export class AgentBridge {
       }
 
       try {
-        const result = mode === "steer"
-          ? await adapter.steerMessage!(providerSessionId, request)
+        const result = providerOwnedSteer
+          ? await adapter.steerQueuedMessage!(providerSessionId, record.providerMessageId ?? messageId, request)
+          : mode === "steer"
+            ? await adapter.steerMessage!(providerSessionId, request)
           : await this.sendMessage(record.view.sessionId, request);
         if (!result.accepted) throw new Error(result.details.join(" ") || "The harness did not accept the queued instruction");
         if (this.#queuedMessages.has(messageId)) {
@@ -1905,7 +2487,11 @@ export class AgentBridge {
         this.#cache.updateState(record.view.sessionId, "working", false);
         return true;
       } catch (error) {
-        if (record.providerOwned && providerQueueRemoved) {
+        if (providerOwnedSteer) {
+          // The provider owns the transaction and restores the exact native
+          // composer record (including attachments/context) before rejecting.
+          // Its queue change event repopulates this view if it was removed.
+        } else if (record.providerOwned && providerQueueRemoved) {
           try {
             const restored = await adapter.restoreQueuedMessage!(providerSessionId, {
               requestId: `queue_restore_${randomUUID()}`,
@@ -2131,7 +2717,7 @@ export class AgentBridge {
       throw new Error(`${providerId} does not support steering active work`);
     }
     try {
-      const result = await adapter.steerMessage(providerSessionId, await this.withGlobalAgentInstructions(request));
+      const result = await adapter.steerMessage(providerSessionId, await this.withGlobalAgentInstructions(globalSessionId, request));
       this.invalidateMessageSnapshot(globalSessionId);
       consumption.commit();
       return result;
@@ -2161,11 +2747,22 @@ export class AgentBridge {
   }
 
   public async interrupt(globalSessionId: string): Promise<void> {
+    const active = this.#interruptions.get(globalSessionId);
+    if (active !== undefined) {
+      await active;
+      return;
+    }
     const { providerId, providerSessionId, hostId } = parseGlobalSessionId(globalSessionId);
     if (hostId !== this.config.hostId) throw new Error("Session belongs to a different host");
     const adapter = this.requireAdapter(providerId);
     if (adapter.interrupt === undefined) throw new Error(`${providerId} does not support interruption`);
-    await adapter.interrupt(providerSessionId);
+    const interruption = adapter.interrupt(providerSessionId);
+    this.#interruptions.set(globalSessionId, interruption);
+    try {
+      await interruption;
+    } finally {
+      if (this.#interruptions.get(globalSessionId) === interruption) this.#interruptions.delete(globalSessionId);
+    }
   }
 
   public pendingApprovals() {
@@ -2258,6 +2855,30 @@ export class AgentBridge {
     return this.#events.replaySince(sequence);
   }
 
+  public subscribeEventAppended(listener: () => void): () => void {
+    return this.#events.subscribe(listener);
+  }
+
+  public async watchSession(globalSessionId: string): Promise<void> {
+    this.assertActive();
+    const { providerId, providerSessionId } = this.assertSessionHost(globalSessionId);
+    this.#watchedSessionIds.add(globalSessionId);
+    const adapter = this.requireAdapter(providerId);
+    if (adapter.watchSession !== undefined) await adapter.watchSession(providerSessionId);
+  }
+
+  public unwatchSession(globalSessionId: string): void {
+    if (!this.#watchedSessionIds.delete(globalSessionId)) return;
+    try {
+      const { providerId, providerSessionId } = parseGlobalSessionId(globalSessionId);
+      const adapter = this.#adapters.get(providerId);
+      adapter?.unwatchSession?.(providerSessionId);
+      if (adapter !== undefined) void this.releaseProviderIfIdle(adapter);
+    } catch {
+      // Session ids from a closed view can be ignored once the watch set has dropped them.
+    }
+  }
+
   public latestSequence(): number {
     return this.#events.latestSequence();
   }
@@ -2267,11 +2888,15 @@ export class AgentBridge {
     this.#disposed = true;
     if (this.#delegationTimer !== undefined) clearInterval(this.#delegationTimer);
     this.#delegationTimer = undefined;
+    for (const timer of this.#resubscribeTimers.values()) clearTimeout(timer);
+    this.#resubscribeTimers.clear();
+    this.#resubscribeAttempts.clear();
     this.#events.append({ type: "host.disconnected", payload: {} });
     await Promise.allSettled(this.#subscriptions.map((subscription) => subscription.unsubscribe()));
     await Promise.allSettled([...this.#adapters.values()].map((adapter) => adapter.dispose()));
     this.#subscriptions.length = 0;
     this.#messageSnapshots.clear();
+    this.#watchedSessionIds.clear();
     this.#messageSnapshotGenerations.clear();
     this.#openSessionLoads.clear();
     this.#pendingContextHandoffs.clear();
@@ -2286,8 +2911,14 @@ export class AgentBridge {
     this.#crossSessionPumps.clear();
     this.#delegations.clear();
     this.#visionProxies.clear();
+    this.#earsHelpers.clear();
+    this.#earsHelperCreations.clear();
+    this.#earsTranscriptionTails.clear();
+    this.#earsJobs.clear();
+    this.#interruptions.clear();
     this.#internalSessionIds.clear();
     this.#internalSessionCreations.clear();
+    this.#pendingExternalLaunches.splice(0);
   }
 
   private async receiveProviderEvent(event: ProviderEvent): Promise<void> {
@@ -2297,6 +2928,7 @@ export class AgentBridge {
       return;
     }
     if (!this.#deduper.accept(`${event.providerId}:${event.eventId}`)) return;
+    this.#refresh.noteProviderEvent(event.providerId);
     if (event.type === "message.queue_updated" && Array.isArray(event.payload.messages)) {
       this.syncProviderQueue(event.providerId, event.payload.messages);
       return;
@@ -2304,6 +2936,13 @@ export class AgentBridge {
     const globalSessionId = event.providerSessionId === undefined ? undefined : makeGlobalSessionId(this.config.hostId, event.providerId, event.providerSessionId);
     if (globalSessionId !== undefined && this.#internalSessionIds.has(globalSessionId)) return;
     let payload: JsonObject = event.payload;
+    if (globalSessionId !== undefined && (event.type === "command.started" || event.type === "command.completed")) {
+      const launches = observedExternalLaunchesFromPayload(event.payload);
+      if (launches.length > 0) {
+        this.rememberExternalLaunches(globalSessionId, launches);
+        this.linkObservedExternalSessions(this.#pendingExternalLaunches);
+      }
+    }
     if (event.approval !== undefined && globalSessionId !== undefined) {
       const approval = this.#approvals.add(this.config.hostId, globalSessionId, this.requireAdapter(event.providerId), event.approval);
       payload = { ...event.payload, approval: approval as unknown as JsonObject };
@@ -2334,12 +2973,23 @@ export class AgentBridge {
       if (event.type === "session.status_changed" && isSessionState(event.payload.state)) {
         const state = event.payload.state as RemoteSession["state"];
         this.#cache.updateState(globalSessionId, state, state === "needs_approval");
+        const providerStatus = providerStatusFromPayload(event.payload);
+        if (providerStatus !== undefined) this.#cache.updateProviderStatus(globalSessionId, providerStatus);
+        else if (state !== "working") this.#cache.updateProviderStatus(globalSessionId, null);
       } else if (event.type === "session.updated") {
-        this.#cache.updateMetadata(globalSessionId, sessionMetadataPatch(event.payload, this.config.hostId, event.providerId));
-      } else if (event.type === "message.started" || event.type === "tool.started" || event.type === "command.started") this.#cache.updateState(globalSessionId, "working", false);
+        const patch = sessionMetadataPatch(event.payload, this.config.hostId, event.providerId);
+        this.#cache.updateMetadata(globalSessionId, patch);
+        // A harness announcing its model or reasoning level is the authority on
+        // what the session runs, and worth keeping so the next start is not blind.
+        this.#cache.rememberReportedSelection(globalSessionId, {
+          ...(patch.modelId !== undefined ? { modelId: patch.modelId } : {}),
+          ...(patch.reasoningEffort !== undefined ? { reasoningEffort: patch.reasoningEffort } : {}),
+        });
+      } else if (event.type === "message.started" || event.type === "message.delta" || event.type === "tool.started" || event.type === "command.started") this.#cache.updateState(globalSessionId, "working", false);
       else if (event.type === "agent.completed") this.#cache.updateState(globalSessionId, "completed", false);
       else if (event.type === "agent.error") this.#cache.updateState(globalSessionId, "failed", false);
       else if (event.type === "agent.interrupted") this.#cache.updateState(globalSessionId, "idle", false);
+      if (providerEventClearsProviderStatus(event)) this.#cache.updateProviderStatus(globalSessionId, null);
     }
     this.#events.append({
       eventId: `${event.providerId}:${event.eventId}`,
@@ -2461,7 +3111,8 @@ export class AgentBridge {
       this.#cache.updateState(runtime.task.parentSessionId, "working", false);
       await this.sendMessage(runtime.task.parentSessionId, {
         requestId: `delegation_synthesis_${runtime.task.id}`,
-        content: delegationSynthesisInstruction(runtime.task, reports, this.#clientTooling !== undefined),
+        content: hiddenProviderControlContent(`mesh-result:${runtime.task.id}`),
+        developerInstructions: delegationSynthesisInstruction(runtime.task, reports, this.#clientTooling !== undefined),
         metadata: { delegationId: runtime.task.id, kind: "delegation_synthesis" },
       });
     } catch (error) {
@@ -2490,6 +3141,20 @@ export class AgentBridge {
     this.#onDelegationsChange?.(this.delegations());
   }
 
+  /**
+   * Provider session listings lag live turns, so a freshly created delegated
+   * child is often listed as idle while its first turn is still running. A
+   * reconcile must not downgrade a child the delegation bookkeeping still
+   * tracks and whose cached state already says working; provider events and
+   * the delegation completion path settle the state for real.
+   */
+  private delegatedChildTurnInFlight(sessionId: string): boolean {
+    if (this.#cache.get(sessionId)?.state !== "working") return false;
+    return [...this.#delegations.values()].some((runtime) =>
+      runtime.task.state !== "completed" && runtime.task.state !== "failed"
+      && runtime.task.children.some((child) => child.sessionId === sessionId));
+  }
+
   private restoreDelegationLinks(): void {
     for (const runtime of this.#delegations.values()) {
       for (const child of runtime.task.children) {
@@ -2511,6 +3176,16 @@ export class AgentBridge {
 
   private async connectProvider(adapter: AgentProviderAdapter): Promise<void> {
     if (this.#subscribedProviders.has(adapter.providerId)) return;
+    const inFlight = this.#connectPromises.get(adapter.providerId);
+    if (inFlight !== undefined) return await inFlight;
+    const attempt = this.connectProviderOnce(adapter).finally(() => {
+      this.#connectPromises.delete(adapter.providerId);
+    });
+    this.#connectPromises.set(adapter.providerId, attempt);
+    await attempt;
+  }
+
+  private async connectProviderOnce(adapter: AgentProviderAdapter): Promise<void> {
     try {
       const detection = await adapter.detect();
       if (!detection.available) throw this.providerUnavailableError(adapter, detection);
@@ -2526,6 +3201,7 @@ export class AgentBridge {
       this.#subscriptions.push(subscription);
       this.#subscribedProviders.add(adapter.providerId);
       this.#providerConnectionErrors.delete(adapter.providerId);
+      this.#resubscribeAttempts.delete(adapter.providerId);
       this.#events.append({ type: "provider.connected", providerId: adapter.providerId, payload: {} });
       await this.releaseProviderIfIdle(adapter);
     } catch (error) {
@@ -2536,8 +3212,43 @@ export class AgentBridge {
         providerId: adapter.providerId,
         payload: { code: providerError.code, message: providerError.message },
       });
+      // The tool this app starts for you is not listening yet when the first
+      // attempt runs, and that first attempt used to be the only one: nothing
+      // re-ran it, so a harness that came up a second later stayed recorded as
+      // missing for the whole session, taking the composer's send with it. Every
+      // failure now books its own next attempt, and the success emits
+      // provider.connected, which is what tells the window to look again.
+      this.scheduleProviderResubscribe(adapter.providerId);
       throw error;
     }
+  }
+
+  /**
+   * A detected provider without a live subscription has no way to recover on its
+   * own: nothing re-runs connectProvider unless a refresh happens to notice it.
+   * Schedule one bounded re-connect so the next providerConnections() reading
+   * reports online. Failures keep the bridge quiet (connectProvider already
+   * emits provider.disconnected), and a success emits provider.connected, which
+   * is the renderer's signal to refresh its snapshot.
+   */
+  private scheduleProviderResubscribe(providerId: string): void {
+    if (this.#disposed || this.#resubscribeTimers.has(providerId)) return;
+    // A tool that is starting up answers within a few seconds, so the first
+    // retries come quickly; one that is simply not installed on this machine
+    // backs off toward a slow heartbeat rather than being probed forever at
+    // full speed. A success resets this, so a later stumble recovers fast again.
+    const attempt = this.#resubscribeAttempts.get(providerId) ?? 0;
+    this.#resubscribeAttempts.set(providerId, attempt + 1);
+    const delay = Math.min(resubscribeCooldownMs * 2 ** attempt, maximumResubscribeCooldownMs);
+    const timer = setTimeout(() => {
+      this.#resubscribeTimers.delete(providerId);
+      if (this.#disposed) return;
+      const adapter = this.#adapters.get(providerId);
+      if (adapter === undefined) return;
+      void this.connectProvider(adapter).catch(() => undefined);
+    }, delay);
+    timer.unref();
+    this.#resubscribeTimers.set(providerId, timer);
   }
 
   private providerUnavailableError(adapter: AgentProviderAdapter, detection: ProviderDetection): ProviderAdapterError {
@@ -2555,11 +3266,52 @@ export class AgentBridge {
 
   private async releaseProviderIfIdle(adapter: AgentProviderAdapter): Promise<void> {
     if (this.#disposed || adapter.releaseIdleResources === undefined) return;
+    const hasWatchedSession = [...this.#watchedSessionIds].some((sessionId) => {
+      try {
+        return parseGlobalSessionId(sessionId).providerId === adapter.providerId;
+      } catch {
+        return false;
+      }
+    });
+    if (hasWatchedSession) return;
     const hasLiveSession = this.#cache.all().some((session) =>
       session.providerId === adapter.providerId &&
       (session.state === "working" || session.state === "needs_approval" || session.state === "needs_input"));
     if (hasLiveSession) return;
     await adapter.releaseIdleResources().catch(() => undefined);
+  }
+
+  /**
+   * A provider we cannot reach right now.
+   *
+   * Reaching a coding tool and being able to send to it are different questions,
+   * and answering the first badly used to settle the second: any failure here -
+   * a probe that timed out, an auth read that blipped, a server mid-restart -
+   * reported every capability as false, and a capability list without
+   * sendMessage is what puts "cannot accept messages right now" in front of
+   * someone whose tool is running perfectly well. The failure also outlived the
+   * blip, because the next answer only arrived on the next refresh.
+   *
+   * So a tool that has told us what it can do keeps that answer. It is reported
+   * offline with the real error attached, which is what the task list and the
+   * provider list read, and what still holds back starting new work there. What
+   * it no longer does is quietly withdraw the ability to write into a
+   * conversation that is open in front of someone: if the tool really has gone,
+   * the send itself says so, in the provider's own words, and the moment the
+   * tool answers again this clears on its own. A tool that has never answered is
+   * unchanged - nothing is known about it, so nothing is claimed.
+   */
+  private unreachableProvider(adapter: AgentProviderAdapter, error: unknown): ProviderConnection {
+    const known = this.#lastGoodCapabilities.get(adapter.providerId);
+    return {
+      providerId: adapter.providerId,
+      displayName: adapter.displayName,
+      state: "offline",
+      detected: known !== undefined,
+      authenticated: null,
+      capabilities: known ?? this.unavailableProviderCapabilities(),
+      lastError: providerErrorFromUnknown(adapter.providerId, error),
+    };
   }
 
   private unavailableProviderCapabilities() {
@@ -2583,6 +3335,20 @@ export class AgentBridge {
     const parsed = parseGlobalSessionId(globalSessionId);
     if (parsed.hostId !== this.config.hostId) throw new Error("Session belongs to a different host");
     return parsed;
+  }
+
+  private rememberCompactionThreshold(globalSessionId: string, threshold: number): void {
+    this.#compactionThresholds.delete(globalSessionId);
+    this.#compactionThresholds.set(globalSessionId, threshold);
+    while (this.#compactionThresholds.size > maximumCompactionThresholds) {
+      const oldest = this.#compactionThresholds.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.#compactionThresholds.delete(oldest);
+    }
+  }
+
+  private async persistCompactionThresholds(): Promise<void> {
+    await this.#onCompactionThresholdsChange?.(Object.fromEntries(this.#compactionThresholds));
   }
 
   private async maybeAutoCompact(globalSessionId: string): Promise<void> {
@@ -2648,15 +3414,40 @@ export class AgentBridge {
       mode: "queue",
       state: message.state,
       createdAt: message.createdAt,
-      attachments: [],
+      attachments: (message.attachments ?? []).flatMap((attachment) => {
+        if (!attachment || typeof attachment.name !== "string" || typeof attachment.mimeType !== "string"
+          || typeof attachment.byteLength !== "number" || !Number.isFinite(attachment.byteLength) || attachment.byteLength < 0) return [];
+        return [{
+          name: attachment.name,
+          mimeType: attachment.mimeType,
+          byteLength: attachment.byteLength,
+          ...(typeof attachment.dataUrl === "string" ? { dataUrl: attachment.dataUrl } : {}),
+          ...(typeof attachment.durationSeconds === "number" && Number.isFinite(attachment.durationSeconds) && attachment.durationSeconds > 0
+            ? { durationSeconds: attachment.durationSeconds }
+            : {}),
+        }];
+      }),
       ...(message.error !== undefined ? { error: message.error } : {}),
     };
   }
 
+  private sessionHoldsFollowUpQueue(globalSessionId: string): boolean {
+    const session = this.#cache.get(globalSessionId);
+    if (session === undefined) return false;
+    if (session.state === "working" || session.state === "needs_approval" || session.state === "needs_input"
+      || session.state === "disconnected" || session.state === "unknown") {
+      return true;
+    }
+    try {
+      return this.requireAdapter(session.providerId).hasActiveTurn?.(session.providerSessionId) === true;
+    } catch {
+      return false;
+    }
+  }
+
   private async pumpQueue(globalSessionId: string): Promise<void> {
     if (this.#queuePumps.has(globalSessionId) || this.#disposed) return;
-    const state = this.#cache.get(globalSessionId)?.state;
-    if (state === "working" || state === "needs_approval" || state === "needs_input" || state === "disconnected" || state === "unknown") return;
+    if (this.sessionHoldsFollowUpQueue(globalSessionId)) return;
     const next = [...this.#queuedMessages.values()]
       .filter((record) => !record.providerOwned
         && !this.#queueMutations.has(record.view.id)
@@ -2913,10 +3704,7 @@ export class AgentBridge {
 
   private async validateVisionProxySelection(selection: VisionProxySelection): Promise<void> {
     if (!selection.providerId.trim() || !selection.modelId.trim()) throw new Error("Visual support requires a harness and model");
-    const adapter = this.requireAdapter(selection.providerId);
-    if (adapter.sessionCreationFeatures?.hiddenDeveloperInstructions !== true) {
-      throw new Error(`${selection.providerId} cannot receive hidden session-scoped visual-support instructions`);
-    }
+    this.requireAdapter(selection.providerId);
     const model = (await this.listModels(selection.providerId)).find((candidate) => candidate.id === selection.modelId);
     if (model === undefined) throw new Error("The selected visual-support model is unavailable");
     if (model.inputModalities?.includes("image") !== true) throw new Error("The selected model does not advertise image input");
@@ -2949,7 +3737,10 @@ export class AgentBridge {
 
   private assertAttachmentProvider(providerId: string, attachments: readonly MessageAttachment[] | undefined): void {
     if (providerId === "opencode" || attachments === undefined) return;
-    if (attachments.some((attachment) => !attachment.mimeType.toLowerCase().startsWith("image/"))) {
+    for (const attachment of attachments) {
+      const mimeType = attachment.mimeType.toLowerCase();
+      if (mimeType.startsWith("image/")) continue;
+      if (mimeType.startsWith("audio/") && (providerId === "direct" || providerId === "codex")) continue;
       throw new Error("Generic file attachments are available only for OpenCode");
     }
   }
@@ -2971,6 +3762,119 @@ export class AgentBridge {
     return model?.inputModalities === undefined ? null : model.inputModalities.includes("image");
   }
 
+  private async ensureEarsHelperSession(input: {
+    readonly providerId: string;
+    readonly modelId: string;
+    readonly reasoningEffort?: string;
+  }, staleHelperId?: string): Promise<RemoteSession> {
+    const key = earsModelKey(input.providerId, input.modelId);
+    const pending = this.#earsHelperCreations.get(key);
+    if (pending !== undefined) return await pending;
+    const creation = this.resolveEarsHelperSession(key, input, staleHelperId);
+    this.#earsHelperCreations.set(key, creation);
+    try {
+      return await creation;
+    } finally {
+      if (this.#earsHelperCreations.get(key) === creation) this.#earsHelperCreations.delete(key);
+    }
+  }
+
+  private async resolveEarsHelperSession(
+    key: string,
+    input: {
+      readonly providerId: string;
+      readonly modelId: string;
+      readonly reasoningEffort?: string;
+    },
+    staleHelperId?: string,
+  ): Promise<RemoteSession> {
+    const adapter = this.requireAdapter(input.providerId);
+    const existingId = this.#earsHelpers.get(key);
+    if (existingId !== undefined) {
+      if (existingId === staleHelperId) {
+        this.discardEarsHelper(key, existingId);
+      } else {
+        try {
+          const { providerSessionId } = parseGlobalSessionId(existingId);
+          const existing = this.asEarsHelper(await adapter.getSession(providerSessionId), input);
+          this.#internalSessionIds.add(existing.id);
+          this.#cache.upsert(existing);
+          return existing;
+        } catch (error) {
+          if (!isMissingProviderSessionError(error)) throw error;
+          this.discardEarsHelper(key, existingId);
+        }
+      }
+    }
+    this.beginInternalSessionCreation(adapter.providerId);
+    let created: RemoteSession;
+    try {
+      created = await adapter.createSession({
+        workingDirectory: this.#internalHelperWorkingDirectory,
+        title: "EARS",
+        modelId: input.modelId,
+        ...(input.reasoningEffort !== undefined ? { reasoningEffort: input.reasoningEffort } : {}),
+        ephemeral: adapter.sessionCreationFeatures?.ephemeralSessions === true,
+        ...(adapter.sessionCreationFeatures?.selectableClientTools === true ? { clientTools: "none" as const } : {}),
+        mcpServers: "none",
+        metadata: { internalPurpose: "ears" },
+      });
+      this.#internalSessionIds.add(created.id);
+    } finally {
+      await this.finishInternalSessionCreation(adapter.providerId);
+    }
+    const helper = this.asEarsHelper(created, input);
+    this.#earsHelpers.set(key, helper.id);
+    this.notifyEarsHelpersChange();
+    this.#internalSessionIds.add(helper.id);
+    this.#cache.upsert(helper);
+    return helper;
+  }
+
+  private asEarsHelper(
+    session: RemoteSession,
+    input: { readonly modelId: string; readonly reasoningEffort?: string },
+  ): RemoteSession {
+    const { parentSessionId: _parentSessionId, relationship: _relationship, ...unparented } = session;
+    return {
+      ...unparented,
+      sessionKind: "internal",
+      agentNickname: "EARS",
+      agentRole: "ears",
+      modelId: input.modelId,
+      ...(input.reasoningEffort !== undefined ? { reasoningEffort: input.reasoningEffort } : {}),
+      nativeMetadata: { ...session.nativeMetadata, internal: true, internalPurpose: "ears" },
+    };
+  }
+
+  private discardEarsHelper(key: string, helperId: string): void {
+    if (this.#earsHelpers.get(key) === helperId) {
+      this.#earsHelpers.delete(key);
+      this.notifyEarsHelpersChange();
+    }
+    this.#internalSessionIds.delete(helperId);
+    this.#cache.delete(helperId);
+  }
+
+  private notifyEarsHelpersChange(): void {
+    this.#onEarsHelpersChange?.(Object.fromEntries(this.#earsHelpers));
+  }
+
+  private async withEarsTranscriptionLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.#earsTranscriptionTails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    const tail = previous.then(() => current);
+    this.#earsTranscriptionTails.set(key, tail);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.#earsTranscriptionTails.get(key) === tail) this.#earsTranscriptionTails.delete(key);
+    }
+  }
+
   private async ensureVisionHelperSession(sessionId: string, runtime: VisionProxyRuntime): Promise<RemoteSession> {
     if (runtime.helperSessionId !== undefined) {
       const cached = this.#cache.get(runtime.helperSessionId);
@@ -2986,7 +3890,6 @@ export class AgentBridge {
         title: "Visual support",
         modelId: runtime.selection.modelId,
         ...(runtime.selection.reasoningEffort !== undefined ? { reasoningEffort: runtime.selection.reasoningEffort } : {}),
-        developerInstructions: visionProxyDeveloperInstructions,
         ephemeral: adapter.sessionCreationFeatures?.ephemeralSessions === true,
         ...(adapter.sessionCreationFeatures?.selectableClientTools === true ? { clientTools: "none" as const } : {}),
         mcpServers: "none",
@@ -3030,26 +3933,56 @@ export class AgentBridge {
     providerId: string,
     providerSessionId: string,
     before: readonly RemoteMessage[],
+    label = "Visual support",
+    isCancelled?: () => boolean,
   ): Promise<string> {
     const adapter = this.requireAdapter(providerId);
     const priorAssistantIds = new Set(before.filter((message) => message.role === "assistant").map((message) => message.id));
     const deadline = Date.now() + 90_000;
     while (Date.now() < deadline) {
+      if (isCancelled?.()) throw new Error(label === "EARS" ? earsCancelledMessage : `${label} was cancelled`);
       const messages = await adapter.getMessages(providerSessionId);
+      if (isCancelled?.()) throw new Error(label === "EARS" ? earsCancelledMessage : `${label} was cancelled`);
       for (let index = messages.length - 1; index >= 0; index -= 1) {
         const message = messages[index]!;
         if (message.role !== "assistant" || priorAssistantIds.has(message.id) || message.status === "streaming") continue;
         const text = message.parts.flatMap((part) => part.type === "text" ? [part.text.trim()] : []).filter(Boolean).join("\n");
         if (text.length > 0) return text;
       }
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      const sliceEnd = Date.now() + 250;
+      while (Date.now() < sliceEnd) {
+        if (isCancelled?.()) throw new Error(label === "EARS" ? earsCancelledMessage : `${label} was cancelled`);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
     }
-    throw new Error("Visual support did not return an observation before the timeout");
+    throw new Error(`${label} did not return a result before the timeout`);
   }
 
   private assertActive(): void {
     if (this.#disposed) throw new Error("Agent Bridge has been disposed");
   }
+}
+
+function earsEffortsFromModel(model: RemoteModel): readonly string[] {
+  const raw = model.nativeMetadata.supportedReasoningEfforts;
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((entry) => {
+    if (typeof entry === "string" && entry.trim()) return [entry];
+    if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+      const item = entry as Record<string, unknown>;
+      const value = item.reasoningEffort ?? item.id;
+      return typeof value === "string" && value.trim() ? [value] : [];
+    }
+    return [];
+  });
+}
+
+function isMissingProviderSessionError(error: unknown): boolean {
+  if (error instanceof ProviderAdapterError) {
+    return error.code === "SESSION_NOT_FOUND" || error.code === "HTTP_404";
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return /\bthread not found\b/iu.test(message);
 }
 
 function sameVisionSelection(left: VisionProxySelection | undefined, right: VisionProxySelection): boolean {
@@ -3075,6 +4008,54 @@ function transferMetadata(relationship: SessionRelationship): JsonObject {
     relationshipSourceSessionId: relationship.sourceSessionId,
     relationshipStrategy: relationship.strategy,
   };
+}
+
+function normalizedLaunchPath(value: string | undefined): string {
+  return (value ?? "").trim().replaceAll("\\", "/").replace(/\/+$/u, "").toLowerCase();
+}
+
+function externalLaunchSignature(launch: ObservedExternalSessionLaunch): string {
+  const observed = Date.parse(launch.observedAt);
+  const timeBucket = Number.isFinite(observed) ? Math.floor(observed / (10 * 60_000)) : -1;
+  return [
+    launch.targetProviderId.toLowerCase(),
+    launch.title.trim().toLowerCase(),
+    normalizedLaunchPath(launch.workingDirectory),
+    (launch.modelId ?? "").trim().toLowerCase(),
+    String(timeBucket),
+  ].join("\u0000");
+}
+
+function externalLaunchMatchesSession(launch: ParentObservedExternalLaunch, session: RemoteSession): boolean {
+  if (launch.targetProviderId !== session.providerId || launch.workingDirectory === undefined || session.createdAt === undefined) return false;
+  if (launch.title.trim().toLowerCase() !== session.title.trim().toLowerCase()) return false;
+  if (normalizedLaunchPath(launch.workingDirectory) !== normalizedLaunchPath(session.workingDirectory)) return false;
+  if (launch.modelId !== undefined && session.modelId !== undefined
+    && launch.modelId.trim().toLowerCase() !== session.modelId.trim().toLowerCase()) return false;
+  const observed = Date.parse(launch.observedAt);
+  const created = Date.parse(session.createdAt);
+  return Number.isFinite(observed) && Number.isFinite(created)
+    && created >= observed - 30_000 && created <= observed + externalLaunchMatchWindowMs;
+}
+
+function observedExternalLaunchesFromPayload(payload: JsonObject): ObservedExternalSessionLaunch[] {
+  const value = payload.externalSessionLaunches;
+  if (!Array.isArray(value)) return [];
+  const launches: ObservedExternalSessionLaunch[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
+    const item = entry as Record<string, unknown>;
+    if (typeof item.targetProviderId !== "string" || typeof item.title !== "string" || typeof item.observedAt !== "string") continue;
+    if (!item.targetProviderId.trim() || !item.title.trim() || !Number.isFinite(Date.parse(item.observedAt))) continue;
+    launches.push({
+      targetProviderId: item.targetProviderId.trim(),
+      title: item.title.trim(),
+      observedAt: item.observedAt,
+      ...(typeof item.workingDirectory === "string" && item.workingDirectory.trim() ? { workingDirectory: item.workingDirectory.trim() } : {}),
+      ...(typeof item.modelId === "string" && item.modelId.trim() ? { modelId: item.modelId.trim() } : {}),
+    });
+  }
+  return launches;
 }
 
 function copyBranchMessages(messages: readonly RemoteMessage[], branchSessionId: string): readonly RemoteMessage[] {
@@ -3142,6 +4123,39 @@ function sessionMetadataPatch(payload: JsonObject, hostId: string, providerId: s
     ...(agentNickname !== undefined ? { agentNickname } : {}),
     ...(agentRole !== undefined ? { agentRole } : {}),
   };
+}
+
+function providerStatusFromPayload(
+  payload: JsonObject,
+): NonNullable<RemoteSession["providerStatus"]> | null | undefined {
+  if (!Object.hasOwn(payload, "providerStatus")) return undefined;
+  const value = payload.providerStatus;
+  if (value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) return undefined;
+  if (value.kind !== "retry" || typeof value.message !== "string" || value.message.trim().length === 0) return undefined;
+  const retryAt = typeof value.retryAt === "string" && value.retryAt.trim().length > 0 ? value.retryAt.trim() : undefined;
+  return {
+    kind: "retry",
+    message: value.message.trim(),
+    ...(retryAt !== undefined ? { retryAt } : {}),
+  };
+}
+
+function providerEventClearsProviderStatus(event: ProviderEvent): boolean {
+  if (event.type === "message.started") {
+    const info = event.payload.info;
+    const role = typeof event.payload.role === "string"
+      ? event.payload.role
+      : typeof info === "object" && info !== null && !Array.isArray(info) && typeof info.role === "string"
+        ? info.role
+        : undefined;
+    return role === "assistant";
+  }
+  if (event.type === "message.delta") return typeof event.payload.text === "string" && event.payload.text.length > 0;
+  if (event.type === "message.completed") return true;
+  return event.type === "tool.started" || event.type === "tool.output" || event.type === "tool.completed"
+    || event.type === "command.started" || event.type === "command.output" || event.type === "command.completed"
+    || event.type === "agent.completed" || event.type === "agent.interrupted" || event.type === "agent.error";
 }
 
 function normalizedMetadataValue(value: unknown): string | undefined {
@@ -3216,14 +4230,39 @@ function clearDelegationError(task: DelegationTask): DelegationTask {
   return copy;
 }
 
-function delegatedWorkerInstruction(prompt: string, parent: RemoteSession, displayName: string): string {
+/**
+ * Framing only, never the request itself. This rides as developer guidance beside the
+ * instruction rather than being pasted in front of it: prepending it made the operator's
+ * own words the tail of a long briefing, so a one-word message read as a mandate to go
+ * and work. The prompt stays the whole visible message, and the worker is told plainly
+ * that its scope is whatever that message asks for and nothing more.
+ */
+function delegatedWorkerInstruction(parent: RemoteSession, displayName: string): string {
   return [
     `You are a ${displayName} worker delegated by another coding-agent session.`,
-    "Work independently on the task below in the same project. Return a concise, self-contained result for the parent agent to consume.",
+    `The user's message is the task. Match its scope exactly: answer a small or casual message briefly and stop, and do substantial work only when the message actually asks for it. Never expand a short message into a large autonomous effort.`,
+    "Work independently in the same project and return a concise, self-contained result the parent agent can consume.",
     "Do not wait for, message, or attempt to spawn the parent. If you cannot complete something, state the exact blocker.",
-    `Parent task: ${parent.title}`,
-    "",
-    prompt,
+    `Parent task, for background only: ${parent.title}`,
+  ].join("\n");
+}
+
+const foreignSubagentMarker = "[[TETHOQ_FOREIGN_SUBAGENTS_V1]]";
+
+/**
+ * Capability guidance for sessions the desktop has allowed to spawn subagents
+ * on a different coding tool. It rides as developer instructions so it never
+ * appears in the visible transcript, and the marker line stops retried queue
+ * deliveries from stacking the same guidance twice.
+ */
+function foreignSubagentInstruction(): string {
+  return [
+    foreignSubagentMarker,
+    "This Tethoq session is allowed to delegate work to subagents that run on a different coding tool (harness) than your own.",
+    'To find a candidate task on another tool, call mesh_list_sessions with an optional "query" search string and a "limit" from 1 to 25; it returns tasks with their stable session IDs and harness names.',
+    'To send a subagent request to that task, call mesh_message_session with "target_session_id" (a session ID from mesh_list_sessions), "message" (the work request), and "request_id" (a stable unique ID for this send; reuse it only when retrying the same target and message). The other task receives the request through its own inbox after its user-authored work.',
+    'Manage existing delegated child sessions with mesh_list_children, mesh_message_child ("child_session_id", "message"), mesh_wait ("child_session_ids", "timeout_seconds"), and mesh_read_result ("child_session_id").',
+    "This capability is per session. When it is off for a session you must not spawn or message foreign subagents with these tools; say plainly that cross-tool subagents are disabled for this task instead of working around the restriction.",
   ].join("\n");
 }
 

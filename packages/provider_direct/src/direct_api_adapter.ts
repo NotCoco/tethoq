@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import {
   makeGlobalSessionId,
   type ConfigureWalletRequest,
@@ -25,6 +26,7 @@ import {
   type AuthStatus,
   type CreateSessionOptions,
   type ListSessionsOptions,
+  type MessageAttachment,
   type PaginatedSessions,
   type ProviderDetection,
   type ProviderEvent,
@@ -43,7 +45,7 @@ interface ModelSeed {
   readonly id: string;
   readonly name: string;
   readonly contextWindow?: number;
-  readonly inputModalities?: readonly ("text" | "image")[];
+  readonly inputModalities?: readonly ("text" | "image" | "audio")[];
   readonly inputPricePerToken?: number;
   readonly outputPricePerToken?: number;
 }
@@ -53,8 +55,9 @@ interface EndpointDefinition {
   readonly name: string;
   readonly baseUrl: string;
   readonly protocol: DirectProtocol;
-  readonly apiKeyEnvironment: string;
+  readonly apiKeyEnvironment?: string;
   readonly apiKeyEnvironmentAliases?: readonly string[];
+  readonly openCodeProviderId?: string;
   readonly usageUrl?: string;
   readonly models: readonly ModelSeed[];
 }
@@ -86,6 +89,7 @@ interface StoredMessage {
   readonly role: "user" | "assistant" | "system";
   readonly text: string;
   readonly images?: readonly StoredAttachment[];
+  readonly audio?: readonly StoredAttachment[];
   readonly workflows?: SendMessageRequest["workflows"];
   readonly reasoning?: string;
   readonly createdAt: string;
@@ -128,6 +132,7 @@ export interface DirectApiProviderOptions {
   readonly environment?: NodeJS.ProcessEnv;
   readonly fetch?: typeof fetch;
   readonly now?: () => Date;
+  readonly homeDirectory?: string;
 }
 
 const staticEndpoints: readonly EndpointDefinition[] = [
@@ -187,7 +192,7 @@ const staticEndpoints: readonly EndpointDefinition[] = [
     apiKeyEnvironment: "GOOGLE_API_KEY",
     apiKeyEnvironmentAliases: ["GEMINI_API_KEY"],
     models: [
-      { id: "gemini-3.6-flash", name: "Gemini 3.6 Flash", contextWindow: 1_048_576, inputModalities: ["text", "image"] },
+      { id: "gemini-3.6-flash", name: "Gemini 3.6 Flash", contextWindow: 1_048_576, inputModalities: ["text", "image", "audio"] },
     ],
   },
   { id: "openrouter", name: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", protocol: "chat_completions", apiKeyEnvironment: "OPENROUTER_API_KEY", models: [] },
@@ -200,6 +205,125 @@ const staticEndpoints: readonly EndpointDefinition[] = [
   { id: "cerebras", name: "Cerebras API", baseUrl: "https://api.cerebras.ai/v1", protocol: "chat_completions", apiKeyEnvironment: "CEREBRAS_API_KEY", models: [] },
   { id: "perplexity", name: "Perplexity Agent API", baseUrl: "https://api.perplexity.ai/v1", protocol: "responses", apiKeyEnvironment: "PERPLEXITY_API_KEY", models: [] },
 ];
+
+interface OpenCodePaths {
+  readonly auth: string;
+  readonly config: string;
+  readonly models: string;
+}
+
+interface OpenCodeDiscovery {
+  readonly keys: ReadonlyMap<string, string>;
+  readonly endpoints: readonly EndpointDefinition[];
+}
+
+function openCodePaths(homeDirectory: string): OpenCodePaths {
+  return {
+    auth: join(homeDirectory, ".local", "share", "opencode", "auth.json"),
+    config: join(homeDirectory, ".config", "opencode", "opencode.jsonc"),
+    models: join(homeDirectory, ".cache", "opencode", "models.json"),
+  };
+}
+
+async function readJsonFile(filePath: string): Promise<unknown> {
+  try {
+    return JSON.parse((await readFile(filePath, "utf8")).replace(/^\uFEFF/u, "")) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readJsonCFile(filePath: string): Promise<unknown> {
+  try {
+    const text = (await readFile(filePath, "utf8")).replace(/^\uFEFF/u, "");
+    try {
+      return JSON.parse(text) as unknown;
+    } catch {
+      // opencode.jsonc allows comments; strip them before retrying.
+      return JSON.parse(text.replace(/\/\*[\s\S]*?\*\//gu, "").replace(/(^|[^:"\\])\/\/[^\n]*/gmu, "$1")) as unknown;
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+function openCodeApiKeys(value: unknown): ReadonlyMap<string, string> {
+  const keys = new Map<string, string>();
+  if (!isObject(value)) return keys;
+  for (const [providerId, entry] of Object.entries(value)) {
+    if (!isObject(entry) || entry.type !== "api" || typeof entry.key !== "string") continue;
+    const key = entry.key.trim();
+    if (key === "") continue;
+    keys.set(providerId, key);
+  }
+  return keys;
+}
+
+function openCodeConfigProviders(value: unknown): ReadonlyMap<string, { readonly name?: string; readonly baseUrl?: string }> {
+  const providers = new Map<string, { readonly name?: string; readonly baseUrl?: string }>();
+  if (!isObject(value)) return providers;
+  const configured = isObject(value.provider) ? value.provider : {};
+  for (const [providerId, entry] of Object.entries(configured)) {
+    if (!isObject(entry)) continue;
+    const options = isObject(entry.options) ? entry.options : {};
+    const baseUrl = typeof options.baseURL === "string" ? options.baseURL : typeof entry.api === "string" ? entry.api : undefined;
+    const name = typeof entry.name === "string" && entry.name.trim() !== "" ? entry.name.trim() : undefined;
+    providers.set(providerId, { ...(name !== undefined ? { name } : {}), ...(baseUrl !== undefined ? { baseUrl } : {}) });
+  }
+  return providers;
+}
+
+function openCodeProviders(value: unknown): ReadonlyMap<string, { readonly name?: string; readonly baseUrl?: string; readonly models: readonly ModelSeed[] }> {
+  const providers = new Map<string, { readonly name?: string; readonly baseUrl?: string; readonly models: readonly ModelSeed[] }>();
+  if (!isObject(value)) return providers;
+  for (const [providerId, entry] of Object.entries(value)) {
+    if (!isObject(entry)) continue;
+    const baseUrl = typeof entry.api === "string" ? entry.api : typeof entry.baseUrl === "string" ? entry.baseUrl : undefined;
+    const name = typeof entry.name === "string" && entry.name.trim() !== "" ? entry.name.trim() : undefined;
+    const modelEntries = isObject(entry.models) ? entry.models : {};
+    const models: ModelSeed[] = [];
+    for (const [modelId, model] of Object.entries(modelEntries)) {
+      if (!isObject(model)) continue;
+      models.push({ id: modelId, name: typeof model.name === "string" && model.name.trim() !== "" ? model.name.trim() : modelId });
+    }
+    providers.set(providerId, { ...(name !== undefined ? { name } : {}), ...(baseUrl !== undefined ? { baseUrl } : {}), models });
+  }
+  return providers;
+}
+
+async function discoverOpenCodeEndpoints(paths: OpenCodePaths): Promise<OpenCodeDiscovery> {
+  const [authValue, modelsValue, configValue] = await Promise.all([
+    readJsonFile(paths.auth),
+    readJsonFile(paths.models),
+    readJsonCFile(paths.config),
+  ]);
+  const keys = openCodeApiKeys(authValue);
+  if (keys.size === 0) return { keys, endpoints: [] };
+  const providers = openCodeProviders(modelsValue);
+  const configured = openCodeConfigProviders(configValue);
+  const endpoints: EndpointDefinition[] = [];
+  for (const providerId of keys.keys()) {
+    if (staticEndpoints.some((preset) => preset.id === providerId)) continue;
+    if (!/^[a-z0-9][a-z0-9._-]{1,63}$/u.test(providerId)) continue;
+    const baseUrl = providers.get(providerId)?.baseUrl ?? configured.get(providerId)?.baseUrl;
+    if (baseUrl === undefined || baseUrl.includes("${")) continue;
+    let normalized: string;
+    try {
+      normalized = normalizedBaseUrl(baseUrl);
+    } catch {
+      continue;
+    }
+    endpoints.push({
+      id: providerId,
+      name: providers.get(providerId)?.name ?? configured.get(providerId)?.name ?? providerId,
+      baseUrl: normalized,
+      protocol: "chat_completions",
+      openCodeProviderId: providerId,
+      models: providers.get(providerId)?.models ?? [],
+    });
+  }
+  return { keys, endpoints };
+}
 
 const capabilities: ProviderCapabilities = {
   authentication: true,
@@ -260,7 +384,8 @@ function endpointUrl(baseUrl: string, path: string): string {
 }
 
 function apiKeyLabel(definition: EndpointDefinition): string {
-  return [definition.apiKeyEnvironment, ...(definition.apiKeyEnvironmentAliases ?? [])].join(" / ");
+  if (definition.openCodeProviderId !== undefined) return `opencode '${definition.openCodeProviderId}' key`;
+  return [definition.apiKeyEnvironment, ...(definition.apiKeyEnvironmentAliases ?? [])].filter((name): name is string => name !== undefined).join(" / ");
 }
 
 function isLoopbackHostname(hostname: string): boolean {
@@ -296,10 +421,14 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
   readonly #now: () => Date;
   readonly #events = new ProviderEventHub();
   readonly #modelsCache = new Map<string, { readonly expiresAt: number; readonly models: readonly ListedModel[] }>();
+  readonly #openCodePaths: OpenCodePaths;
+  #openCodeEndpointsPromise: Promise<readonly EndpointDefinition[]> | undefined;
+  #openCodeKeys: ReadonlyMap<string, string> = new Map();
   #statePromise: Promise<DirectState> | undefined;
   #writeChain: Promise<void> = Promise.resolve();
   #eventCounter = 0;
   #disposed = false;
+  readonly #activePrompts = new Set<string>();
   #clientTooling: ProviderClientTooling | undefined;
 
   public constructor(options: DirectApiProviderOptions) {
@@ -309,6 +438,7 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
     this.#environment = options.environment ?? process.env;
     this.#fetch = options.fetch ?? fetch;
     this.#now = options.now ?? (() => new Date());
+    this.#openCodePaths = openCodePaths(options.homeDirectory ?? homedir());
   }
 
   public async detect(): Promise<ProviderDetection> {
@@ -317,7 +447,7 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
 
   public async getAuthStatus(): Promise<AuthStatus> {
     const state = await this.state();
-    const configured = this.definitions(state).filter((definition) => this.apiKey(definition, state) !== undefined);
+    const configured = (await this.definitions(state)).filter((definition) => this.apiKey(definition, state) !== undefined);
     return {
       authenticated: configured.length > 0,
       method: "user-api-key",
@@ -345,15 +475,16 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
   public async listModels(): Promise<readonly RemoteModel[]> {
     this.assertActive();
     const state = await this.state();
-    const groups = await Promise.all(this.definitions(state).map((definition) => this.modelsForEndpoint(definition, state)));
+    const groups = await Promise.all((await this.definitions(state)).map((definition) => this.modelsForEndpoint(definition, state)));
     return groups.flatMap((group) => group.map((entry) => entry.model));
   }
 
   public async getWalletStatus(modelId?: string, requestedEndpointId?: string): Promise<ProviderWalletStatus> {
     const state = await this.state();
+    const definitions = await this.definitions(state);
     const endpointId = requestedEndpointId?.trim()
-      || (modelId === undefined ? this.definitions(state)[0]?.id ?? "openai" : splitDirectModelId(modelId).endpointId);
-    const definition = this.requireDefinition(endpointId, state);
+      || (modelId === undefined ? definitions[0]?.id ?? "openai" : splitDirectModelId(modelId).endpointId);
+    const definition = await this.requireDefinition(endpointId, state);
     const entry = state.endpoints[endpointId];
     const key = this.apiKey(definition, state);
     let providerBalance: number | undefined;
@@ -379,7 +510,7 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
       apiKeyConfigured: key !== undefined,
       apiKeyLabel: apiKeyLabel(definition),
       ...(key === undefined ? { caution: `Enter a ${definition.name} API key to use this model` } : balance === undefined ? { caution: "No provider balance API is available; add an optional local spend budget if desired" } : {}),
-      availableEndpoints: this.definitions(state).map((endpoint) => ({
+      availableEndpoints: definitions.map((endpoint) => ({
         id: endpoint.id,
         name: endpoint.name,
         apiKeyLabel: apiKeyLabel(endpoint),
@@ -391,7 +522,7 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
     const endpointId = request.endpointId.trim();
     if (!/^[a-z0-9][a-z0-9._-]{1,63}$/u.test(endpointId)) throw new Error("Endpoint ID must use 2-64 lowercase letters, numbers, dots, dashes, or underscores");
     await this.mutate(async (state) => {
-      let definition = this.definitions(state).find((candidate) => candidate.id === endpointId);
+      let definition = (await this.definitions(state)).find((candidate) => candidate.id === endpointId);
       if (request.customEndpoint !== undefined) {
         if (staticEndpoints.some((candidate) => candidate.id === endpointId)) throw new Error("Built-in direct API endpoints cannot be replaced");
         if (request.customEndpoint.id.trim() !== endpointId) throw new Error("Custom endpoint ID must match endpointId");
@@ -435,7 +566,7 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
       if (request.addBalance !== undefined) current.balance = this.balanceValue((current.balance ?? 0) + request.addBalance);
       this.#modelsCache.delete(endpointId);
     });
-    return await this.getWalletStatus(directModelId(endpointId, this.requireDefinition(endpointId, await this.state()).models[0]?.id ?? "default"));
+    return await this.getWalletStatus(directModelId(endpointId, (await this.requireDefinition(endpointId, await this.state())).models[0]?.id ?? "default"));
   }
 
   public async listSessions(options: ListSessionsOptions = {}): Promise<PaginatedSessions> {
@@ -464,7 +595,7 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
     this.assertActive();
     const selected = splitDirectModelId(options.modelId ?? "openai::gpt-5.6-terra");
     const state = await this.state();
-    const definition = this.requireDefinition(selected.endpointId, state);
+    const definition = await this.requireDefinition(selected.endpointId, state);
     if (this.apiKey(definition, state) === undefined) throw new ProviderAdapterError(this.providerId, "AUTH_REQUIRED", `Enter a ${definition.name} API key in the blue user wallet`, false);
     const model = (await this.modelsForEndpoint(definition, state)).find((candidate) => candidate.model.id === directModelId(selected.endpointId, selected.modelId));
     const now = this.#now().toISOString();
@@ -512,20 +643,22 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
     const selected = request.modelId === undefined
       ? { endpointId: session.endpointId, modelId: session.modelId }
       : splitDirectModelId(request.modelId);
-    const definition = this.requireDefinition(selected.endpointId, state);
+    const definition = await this.requireDefinition(selected.endpointId, state);
     if (this.apiKey(definition, state) === undefined) throw new ProviderAdapterError(this.providerId, "AUTH_REQUIRED", `Enter a ${definition.name} API key in the blue user wallet`, false);
     const wallet = state.endpoints[definition.id];
     if (wallet?.balance !== undefined && wallet.spent >= wallet.balance) {
       throw new ProviderAdapterError(this.providerId, "LOCAL_BUDGET_EXHAUSTED", `${definition.name}'s local spend budget has been reached. Raise it in the blue user wallet before sending another request.`, false);
     }
     const now = this.#now().toISOString();
+    const { imageAttachments, audioAttachments } = splitDirectAttachments(request.attachments ?? []);
     const selectedModel = (await this.modelsForEndpoint(definition, state)).find((candidate) => candidate.model.id === directModelId(selected.endpointId, selected.modelId));
     const user: StoredMessage = {
       id: `user_${randomUUID()}`,
       providerMessageId: request.requestId,
       role: "user",
       text: request.content,
-      ...(request.attachments?.length ? { images: request.attachments.map((attachment) => ({ ...attachment })) } : {}),
+      ...(imageAttachments.length ? { images: imageAttachments } : {}),
+      ...(audioAttachments.length ? { audio: audioAttachments } : {}),
       ...(request.workflows?.length ? { workflows: request.workflows.map((workflow) => ({ ...workflow })) } : {}),
       createdAt: now,
     };
@@ -541,8 +674,13 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
       session.state = "working";
     });
     const providerTurnId = `turn_${randomUUID()}`;
+    this.#activePrompts.add(session.id);
     void this.completeTurn(session, definition, request, providerTurnId);
     return { accepted: true, providerTurnId, details: [`Using ${definition.name} user API wallet`] };
+  }
+
+  public hasActiveTurn(providerSessionId: string): boolean {
+    return this.#activePrompts.has(providerSessionId);
   }
 
   public async getSessionContext(providerSessionId: string): Promise<Omit<SessionContextState, "sessionId" | "compactionThresholdTokens" | "minimumThresholdTokens" | "supportsThreshold" | "isCompacting" | "compactionKind">> {
@@ -616,12 +754,14 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
         state.endpoints[definition.id] = endpoint;
         if (response.usage.cost !== undefined) endpoint.spent += response.usage.cost;
       });
-      if (response.reasoning !== undefined) await this.emit({ type: "message.delta", providerSessionId: session.id, payload: { messageId: assistantId, reasoning: response.reasoning } });
+      if (response.reasoning !== undefined) await this.emit({ type: "message.delta", providerSessionId: session.id, payload: { messageId: assistantId, partType: "reasoning", reasoning: response.reasoning } });
       if (response.text !== "") await this.emit({ type: "message.delta", providerSessionId: session.id, payload: { messageId: assistantId, text: response.text } });
       await this.emit({ type: "message.completed", providerSessionId: session.id, payload: { messageId: assistantId, role: "assistant", parts: this.remoteMessage(session, assistant).parts } as unknown as JsonObject });
+      this.#activePrompts.delete(session.id);
       await this.emit({ type: "agent.completed", providerSessionId: session.id, payload: { providerTurnId, usage: response.usage as JsonObject } });
     } catch (error) {
       await this.mutate(async () => { session.state = "failed"; session.updatedAt = this.#now().toISOString(); });
+      this.#activePrompts.delete(session.id);
       await this.emit({ type: "agent.error", providerSessionId: session.id, payload: { message: error instanceof Error ? error.message : String(error), providerTurnId } });
     }
   }
@@ -676,6 +816,7 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
       content: [
         ...(message.text === "" ? [] : [{ type: "input_text", text: message.text }]),
         ...(message.images ?? []).map((image) => ({ type: "input_image", image_url: storedImageUri(image) })),
+        ...(message.audio ?? []).map((audio) => ({ type: "input_audio", input_audio: inputAudio(audio) })),
       ],
     }));
     const tools = this.directTools(session, "responses");
@@ -755,7 +896,12 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
       const discovered = data.flatMap((entry): ListedModel[] => {
         if (!isObject(entry) || typeof entry.id !== "string") return [];
         const architecture = isObject(entry.architecture) ? entry.architecture : {};
-        const modalities = Array.isArray(architecture.input_modalities) && architecture.input_modalities.includes("image") ? ["text", "image"] as const : ["text"] as const;
+        const supported = Array.isArray(architecture.input_modalities) ? architecture.input_modalities : [];
+        const modalities: Array<"text" | "image" | "audio"> = [
+          "text",
+          ...(supported.includes("image") ? ["image"] as const : []),
+          ...(supported.includes("audio") ? ["audio"] as const : []),
+        ];
         return [this.listedModel(definition, {
           id: entry.id,
           name: typeof entry.name === "string" ? entry.name : entry.id,
@@ -763,7 +909,7 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
           inputModalities: modalities,
         }, key !== undefined)];
       });
-      const combined = dedupeModels([...discovered, ...seeds]);
+      const combined = dedupeModels([...seeds, ...discovered]);
       this.#modelsCache.set(definition.id, { expiresAt: Date.now() + 5 * 60_000, models: combined });
       return combined;
     } catch {
@@ -802,18 +948,35 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
     return (await this.modelsForEndpoint(definition, state)).find((entry) => entry.model.id === directModelId(definition.id, modelId)) ?? {};
   }
 
-  private definitions(state: DirectState): readonly EndpointDefinition[] {
+  private async definitions(state: DirectState): Promise<readonly EndpointDefinition[]> {
     const custom = Object.values(state.endpoints).flatMap((entry) => entry.definition === undefined ? [] : [entry.definition]);
-    return [...staticEndpoints, ...custom.filter((entry) => !staticEndpoints.some((preset) => preset.id === entry.id))];
+    const discovered = (await this.openCodeEndpoints()).filter((entry) => !staticEndpoints.some((preset) => preset.id === entry.id) && !custom.some((candidate) => candidate.id === entry.id));
+    return [...staticEndpoints, ...custom.filter((entry) => !staticEndpoints.some((preset) => preset.id === entry.id)), ...discovered];
   }
 
-  private requireDefinition(endpointId: string, state: DirectState): EndpointDefinition {
-    const definition = this.definitions(state).find((entry) => entry.id === endpointId);
+  private async requireDefinition(endpointId: string, state: DirectState): Promise<EndpointDefinition> {
+    const definition = (await this.definitions(state)).find((entry) => entry.id === endpointId);
     if (definition === undefined) throw new ProviderAdapterError(this.providerId, "ENDPOINT_UNKNOWN", `Unknown direct API endpoint ${endpointId}`, false);
     return definition;
   }
 
+  private openCodeEndpoints(): Promise<readonly EndpointDefinition[]> {
+    if (this.#openCodeEndpointsPromise === undefined) {
+      this.#openCodeEndpointsPromise = (async () => {
+        try {
+          const discovered = await discoverOpenCodeEndpoints(this.#openCodePaths);
+          this.#openCodeKeys = discovered.keys;
+          return discovered.endpoints;
+        } catch {
+          return [];
+        }
+      })();
+    }
+    return this.#openCodeEndpointsPromise;
+  }
+
   private apiKey(definition: EndpointDefinition, state: DirectState): string | undefined {
+    if (definition.openCodeProviderId !== undefined) return this.#openCodeKeys.get(definition.openCodeProviderId);
     const environment = this.environmentApiKey(definition);
     if (environment !== undefined) return environment.value;
     const encrypted = state.endpoints[definition.id]?.encryptedApiKey;
@@ -823,6 +986,7 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
 
   private environmentApiKey(definition: EndpointDefinition): { readonly name: string; readonly value: string } | undefined {
     for (const name of [definition.apiKeyEnvironment, ...(definition.apiKeyEnvironmentAliases ?? [])]) {
+      if (name === undefined) continue;
       const value = this.#environment[name]?.trim();
       if (value) return { name, value };
     }
@@ -912,6 +1076,12 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
         ...(image.mimeType !== undefined ? { mimeType: image.mimeType } : {}),
         name: image.name,
       })),
+      ...(message.audio ?? []).map((audio): ContentPart => ({
+        type: "audio",
+        uri: storedImageUri(audio),
+        mimeType: audio.mimeType ?? "audio/mpeg",
+        name: audio.name,
+      })),
       ...(message.workflows ?? []).map((workflow): ContentPart => {
         const { promptReference: _promptReference, ...visibleWorkflow } = workflow;
         return { type: "workflow", workflow: visibleWorkflow };
@@ -970,13 +1140,43 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
 }
 
 function chatMessage(message: StoredMessage): Record<string, unknown> {
-  const content = message.images?.length
+  const content = (message.images?.length || message.audio?.length)
     ? [
         ...(message.text === "" ? [] : [{ type: "text", text: message.text }]),
-        ...message.images.map((image) => ({ type: "image_url", image_url: { url: storedImageUri(image) } })),
+        ...(message.images ?? []).map((image) => ({ type: "image_url", image_url: { url: storedImageUri(image) } })),
+        ...(message.audio ?? []).map((audio) => ({ type: "input_audio", input_audio: inputAudio(audio) })),
       ]
     : message.text;
   return { role: message.role, content };
+}
+
+/** Splits incoming attachments by modality and validates audio containers for direct API input_audio blocks. */
+function splitDirectAttachments(attachments: readonly MessageAttachment[]): { readonly imageAttachments: readonly StoredAttachment[]; readonly audioAttachments: readonly StoredAttachment[] } {
+  const imageAttachments: StoredAttachment[] = [];
+  const audioAttachments: StoredAttachment[] = [];
+  for (const attachment of attachments) {
+    const mimeType = attachment.mimeType.toLowerCase();
+    if (mimeType.startsWith("image/")) {
+      imageAttachments.push({ ...attachment });
+    } else if (mimeType.startsWith("audio/")) {
+      inputAudio(attachment);
+      audioAttachments.push({ ...attachment });
+    } else {
+      throw new Error(`${attachment.name} is not an image or audio attachment`);
+    }
+  }
+  return { imageAttachments, audioAttachments };
+}
+
+/** Builds the input_audio payload used by the Responses and Chat Completions APIs. */
+function inputAudio(attachment: { readonly mimeType?: string; readonly dataBase64?: string }): { readonly data: string; readonly format: "mp3" | "wav" } {
+  if (attachment.dataBase64 === undefined) throw new Error("Direct API audio input is missing its audio data");
+  const mimeType = attachment.mimeType?.toLowerCase() ?? "";
+  let format: "mp3" | "wav";
+  if (mimeType === "audio/mpeg" || mimeType === "audio/mp3") format = "mp3";
+  else if (mimeType === "audio/wav" || mimeType === "audio/x-wav" || mimeType === "audio/wave") format = "wav";
+  else throw new Error("Direct API audio input must be an MP3 or WAV recording");
+  return { data: attachment.dataBase64, format };
 }
 
 function parseAssistantContent(value: unknown): { readonly text: string; readonly images: readonly StoredAttachment[] } {

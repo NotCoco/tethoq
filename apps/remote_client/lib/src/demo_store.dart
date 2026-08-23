@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'ears.dart';
 import 'models.dart';
 import 'security.dart';
 import 'store.dart';
@@ -488,6 +489,9 @@ class DemoRemoteAppStore extends RemoteAppStore {
           _ => 'Default model',
         },
         isDefault: true,
+        inputModalities: providerId == 'codex'
+            ? const <String>['text', 'image']
+            : const <String>[],
         nativeMetadata: providerId == 'codex'
             ? const <String, Object?>{
                 'supportedReasoningEfforts': <Object?>[
@@ -526,6 +530,15 @@ class DemoRemoteAppStore extends RemoteAppStore {
   }
 
   @override
+  Future<void> setEars(EarsSettings value) async {
+    ears = value;
+    notifyListeners();
+  }
+
+  @override
+  Future<void> cancelEars() async {}
+
+  @override
   Future<void> sendMessage(
     String sessionId,
     String content, {
@@ -534,8 +547,22 @@ class DemoRemoteAppStore extends RemoteAppStore {
     List<RemoteAttachment> attachments = const <RemoteAttachment>[],
     SimplifySettings? simplify,
   }) async {
-    final trimmed = content.trim();
-    if (trimmed.isEmpty) return;
+    var nextContent = content;
+    var nextAttachments = List<RemoteAttachment>.of(attachments);
+    if (ears.enabled) {
+      final clips = nextAttachments
+          .where(isDictationAudioAttachment)
+          .toList(growable: false);
+      if (clips.isNotEmpty) {
+        nextContent = composeEarsDestinationText(
+            content, const <String>['Transcribed dictation']);
+        nextAttachments = nextAttachments
+            .where((attachment) => !isDictationAudioAttachment(attachment))
+            .toList(growable: false);
+      }
+    }
+    final trimmed = nextContent.trim();
+    if (trimmed.isEmpty && nextAttachments.isEmpty) return;
     final visibleContent = simplifyVisibleContent(trimmed);
     drafts[sessionId] = '';
     draftAttachments.remove(sessionId);

@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
+import 'ears.dart';
 import 'json.dart';
 import 'models.dart';
 
@@ -227,6 +228,7 @@ class DeviceSecurity {
   static const _delegationPreferencesKey = 'uar.delegation_preferences.v1';
   static const _agentDefaultsKey = 'uar.agent_defaults.v1';
   static const _recentModelsKey = 'uar.recent_models.v1';
+  static const _earsSettingsKey = 'uar.ears_settings.v1';
   final FlutterSecureStorage _storage;
   final Ed25519 _algorithm = Ed25519();
 
@@ -564,6 +566,23 @@ class DeviceSecurity {
         .where((value) => value.length <= 300 && value.contains('\u0000'))
         .take(5)
         .toList(growable: false);
+  }
+
+  Future<EarsSettings> readEarsSettings() async {
+    final raw = await _storage.read(key: _earsSettingsKey);
+    if (raw == null || raw.isEmpty) return const EarsSettings();
+    try {
+      return EarsSettings.fromJson(jsonDecode(raw));
+    } on Object {
+      return const EarsSettings();
+    }
+  }
+
+  Future<void> saveEarsSettings(EarsSettings settings) async {
+    await _storage.write(
+      key: _earsSettingsKey,
+      value: jsonEncode(settings.toJson()),
+    );
   }
 
   Future<void> saveRecentModelKeys(Iterable<String> keys) async {

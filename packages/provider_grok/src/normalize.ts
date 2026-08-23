@@ -66,6 +66,8 @@ export function normalizeAcpSession(
     ? stripProviderPromptGuidance(value.title)
     : `Untitled ${identity.sessionLabel ?? identity.displayName} session`;
   const updatedAt = parseTimestamp(value.updatedAt ?? value.lastActivityAt, now);
+  const modelId = firstString(value, ["modelId", "model_id", "model"]);
+  const reasoningEffort = firstString(value, ["reasoningEffort", "reasoning_effort", "thoughtLevel", "thought_level"]);
   return {
     id: makeGlobalSessionId(hostId, identity.providerId, providerSessionId),
     hostId,
@@ -76,6 +78,8 @@ export function normalizeAcpSession(
     state: sessionState(value),
     lastActivityAt: updatedAt,
     preview: typeof value.preview === "string" ? stripProviderPromptGuidance(value.preview) : title,
+    ...(modelId !== undefined ? { modelId } : {}),
+    ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
     needsApproval: false,
     stale: false,
     nativeMetadata: asJsonObject(value),
@@ -186,15 +190,40 @@ export function appendAcpSubagentPart(
   return message;
 }
 
+function thoughtText(source: Record<string, unknown>): string | undefined {
+  for (const key of ["text", "thought", "thinking", "reasoning", "delta"] as const) {
+    const value = source[key];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return undefined;
+}
+
+export function acpContentLooksLikeThought(content: unknown): boolean {
+  if (!isRecord(content)) return false;
+  const type = typeof content.type === "string" ? content.type.toLowerCase() : "";
+  if (type === "thought" || type === "thinking" || type === "reasoning" || type === "agent_thought" || type === "thought_delta" || type === "reasoning_content") {
+    return true;
+  }
+  return content.thought === true || content.isThought === true || content.isThinking === true;
+}
+
+export function acpUpdateLooksLikeThought(update: Record<string, unknown>, sessionUpdate: string): boolean {
+  const name = sessionUpdate.toLowerCase();
+  if (name.includes("thought") || name.includes("thinking") || name.includes("reason")) return true;
+  if (update.thought === true || update.isThought === true || update.isThinking === true) return true;
+  if (typeof update.thought === "string" || typeof update.thinking === "string" || typeof update.reasoning === "string") return true;
+  return acpContentLooksLikeThought(update.content);
+}
+
 function textFromContent(content: unknown): { readonly part: ContentPart; readonly text: string } | null {
   if (typeof content === "string") return { part: { type: "text", text: content }, text: content };
   if (!isRecord(content)) return null;
-  if (content.type === "text" && typeof content.text === "string") return { part: { type: "text", text: content.text }, text: content.text };
   if (content.type === "image" && typeof content.uri === "string") return {
     part: { type: "image", uri: content.uri, ...(typeof content.mimeType === "string" ? { mimeType: content.mimeType } : {}) },
     text: "",
   };
-  if (typeof content.text === "string") return { part: { type: "text", text: content.text }, text: content.text };
+  const text = thoughtText(content);
+  if (text !== undefined) return { part: { type: "text", text }, text };
   return null;
 }
 
@@ -210,7 +239,7 @@ export function appendAcpContentChunk(
   partType: "text" | "reasoning" = "text",
   identity: AcpProviderIdentity = GROK_ACP_IDENTITY,
 ): RemoteMessage | null {
-  const content = textFromContent(update.content);
+  const content = textFromContent(update.content) ?? (isRecord(update) ? textFromContent(update) : null);
   if (content === null) return null;
   const nativeId = typeof update.messageId === "string" && update.messageId.length > 0
     ? update.messageId

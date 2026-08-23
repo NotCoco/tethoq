@@ -44,6 +44,7 @@ test("preload exposes a narrow frozen API without Node or raw IPC access", async
     "selectFiles",
     "captureScreens",
     "revealPath",
+    "copyText",
     "localOpenHandlers",
     "openLocalTarget",
     "openDictationSetupPage",
@@ -134,7 +135,14 @@ test("provider requests stay in the main process and event replay is bounded", a
   assert.doesNotMatch(ensureOpenCode, /reconnectProvider/);
   const startOnce = runtime.match(/private async startOnce\([\s\S]*?\n  }/)?.[0] ?? "";
   assert.match(startOnce, /#openCode\.probe\(\)/);
+  // The desktop owns the OpenCode server for its whole lifetime, but a cold
+  // server can take seconds to answer, so readiness is reported first and the
+  // start runs behind it.
   assert.doesNotMatch(startOnce, /#openCode\.ensureRunning\(\)/);
+  assert.match(startOnce, /this\.#onState\(\{ state: "ready" \}\);\s*\n\s*this\.startOpenCodeInBackground\(bridge\)/);
+  const backgroundStart = runtime.match(/private startOpenCodeInBackground\([\s\S]*?\n  }/)?.[0] ?? "";
+  assert.match(backgroundStart, /this\.ensureOpenCode\(\)/);
+  assert.match(backgroundStart, /reconnectProvider\("opencode"\)/);
   assert.match(runtime, /new MeshToolGateway\(/);
   assert.match(runtime, /bridge\.configureClientTooling\(clientTools\)/);
   assert.match(runtime, /catch \(error\) \{[\s\S]*?#bridge\?\.dispose\(\)[\s\S]*?#clientTools\?\.close\(\)[\s\S]*?#connectorRegistry\?\.dispose\(\)[\s\S]*?#openCode\.dispose\(\)/);
@@ -168,6 +176,10 @@ test("IPC request routing is allowlisted and provider targets are validated", as
   assert.ok(allowed.length >= 20, "desktop request allowlist unexpectedly collapsed");
   assert.equal(new Set(allowed).size, allowed.length, "desktop request allowlist contains duplicates");
   assert.ok(allowed.includes("session.create"));
+  assert.ok(allowed.includes("session.watch"));
+  assert.ok(allowed.includes("session.unwatch"));
+  assert.ok(allowed.includes("ears.process"));
+  assert.ok(allowed.includes("ears.cancel"));
   assert.ok(allowed.includes("approval.respond"));
   assert.ok(allowed.includes("delegation.start"));
   assert.ok(allowed.includes("session.context_handoff"));
@@ -196,12 +208,30 @@ test("the Electron window keeps renderer privileges disabled", async () => {
   assert.match(main, /hardenSession\(session\.defaultSession\)/);
   assert.match(main, /hardenWindow\(window\)/);
   assert.match(main, /titleBarStyle:\s*"hidden"/);
-  assert.match(main, /titleBarOverlay:\s*\{[\s\S]*?color:\s*"#0d0d0c"[\s\S]*?height:\s*46/);
+  assert.match(main, /backgroundColor:\s*"#0b0b0a"/);
+  assert.match(main, /titleBarOverlay:\s*\{[\s\S]*?color:\s*"#0b0b0a"[\s\S]*?height:\s*46/);
   assert.match(main, /minWidth:\s*760/);
   assert.match(main, /minHeight:\s*480/);
-  assert.match(main, /backgroundThrottling:\s*true/);
+  assert.match(main, /backgroundThrottling:\s*false/);
+  assert.match(main, /webContents\.setBackgroundThrottling\(false\)/);
+  assert.match(main, /disable-renderer-backgrounding/);
+  assert.match(main, /disable-background-timer-throttling/);
+  assert.match(main, /disable-backgrounding-occluded-windows/);
+  assert.match(main, /disable-features[\s\S]*CalculateNativeWinOcclusion/);
   assert.match(main, /window\.on\("hide"[\s\S]*?setWindowVisible\(false\)[\s\S]*?setHostVisible\(false\)/);
-  assert.match(main, /ready-to-show[\s\S]*?TETHOQ_PACKAGED_SMOKE\s*===\s*"1"[\s\S]*?else if \(!startedHidden\(\)\) \{\s*window\.show\(\)/);
+  // Revealing is gated on the renderer's first snapshot rather than first paint, but the
+  // smoke build must still stay invisible and inert, and a hidden start must stay hidden.
+  assert.match(main, /const reveal = \(\): void =>[\s\S]*?TETHOQ_PACKAGED_SMOKE\s*===\s*"1"[\s\S]*?else if \(!startedHidden\(\)\) \{\s*window\.show\(\);\s*window\.focus\(\);/);
+  // Only this window's own renderer may reveal it. If Chromium never emits ready-to-show,
+  // a startup fallback still reveals an explicit launch so the process cannot sit invisible.
+  assert.match(main, /if \(event\.sender === window\.webContents\) reveal\(\)/);
+  assert.match(main, /ready-to-show[\s\S]*?revealTimer = setTimeout\(reveal, RENDERER_READY_REVEAL_MS\)/);
+  assert.match(main, /startupRevealTimer = setTimeout\(reveal, STARTUP_REVEAL_FALLBACK_MS\)/);
+  assert.match(main, /export const RENDERER_READY_REVEAL_MS = 4000/);
+  assert.match(main, /export const STARTUP_REVEAL_FALLBACK_MS = 8000/);
+  assert.match(main, /clampWindowStateToDisplay\(remembered, display\.workArea\)/);
+  assert.match(main, /else if \(!startedHidden\(\)\) \{\s*window\.show\(\);\s*window\.focus\(\);/);
+  assert.match(main, /window\.once\("closed", \(\) => \{ ipcMain\.removeListener\(IPC_CHANNELS\.rendererReady, onRendererReady\); \}\)/);
   assert.match(security, /contextIsolation:\s*true/);
   assert.match(security, /nodeIntegration:\s*false/);
   assert.match(security, /sandbox:\s*true/);
@@ -215,6 +245,9 @@ test("the Electron window keeps renderer privileges disabled", async () => {
   assert.equal((security.match(/http:\/\/\[::1\]:\*/g) ?? []).length, 2);
   assert.doesNotMatch(security, /img-src[^;]*\shttp:(?:\s|;)/);
   assert.doesNotMatch(security, /connect-src[^;]*http:/);
+  assert.equal((security.match(/media-src 'self' blob: tethoq-media:/g) ?? []).length, 2);
+  assert.match(main, /registerLocalMediaScheme\(\)/);
+  assert.match(main, /registerLocalMediaProtocol\(session\.defaultSession\)/);
   assert.doesNotMatch(security, /connect-src[^;]*https:/);
   assert.match(security, /will-navigate/);
   assert.match(security, /setWindowOpenHandler/);
@@ -228,7 +261,7 @@ test("packaged smoke compositor priming stays invisible and environment-guarded"
   assert.match(main, /window\.setOpacity\(0\)/);
   assert.match(main, /window\.showInactive\(\)/);
   // Outside smoke, the window shows unless the user asked Windows to start Tethoq in the tray.
-  assert.match(main, /else if \(!startedHidden\(\)\) \{\s*window\.show\(\)/);
+  assert.match(main, /else if \(!startedHidden\(\)\) \{\s*window\.show\(\);\s*window\.focus\(\);/);
 });
 
 test("the packaged preload is emitted as sandbox-compatible CommonJS", async () => {

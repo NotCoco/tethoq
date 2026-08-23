@@ -657,6 +657,7 @@ void main() {
       ..providers.addAll(<ProviderConnection>[
         _provider('codex', modelEnumeration: true),
         _provider('direct', modelEnumeration: true),
+        _provider('opencode', modelEnumeration: true),
       ])
       ..modelsByProvider['codex'] = <RemoteModel>[
         _model('codex', 'codex-a', 'Codex Alpha', isDefault: true),
@@ -664,6 +665,28 @@ void main() {
       ]
       ..modelsByProvider['direct'] = <RemoteModel>[
         _model('direct', 'openai::api-a', 'API Alpha'),
+      ]
+      ..modelsByProvider['opencode'] = <RemoteModel>[
+        const RemoteModel(
+          id: 'deepseek/deepseek-v4',
+          providerId: 'opencode',
+          displayName: 'DeepSeek V4',
+          isDefault: false,
+          nativeMetadata: <String, Object?>{
+            'sourceProviderId': 'deepseek',
+            'sourceProviderName': 'DeepSeek',
+          },
+        ),
+        const RemoteModel(
+          id: 'opencode-go/deepseek-v4',
+          providerId: 'opencode',
+          displayName: 'DeepSeek V4',
+          isDefault: false,
+          nativeMetadata: <String, Object?>{
+            'sourceProviderId': 'opencode-go',
+            'sourceProviderName': 'OpenCode Go',
+          },
+        ),
       ];
     final source = store.prepareSession('codex');
     store.rememberModelSelection('codex', 'codex-b');
@@ -686,6 +709,15 @@ void main() {
     expect(find.text('Recent'), findsOneWidget);
     expect(find.text('Codex'), findsOneWidget);
     expect(find.text('Direct API'), findsOneWidget);
+    expect(find.text('DeepSeek'), findsOneWidget);
+    final openCodeGoHeader = find.byWidgetPredicate(
+        (widget) => widget is Text && widget.data == 'OpenCode Go');
+    expect(openCodeGoHeader, findsOneWidget);
+    await tester.enterText(
+        find.byKey(const Key('model-search-field')), 'OpenCode Go');
+    await tester.pump();
+    expect(find.text('DeepSeek V4'), findsOneWidget);
+    expect(openCodeGoHeader, findsOneWidget);
     await tester.enterText(find.byKey(const Key('model-search-field')), 'Beta');
     await tester.pump();
     expect(find.text('Codex Beta'), findsWidgets);
@@ -1112,8 +1144,8 @@ Detail 16''',
     await tester.pump();
 
     expect(find.text('Reasoning'), findsOneWidget);
-    final toggle = find.byKey(
-        const Key('reasoning-toggle-tethoq-live-reasoning'));
+    final toggle =
+        find.byKey(const Key('reasoning-toggle-tethoq-live-reasoning'));
     tester.widget<InkWell>(toggle).onTap!();
     await tester.pump();
     expect(find.text('Working…'), findsOneWidget);
@@ -1121,8 +1153,8 @@ Detail 16''',
     store.sessions[0] = source.copyWith(state: 'completed');
     store.notifyListeners();
     await tester.pump();
-    expect(find.byKey(
-        const Key('reasoning-toggle-tethoq-live-reasoning')), findsNothing);
+    expect(find.byKey(const Key('reasoning-toggle-tethoq-live-reasoning')),
+        findsNothing);
   });
 
   testWidgets('expanded reasoning display opens thinking but not tool bodies',
@@ -1363,6 +1395,9 @@ class _FeatureStore extends RemoteAppStore {
 }
 
 class _NoopRecorder implements DictationRecorder {
+  @override
+  Stream<double> get levelStream => const Stream<double>.empty();
+
   @override
   Future<void> cancel() async {}
 

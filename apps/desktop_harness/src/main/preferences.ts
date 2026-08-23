@@ -8,9 +8,11 @@ import {
   type DesktopAlertLevel,
   type DesktopCloseAction,
   type DesktopLaunchAtLogin,
+  type EarsSettings,
   type LocalOpenHandlerId,
   type TaskOverride,
 } from "../shared/desktop_api.js";
+import { defaultEarsSettings, normalizeEarsSettings } from "../../../../packages/protocol/src/ears.js";
 
 export const DESKTOP_PREFERENCES_VERSION = 1 as const;
 
@@ -34,6 +36,11 @@ export interface DesktopPreferences {
   readonly globalAgentsPath: string | null;
   /** User-owned task name, pin, and archive state keyed by session ID. */
   readonly taskOverrides: Readonly<Record<string, TaskOverride>>;
+  /** Master gate for spawning subagents on a different provider/harness. Off by default so cross-harness spawns stay opt-in. */
+  readonly allowForeignSubagents: boolean;
+  /** Per-session opt-in/opt-out recorded explicitly by the user; absence means "follow the default". */
+  readonly foreignSubagentOverrides: Readonly<Record<string, boolean>>;
+  readonly ears: EarsSettings;
 }
 
 const LOCAL_OPEN_HANDLER_IDS = new Set<LocalOpenHandlerId>(["system", "vscode", "cursor", "windsurf", "sublime", "notepadpp", "zed"]);
@@ -90,6 +97,26 @@ function validateTaskOverrides(value: unknown): Readonly<Record<string, TaskOver
   return result;
 }
 
+/**
+ * An override is a plain boolean. `false` is a real stored value (the user
+ * opted a session out) so it must survive the normalize step, unlike task
+ * overrides where an empty object means "nothing set".
+ */
+export function normalizeForeignSubagentOverride(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function validateForeignSubagentOverrides(value: unknown): Readonly<Record<string, boolean>> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
+  const result: Record<string, boolean> = {};
+  for (const [rawSessionId, rawOverride] of Object.entries(value).slice(0, MAX_TASK_OVERRIDES)) {
+    const sessionId = preferenceString(rawSessionId, MAX_SESSION_ID_CHARACTERS);
+    const override = normalizeForeignSubagentOverride(rawOverride);
+    if (sessionId && override !== undefined) result[sessionId] = override;
+  }
+  return result;
+}
+
 export function validateDesktopPreferences(value: unknown): DesktopPreferences {
   const input = typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
   return {
@@ -115,6 +142,9 @@ export function validateDesktopPreferences(value: unknown): DesktopPreferences {
       ? resolve(input.globalAgentsPath)
       : null,
     taskOverrides: validateTaskOverrides(input.taskOverrides),
+    allowForeignSubagents: input.allowForeignSubagents === true,
+    foreignSubagentOverrides: validateForeignSubagentOverrides(input.foreignSubagentOverrides),
+    ears: normalizeEarsSettings(input.ears),
   };
 }
 
@@ -143,7 +173,7 @@ export class DesktopPreferencesStore {
 
   public static async load(path: string): Promise<DesktopPreferencesStore> {
     const store = new JsonFileStore(path, validateDesktopPreferences);
-    const defaults: DesktopPreferences = { version: DESKTOP_PREFERENCES_VERSION, experimentalFeatures: false, reasoningDisplay: "compact", localOpenHandlerId: "system", closeAction: "tray", launchAtLogin: "off", alerts: "all", agentDefaults: {}, globalAgentsPath: null, taskOverrides: {} };
+    const defaults: DesktopPreferences = { version: DESKTOP_PREFERENCES_VERSION, experimentalFeatures: false, reasoningDisplay: "compact", localOpenHandlerId: "system", closeAction: "tray", launchAtLogin: "off", alerts: "all", agentDefaults: {}, globalAgentsPath: null, taskOverrides: {}, allowForeignSubagents: false, foreignSubagentOverrides: {}, ears: defaultEarsSettings };
     const value = await store.read(defaults);
     const validated = validateDesktopPreferences(value);
     if (JSON.stringify(validated) !== JSON.stringify(value)) await store.write(validated);
@@ -174,6 +204,54 @@ export class DesktopPreferencesStore {
 
   public async setReasoningDisplay(value: "compact" | "expanded"): Promise<DesktopPreferences> {
     return await this.#commit({ ...this.#value, reasoningDisplay: value });
+  }
+
+  /**
+   * Toggles the master gate. Turning it off flips every stored `true` override
+   * to `false` in storage so sessions the user allowed before the shutdown do
+   * not silently regain permission when the gate reopens; turning it on never
+   * touches stored values.
+   */
+  public async setAllowForeignSubagents(enabled: boolean): Promise<DesktopPreferences> {
+    const allowForeignSubagents = enabled === true;
+    let foreignSubagentOverrides = this.#value.foreignSubagentOverrides;
+    if (this.#value.allowForeignSubagents && !allowForeignSubagents && Object.values(foreignSubagentOverrides).includes(true)) {
+      const flipped: Record<string, boolean> = {};
+      for (const [sessionId, override] of Object.entries(foreignSubagentOverrides)) flipped[sessionId] = override && false;
+      foreignSubagentOverrides = flipped;
+    }
+    return await this.#commit({ ...this.#value, allowForeignSubagents, foreignSubagentOverrides });
+  }
+
+  /**
+   * Records one session's explicit choice. A full map evicts its least
+   * recently touched key, matching the task override bound so neither record
+   * can grow without limit.
+   */
+  public async setSessionForeignSubagents(sessionIdValue: string, allowed: boolean): Promise<DesktopPreferences> {
+    const sessionId = preferenceString(sessionIdValue, MAX_SESSION_ID_CHARACTERS);
+    if (!sessionId) throw new Error("The task is invalid");
+    const foreignSubagentOverrides: Record<string, boolean> = { ...this.#value.foreignSubagentOverrides };
+    delete foreignSubagentOverrides[sessionId];
+    const keys = Object.keys(foreignSubagentOverrides);
+    if (keys.length >= MAX_TASK_OVERRIDES) for (const stale of keys.slice(0, keys.length - MAX_TASK_OVERRIDES + 1)) delete foreignSubagentOverrides[stale];
+    foreignSubagentOverrides[sessionId] = allowed === true;
+    return await this.#commit({ ...this.#value, foreignSubagentOverrides });
+  }
+
+  /**
+   * The master gate always wins: off means no session may spawn a foreign
+   * subagent regardless of what is stored. When the gate is on, sessions the
+   * user has not judged explicitly default to allowed.
+   */
+  public sessionMaySpawnForeignSubagents(sessionId: string): boolean {
+    if (!this.#value.allowForeignSubagents) return false;
+    return this.#value.foreignSubagentOverrides[sessionId] ?? true;
+  }
+
+  /** The per-session control only has meaning while the master gate is on. */
+  public foreignSubagentControlVisible(): boolean {
+    return this.#value.allowForeignSubagents;
   }
 
   public async setLocalOpenHandler(value: LocalOpenHandlerId): Promise<DesktopPreferences> {
@@ -226,5 +304,9 @@ export class DesktopPreferencesStore {
   public async setGlobalAgentsPath(path: string | null): Promise<DesktopPreferences> {
     if (path !== null) await readGlobalAgentInstructions(path);
     return await this.#commit({ ...this.#value, globalAgentsPath: path === null ? null : resolve(path) });
+  }
+
+  public async setEars(value: EarsSettings): Promise<DesktopPreferences> {
+    return await this.#commit({ ...this.#value, ears: normalizeEarsSettings(value) });
   }
 }

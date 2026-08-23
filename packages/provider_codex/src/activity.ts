@@ -2,16 +2,24 @@ import { open, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import type { ContentPart, SessionState } from "../../protocol/src/index.js";
+import type { ObservedExternalSessionLaunch } from "../../provider_contract/src/index.js";
 import { stripProviderPromptGuidance } from "../../provider_contract/src/index.js";
 import { codexUserContentParts, isCodexBootstrapUserText } from "./normalize.js";
+import { readExternalSessionLaunchesFromRollout } from "./external_launches.js";
 
-const DEFAULT_POLL_INTERVAL_MS = 1_000;
+// Codex Desktop owns the live stream for an externally opened task, so its local
+// append-only rollout is Tethoq's fastest safe read path. A whole second made a
+// completed short answer visibly lag behind the owning app; half a second keeps
+// the open transcript responsive without turning the fallback into a busy loop.
+export const codexExternalActivityPollMs = 500;
 const DEFAULT_TAIL_BYTES = 256 * 1_024;
 const MESSAGE_READ_CHUNK_BYTES = 64 * 1_024;
 const MAX_MESSAGE_BYTES_PER_POLL = 1 * 1_024 * 1_024;
 const MAX_ROLLOUT_LINE_BYTES = 1 * 1_024 * 1_024;
 const DEFAULT_HISTORY_BYTES = 8 * 1_024 * 1_024;
 const DEFAULT_HISTORY_MESSAGES = 400;
+const MAX_OBSERVED_TOOL_TEXT = 20_000;
+const MAX_TRACKED_TOOL_CALLS = 256;
 
 type RolloutMarker = "started" | "terminal" | "truncated" | "unknown";
 
@@ -23,9 +31,9 @@ export interface CodexActivityThread {
 
 export interface CodexObservedMessage {
   readonly messageId: string;
-  readonly role: "user" | "assistant";
+  readonly role: "user" | "assistant" | "tool";
   readonly text: string;
-  readonly partType: "text" | "reasoning";
+  readonly partType: "text" | "reasoning" | "compaction" | "activity";
   readonly parts?: readonly ContentPart[];
   readonly phase?: "commentary" | "final_answer";
   readonly createdAt?: string;
@@ -65,6 +73,14 @@ interface TrackedThread {
   messageOffset: number;
   partialLine: Buffer;
   droppingOversizedLine: boolean;
+  toolCalls: Map<string, ObservedToolCall>;
+}
+
+interface ObservedToolCall {
+  readonly callId: string;
+  readonly name: string;
+  readonly input?: string;
+  readonly createdAt?: string;
 }
 
 interface TrackedTurnMetadata {
@@ -93,6 +109,7 @@ export class CodexActivityReconciler {
   readonly #onTurnMetadataChanged: (providerSessionId: string, metadata: CodexTurnMetadata) => void | Promise<void>;
   readonly #onContextChanged: (providerSessionId: string, context: CodexContextObservation) => void | Promise<void>;
   readonly #knownPaths = new Map<string, string>();
+  readonly #knownPathHistory = new Map<string, string[]>();
   readonly #trackedTurnMetadata = new Map<string, TrackedTurnMetadata>();
   readonly #turnMetadata = new Map<string, CodexTurnMetadata>();
   readonly #context = new Map<string, CodexContextObservation>();
@@ -103,7 +120,7 @@ export class CodexActivityReconciler {
 
   public constructor(options: CodexActivityReconcilerOptions) {
     this.#codexHome = options.codexHome ?? process.env.CODEX_HOME ?? join(homedir(), ".codex");
-    this.#pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    this.#pollIntervalMs = options.pollIntervalMs ?? codexExternalActivityPollMs;
     this.#tailBytes = options.tailBytes ?? DEFAULT_TAIL_BYTES;
     this.#isLockHeld = options.isLockHeld ?? lockFileExists;
     this.#onStateChanged = options.onStateChanged;
@@ -115,7 +132,12 @@ export class CodexActivityReconciler {
   public async reconcile(threads: readonly CodexActivityThread[]): Promise<ReadonlyMap<string, SessionState>> {
     const result = new Map<string, SessionState>();
     for (const thread of threads) {
-      if (validRolloutPath(thread.path)) this.#knownPaths.set(thread.providerSessionId, thread.path);
+      if (validRolloutPath(thread.path)) {
+        this.#knownPaths.set(thread.providerSessionId, thread.path);
+        const paths = this.#knownPathHistory.get(thread.providerSessionId) ?? [];
+        const next = [...paths.filter((path) => path !== thread.path), thread.path].slice(-8);
+        this.#knownPathHistory.set(thread.providerSessionId, next);
+      }
       const path = validRolloutPath(thread.path) ? thread.path : this.#knownPaths.get(thread.providerSessionId);
       if (path !== undefined) await this.trackTurnMetadata(thread.providerSessionId, path);
       if (thread.nativeState !== "unknown") {
@@ -141,6 +163,7 @@ export class CodexActivityReconciler {
           messageOffset: await rolloutSize(path) ?? 0,
           partialLine: Buffer.alloc(0),
           droppingOversizedLine: false,
+          toolCalls: new Map(),
         };
         this.#tracked.set(thread.providerSessionId, tracked);
       }
@@ -159,6 +182,16 @@ export class CodexActivityReconciler {
     return this.#context.get(providerSessionId);
   }
 
+  public async hasWriterLock(providerSessionId: string): Promise<boolean> {
+    if (!safeThreadId(providerSessionId)) return false;
+    const lockPath = join(this.#codexHome, "thread-writer-locks", `${providerSessionId}.lock`);
+    try {
+      return await this.#isLockHeld(lockPath);
+    } catch {
+      return false;
+    }
+  }
+
   public async activeThreadIds(maximum = 16): Promise<readonly string[]> {
     try {
       const entries = await readdir(join(this.#codexHome, "thread-writer-locks"), { withFileTypes: true });
@@ -174,6 +207,18 @@ export class CodexActivityReconciler {
   public async recentMessages(providerSessionId: string): Promise<readonly CodexObservedMessage[]> {
     const path = this.#knownPaths.get(providerSessionId);
     return path === undefined ? [] : readRecentRolloutMessages(path);
+  }
+
+  public async externalSessionLaunches(providerSessionId: string, since: string): Promise<readonly ObservedExternalSessionLaunch[]> {
+    const latest = this.#knownPaths.get(providerSessionId);
+    const paths = this.#knownPathHistory.get(providerSessionId) ?? (latest === undefined ? [] : [latest]);
+    const launches = (await Promise.all(paths.map(async (path) => await readExternalSessionLaunchesFromRollout(path, since)))).flat();
+    const unique = new Map<string, ObservedExternalSessionLaunch>();
+    for (const launch of launches) {
+      const key = [launch.targetProviderId, launch.title, launch.workingDirectory ?? "", launch.modelId ?? "", launch.observedAt].join("\u0000").toLowerCase();
+      unique.set(key, launch);
+    }
+    return [...unique.values()].sort((left, right) => left.observedAt.localeCompare(right.observedAt));
   }
 
   /** Exposed for deterministic tests and immediate host refreshes. */
@@ -226,12 +271,7 @@ export class CodexActivityReconciler {
     if (tracked.marker === "terminal") return "idle";
     if (tracked.marker !== "started" && tracked.marker !== "truncated") return "unknown";
     if (!safeThreadId(providerSessionId)) return "unknown";
-    const lockPath = join(this.#codexHome, "thread-writer-locks", `${providerSessionId}.lock`);
-    try {
-      return await this.#isLockHeld(lockPath) ? "working" : "idle";
-    } catch {
-      return "unknown";
-    }
+    return await this.hasWriterLock(providerSessionId) ? "working" : "idle";
   }
 
   private async readNewMessages(providerSessionId: string, tracked: TrackedThread): Promise<void> {
@@ -245,6 +285,7 @@ export class CodexActivityReconciler {
         tracked.messageOffset = metadata.size;
         tracked.partialLine = Buffer.alloc(0);
         tracked.droppingOversizedLine = false;
+        tracked.toolCalls.clear();
         return;
       }
       if (metadata.size === tracked.messageOffset) return;
@@ -334,7 +375,7 @@ function consumeRolloutBytes(tracked: TrackedThread, bytes: Buffer): RolloutObse
     } else {
       if (tracked.partialLine.length + segment.length <= MAX_ROLLOUT_LINE_BYTES) {
         const line = tracked.partialLine.length === 0 ? segment : Buffer.concat([tracked.partialLine, segment]);
-        const observation = observationFromLine(line);
+        const observation = observationFromLine(line, tracked.toolCalls);
         if (observation !== null) observations.push(observation);
       }
     }
@@ -355,14 +396,14 @@ function consumeRolloutBytes(tracked: TrackedThread, bytes: Buffer): RolloutObse
   return observations;
 }
 
-function observationFromLine(line: Buffer): RolloutObservation | null {
+function observationFromLine(line: Buffer, toolCalls: Map<string, ObservedToolCall>): RolloutObservation | null {
   let value: unknown;
   try {
     value = JSON.parse(line.toString("utf8").trim());
   } catch {
     return null;
   }
-  const message = observedMessageFromValue(value);
+  const message = observedMessageFromValue(value, toolCalls);
   const context = contextFromValue(value);
   return message === null && context === null ? null : {
     ...(message !== null ? { message } : {}),
@@ -370,9 +411,134 @@ function observationFromLine(line: Buffer): RolloutObservation | null {
   };
 }
 
-function observedMessageFromValue(value: unknown): CodexObservedMessage | null {
-  if (!isRecord(value) || value.type !== "response_item" || !isRecord(value.payload)) return null;
+function observedToolText(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed ? trimmed.slice(0, MAX_OBSERVED_TOOL_TEXT) : undefined;
+  }
+  if (value === undefined || value === null) return undefined;
+  try {
+    const text = JSON.stringify(value);
+    return text ? text.slice(0, MAX_OBSERVED_TOOL_TEXT) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function observedToolOutput(value: unknown): string | undefined {
+  if (typeof value === "string") return observedToolText(value);
+  if (Array.isArray(value)) {
+    const text = value.map(observedToolOutput).filter((item): item is string => item !== undefined).join("\n").trim();
+    return text ? text.slice(0, MAX_OBSERVED_TOOL_TEXT) : undefined;
+  }
+  if (isRecord(value)) {
+    for (const candidate of [value.output, value.text, value.message, value.content, value.result, value.summary]) {
+      const text = observedToolOutput(candidate);
+      if (text !== undefined) return text;
+    }
+  }
+  return observedToolText(value);
+}
+
+function observedExecCommands(input: string | undefined): string[] {
+  if (input === undefined) return ["exec"];
+  const commands: string[] = [];
+  for (const match of input.matchAll(/(?:\bcmd\b|"cmd")\s*:\s*("(?:\\.|[^"\\])*")/gu)) {
+    try {
+      const command: unknown = JSON.parse(match[1]!);
+      if (typeof command === "string" && command.trim()) commands.push(command.trim().slice(0, MAX_OBSERVED_TOOL_TEXT));
+    } catch {
+      // Keep looking: one malformed nested call must not hide a valid sibling.
+    }
+  }
+  return commands.length > 0 ? commands : [input.trim().slice(0, MAX_OBSERVED_TOOL_TEXT) || "exec"];
+}
+
+function rememberObservedToolCall(toolCalls: Map<string, ObservedToolCall>, call: ObservedToolCall): void {
+  toolCalls.set(call.callId, call);
+  while (toolCalls.size > MAX_TRACKED_TOOL_CALLS) {
+    const oldest = toolCalls.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    toolCalls.delete(oldest);
+  }
+}
+
+function observedToolMessage(
+  call: ObservedToolCall,
+  output: string | undefined,
+  completed: boolean,
+): CodexObservedMessage {
+  const parts: readonly ContentPart[] = call.name === "exec"
+    ? observedExecCommands(call.input).map((command): ContentPart => ({
+        type: "command",
+        command,
+        ...(output !== undefined ? { output } : {}),
+        status: completed ? "completed" : "running",
+      }))
+    : [{
+        type: "tool",
+        name: call.name,
+        callId: call.callId,
+        ...(call.input !== undefined ? { input: call.input } : {}),
+        ...(output !== undefined ? { output } : {}),
+        status: completed ? "completed" : "running",
+      }];
+  return {
+    messageId: call.callId,
+    role: "tool",
+    text: output ?? call.input ?? call.name,
+    partType: "activity",
+    parts,
+    ...(call.createdAt !== undefined ? { createdAt: call.createdAt } : {}),
+  };
+}
+
+function observedMessageFromValue(value: unknown, toolCalls = new Map<string, ObservedToolCall>()): CodexObservedMessage | null {
+  if (!isRecord(value) || !isRecord(value.payload)) return null;
+  if (value.type === "compacted") {
+    const text = typeof value.payload.message === "string" ? value.payload.message.trim() : "";
+    const createdAt = typeof value.timestamp === "string" ? value.timestamp : undefined;
+    if (!text || createdAt === undefined) return null;
+    return {
+      messageId: `compaction-${createdAt}`,
+      role: "assistant",
+      text,
+      partType: "compaction",
+      phase: "commentary",
+      createdAt,
+    };
+  }
+  if (value.type !== "response_item") return null;
   const payload = value.payload;
+  if (payload.type === "custom_tool_call") {
+    const callId = typeof payload.call_id === "string" && payload.call_id.trim()
+      ? payload.call_id.trim()
+      : typeof payload.id === "string" && payload.id.trim() ? payload.id.trim() : undefined;
+    const name = typeof payload.name === "string" && payload.name.trim() ? payload.name.trim() : undefined;
+    if (callId === undefined || name === undefined) return null;
+    const call: ObservedToolCall = {
+      callId,
+      name,
+      ...(observedToolText(payload.input) !== undefined ? { input: observedToolText(payload.input)! } : {}),
+      ...(typeof value.timestamp === "string" ? { createdAt: value.timestamp } : {}),
+    };
+    rememberObservedToolCall(toolCalls, call);
+    return observedToolMessage(call, undefined, payload.status === "completed");
+  }
+  if (payload.type === "custom_tool_call_output") {
+    const callId = typeof payload.call_id === "string" && payload.call_id.trim()
+      ? payload.call_id.trim()
+      : typeof payload.id === "string" && payload.id.trim() ? payload.id.trim() : undefined;
+    if (callId === undefined) return null;
+    const known = toolCalls.get(callId);
+    const call: ObservedToolCall = known ?? {
+      callId,
+      name: "tool",
+      ...(typeof value.timestamp === "string" ? { createdAt: value.timestamp } : {}),
+    };
+    toolCalls.delete(callId);
+    return observedToolMessage(call, observedToolOutput(payload.output), true);
+  }
   if (payload.type === "reasoning") {
     if (typeof payload.id !== "string" || payload.id.length === 0 || !Array.isArray(payload.summary)) return null;
     const text = payload.summary
@@ -420,8 +586,8 @@ function observedMessageFromValue(value: unknown): CodexObservedMessage | null {
 
 /**
  * Reads only a bounded recent tail from a Codex rollout. The parser exposes
- * user/assistant text and reasoning summaries; commands, tool payloads,
- * encrypted content, and the incomplete leading record are ignored.
+ * user/assistant text, reasoning summaries, and bounded tool activity. Encrypted
+ * content, unknown response items, and the incomplete leading record are ignored.
  */
 export async function readRecentRolloutMessages(
   path: string,
@@ -444,6 +610,8 @@ export async function readRecentRolloutMessages(
       text = text.slice(boundary + 1);
     }
     const messages: CodexObservedMessage[] = [];
+    const messageIndexes = new Map<string, number>();
+    const toolCalls = new Map<string, ObservedToolCall>();
     for (const rawLine of text.split("\n")) {
       if (Buffer.byteLength(rawLine, "utf8") > MAX_ROLLOUT_LINE_BYTES) continue;
       let value: unknown;
@@ -452,8 +620,16 @@ export async function readRecentRolloutMessages(
       } catch {
         continue;
       }
-      const message = observedMessageFromValue(value);
-      if (message !== null) messages.push(message);
+      const message = observedMessageFromValue(value, toolCalls);
+      if (message !== null) {
+        const existing = message.partType === "activity" ? messageIndexes.get(message.messageId) : undefined;
+        if (existing === undefined) {
+          if (message.partType === "activity") messageIndexes.set(message.messageId, messages.length);
+          messages.push(message);
+        } else {
+          messages[existing] = message;
+        }
+      }
     }
     return messages.slice(-Math.max(1, maxMessages));
   } catch {

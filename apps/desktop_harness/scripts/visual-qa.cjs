@@ -27,6 +27,7 @@ const viewports = [
   { name: 'dictation-source-hover-980x680', width: 980, height: 680, kind: 'dictation-hover', selector: '.dictation-source-menu > button' },
   { name: 'dictation-empty-state-980x680', width: 980, height: 680, kind: 'dictation-empty', selector: '.dictation-source-empty' },
   { name: 'composer-queue-strip-1100x760', width: 1100, height: 760, kind: 'queue-strip', selector: '.queued-message-menu .composer-popover' },
+  { name: 'composer-queue-strip-760x480', width: 760, height: 480, kind: 'queue-strip', selector: '.queued-message-menu .composer-popover' },
   { name: 'queue-new-task-1100x760', width: 1100, height: 760, kind: 'queue-new-task', selector: '.queue-new-task-picker' },
   { name: 'composer-stream-follow-1100x760', width: 1100, height: 760, kind: 'composer-stream-follow', selector: '.conversation-tail-spacer' },
   { name: 'composer-stream-follow-760x480', width: 760, height: 480, kind: 'composer-stream-follow', selector: '.conversation-tail-spacer' },
@@ -36,21 +37,29 @@ const viewports = [
   { name: 'composer-vision-eyes-980x680', width: 980, height: 680, kind: 'composer-vision', selector: '.vision-eyes-picker' },
   { name: 'context-compaction-1100x760', width: 1100, height: 760, kind: 'context-compaction', selector: '.context-usage-popover' },
   { name: 'task-details-1100x760', width: 1100, height: 760, kind: 'task-details', selector: '.task-details-popover' },
+  { name: 'subagents-hover-1100x760', width: 1100, height: 760, kind: 'subagents-hover', selector: '.session-subagents-tooltip.visible' },
+  { name: 'subagents-hover-800x560', width: 800, height: 560, kind: 'subagents-hover', selector: '.session-subagents-tooltip.visible' },
+  { name: 'subagents-1100x760', width: 1100, height: 760, kind: 'subagents', selector: '.session-subagents-popover' },
+  { name: 'subagents-800x560', width: 800, height: 560, kind: 'subagents', selector: '.session-subagents-popover' },
   { name: 'local-open-menu-1100x760', width: 1100, height: 760, kind: 'local-open', selector: '.workspace-local-open-menu' },
   { name: 'slash-command-palette-1100x760', width: 1100, height: 760, kind: 'slash-command', selector: '.slash-command-palette' },
   { name: 'simplify-settings-1100x760', width: 1100, height: 760, kind: 'simplify-settings', selector: '.simplify-settings' },
   { name: 'trace-collapsed-sidebar-1100x760', width: 1100, height: 760, kind: 'trace-collapsed', selector: '.reasoning-disclosure[aria-expanded="false"]' },
   { name: 'sidebar-resized-1100x760', width: 1100, height: 760, kind: 'sidebar-resized', selector: '.navigation-resize-handle' },
   { name: 'trace-compacting-1100x760', width: 1100, height: 760, kind: 'trace-compacting', selector: '.timeline-compaction-active' },
-  { name: 'trace-compacted-1100x760', width: 1100, height: 760, kind: 'trace-compacted', selector: '.timeline-compaction-completed' },
+  { name: 'trace-compacted-1100x760', width: 1100, height: 760, kind: 'trace-compacted', selector: '.timeline-compaction-toggle[aria-expanded="false"]' },
+  { name: 'trace-compacted-expanded-1100x760', width: 1100, height: 760, kind: 'trace-compacted-expanded', selector: '.timeline-compaction-toggle' },
   { name: 'trace-expanded-1100x760', width: 1100, height: 760, kind: 'trace-expanded', selector: '.reasoning-segments' },
   { name: 'trace-thinking-expanded-1100x760', width: 1100, height: 760, kind: 'trace-thinking-expanded', selector: '.reasoning-thinking-segment .reasoning-flow' },
+  { name: 'trace-thinking-expanded-760x480', width: 760, height: 480, kind: 'trace-thinking-expanded', selector: '.reasoning-thinking-segment .reasoning-flow' },
   { name: 'trace-snippet-1100x760', width: 1100, height: 760, kind: 'trace-snippet', selector: '.activity-snippet' },
   { name: 'final-message-meta-1100x760', width: 1100, height: 760, kind: 'final-message-meta', selector: '.message-footer' },
   { name: 'user-message-meta-1100x760', width: 1100, height: 760, kind: 'user-message-meta', selector: '.message-user .message-footer' },
   { name: 'thinking-message-meta-1100x760', width: 1100, height: 760, kind: 'thinking-message-meta', selector: '.reasoning-thinking-segment .timeline-item-meta' },
   { name: 'message-error-1100x760', width: 1100, height: 760, kind: 'message-error', selector: '.timeline-error-notice' },
   { name: 'user-attachment-1100x760', width: 1100, height: 760, kind: 'user-attachment', selector: '.message-user .message-images-before' },
+  { name: 'dictation-audio-source-980x680', width: 980, height: 680, kind: 'dictation-audio-source', selector: '.dictation-source-menu .composer-popover' },
+  { name: 'audio-message-1100x760', width: 1100, height: 760, kind: 'audio-message', selector: '.message-audio-before' },
   { name: 'workflow-message-1100x760', width: 1100, height: 760, kind: 'workflow-message', selector: '.message-workflow-panel' },
   { name: 'wallet-dropdown-1100x760', width: 1100, height: 760, kind: 'wallet', selector: '.wallet-popover' },
   { name: 'wallet-direct-advanced-1100x760', width: 1100, height: 760, kind: 'wallet-direct-advanced', selector: '.wallet-advanced' },
@@ -77,12 +86,18 @@ if (process.argv.includes('--context-only')) {
 } else if (process.argv.includes('--task-details-only')) {
   const taskDetailsViewport = viewports.find((viewport) => viewport.kind === 'task-details');
   viewports.splice(0, viewports.length, taskDetailsViewport);
+} else if (process.argv.includes('--subagents-only')) {
+  const subagentsViewports = viewports.filter((viewport) => viewport.kind.startsWith('subagents'));
+  viewports.splice(0, viewports.length, ...subagentsViewports);
 } else if (process.argv.includes('--compaction-events-only')) {
-  const compactionViewports = viewports.filter((viewport) => viewport.kind === 'trace-compacting' || viewport.kind === 'trace-compacted');
+  const compactionViewports = viewports.filter((viewport) => viewport.kind === 'trace-compacting' || viewport.kind.startsWith('trace-compacted'));
   viewports.splice(0, viewports.length, ...compactionViewports);
 } else if (process.argv.includes('--trace-only')) {
   const traceViewports = viewports.filter((viewport) => viewport.kind.startsWith('trace-'));
   viewports.splice(0, viewports.length, ...traceViewports);
+} else if (process.argv.includes('--trace-thinking-only')) {
+  const traceThinkingViewports = viewports.filter((viewport) => viewport.kind === 'trace-thinking-expanded');
+  viewports.splice(0, viewports.length, ...traceThinkingViewports);
 } else if (process.argv.includes('--trace-snippet-only')) {
   const traceSnippetViewport = viewports.find((viewport) => viewport.kind === 'trace-snippet');
   viewports.splice(0, viewports.length, traceSnippetViewport);
@@ -93,8 +108,8 @@ if (process.argv.includes('--context-only')) {
   const sidebarResizeViewport = viewports.find((viewport) => viewport.kind === 'sidebar-resized');
   viewports.splice(0, viewports.length, sidebarResizeViewport);
 } else if (process.argv.includes('--queue-only')) {
-  const queueViewport = viewports.find((viewport) => viewport.kind === 'queue-strip');
-  viewports.splice(0, viewports.length, queueViewport);
+  const queueViewports = viewports.filter((viewport) => viewport.kind === 'queue-strip');
+  viewports.splice(0, viewports.length, ...queueViewports);
 } else if (process.argv.includes('--queue-new-task-only')) {
   const queueNewTaskViewport = viewports.find((viewport) => viewport.kind === 'queue-new-task');
   viewports.splice(0, viewports.length, queueNewTaskViewport);
@@ -137,6 +152,9 @@ if (process.argv.includes('--context-only')) {
 } else if (process.argv.includes('--composer-actions-only')) {
   const composerActionsViewport = viewports.find((viewport) => viewport.kind === 'composer-actions');
   viewports.splice(0, viewports.length, composerActionsViewport);
+} else if (process.argv.includes('--composer-model-only')) {
+  const modelViewport = viewports.find((viewport) => viewport.kind === 'composer-model');
+  viewports.splice(0, viewports.length, modelViewport);
 } else if (process.argv.includes('--dictation-only')) {
   const dictationViewport = viewports.find((viewport) => viewport.kind === 'dictation-hover');
   viewports.splice(0, viewports.length, dictationViewport);
@@ -152,6 +170,9 @@ if (process.argv.includes('--context-only')) {
 } else if (process.argv.includes('--user-attachment-only')) {
   const attachmentViewport = viewports.find((viewport) => viewport.kind === 'user-attachment');
   viewports.splice(0, viewports.length, attachmentViewport);
+} else if (process.argv.includes('--dictation-audio-only')) {
+  const audioViewports = viewports.filter((viewport) => viewport.kind === 'dictation-audio-source' || viewport.kind === 'audio-message');
+  viewports.splice(0, viewports.length, ...audioViewports);
 } else if (process.argv.includes('--single-workspace')) viewports.splice(1);
 
 app.commandLine.appendSwitch('disable-gpu');
@@ -192,6 +213,7 @@ async function capture(viewport) {
     },
   });
   const diagnostics = [];
+  let subagentTransition = null;
   window.webContents.on('console-message', (event) => {
     diagnostics.push(`console[${event.level ?? 'unknown'}] ${event.message ?? ''} (${event.sourceId ?? ''}:${event.lineNumber ?? 0})`);
   });
@@ -314,12 +336,19 @@ async function capture(viewport) {
     await window.webContents.executeJavaScript(`document.querySelector('.session-row')?.click()`, true);
   } else if (viewport.kind === 'composer-model') {
     await window.webContents.executeJavaScript(`document.querySelector('.model-picker-trigger')?.click()`, true);
+    if (process.argv.includes('--provider-groups')) {
+      await window.webContents.executeJavaScript(`document.querySelector('[data-route-group="opencode:deepseek"]')?.scrollIntoView({ block: 'start' })`, true);
+    }
   } else if (viewport.kind === 'composer-model-browser') {
     await window.webContents.executeJavaScript(`document.querySelector('.model-picker-trigger')?.click()`, true);
     await window.webContents.executeJavaScript(`document.querySelector('button[aria-label="Open full model browser"]')?.click()`, true);
   } else if (viewport.kind === 'composer-actions') {
     await window.webContents.executeJavaScript(`document.querySelector('button[aria-label="More message actions"]')?.click()`, true);
   } else if (viewport.kind === 'queue-strip') {
+    if (viewport.width <= 780) {
+      await window.webContents.executeJavaScript(`document.querySelector('.session-row')?.click()`, true);
+      await window.webContents.executeJavaScript(`new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))`, true);
+    }
     await window.webContents.executeJavaScript(`new Promise((resolve, reject) => {
       const started = Date.now();
       const check = () => {
@@ -369,6 +398,20 @@ async function capture(viewport) {
   } else if (viewport.kind === 'side-chat') {
     await window.webContents.executeJavaScript(`document.querySelector('button[aria-label="More message actions"]')?.click()`, true);
     await window.webContents.executeJavaScript(`[...document.querySelectorAll('.composer-actions-menu [role="menuitem"]')].find((button) => button.textContent?.includes('Open side chat'))?.click()`, true);
+  } else if (viewport.kind === 'dictation-audio-source' || viewport.kind === 'audio-message') {
+    await window.webContents.executeJavaScript(`new Promise((resolve, reject) => {
+      const started = Date.now();
+      const check = () => {
+        const row = [...document.querySelectorAll('.session-row')].find((candidate) => candidate.textContent?.includes('Listen to my recording'));
+        if (row) { row.click(); return requestAnimationFrame(() => requestAnimationFrame(resolve)); }
+        if (Date.now() - started > 5000) return reject(new Error('Voice notes demo session did not render'));
+        requestAnimationFrame(check);
+      };
+      check();
+    })`, true);
+    if (viewport.kind === 'dictation-audio-source') {
+      await window.webContents.executeJavaScript(`document.querySelector('.dictation-source-menu > button')?.click()`, true);
+    }
   } else if (viewport.kind === 'composer-handoff') {
     await window.webContents.executeJavaScript(`document.querySelector('button[aria-label="More message actions"]')?.click()`, true);
     await window.webContents.executeJavaScript(`[...document.querySelectorAll('.composer-actions-menu [role="menuitem"]')].find((button) => button.textContent?.includes('Context Handoff'))?.click()`, true);
@@ -556,15 +599,121 @@ async function capture(viewport) {
       check();
     })`, true);
   } else if (viewport.kind === 'context-compaction') {
-    await window.webContents.executeJavaScript(`document.querySelector('.context-usage-trigger')?.click()`, true);
-    await window.webContents.executeJavaScript(`(() => {
-      const input = document.querySelector('.context-threshold-meter input[type="range"]');
-      if (!input) return;
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set?.call(input, input.min);
-      input.dispatchEvent(new Event('input', { bubbles: true }));
+    const clickPoint = async (point) => {
+      if (!point) throw new Error('Context compaction control did not render');
+      window.webContents.sendInputEvent({ type: 'mouseMove', x: point.x, y: point.y });
+      window.webContents.sendInputEvent({ type: 'mouseDown', x: point.x, y: point.y, button: 'left', clickCount: 1 });
+      window.webContents.sendInputEvent({ type: 'mouseUp', x: point.x, y: point.y, button: 'left', clickCount: 1 });
+      await new Promise((resolve) => setTimeout(resolve, 90));
+    };
+    const elementPoint = async (expression) => await window.webContents.executeJavaScript(`(() => {
+      const element = ${expression};
+      const rect = element?.getBoundingClientRect();
+      return rect ? { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) } : null;
     })()`, true);
+    const triggerPoint = async () => await elementPoint(`document.querySelector('.context-usage-trigger')`);
+    const applyPoint = async () => await elementPoint(`[...document.querySelectorAll('.context-threshold button')].find((button) => button.textContent?.trim() === 'Apply')`);
+    const contextReading = async () => await window.webContents.executeJavaScript(`(() => {
+      const input = document.querySelector('.context-threshold-meter input[type="range"]');
+      const meter = document.querySelector('.context-usage-track');
+      const applied = [...document.querySelectorAll('.context-usage-stats > div')].find((row) => row.querySelector('dt')?.textContent?.trim() === 'Compacts at');
+      return {
+        sliderValue: input ? Number(input.value) : null,
+        thresholdText: document.querySelector('.context-usage-heading b')?.textContent?.trim() ?? null,
+        percentText: document.querySelector('.context-usage-percent')?.textContent?.trim() ?? null,
+        ariaNow: meter?.getAttribute('aria-valuenow') ?? null,
+        meterLabel: meter?.getAttribute('aria-label') ?? null,
+        appliedText: applied?.querySelector('dd')?.textContent?.trim() ?? null,
+        noteText: document.querySelector('.context-threshold-note')?.textContent?.trim() ?? null,
+      };
+    })()`, true);
+    const dragThresholdToMinimum = async () => {
+      const drag = await window.webContents.executeJavaScript(`(() => {
+        const input = document.querySelector('.context-threshold-meter input[type="range"]');
+        const rect = input?.getBoundingClientRect();
+        if (!input || !rect) return null;
+        const minimum = Number(input.min);
+        const maximum = Number(input.max);
+        const value = Number(input.value);
+        const fraction = maximum > minimum ? (value - minimum) / (maximum - minimum) : 0;
+        return {
+          startX: Math.round(rect.left + Math.max(0, Math.min(1, fraction)) * rect.width),
+          endX: Math.round(rect.left + 1),
+          y: Math.round(rect.top + rect.height / 2),
+        };
+      })()`, true);
+      if (!drag) throw new Error('Context threshold slider did not render');
+      window.webContents.sendInputEvent({ type: 'mouseMove', x: drag.startX, y: drag.y });
+      window.webContents.sendInputEvent({ type: 'mouseDown', x: drag.startX, y: drag.y, button: 'left', clickCount: 1 });
+      window.webContents.sendInputEvent({ type: 'mouseMove', x: drag.endX, y: drag.y, button: 'left' });
+      window.webContents.sendInputEvent({ type: 'mouseUp', x: drag.endX, y: drag.y, button: 'left', clickCount: 1 });
+      await new Promise((resolve) => setTimeout(resolve, 120));
+    };
+
+    await clickPoint(await triggerPoint());
+    const initial = await contextReading();
+    await dragThresholdToMinimum();
+    const draft = await contextReading();
+    await clickPoint(await triggerPoint());
+    await clickPoint(await triggerPoint());
+    const reopened = await contextReading();
+    await dragThresholdToMinimum();
+    await clickPoint(await applyPoint());
+    await window.webContents.executeJavaScript(`new Promise((resolve, reject) => {
+      const started = Date.now();
+      const check = () => {
+        if (!document.querySelector('.context-usage-popover')) return resolve();
+        if (Date.now() - started > 3000) return reject(new Error('Context Apply did not close the popover'));
+        requestAnimationFrame(check);
+      };
+      check();
+    })`, true);
+    await clickPoint(await triggerPoint());
+    const applied = await contextReading();
+    await window.webContents.executeJavaScript(`window.__tethoqContextInteraction = ${JSON.stringify({ initial, draft, reopened, applied })}`, true);
+  } else if (viewport.kind === 'trace-compacted-expanded') {
+    await window.webContents.executeJavaScript(`document.querySelector('.timeline-compaction-toggle[aria-expanded="false"]')?.click()`, true);
   } else if (viewport.kind === 'task-details') {
     await window.webContents.executeJavaScript(`document.querySelector('.task-details-trigger')?.click()`, true);
+  } else if (viewport.kind === 'subagents-hover') {
+    const point = await window.webContents.executeJavaScript(`(() => { const rect = document.querySelector('.session-subagents-trigger')?.getBoundingClientRect(); return rect ? { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) } : null; })()`, true);
+    if (!point) throw new Error('Sub-agent hover target is missing');
+    window.webContents.sendInputEvent({ type: 'mouseMove', x: point.x, y: point.y });
+    await new Promise((resolve) => setTimeout(resolve, 650));
+  } else if (viewport.kind === 'subagents') {
+    const point = await window.webContents.executeJavaScript(`(() => { const rect = document.querySelector('.session-subagents-trigger')?.getBoundingClientRect(); return rect ? { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) } : null; })()`, true);
+    if (!point) throw new Error('Sub-agent disclosure target is missing');
+    window.webContents.sendInputEvent({ type: 'mouseMove', x: point.x, y: point.y });
+    window.webContents.sendInputEvent({ type: 'mouseDown', x: point.x, y: point.y, button: 'left', clickCount: 1 });
+    window.webContents.sendInputEvent({ type: 'mouseUp', x: point.x, y: point.y, button: 'left', clickCount: 1 });
+    const readChildState = async () => await window.webContents.executeJavaScript(`(() => {
+      const row = document.querySelector('.session-subagents-popover > button');
+      const label = row?.querySelector('small')?.textContent ?? '';
+      const spinner = row?.querySelector('.spinner');
+      return row ? {
+        label,
+        spinnerCount: row.querySelectorAll('.spinner').length,
+        spinnerAnimation: spinner ? getComputedStyle(spinner).animationName : 'none',
+      } : null;
+    })()`, true);
+    const waitForChildLabel = async (expected) => await window.webContents.executeJavaScript(`new Promise((resolve, reject) => {
+      const started = Date.now();
+      const check = () => {
+        const row = document.querySelector('.session-subagents-popover > button');
+        const label = row?.querySelector('small')?.textContent ?? '';
+        if (label.includes(${JSON.stringify(expected)})) return resolve();
+        if (Date.now() - started > 4500) return reject(new Error('Sub-agent did not reach ${expected}: ' + label));
+        setTimeout(check, 40);
+      };
+      check();
+    })`, true);
+    await waitForChildLabel('Idle');
+    const idle = await readChildState();
+    await waitForChildLabel('Working');
+    const working = await readChildState();
+    await waitForChildLabel('Completed');
+    const completed = await readChildState();
+    subagentTransition = { idle, working, completed };
   } else if (viewport.kind === 'local-open') {
     await window.webContents.executeJavaScript(`document.querySelector('.workspace-local-open-arrow')?.click()`, true);
   } else if (viewport.kind === 'slash-command') {
@@ -593,18 +742,13 @@ async function capture(viewport) {
       check();
     })`, true);
   } else if (viewport.kind === 'trace-expanded' || viewport.kind === 'trace-thinking-expanded' || viewport.kind === 'trace-snippet' || viewport.kind === 'thinking-message-meta') {
+    if (viewport.width <= 780) {
+      await window.webContents.executeJavaScript(`document.querySelector('.session-row')?.click()`, true);
+      await window.webContents.executeJavaScript(`new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))`, true);
+    }
     await window.webContents.executeJavaScript(`document.querySelector('.reasoning-disclosure[aria-expanded="false"]')?.click()`, true);
     if (viewport.kind === 'trace-thinking-expanded') {
-      await window.webContents.executeJavaScript(`new Promise((resolve, reject) => {
-        const started = Date.now();
-        const check = () => {
-          const button = document.querySelector('.reasoning-thinking-segment .reasoning-segment-row:not(:disabled)');
-          if (button) { button.click(); return requestAnimationFrame(resolve); }
-          if (Date.now() - started > 5000) return reject(new Error('Expandable thinking row did not render'));
-          requestAnimationFrame(check);
-        };
-        check();
-      })`, true);
+      await window.webContents.executeJavaScript(`new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))`, true);
       await window.webContents.executeJavaScript(`document.querySelector('.reasoning-group')?.scrollIntoView({ block: 'center' })`, true);
     } else if (viewport.kind === 'trace-snippet') {
       await window.webContents.executeJavaScript(`document.querySelector('.reasoning-activity-segment > .reasoning-segment-row[aria-expanded="false"]')?.click()`, true);
@@ -953,11 +1097,26 @@ async function capture(viewport) {
         return empty && popover && bounds ? {
           heading: empty.querySelector('strong')?.textContent?.trim() ?? null,
           guidance: empty.querySelector('small')?.textContent?.trim() ?? null,
-          setupRows: [...popover.querySelectorAll(':scope > button')].filter((button) => button.textContent?.includes('Set up')).length,
-          checkedRows: popover.querySelectorAll(':scope > button[aria-checked="true"]').length,
+          setupRows: [...popover.querySelectorAll('.dictation-sources-scroll > button')].filter((button) => button.textContent?.includes('Set up')).length,
+          checkedRows: popover.querySelectorAll('.dictation-unlimited-group > button[aria-checked="true"], .dictation-sources-scroll > button[aria-checked="true"]').length,
           bounds: { x: bounds.x, y: bounds.y, right: bounds.right, bottom: bounds.bottom, width: bounds.width, height: bounds.height },
         } : null;
       })(),
+      modelCatalog: ${JSON.stringify(viewport.kind === 'composer-model')} ? (() => {
+        const panel = document.querySelector('.model-picker-dropup');
+        const headings = [...(panel?.querySelectorAll('h4') ?? [])].map((heading) => heading.textContent?.trim() ?? '');
+        const badges = [...(panel?.querySelectorAll('.model-row-meta') ?? [])].map((meta) => meta.textContent?.trim() ?? '');
+        return panel ? { headings, badges, text: panel.textContent?.replace(/\s+/g, ' ').trim() ?? '' } : null;
+      })() : null,
+      dictationAudioSource: ${JSON.stringify(viewport.kind === 'dictation-audio-source')} ? (() => {
+        const popover = document.querySelector('.dictation-source-menu .composer-popover');
+        const option = popover?.querySelector('.dictation-direct-audio-option');
+        return popover ? {
+          text: popover.textContent?.replace(/\s+/g, ' ').trim() ?? '',
+          mp3Label: option?.querySelector('strong')?.textContent?.trim() ?? null,
+          checked: option?.getAttribute('aria-checked') ?? null,
+        } : null;
+      })() : null,
       messageMetadata: (() => {
         const measureFooter = (selector) => {
           const footer = document.querySelector(selector);
@@ -1066,12 +1225,27 @@ async function capture(viewport) {
       queueStrip: ${JSON.stringify(viewport.kind === 'queue-strip')} ? (() => {
         const strip = document.querySelector('.queued-strip');
         const menu = document.querySelector('.queued-message-menu .composer-popover');
+        const firstRow = document.querySelector('.queued-message-row');
+        const attachmentStrip = firstRow?.querySelector('.queued-attachment-widgets');
+        const messageText = firstRow?.querySelector('.queued-message-content > strong');
+        const attachmentBounds = attachmentStrip?.getBoundingClientRect();
+        const textBounds = messageText?.getBoundingClientRect();
+        const actionBounds = firstRow?.querySelector('.queued-message-actions')?.getBoundingClientRect();
         return strip && menu ? {
           overflowY: getComputedStyle(strip).overflowY,
           clientWidth: strip.clientWidth,
           offsetWidth: strip.offsetWidth,
           clientHeight: strip.clientHeight,
           scrollHeight: strip.scrollHeight,
+          rowClientHeight: firstRow?.clientHeight ?? 0,
+          rowScrollHeight: firstRow?.scrollHeight ?? 0,
+          attachmentWidgets: attachmentStrip?.children.length ?? 0,
+          imagePreviews: attachmentStrip?.querySelectorAll('.queued-attachment-image img').length ?? 0,
+          imageFallbacks: attachmentStrip?.querySelectorAll('.queued-attachment-image-fallback').length ?? 0,
+          audioPlayers: attachmentStrip?.querySelectorAll('.queued-attachment-audio').length ?? 0,
+          fileWidgets: attachmentStrip?.querySelectorAll('.queued-attachment-file').length ?? 0,
+          attachmentsAboveText: Boolean(attachmentBounds && textBounds && attachmentBounds.bottom <= textBounds.top + .5),
+          actionsInsideRow: Boolean(actionBounds && actionBounds.top >= firstRow.getBoundingClientRect().top && actionBounds.right <= firstRow.getBoundingClientRect().right + .5),
           menuText: menu.textContent?.trim() ?? '',
           routes: window.__tethoqQueueMenuRoutes ?? null,
         } : null;
@@ -1098,6 +1272,7 @@ async function capture(viewport) {
       contextCompaction: ${JSON.stringify(viewport.kind === 'context-compaction')} ? {
         title: document.querySelector('.context-usage-heading strong')?.textContent?.trim() ?? null,
         note: document.querySelector('.context-threshold-note')?.textContent?.trim() ?? null,
+        interaction: window.__tethoqContextInteraction ?? null,
         noteVisual: (() => {
           const note = document.querySelector('.context-threshold-note');
           const rect = note?.getBoundingClientRect();
@@ -1114,6 +1289,34 @@ async function capture(viewport) {
           text: panel.textContent?.trim() ?? '',
           background: getComputedStyle(panel).backgroundColor,
         } : null;
+      })() : null,
+      subagents: ${JSON.stringify(viewport.kind === 'subagents')} ? (() => {
+        const trigger = document.querySelector('.session-subagents-trigger');
+        const panel = document.querySelector('.session-subagents-popover');
+        return panel ? {
+          triggerLabel: trigger?.getAttribute('aria-label') ?? '',
+          expanded: trigger?.getAttribute('aria-expanded') ?? '',
+          childRows: panel.querySelectorAll(':scope > button').length,
+          text: panel.textContent?.trim() ?? '',
+          background: getComputedStyle(panel).backgroundColor,
+          topLevelTitles: [...document.querySelectorAll('.session-row-title')].map((title) => title.textContent?.trim() ?? ''),
+        } : null;
+      })() : null,
+      subagentTooltip: ${JSON.stringify(viewport.kind === 'subagents-hover')} ? (() => {
+        const trigger = document.querySelector('.session-subagents-trigger');
+        const tooltips = [...document.querySelectorAll('.session-subagents-tooltip')];
+        const visibleTooltips = tooltips.filter((tooltip) => visible(tooltip));
+        const tooltip = visibleTooltips[0];
+        const bounds = tooltip?.getBoundingClientRect();
+        return {
+          visibleCount: visibleTooltips.length,
+          text: tooltip?.textContent?.trim() ?? '',
+          bounds: bounds ? { left: bounds.left, top: bounds.top, right: bounds.right, bottom: bounds.bottom, width: bounds.width, height: bounds.height } : null,
+          parentIsBody: tooltip?.parentElement === document.body,
+          nestedTooltipSources: trigger?.querySelectorAll('[data-tooltip]').length ?? -1,
+          triggerHasTooltipSource: trigger?.hasAttribute('data-tooltip') ?? true,
+          triggerPseudoContent: trigger ? getComputedStyle(trigger, '::after').content : null,
+        };
       })() : null,
       composerTail: ${JSON.stringify(viewport.kind === 'composer-stream-follow')} ? (() => {
         const scroller = document.querySelector('.conversation-scroll');
@@ -1157,9 +1360,11 @@ async function capture(viewport) {
         const reasoningFlow = document.querySelector('.reasoning-thinking-segment .reasoning-flow');
         const reasoningFlowStyle = reasoningFlow ? getComputedStyle(reasoningFlow) : null;
         const reasoningFlowRect = reasoningFlow?.getBoundingClientRect();
-        const compactionStatus = document.querySelector('.timeline-compaction-active, .timeline-compaction-completed');
+        const compactionStatus = document.querySelector('.timeline-compaction-active, .timeline-compaction-disclosure');
+        const compactionToggle = compactionStatus?.querySelector('.timeline-compaction-toggle');
+        const compactionVisual = compactionToggle ?? compactionStatus;
         const compactionStatusRect = compactionStatus?.getBoundingClientRect();
-        const compactionStatusStyle = compactionStatus ? getComputedStyle(compactionStatus) : null;
+        const compactionStatusStyle = compactionVisual ? getComputedStyle(compactionVisual) : null;
         const reasoningIdentityCount = document.querySelectorAll('.reasoning-group .assistant-identity').length;
         const answerIdentityCount = [...document.querySelectorAll('.message-with-identity')].filter((entry) => visible(entry)).length;
         const assistantMark = (() => {
@@ -1235,6 +1440,7 @@ async function capture(viewport) {
             previousVisibleToGroup: previousVisible ? groupRect.top - previousVisible.bottom : null,
             groupToNextElement: nextRect ? nextRect.top - groupRect.bottom : null,
             groupToNextVisible: nextVisible ? nextVisible.top - groupRect.bottom : null,
+            finalBoundary: Boolean(document.querySelector('.timeline-final-boundary')),
             exactTurnBoundaries,
           };
         })();
@@ -1253,13 +1459,15 @@ async function capture(viewport) {
           activitySegmentsExpanded: document.querySelectorAll('.reasoning-activity-segment > .reasoning-segment-row[aria-expanded="true"]').length,
           controlsVisible: Boolean(controls && visible(controls)),
           compactionStatus: compactionStatus && compactionStatusRect && compactionStatusStyle ? {
-            text: compactionStatus.textContent?.trim() ?? null,
+            text: (compactionToggle?.querySelector('span') ?? compactionStatus.querySelector('span'))?.textContent?.trim() ?? null,
             role: compactionStatus.getAttribute('role'),
+            expanded: compactionToggle?.getAttribute('aria-expanded') ?? null,
+            detailVisible: Boolean(compactionStatus.querySelector('.timeline-compaction-detail') && visible(compactionStatus.querySelector('.timeline-compaction-detail'))),
             color: compactionStatusStyle.color,
             backgroundColor: compactionStatusStyle.backgroundColor,
             borderTopWidth: compactionStatusStyle.borderTopWidth,
             iconWidth: compactionStatus.querySelector('svg')?.getBoundingClientRect().width ?? null,
-            textAnimation: compactionStatus.querySelector('span') ? getComputedStyle(compactionStatus.querySelector('span')).animationName : null,
+            textAnimation: (compactionToggle?.querySelector('span') ?? compactionStatus.querySelector('span')) ? getComputedStyle(compactionToggle?.querySelector('span') ?? compactionStatus.querySelector('span')).animationName : null,
             iconAnimation: compactionStatus.querySelector('svg') ? getComputedStyle(compactionStatus.querySelector('svg')).animationName : null,
           } : null,
           assistantMark,
@@ -1280,6 +1488,8 @@ async function capture(viewport) {
             scrollHeight: reasoningFlow.scrollHeight,
             maxHeight: reasoningFlowStyle.maxHeight,
             overflowY: reasoningFlowStyle.overflowY,
+            textAnimation: reasoningFlow.querySelector('.rich-text') ? getComputedStyle(reasoningFlow.querySelector('.rich-text')).animationName : 'none',
+            iconAnimation: document.querySelector('.reasoning-running .reasoning-mark i') ? getComputedStyle(document.querySelector('.reasoning-running .reasoning-mark i')).animationName : 'none',
           } : null,
           activitiesVisible: Boolean(activities && visible(activities)),
           activityRows: rows.filter(visible).length,
@@ -1365,6 +1575,7 @@ async function capture(viewport) {
       })() : null,
     };
   })()`, true);
+  if (subagentTransition) layout.subagentTransition = subagentTransition;
   if (layout.composerTail) layout.composerTail.coverPixels = composerCoverPixels;
 
   const image = await window.webContents.capturePage();
@@ -1485,7 +1696,7 @@ async function capture(viewport) {
     assert.ok(Math.abs(layout.composerAlignment.effortValueDelta) <= .75, `${viewport.name}: reasoning label and value are not vertically aligned`);
     assert.ok(Math.abs(layout.composerAlignment.labelDelta) <= .75, `${viewport.name}: model and reasoning rows do not share a vertical centre`);
     assert.ok(Math.abs(layout.composerAlignment.microphoneSendDelta) <= .75, `${viewport.name}: microphone is not vertically aligned with Send`);
-    assert.ok(Math.abs(layout.composerAlignment.arrowMicrophoneDelta + 1) <= .75, `${viewport.name}: dictation arrow did not receive its one-pixel left optical correction`);
+    assert.ok(Math.abs(layout.composerAlignment.arrowMicrophoneDelta) <= .75, `${viewport.name}: dictation arrow is not optically centred under the microphone`);
   }
   if (layout.headerAlignment) assert.ok(layout.headerAlignment.contextTrackDelta >= 1.5 && layout.headerAlignment.contextTrackDelta <= 2.5, `${viewport.name}: context bar is not optically aligned with the task title`);
   if (layout.composerMore) {
@@ -1508,6 +1719,18 @@ async function capture(viewport) {
     assert.equal(layout.dictationShape.upperHitIsMain, true, `${viewport.name}: upper microphone hit region does not start dictation`);
     assert.equal(layout.dictationShape.lowerHitIsSource, true, `${viewport.name}: lower crescent hit region does not open sources`);
     if (viewport.kind === 'dictation-hover') assert.equal(layout.dictationShape.fill.background, 'rgb(58, 58, 55)', `${viewport.name}: dictation selector hover fill is not visible`);
+  }
+  if (viewport.kind === 'composer-model') {
+    assert.ok(layout.modelCatalog, `${viewport.name}: model picker did not open`);
+    assert.doesNotMatch(layout.modelCatalog?.text ?? '', /\bDefault\b/u, `${viewport.name}: Default is still stamped on model rows`);
+    assert.ok((layout.modelCatalog?.headings ?? []).some((heading) => heading === 'OpenAI Codex' || heading.includes('Codex')), `${viewport.name}: OpenAI Codex group is missing`);
+    assert.ok((layout.modelCatalog?.headings ?? []).includes('OpenCode'), `${viewport.name}: OpenCode-native routes are not identified`);
+    assert.ok((layout.modelCatalog?.headings ?? []).includes('OpenCode Go via OpenCode'), `${viewport.name}: OpenCode Go routes are not grouped under their reported upstream`);
+    assert.ok((layout.modelCatalog?.headings ?? []).includes('DeepSeek via OpenCode'), `${viewport.name}: DeepSeek routes are not grouped under their reported upstream`);
+  }
+  if (viewport.kind === 'dictation-audio-source') {
+    assert.equal(layout.dictationAudioSource?.mp3Label, 'MP3', `${viewport.name}: MP3 is not listed under the dictate crescent`);
+    assert.equal(layout.dictationAudioSource?.checked, 'true', `${viewport.name}: MP3 is not the selected dictation source`);
   }
   if (viewport.kind === 'dictation-empty') {
     assert.equal(layout.dictationEmpty?.heading, 'No dictation source is enabled', `${viewport.name}: empty state does not plainly name the missing setup`);
@@ -1564,6 +1787,14 @@ async function capture(viewport) {
     assert.ok(layout.queueStrip, `${viewport.name}: queued instruction menu did not open`);
     assert.equal(layout.queueStrip.overflowY, 'visible', `${viewport.name}: queued instructions still create an internal scrollbar`);
     assert.equal(layout.queueStrip.offsetWidth, layout.queueStrip.clientWidth, `${viewport.name}: queued instructions still reserve a scrollbar gutter`);
+    assert.equal(layout.queueStrip.rowClientHeight, layout.queueStrip.rowScrollHeight, `${viewport.name}: queued attachment row clips or scrolls internally`);
+    assert.equal(layout.queueStrip.attachmentWidgets, 4, `${viewport.name}: queued instruction did not render every attachment`);
+    assert.equal(layout.queueStrip.imagePreviews, 1, `${viewport.name}: queued image preview is missing`);
+    assert.equal(layout.queueStrip.imageFallbacks, 1, `${viewport.name}: queued image without safe bytes lost its fallback widget`);
+    assert.equal(layout.queueStrip.audioPlayers, 1, `${viewport.name}: queued audio did not render the playback widget`);
+    assert.equal(layout.queueStrip.fileWidgets, 1, `${viewport.name}: queued file widget is missing`);
+    assert.equal(layout.queueStrip.attachmentsAboveText, true, `${viewport.name}: queued attachments are not above the instruction text`);
+    assert.equal(layout.queueStrip.actionsInsideRow, true, `${viewport.name}: queued actions overlap or escape the attachment row`);
     assert.deepEqual(layout.queueStrip.routes, { click: true, context: true }, `${viewport.name}: queued instruction menu is not reachable from both the three dots and right-click`);
     assert.match(layout.queueStrip.menuText, /Edit message[\s\S]*Open in side chat[\s\S]*Send to new task[\s\S]*Turn off queuing/u, `${viewport.name}: queued instruction actions are incomplete`);
   }
@@ -1581,10 +1812,25 @@ async function capture(viewport) {
     assert.ok(layout.selectedStateBounds, `${viewport.name}: context settings are missing`);
     assert.ok(layout.selectedStateBounds.x >= 0 && layout.selectedStateBounds.y >= 0 && layout.selectedStateBounds.x + layout.selectedStateBounds.width <= layout.viewport.width + 1 && layout.selectedStateBounds.bottom <= layout.viewport.height + 1, `${viewport.name}: context settings are clipped`);
     assert.equal(layout.contextCompaction?.title, 'Set automatic compaction', `${viewport.name}: context title is unclear`);
-    assert.equal(layout.contextCompaction?.note, 'Applying now may compact while this turn is still running.', `${viewport.name}: active-turn threshold guidance is not concise and inline`);
     assert.equal(layout.contextCompaction?.modalCount, 0, `${viewport.name}: context Apply still opens a confirmation modal`);
-    assert.ok(layout.contextCompaction?.noteVisual?.height > 12 && layout.contextCompaction.noteVisual.opacity !== '0' && layout.contextCompaction.noteVisual.visibility === 'visible', `${viewport.name}: active-turn note is not visibly readable`);
     assert.equal(layout.contextCompaction?.background, 'rgb(24, 24, 23)', `${viewport.name}: context panel is not fully opaque`);
+    assert.deepEqual(layout.contextCompaction?.interaction?.initial, {
+      sliderValue: 96_000,
+      thresholdText: '96.0k',
+      percentText: '45%',
+      ariaNow: '45',
+      meterLabel: 'Automatic compaction limit used',
+      appliedText: '96.0k',
+      noteText: null,
+    }, `${viewport.name}: the initial meter does not reflect the applied automatic-compaction limit`);
+    assert.equal(layout.contextCompaction?.interaction?.draft?.sliderValue, 8_000, `${viewport.name}: physical threshold drag did not reach the supported minimum`);
+    assert.equal(layout.contextCompaction?.interaction?.draft?.percentText, '100%', `${viewport.name}: the percentage did not preview the draft threshold live`);
+    assert.equal(layout.contextCompaction?.interaction?.draft?.appliedText, '96.0k', `${viewport.name}: dragging falsely changed the applied threshold before Apply`);
+    assert.equal(layout.contextCompaction?.interaction?.draft?.noteText, 'Applying now may compact while this turn is still running.', `${viewport.name}: active-turn threshold guidance is not concise and inline`);
+    assert.deepEqual(layout.contextCompaction?.interaction?.reopened, layout.contextCompaction?.interaction?.initial, `${viewport.name}: closing without Apply did not discard the draft threshold`);
+    assert.equal(layout.contextCompaction?.interaction?.applied?.sliderValue, 8_000, `${viewport.name}: Apply did not retain the chosen threshold`);
+    assert.equal(layout.contextCompaction?.interaction?.applied?.percentText, '100%', `${viewport.name}: the applied percentage did not stay relative to the compaction limit`);
+    assert.equal(layout.contextCompaction?.interaction?.applied?.appliedText, '8.0k', `${viewport.name}: Usage did not show the bridge-confirmed applied threshold`);
   }
   if (viewport.kind === 'task-details') {
     assert.ok(layout.selectedStateBounds, `${viewport.name}: task details are missing`);
@@ -1592,6 +1838,34 @@ async function capture(viewport) {
     assert.equal(layout.taskDetails?.childRows, 1, `${viewport.name}: spawned sub-agent row is missing`);
     assert.match(layout.taskDetails?.text ?? '', /Sub-agents[\s\S]*Layout review[\s\S]*Location/u, `${viewport.name}: task details hierarchy is unclear`);
     assert.equal(layout.taskDetails?.background, 'rgb(24, 24, 23)', `${viewport.name}: task details panel is not opaque`);
+  }
+  if (viewport.kind === 'subagents') {
+    assert.ok(layout.selectedStateBounds, `${viewport.name}: sub-agent disclosure is missing`);
+    assert.ok(layout.selectedStateBounds.x >= 0 && layout.selectedStateBounds.y >= 0 && layout.selectedStateBounds.x + layout.selectedStateBounds.width <= layout.viewport.width + 1 && layout.selectedStateBounds.bottom <= layout.viewport.height + 1, `${viewport.name}: sub-agent disclosure is clipped`);
+    assert.equal(layout.subagents?.triggerLabel, '2 sub-agents', `${viewport.name}: parent row does not expose the child count`);
+    assert.equal(layout.subagents?.expanded, 'true', `${viewport.name}: sub-agent disclosure did not open`);
+    assert.equal(layout.subagents?.childRows, 2, `${viewport.name}: sub-agent disclosure did not render every child`);
+    assert.match(layout.subagents?.text ?? '', /Layout review[\s\S]*Provider research/u, `${viewport.name}: child task names are missing or out of order`);
+    assert.equal(layout.subagents?.background, 'rgb(24, 24, 23)', `${viewport.name}: sub-agent disclosure is not opaque`);
+    assert.equal(layout.subagents?.topLevelTitles.includes('Review the desktop layout'), false, `${viewport.name}: a child leaked into the top-level task list`);
+    assert.equal(layout.subagents?.topLevelTitles.includes('Research the provider boundary'), false, `${viewport.name}: a child leaked into the top-level task list`);
+    assert.match(layout.subagentTransition?.idle?.label ?? '', /Idle/u, `${viewport.name}: initial child state did not render`);
+    assert.equal(layout.subagentTransition?.idle?.spinnerCount, 0, `${viewport.name}: idle child displayed a working spinner`);
+    assert.match(layout.subagentTransition?.working?.label ?? '', /Working/u, `${viewport.name}: child did not update live to working`);
+    assert.equal(layout.subagentTransition?.working?.spinnerCount, 1, `${viewport.name}: working child is missing its spinner`);
+    assert.notEqual(layout.subagentTransition?.working?.spinnerAnimation, 'none', `${viewport.name}: working child spinner is not animated`);
+    assert.match(layout.subagentTransition?.completed?.label ?? '', /Completed/u, `${viewport.name}: child did not update live to completed`);
+    assert.equal(layout.subagentTransition?.completed?.spinnerCount, 0, `${viewport.name}: completed child kept a stale spinner`);
+  }
+  if (viewport.kind === 'subagents-hover') {
+    assert.ok(layout.selectedStateBounds, `${viewport.name}: sub-agent hover tooltip is missing`);
+    assert.equal(layout.subagentTooltip?.visibleCount, 1, `${viewport.name}: sub-agent hover produced overlapping tooltip layers`);
+    assert.equal(layout.subagentTooltip?.text, '2 sub-agents', `${viewport.name}: sub-agent hover label is incorrect`);
+    assert.equal(layout.subagentTooltip?.parentIsBody, true, `${viewport.name}: sub-agent tooltip is still trapped inside the task rail`);
+    assert.equal(layout.subagentTooltip?.nestedTooltipSources, 0, `${viewport.name}: provider logo still creates a second tooltip`);
+    assert.equal(layout.subagentTooltip?.triggerHasTooltipSource, false, `${viewport.name}: trigger still creates the clipped pseudo-element tooltip`);
+    assert.ok(layout.subagentTooltip?.triggerPseudoContent === 'none' || layout.subagentTooltip?.triggerPseudoContent === 'normal', `${viewport.name}: an underlying trigger pseudo-tooltip is still painted`);
+    assert.ok(layout.subagentTooltip?.bounds && layout.subagentTooltip.bounds.left >= 8 && layout.subagentTooltip.bounds.top >= 8 && layout.subagentTooltip.bounds.right <= layout.viewport.width - 8 + 1 && layout.subagentTooltip.bounds.bottom <= layout.viewport.height - 8 + 1, `${viewport.name}: sub-agent hover tooltip is clipped by the viewport`);
   }
   if (viewport.kind === 'local-open') {
     assert.ok(layout.selectedStateBounds, `${viewport.name}: Open in menu is missing`);
@@ -1615,18 +1889,22 @@ async function capture(viewport) {
   }
   if (viewport.kind.startsWith('trace-')) {
     assert.equal(layout.trace?.reasoningIdentityCount, 0, `${viewport.name}: Reasoning should not carry a provider mark`);
-    assert.equal(layout.trace?.answerIdentityCount, 1, `${viewport.name}: the turn should have exactly one provider mark on its answer`);
+    if (viewport.kind !== 'trace-thinking-expanded') assert.equal(layout.trace?.answerIdentityCount, 1, `${viewport.name}: the turn should have exactly one provider mark on its answer`);
     if (layout.trace.assistantMark) assert.ok(Math.abs(layout.trace.assistantMark.centerDelta) <= 2, `${viewport.name}: assistant mark is not aligned with the first rendered line`);
     assert.ok(layout.trace?.flowGaps, `${viewport.name}: reasoning transition metrics are missing`);
-    assert.ok(layout.trace.flowGaps.exactTurnBoundaries, `${viewport.name}: exact turn-boundary fixture is missing`);
-    assert.ok(layout.trace.flowGaps.exactTurnBoundaries.expected >= 18, `${viewport.name}: configured turn-boundary gap is not materially larger than assistant-internal spacing`);
-    assert.ok(Math.abs(layout.trace.flowGaps.previousElementToGroup - layout.trace.flowGaps.exactTurnBoundaries.expected) <= 0.75, `${viewport.name}: actual user to reasoning spacing does not match the shared turn boundary`);
-    assert.ok(Math.abs(layout.trace.flowGaps.previousVisibleToGroup - layout.trace.flowGaps.exactTurnBoundaries.expected) <= 0.75, `${viewport.name}: visible user content is not evenly spaced before reasoning`);
-    assert.ok(Math.abs(layout.trace.flowGaps.exactTurnBoundaries.assistantToUser - layout.trace.flowGaps.exactTurnBoundaries.expected) <= 0.75, `${viewport.name}: assistant to user spacing does not match the shared turn boundary`);
-    assert.ok(Math.abs(layout.trace.flowGaps.exactTurnBoundaries.userToReasoning - layout.trace.flowGaps.exactTurnBoundaries.expected) <= 0.75, `${viewport.name}: user to reasoning spacing does not match the shared turn boundary`);
-    assert.ok(Math.abs(layout.trace.flowGaps.exactTurnBoundaries.finalToUser - layout.trace.flowGaps.exactTurnBoundaries.expected) <= 0.75, `${viewport.name}: final answer to user spacing does not match the shared turn boundary`);
-    assert.ok(layout.trace.flowGaps.groupToNextElement >= 4 && layout.trace.flowGaps.groupToNextElement <= 8, `${viewport.name}: reasoning to assistant element spacing is not tight`);
-    assert.ok(layout.trace.flowGaps.groupToNextVisible >= 4 && layout.trace.flowGaps.groupToNextVisible <= 8, `${viewport.name}: reasoning to visible assistant text spacing is not tight`);
+    if (viewport.kind !== 'trace-thinking-expanded') {
+      assert.ok(layout.trace.flowGaps.exactTurnBoundaries, `${viewport.name}: exact turn-boundary fixture is missing`);
+      assert.ok(layout.trace.flowGaps.exactTurnBoundaries.expected >= 18, `${viewport.name}: configured turn-boundary gap is not materially larger than assistant-internal spacing`);
+      assert.ok(Math.abs(layout.trace.flowGaps.previousElementToGroup - layout.trace.flowGaps.exactTurnBoundaries.expected) <= 0.75, `${viewport.name}: actual user to reasoning spacing does not match the shared turn boundary`);
+      assert.ok(Math.abs(layout.trace.flowGaps.previousVisibleToGroup - layout.trace.flowGaps.exactTurnBoundaries.expected) <= 0.75, `${viewport.name}: visible user content is not evenly spaced before reasoning`);
+      assert.ok(Math.abs(layout.trace.flowGaps.exactTurnBoundaries.assistantToUser - layout.trace.flowGaps.exactTurnBoundaries.expected) <= 0.75, `${viewport.name}: assistant to user spacing does not match the shared turn boundary`);
+      assert.ok(Math.abs(layout.trace.flowGaps.exactTurnBoundaries.userToReasoning - layout.trace.flowGaps.exactTurnBoundaries.expected) <= 0.75, `${viewport.name}: user to reasoning spacing does not match the shared turn boundary`);
+      assert.ok(Math.abs(layout.trace.flowGaps.exactTurnBoundaries.finalToUser - layout.trace.flowGaps.exactTurnBoundaries.expected) <= 0.75, `${viewport.name}: final answer to user spacing does not match the shared turn boundary`);
+      if (!layout.trace.flowGaps.finalBoundary) {
+        assert.ok(layout.trace.flowGaps.groupToNextElement >= 4 && layout.trace.flowGaps.groupToNextElement <= 8, `${viewport.name}: reasoning to assistant element spacing is not tight`);
+        assert.ok(layout.trace.flowGaps.groupToNextVisible >= 4 && layout.trace.flowGaps.groupToNextVisible <= 8, `${viewport.name}: reasoning to visible assistant text spacing is not tight`);
+      }
+    }
   }
   if (viewport.kind.startsWith('trace-')) {
     assert.ok((layout.trace?.runningGroups ?? 0) <= 1, `${viewport.name}: more than the current reasoning group is animated`);
@@ -1691,11 +1969,17 @@ async function capture(viewport) {
     assert.equal(layout.trace?.compactionStatus?.iconAnimation, reducedMotion ? 'none' : 'compaction-icon-sheen', `${viewport.name}: active compaction icon motion does not match the motion preference`);
   }
   if (viewport.kind === 'trace-compacted') {
-    assert.equal(layout.trace?.compactionStatus?.text, 'Automatically compacted context', `${viewport.name}: completed automatic compaction wording is not preserved`);
-    assert.equal(layout.trace?.compactionStatus?.role, 'note', `${viewport.name}: completed compaction is not a quiet transcript event`);
+    assert.equal(layout.trace?.compactionStatus?.text, 'Session compacted', `${viewport.name}: completed compaction wording is not preserved`);
+    assert.equal(layout.trace?.compactionStatus?.expanded, 'false', `${viewport.name}: completed compaction is exposed by default`);
+    assert.equal(layout.trace?.compactionStatus?.detailVisible, false, `${viewport.name}: completed compaction detail is visible at rest`);
     assert.equal(layout.trace?.compactionStatus?.textAnimation, 'none', `${viewport.name}: completed compaction is still animated`);
     assert.equal(layout.trace?.compactionStatus?.iconAnimation, 'none', `${viewport.name}: completed compaction icon is still animated`);
     assert.equal(layout.trace?.compactionStatus?.backgroundColor, 'rgba(0, 0, 0, 0)', `${viewport.name}: completed compaction acquired a heavy surface`);
+  }
+  if (viewport.kind === 'trace-compacted-expanded') {
+    assert.equal(layout.trace?.compactionStatus?.expanded, 'true', `${viewport.name}: completed compaction did not expand`);
+    assert.equal(layout.trace?.compactionStatus?.detailVisible, true, `${viewport.name}: expanded compaction has no readable detail`);
+    assert.equal(layout.trace?.compactionStatus?.text, 'Session compacted', `${viewport.name}: expanded compaction lost its event label`);
   }
   if (viewport.kind === 'trace-expanded') {
     assert.equal(layout.trace?.disclosureExpanded, 'true', `${viewport.name}: reasoning did not expand`);
@@ -1713,16 +1997,14 @@ async function capture(viewport) {
   }
   if (viewport.kind === 'trace-thinking-expanded') {
     assert.equal(layout.trace?.disclosureExpanded, 'true', `${viewport.name}: parent reasoning closed while thinking was open`);
-    assert.ok((layout.trace?.thinkingExpanded ?? 0) >= 1, `${viewport.name}: Expand thinking did not open the thinking rows`);
     assert.ok((layout.trace?.thinkingFlows ?? 0) >= 1, `${viewport.name}: expanded thinking text is missing`);
-    assert.equal(layout.trace?.chevrons?.inner, '0', `${viewport.name}: expanded thinking chevron is visible without interaction`);
     assert.ok(layout.trace?.reasoningFlow, `${viewport.name}: expanded thinking bounds are missing`);
     assert.ok(Number.parseFloat(layout.trace.reasoningFlow.maxHeight) <= 360, `${viewport.name}: verbose thinking is not height-bounded`);
     assert.match(layout.trace.reasoningFlow.overflowY, /auto|scroll/, `${viewport.name}: verbose thinking cannot scroll internally`);
     assert.equal(layout.trace.reasoningFlow.scrollHeight, layout.trace.reasoningFlow.clientHeight, `${viewport.name}: short thinking fixture gained unnecessary internal scrolling`);
-    assert.equal(layout.trace?.activitySegmentsExpanded, 0, `${viewport.name}: Expand thinking also opened tool-call summaries`);
-    assert.equal(layout.trace?.activitiesVisible, false, `${viewport.name}: Expand thinking leaked tool-call rows`);
-    assert.equal(layout.trace?.activityRows, 0, `${viewport.name}: Expand thinking exposed raw tool-call rows`);
+    assert.equal(layout.trace.reasoningFlow.textAnimation, reducedMotion ? 'none' : 'reasoning-flow-shimmer', `${viewport.name}: live reasoning text motion does not match the motion preference`);
+    assert.equal(layout.trace.reasoningFlow.iconAnimation, reducedMotion ? 'none' : 'reasoning-flow', `${viewport.name}: live reasoning motion does not match the motion preference`);
+    assert.equal(layout.trace?.snippetCount, 0, `${viewport.name}: live activity detail opened without reader intent`);
     assert.equal(layout.trace?.snippetCount, 0, `${viewport.name}: Expand thinking opened a tool snippet`);
   }
   if (viewport.kind === 'trace-snippet') {

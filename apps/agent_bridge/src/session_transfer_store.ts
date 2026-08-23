@@ -35,6 +35,7 @@ function relationship(value: unknown): SessionRelationship {
   const sourceSessionId = boundedString(value.sourceSessionId, "source session ID", 16_384)!;
   if (kind === "handoff" && strategy === "summary_bootstrap") return { kind, strategy, sourceSessionId };
   if ((kind === "branch" || kind === "side_chat") && (strategy === "native" || strategy === "transcript_bootstrap")) return { kind, strategy, sourceSessionId };
+  if (kind === "subagent" && strategy === "native") return { kind, strategy, sourceSessionId };
   throw new Error("Persisted session-transfer relationship is invalid");
 }
 

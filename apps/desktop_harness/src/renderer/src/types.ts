@@ -23,6 +23,13 @@ export interface Provider {
   supportsAttachments: boolean;
 }
 
+/** A provider-owned pause that is not reasoning and is not a failed turn. */
+export interface ProviderStatus {
+  kind: "retry";
+  message: string;
+  retryAt?: string;
+}
+
 export interface Session {
   id: string;
   /** Local unsent task. It becomes a provider session on the first send. */
@@ -42,14 +49,18 @@ export interface Session {
   updatedAt: string;
   model: string;
   effort: string;
+  providerStatus?: ProviderStatus;
   unread?: number;
   childCount?: number;
+  childProviderIds?: ProviderId[];
   contextSummary?: string;
   /** True when `title` is the user's own local name rather than the provider's. */
   renamed?: boolean;
   /** Local task organisation. Neither flag is sent to a provider. */
   pinned?: boolean;
   archived?: boolean;
+  /** Codex Desktop owns this task even when its current turn is idle. */
+  externalWriter?: boolean;
 }
 
 export interface SessionUsageTotals {
@@ -92,6 +103,8 @@ export interface TimelineItem {
   id: string;
   /** Stable provider message identity, used to reveal complete recent messages instead of arbitrary content fragments. */
   messageId?: string;
+  /** Stable provider content-part identity, used to reconcile several rows that share one message. */
+  providerPartId?: string;
   kind: TimelineKind;
   /** Provider-supplied assistant phase when the harness distinguishes progress from its final answer. */
   phase?: "commentary" | "final_answer";
@@ -101,8 +114,23 @@ export interface TimelineItem {
   state?: "running" | "completed" | "failed";
   timestamp: string;
   images?: TimelineImage[];
+  audio?: TimelineAudio[];
   workflows?: TimelineWorkflow[];
+  /** Product-rendered response comments parsed from the provider's text envelope. */
+  annotations?: readonly TimelineAnnotation[];
   origin?: TimelineOrigin;
+  /** True for a new chunk, false for an authoritative whole-body replacement, omitted for legacy rows. */
+  streamDelta?: boolean;
+  /** Identity of the event that produced this body, so a replayed batch cannot append twice. */
+  sourceEventId?: string;
+}
+
+export interface TimelineAnnotation {
+  id: string;
+  text: string;
+  annotation: string;
+  audioAttachmentIndex?: number;
+  audio?: TimelineAudio;
 }
 
 export interface TimelineWorkflow {
@@ -125,6 +153,16 @@ export interface TimelineImage {
   mimeType?: string;
   /** Only renderer-safe data-image or HTTPS URLs are retained for display. */
   dataUrl?: string;
+}
+
+export interface TimelineAudio {
+  name: string;
+  mimeType: string;
+  /** Renderer-safe data-audio URL retained for playback. */
+  dataUrl: string;
+  durationSeconds?: number;
+  /** True for a clip the user spoke, as opposed to an audio file they attached. */
+  dictation?: boolean;
 }
 
 export interface ApprovalRequest {
@@ -156,10 +194,17 @@ export interface ModelOption {
   inputModalities?: Array<"text" | "image" | "audio">;
   endpointId?: string;
   endpointName?: string;
+  /** Upstream model host reported by a routing provider such as OpenCode. */
+  sourceProviderId?: string;
+  sourceProviderName?: string;
   source?: string;
   walletKind?: "user_api" | "harness" | "subscription";
   apiKeyConfigured?: boolean;
   caution?: string;
+  /** Provider-reported model facts for the settings catalogue. Absent means unknown. */
+  contextWindowTokens?: number;
+  inputPricePerMillion?: number;
+  outputPricePerMillion?: number;
 }
 
 export interface DesktopSnapshot {

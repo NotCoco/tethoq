@@ -46,6 +46,8 @@ export const SlidersIcon = (props: IconProps) => <Icon {...props}><path d="M4 6h
 export const XIcon = (props: IconProps) => <Icon {...props}><path d="m6 6 12 12M18 6 6 18"/></Icon>;
 export const MoreIcon = (props: IconProps) => <Icon {...props}><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></Icon>;
 export const CopyIcon = (props: IconProps) => <Icon {...props}><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></Icon>;
+export const AnnotationIcon = (props: IconProps) => <Icon {...props}><path d="M5 4h14a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H10l-5 4v-4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z"/><path d="M8 9h8M8 13h5"/></Icon>;
+export const EditIcon = (props: IconProps) => <Icon {...props}><path d="M4 20h4l11-11a2.8 2.8 0 0 0-4-4L4 16z"/><path d="m13.5 6.5 4 4"/></Icon>;
 export const EyeIcon = (props: IconProps) => <Icon {...props}><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2.5"/></Icon>;
 export const BrowserIcon = (props: IconProps) => <Icon {...props}><rect x="2.5" y="3" width="19" height="18" rx="2.5"/><path d="M2.5 8h19M6 5.5h.01M9 5.5h.01"/></Icon>;
 export const GlobeIcon = (props: IconProps) => <Icon {...props}><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.3 2.4 3.5 5.4 3.5 9S14.3 18.6 12 21M12 3c-2.3 2.4-3.5 5.4-3.5 9s1.2 6.6 3.5 9"/></Icon>;

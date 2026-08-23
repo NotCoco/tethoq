@@ -6,6 +6,9 @@ import type { BridgeConfig } from "../../../agent_bridge/src/config.js";
 import { DelegationStateStore, defaultDelegationStatePath } from "../../../agent_bridge/src/delegation_store.js";
 import { SessionTransferStateStore, defaultSessionTransferStatePath } from "../../../agent_bridge/src/session_transfer_store.js";
 import { CrossSessionInboxStore, defaultCrossSessionInboxStatePath } from "../../../agent_bridge/src/cross_session_store.js";
+import { SessionSelectionStore, defaultSessionSelectionStatePath } from "../../../agent_bridge/src/session_selection_store.js";
+import { EarsHelperStore, defaultEarsHelperStatePath } from "../../../agent_bridge/src/ears_helper_store.js";
+import { CompactionThresholdStore, defaultCompactionThresholdStatePath } from "../../../agent_bridge/src/compaction_threshold_store.js";
 import { PairingStateStore, defaultPairingStatePath } from "../../../agent_bridge/src/pairing_store.js";
 import { BridgeRequestRouter } from "../../../agent_bridge/src/request_router.js";
 import { defaultMeshRuntimePath, MeshToolGateway, meshToolDefinitions } from "../../../agent_bridge/src/mesh_tools.js";
@@ -22,6 +25,8 @@ import { DirectApiProviderAdapter } from "../../../../packages/provider_direct/s
 import type { AgentEvent, JsonObject, RequestEnvelope, ResponseEnvelope } from "../../../../packages/protocol/src/index.js";
 import { DESKTOP_PROVIDERS, type ConnectorAction, type ConnectorActionResult, type DesktopConnectorState, type DesktopEventBatch, type DesktopRuntimeState } from "../shared/desktop_api.js";
 import { OpenCodeSupervisor } from "./opencode_supervisor.js";
+import { discoverOpenCodeServerUrl, isOpenCodeServerHealthy, resolveOpenCodeEndpoint, DEFAULT_OPENCODE_URL } from "./opencode_discovery.js";
+import { OpenCodeWatchdog } from "./opencode_watch.js";
 import { approveDesktopConnector, fingerprintInstalledDesktopConnector, loadDesktopConnectors, revokeDesktopConnector, type DesktopConnectorRegistryResult } from "./connectors.js";
 import { BrowserAgentTools, browserToolDefinitions } from "./browser_agent_tools.js";
 import type { BrowserWorkspaceManager } from "./browser_workspace.js";
@@ -29,6 +34,7 @@ import type { BrowserWorkspaceManager } from "./browser_workspace.js";
 const ACTIVE_EVENT_POLL_MS = 100;
 const HIDDEN_EVENT_POLL_MS = 1_000;
 const MAX_EVENT_BATCH = 200;
+const OPENCODE_RELIST_MS = 15_000;
 
 export interface DesktopRuntimeOptions {
   readonly config: BridgeConfig;
@@ -39,6 +45,7 @@ export interface DesktopRuntimeOptions {
   readonly connectorTrustStorePath: string;
   readonly appVersion: string;
   readonly providerAssetsDirectory: string;
+  readonly defaultWorkingDirectory: string;
   readonly browserWorkspace: BrowserWorkspaceManager;
   readonly globalAgentInstructions?: () => Promise<string | undefined>;
 }
@@ -52,18 +59,38 @@ export class DesktopRuntime {
   readonly #connectorTrustStorePath: string;
   readonly #appVersion: string;
   readonly #providerAssetsDirectory: string;
+  readonly #defaultWorkingDirectory: string;
   readonly #meshRuntimePath: string;
-  readonly #openCode: OpenCodeSupervisor;
+  #openCode: OpenCodeSupervisor;
+  /**
+   * True while the supervisor points at a server the desktop discovered (the
+   * user's own opencode) rather than one it started itself. Drives re-discovery
+   * when that server moves or disappears.
+   */
+  #openCodeAdopted = false;
+  /**
+   * Our own managed server kept alive as the provider's secondary feed while a
+   * turn it started is still in flight after the desktop handed over to the
+   * user's server. Stopped by the retirement tick once the feed drains.
+   */
+  #retiredOpenCode: OpenCodeSupervisor | undefined;
   readonly #browserWorkspace: BrowserWorkspaceManager;
   readonly #globalAgentInstructions: (() => Promise<string | undefined>) | undefined;
+  #openCodeWatchdog: OpenCodeWatchdog | undefined;
   #bridge: AgentBridge | undefined;
   #router: BridgeRequestRouter | undefined;
   #pairingStore: PairingStateStore | undefined;
   #delegationStore: DelegationStateStore | undefined;
   #sessionTransferStore: SessionTransferStateStore | undefined;
   #crossSessionStore: CrossSessionInboxStore | undefined;
+  #sessionSelectionStore: SessionSelectionStore | undefined;
+  #earsHelperStore: EarsHelperStore | undefined;
+  #compactionThresholdStore: CompactionThresholdStore | undefined;
   #restartPromise: Promise<void> | undefined;
   #eventTimer: NodeJS.Timeout | undefined;
+  #openCodeRelistTimer: NodeJS.Timeout | undefined;
+  #unsubscribeEventAppended: (() => void) | undefined;
+  #eventFlushQueued = false;
   #windowVisible = true;
   #latestSequence = 0;
   #startPromise: Promise<void> | undefined;
@@ -81,15 +108,46 @@ export class DesktopRuntime {
     this.#connectorTrustStorePath = options.connectorTrustStorePath;
     this.#appVersion = options.appVersion;
     this.#providerAssetsDirectory = options.providerAssetsDirectory;
+    this.#defaultWorkingDirectory = options.defaultWorkingDirectory;
     this.#meshRuntimePath = defaultMeshRuntimePath(options.config.hostId);
     this.#browserWorkspace = options.browserWorkspace;
     this.#globalAgentInstructions = options.globalAgentInstructions;
     const openCodeUrl = tethoqEnvironmentValue(process.env, "TETHOQ_OPENCODE_URL");
+    this.#openCode = new OpenCodeSupervisor(this.#openCodeSupervisorOptions(openCodeUrl ?? DEFAULT_OPENCODE_URL));
+  }
+
+  #openCodeSupervisorOptions(url: string): ConstructorParameters<typeof OpenCodeSupervisor>[0] {
     const openCodeCommand = tethoqEnvironmentValue(process.env, "TETHOQ_OPENCODE_COMMAND");
-    this.#openCode = new OpenCodeSupervisor({
-      ...(openCodeUrl !== undefined ? { url: openCodeUrl } : {}),
+    return {
+      url,
       ...(openCodeCommand !== undefined ? { command: openCodeCommand } : {}),
+      statePath: join(dirname(this.#configPath), "opencode-supervisor.json"),
       environment: { ...process.env, UAR_MESH_RUNTIME: this.#meshRuntimePath },
+    };
+  }
+
+  #createOpenCodeAdapter(options: { url: string; secondaryBaseUrl?: string; secondaryActiveSessionIds?: readonly string[] }): OpenCodeAdapter {
+    const workingDirectory = tethoqEnvironmentValue(process.env, "TETHOQ_PROJECT_DIRECTORY");
+    const openCodeUsername = tethoqEnvironmentValue(process.env, "TETHOQ_OPENCODE_USERNAME")
+      ?? (typeof process.env.OPENCODE_SERVER_USERNAME === "string" && process.env.OPENCODE_SERVER_USERNAME.trim()
+        ? process.env.OPENCODE_SERVER_USERNAME
+        : undefined);
+    const openCodePassword = tethoqEnvironmentValue(process.env, "TETHOQ_OPENCODE_PASSWORD")
+      ?? (typeof process.env.OPENCODE_SERVER_PASSWORD === "string" && process.env.OPENCODE_SERVER_PASSWORD
+        ? process.env.OPENCODE_SERVER_PASSWORD
+        : undefined);
+    const openCodeDatabasePath = tethoqEnvironmentValue(process.env, "TETHOQ_OPENCODE_DB_PATH");
+    return new OpenCodeAdapter({
+      hostId: this.#config.hostId,
+      baseUrl: options.url,
+      ...(workingDirectory !== undefined ? { directory: workingDirectory } : {}),
+      ...(openCodeUsername !== undefined ? { username: openCodeUsername } : {}),
+      ...(openCodePassword !== undefined ? { password: openCodePassword } : {}),
+      localActivity: openCodeDatabasePath === undefined ? {} : { databasePath: openCodeDatabasePath },
+      ...(options.secondaryBaseUrl !== undefined ? { secondaryBaseUrl: options.secondaryBaseUrl } : {}),
+      ...(options.secondaryActiveSessionIds !== undefined && options.secondaryActiveSessionIds.length > 0
+        ? { secondaryActiveSessionIds: options.secondaryActiveSessionIds }
+        : {}),
     });
   }
 
@@ -155,7 +213,75 @@ export class DesktopRuntime {
     // The caller routes the single provider.reconnect request after ensuring
     // the HTTP process exists. Reconnecting here as well duplicates provider
     // subscriptions and can race two refreshes from one UI action.
+    const envUrl = tethoqEnvironmentValue(process.env, "TETHOQ_OPENCODE_URL");
+    const status = this.#openCode.status();
+    if (envUrl === undefined) {
+      const discoveredUrl = await discoverOpenCodeServerUrl();
+      const decision = resolveOpenCodeEndpoint({
+        envUrl,
+        discoveredUrl,
+        discoveredHealthy: discoveredUrl === undefined ? false : await isOpenCodeServerHealthy(discoveredUrl),
+        currentUrl: status.url,
+        adopted: this.#openCodeAdopted,
+        currentExternal: status.state === "external",
+        defaultUrl: DEFAULT_OPENCODE_URL,
+      });
+      if (decision !== undefined) {
+        try {
+          await this.#adoptOpenCodeServer(decision.url);
+        } catch {
+          // The supervisor has already repointed; the provider retries through
+          // the bridge's resubscribe loop against the new server.
+        }
+        this.#openCodeAdopted = decision.adopted;
+      }
+    }
+    await this.#retireOpenCodeIfIdle();
     return await this.#openCode.ensureRunning();
+  }
+
+  /**
+   * Swaps the supervisor to a different server and repoints the provider.
+   * When our own managed server still has a turn in flight, it is kept alive as
+   * the adapter's secondary feed instead of being killed under that turn; the
+   * retirement tick stops it once the feed drains.
+   */
+  async #adoptOpenCodeServer(url: string): Promise<void> {
+    const old = this.#openCode;
+    const childOwner = this.#retiredOpenCode ?? old;
+    const activeSessions = await this.#bridge?.providerActiveSessions("opencode") ?? [];
+    const keepOurs = childOwner.hasManagedChild
+      && childOwner.status().url !== url
+      && activeSessions.length > 0;
+    const next = new OpenCodeSupervisor(this.#openCodeSupervisorOptions(url));
+    if (keepOurs) {
+      if (this.#retiredOpenCode === undefined) this.#retiredOpenCode = old;
+    } else {
+      await old.dispose();
+      if (this.#retiredOpenCode !== undefined && childOwner.status().url !== url) {
+        await this.#retiredOpenCode.dispose();
+        this.#retiredOpenCode = undefined;
+      }
+    }
+    this.#openCode = next;
+    await this.#bridge?.replaceProviderAdapter(this.#createOpenCodeAdapter({
+      url,
+      ...(keepOurs ? {
+        secondaryBaseUrl: childOwner.status().url,
+        secondaryActiveSessionIds: activeSessions,
+      } : {}),
+    }));
+  }
+
+  /** Stops the previous server once nothing streams through its feed anymore. */
+  async #retireOpenCodeIfIdle(): Promise<void> {
+    const retired = this.#retiredOpenCode;
+    if (retired === undefined) return;
+    if (retired.status().url === this.#openCode.status().url) return;
+    if (await this.#bridge?.isProviderSecondaryBusy("opencode") === true) return;
+    await retired.dispose();
+    this.#retiredOpenCode = undefined;
+    await this.#bridge?.setProviderSecondaryUrl("opencode", undefined);
   }
 
   /** Keeps active chat streaming responsive while avoiding a 10 Hz hidden-window poll. */
@@ -199,10 +325,17 @@ export class DesktopRuntime {
     if (this.#disposed) return;
     this.#disposed = true;
     this.#onState({ state: "stopping" });
+    this.#unsubscribeEventAppended?.();
+    this.#unsubscribeEventAppended = undefined;
     clearTimeout(this.#eventTimer);
     this.#eventTimer = undefined;
-    await Promise.allSettled([this.#bridge?.dispose(), this.#clientTools?.close(), this.#connectorRegistry?.dispose(), this.#openCode.dispose()]);
-    await Promise.allSettled([this.#pairingStore?.flush(), this.#delegationStore?.flush(), this.#sessionTransferStore?.flush(), this.#crossSessionStore?.flush()]);
+    clearTimeout(this.#openCodeRelistTimer);
+    this.#openCodeRelistTimer = undefined;
+    this.#openCodeWatchdog?.dispose();
+    this.#openCodeWatchdog = undefined;
+    await Promise.allSettled([this.#bridge?.dispose(), this.#clientTools?.close(), this.#connectorRegistry?.dispose(), this.#openCode.dispose(), this.#retiredOpenCode?.dispose()]);
+    this.#retiredOpenCode = undefined;
+    await Promise.allSettled([this.#pairingStore?.flush(), this.#delegationStore?.flush(), this.#sessionTransferStore?.flush(), this.#crossSessionStore?.flush(), this.#sessionSelectionStore?.flush(), this.#earsHelperStore?.flush(), this.#compactionThresholdStore?.flush()]);
   }
 
   private async startOnce(): Promise<void> {
@@ -210,11 +343,25 @@ export class DesktopRuntime {
     try {
       await installOpenCodeMeshTools({ sourcePath: join(this.#providerAssetsDirectory, "opencode", "uar_mesh.txt") });
       await installPiTools({ sourcePath: join(this.#providerAssetsDirectory, "pi", "tethoq_tools.txt") });
+      // Prefer the opencode the user already runs (the AI Desktop sidecar or a
+      // CLI server): only the server that owns a session emits its live events,
+      // so a separate managed server could never stream this session's output.
+      if (tethoqEnvironmentValue(process.env, "TETHOQ_OPENCODE_URL") === undefined) {
+        const discoveredUrl = await discoverOpenCodeServerUrl();
+        if (discoveredUrl !== undefined && (await isOpenCodeServerHealthy(discoveredUrl))) {
+          await this.#openCode.dispose();
+          this.#openCode = new OpenCodeSupervisor(this.#openCodeSupervisorOptions(discoveredUrl));
+          this.#openCodeAdopted = true;
+        }
+      }
       await this.#openCode.probe();
       const pairingStore = new PairingStateStore(defaultPairingStatePath(this.#configPath));
       const delegationStore = new DelegationStateStore(defaultDelegationStatePath(this.#configPath));
       const sessionTransferStore = new SessionTransferStateStore(defaultSessionTransferStatePath(this.#configPath));
       const crossSessionStore = new CrossSessionInboxStore(defaultCrossSessionInboxStatePath(this.#configPath));
+      const sessionSelectionStore = new SessionSelectionStore(defaultSessionSelectionStatePath(this.#configPath));
+      const earsHelperStore = new EarsHelperStore(defaultEarsHelperStatePath(this.#configPath));
+      const compactionThresholdStore = new CompactionThresholdStore(defaultCompactionThresholdStatePath(this.#configPath));
       const dictationCredentialStore = new DictationCredentialStore(
         defaultDictationCredentialStatePath(this.#configPath),
         this.#config.identity.privateKeyPem,
@@ -223,21 +370,27 @@ export class DesktopRuntime {
       this.#delegationStore = delegationStore;
       this.#sessionTransferStore = sessionTransferStore;
       this.#crossSessionStore = crossSessionStore;
-      const [pairingState, delegationState, sessionTransferState, crossSessionState, dictationCredentials] = await Promise.all([
+      this.#sessionSelectionStore = sessionSelectionStore;
+      this.#earsHelperStore = earsHelperStore;
+      this.#compactionThresholdStore = compactionThresholdStore;
+      const [pairingState, delegationState, sessionTransferState, crossSessionState, dictationCredentials, sessionSelectionState, earsHelperState, compactionThresholdState] = await Promise.all([
         pairingStore.read(),
         delegationStore.read(),
         sessionTransferStore.read(),
         crossSessionStore.read(),
         dictationCredentialStore.read(),
+        sessionSelectionStore.read(),
+        earsHelperStore.read(),
+        compactionThresholdStore.read(),
       ]);
       const openCodeUrl = tethoqEnvironmentValue(process.env, "TETHOQ_OPENCODE_URL") ?? this.#openCode.status().url;
       const configuredWorkingDirectory = tethoqEnvironmentValue(process.env, "TETHOQ_PROJECT_DIRECTORY");
-      const workingDirectory = configuredWorkingDirectory ?? process.cwd();
+      // Explorer/Start Menu launches may inherit System32 or the installed app
+      // folder as process.cwd(). Neither is a truthful user workspace. Electron
+      // resolves the user's real Documents directory across installed machines.
+      const workingDirectory = configuredWorkingDirectory ?? this.#defaultWorkingDirectory;
       const codexCommand = tethoqEnvironmentValue(process.env, "TETHOQ_CODEX_COMMAND");
       const codexArgs = parseStringArray(tethoqEnvironmentValue(process.env, "TETHOQ_CODEX_ARGS"));
-      const openCodeUsername = tethoqEnvironmentValue(process.env, "TETHOQ_OPENCODE_USERNAME");
-      const openCodePassword = tethoqEnvironmentValue(process.env, "TETHOQ_OPENCODE_PASSWORD");
-      const openCodeDatabasePath = tethoqEnvironmentValue(process.env, "TETHOQ_OPENCODE_DB_PATH");
       const grokCommand = tethoqEnvironmentValue(process.env, "TETHOQ_GROK_COMMAND");
       const grokArgs = parseStringArray(tethoqEnvironmentValue(process.env, "TETHOQ_GROK_ARGS"));
       const publicAcpProviderIds: readonly PublicAcpProviderId[] = ["qwen", "goose", "kimi", "hermes", "cline", "copilot"];
@@ -267,14 +420,7 @@ export class DesktopRuntime {
           localActivity: {},
           desktopQueue: {},
         }),
-        new OpenCodeAdapter({
-          hostId: this.#config.hostId,
-          baseUrl: openCodeUrl,
-          ...(configuredWorkingDirectory !== undefined ? { directory: configuredWorkingDirectory } : {}),
-          ...(openCodeUsername !== undefined ? { username: openCodeUsername } : {}),
-          ...(openCodePassword !== undefined ? { password: openCodePassword } : {}),
-          localActivity: openCodeDatabasePath === undefined ? {} : { databasePath: openCodeDatabasePath },
-        }),
+        this.#createOpenCodeAdapter({ url: openCodeUrl }),
         new GrokProviderAdapter({
           hostId: this.#config.hostId,
           cwd: workingDirectory,
@@ -316,6 +462,13 @@ export class DesktopRuntime {
         onSessionTransfersChange: (transfers) => sessionTransferStore.scheduleWrite(transfers),
         crossSessionMessages: crossSessionState.messages,
         onCrossSessionMessagesChange: (messages) => crossSessionStore.scheduleWrite(messages),
+        sessionSelections: sessionSelectionState.selections,
+        onSessionSelectionsChange: (selections) => sessionSelectionStore.scheduleWrite(selections),
+        earsHelpers: earsHelperState.helpers,
+        onEarsHelpersChange: (helpers) => earsHelperStore.scheduleWrite(helpers),
+        compactionThresholds: compactionThresholdState.thresholds,
+        onCompactionThresholdsChange: (thresholds) => compactionThresholdStore.write(thresholds),
+        internalHelperWorkingDirectory: dirname(this.#configPath),
         transcriptionSources: defaultTranscriptionSourceRegistry({
           ...(dictationCredentials["openai-stt"] !== undefined ? { openAiApiKey: dictationCredentials["openai-stt"] } : {}),
           ...(dictationCredentials["xai-stt"] !== undefined ? { xAiApiKey: dictationCredentials["xai-stt"] } : {}),
@@ -350,8 +503,12 @@ export class DesktopRuntime {
       this.#router = new BridgeRequestRouter(bridge);
       await bridge.start();
       this.#latestSequence = 0;
+      this.#unsubscribeEventAppended = bridge.subscribeEventAppended(() => this.queueEventFlush());
       this.scheduleEventPoll();
       this.#onState({ state: "ready" });
+      this.startOpenCodeInBackground(bridge);
+      this.startOpenCodeWatchdog(bridge);
+      this.scheduleOpenCodeRelist();
     } catch (error) {
       clearTimeout(this.#eventTimer);
       this.#eventTimer = undefined;
@@ -369,6 +526,60 @@ export class DesktopRuntime {
       this.#onState({ state: "failed", message });
       throw error;
     }
+  }
+
+  /**
+   * OpenCode sessions only exist while `opencode serve` is up, so the desktop owns
+   * that process for its whole lifetime — started here, re-checked by the watchdog
+   * every interval, and stopped by dispose(). It runs after the runtime reports
+   * ready because a cold server can take seconds to answer its health check, and
+   * blocking on that would hold the whole app on its splash screen.
+   */
+  private startOpenCodeInBackground(bridge: AgentBridge): void {
+    void (async () => {
+      try {
+        const status = await this.ensureOpenCode();
+        if (this.#disposed || this.#bridge !== bridge) return;
+        // "external" counts too: a server we did not start (a previous desktop
+        // left one behind, or the user runs their own) can still have come up
+        // after the startup refresh already wrote OpenCode off as unavailable.
+        if (status.state === "managed" || status.state === "external") await bridge.reconnectProvider("opencode");
+      } catch {
+        // A missing or failing OpenCode install is reported through the
+        // supervisor status; the rest of the desktop stays usable without it.
+      }
+    })();
+  }
+
+  /**
+   * A server that dies after startup must not stay dead for the rest of the app
+   * session. The watchdog probes on a calm cadence, restarts a missing server,
+   * and reconnects the bridge whenever OpenCode enters a running state that
+   * differs from the last one observed — including a killed external server the
+   * desktop replaces with its own. It steps aside while the user's own restart
+   * is stopping the process.
+   */
+  private startOpenCodeWatchdog(bridge: AgentBridge): void {
+    this.#openCodeWatchdog?.dispose();
+    this.#openCodeWatchdog = new OpenCodeWatchdog({
+      // Discovery is part of supervision, not only startup. OpenCode AI
+      // Desktop can appear after Tethoq or restart its sidecar on a new port;
+      // only that owning server carries the live reasoning deltas.
+      ensureRunning: () => this.ensureOpenCode(),
+      reconnect: () => bridge.reconnectProvider("opencode"),
+      connected: () => bridge.isProviderConnected("opencode"),
+      stopping: () => this.#openCode.isStopping,
+    });
+    this.#openCodeWatchdog.start();
+  }
+
+  private queueEventFlush(): void {
+    if (this.#eventFlushQueued || this.#disposed) return;
+    this.#eventFlushQueued = true;
+    setImmediate(() => {
+      this.#eventFlushQueued = false;
+      this.pollEvents();
+    });
   }
 
   private pollEvents(): void {
@@ -393,6 +604,29 @@ export class DesktopRuntime {
       this.scheduleEventPoll();
     }, delay);
     this.#eventTimer.unref();
+  }
+
+  /**
+   * The event feed is the fast path for session lists, and a full refresh
+   * touches every provider (spawning idle processes the doctrine forbids).
+   * OpenCode is the exception: its HTTP list is cheap and the desktop owns the
+   * server, so re-listing it on a calm cadence keeps titles, previews, recency,
+   * and working state fresh in the bridge cache even while the live feed is
+   * quiet — which is what lets the task list update itself without a click.
+   */
+  private scheduleOpenCodeRelist(): void {
+    clearTimeout(this.#openCodeRelistTimer);
+    this.#openCodeRelistTimer = undefined;
+    if (this.#disposed || this.#bridge === undefined) return;
+    this.#openCodeRelistTimer = setTimeout(() => {
+      this.#openCodeRelistTimer = undefined;
+      // reconnectProvider is a no-op for the subscription when it is already
+      // live, and it re-lists the provider afterwards, which is what keeps the
+      // cached session list fresh.
+      void this.#bridge?.reconnectProvider("opencode").catch(() => undefined);
+      this.scheduleOpenCodeRelist();
+    }, OPENCODE_RELIST_MS);
+    this.#openCodeRelistTimer.unref();
   }
 }
 
