@@ -11672,7 +11672,6 @@ class _SessionScreenState extends State<SessionScreen>
                                                         size: 25),
                                                   ),
                                                 ),
-                                                const SizedBox(width: 2),
                                                 Expanded(
                                                   child:
                                                       _SessionComposerModelControl(
@@ -11912,21 +11911,6 @@ class _SessionScreenState extends State<SessionScreen>
                                                           height: 36,
                                                           alignment:
                                                               Alignment.center,
-                                                          decoration:
-                                                              BoxDecoration(
-                                                            shape:
-                                                                BoxShape.circle,
-                                                            color: sendEnabled ||
-                                                                    _preparingSubmission ||
-                                                                    _sending ||
-                                                                    _interruptingCurrentWork
-                                                                ? visual.accent
-                                                                : visual
-                                                                    .surfaceRaised,
-                                                            border: Border.all(
-                                                                color: visual
-                                                                    .border),
-                                                          ),
                                                           child: _preparingSubmission ||
                                                                   _sending ||
                                                                   _interruptingCurrentWork
@@ -11936,7 +11920,7 @@ class _SessionScreenState extends State<SessionScreen>
                                                                       _WorkingSpinner(
                                                                     size: 17,
                                                                     color: visual
-                                                                        .background,
+                                                                        .accent,
                                                                   ),
                                                                 )
                                                               : Icon(
@@ -11948,7 +11932,7 @@ class _SessionScreenState extends State<SessionScreen>
                                                                   size: 21,
                                                                   color: sendEnabled
                                                                       ? visual
-                                                                          .background
+                                                                          .accent
                                                                       : Theme.of(
                                                                               context)
                                                                           .disabledColor,
@@ -12092,12 +12076,12 @@ class _DictationComposerControl extends StatelessWidget {
                 child: ExcludeSemantics(
                   child: Material(
                     color: sourcePickerEnabled
-                        ? visual.surfaceRaised
+                        ? visual.surfaceRaised.withValues(alpha: .5)
                         : Colors.transparent,
                     shape: StadiumBorder(
                       side: BorderSide(
                         color: sourcePickerEnabled
-                            ? visual.border
+                            ? visual.border.withValues(alpha: .65)
                             : disabledColor.withValues(alpha: .35),
                       ),
                     ),
@@ -12108,7 +12092,12 @@ class _DictationComposerControl extends StatelessWidget {
                       child: Icon(
                         Icons.keyboard_arrow_down_rounded,
                         size: 13,
-                        color: sourcePickerEnabled ? null : disabledColor,
+                        color: sourcePickerEnabled
+                            ? Theme.of(context)
+                                .colorScheme
+                                .onSurface
+                                .withValues(alpha: .6)
+                            : disabledColor,
                       ),
                     ),
                   ),
@@ -14504,49 +14493,52 @@ class _SessionComposerModelControl extends StatelessWidget {
           enabled: modelEnabled,
           onTap: modelEnabled ? onTap : null,
           child: ExcludeSemantics(
-            child: TextButton(
-              key: const Key('model-control'),
-              onPressed: modelEnabled ? onTap : null,
-              style: TextButton.styleFrom(
-                foregroundColor: subdued,
-                disabledForegroundColor: subdued,
-                backgroundColor: visual.surfaceRaised.withValues(alpha: .7),
-                padding: const EdgeInsets.symmetric(horizontal: 9),
-                minimumSize: const Size(0, 44),
-                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(10)),
-              ),
-              child: Row(
-                children: <Widget>[
-                  Expanded(
-                    child: Text.rich(
-                      TextSpan(
-                        children: <InlineSpan>[
-                          TextSpan(
-                            text: modelLabel,
-                            style: const TextStyle(fontWeight: FontWeight.w600),
-                          ),
-                          if (reasoningVisible)
+            child: Center(
+              child: TextButton(
+                key: const Key('model-control'),
+                onPressed: modelEnabled ? onTap : null,
+                style: TextButton.styleFrom(
+                  foregroundColor: subdued,
+                  disabledForegroundColor: subdued,
+                  backgroundColor: visual.surfaceRaised.withValues(alpha: .7),
+                  padding: const EdgeInsets.fromLTRB(9, 4, 6, 4),
+                  minimumSize: const Size(0, 32),
+                  tapTargetSize: MaterialTapTargetSize.padded,
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(10)),
+                ),
+                child: Row(
+                  children: <Widget>[
+                    Expanded(
+                      child: Text.rich(
+                        TextSpan(
+                          children: <InlineSpan>[
                             TextSpan(
-                              text: '  ·  $reasoningLabel',
-                              style: TextStyle(
-                                color: effortIsUltra ? ultra : subdued,
-                                fontWeight: FontWeight.w600,
-                              ),
+                              text: modelLabel,
+                              style:
+                                  const TextStyle(fontWeight: FontWeight.w600),
                             ),
-                        ],
+                            if (reasoningVisible)
+                              TextSpan(
+                                text: '  ·  $reasoningLabel',
+                                style: TextStyle(
+                                  color: effortIsUltra ? ultra : subdued,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                          ],
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 12.5),
                       ),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(fontSize: 12.5),
                     ),
-                  ),
-                  if (modelEnabled) ...<Widget>[
-                    const SizedBox(width: 3),
-                    const Icon(Icons.expand_more_rounded, size: 17),
+                    if (modelEnabled) ...<Widget>[
+                      const SizedBox(width: 3),
+                      const Icon(Icons.expand_more_rounded, size: 17),
+                    ],
                   ],
-                ],
+                ),
               ),
             ),
           ),
