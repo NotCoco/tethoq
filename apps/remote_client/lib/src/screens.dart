@@ -16246,12 +16246,12 @@ class _MessageCard extends StatelessWidget {
               width: 34,
               child: showIdentity
                   ? Padding(
-                      padding: const EdgeInsets.only(top: 8),
+                      padding: const EdgeInsets.only(top: 9),
                       child: ProviderLogo(
                         key: ValueKey<String>(
                             'assistant-identity-$presentationId'),
                         providerId: providerId,
-                        size: 22,
+                        size: 28,
                       ),
                     )
                   : null,
@@ -17637,11 +17637,11 @@ class _MessageReasoningSpan extends StatelessWidget {
             width: 34,
             child: showIdentity
                 ? Padding(
-                    padding: const EdgeInsets.only(top: 11),
+                    padding: const EdgeInsets.only(top: 8),
                     child: ProviderLogo(
                       key: ValueKey<String>('assistant-identity-reasoning-$id'),
                       providerId: providerId,
-                      size: 22,
+                      size: 28,
                     ),
                   )
                 : null,
