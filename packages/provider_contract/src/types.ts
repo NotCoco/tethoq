@@ -225,6 +225,19 @@ export interface ProviderUserInputResponse {
   readonly answers: JsonObject;
 }
 
+export interface ProviderPermissionControl {
+  readonly id: string;
+  readonly label: string;
+  readonly description?: string;
+  readonly value: string;
+  readonly options: readonly { readonly value: string; readonly label: string; readonly description?: string; readonly disabled?: boolean }[];
+}
+
+export interface ProviderSessionPermissions {
+  readonly controls: readonly ProviderPermissionControl[];
+  readonly note?: string;
+}
+
 export interface ProviderApprovalRequest {
   readonly providerRequestId: string;
   readonly providerSessionId: string;
@@ -355,6 +368,9 @@ export interface AgentProviderAdapter {
   subscribe(providerSessionId: string | null, sink: ProviderEventSink): Promise<Subscription>;
   respondToApproval?(response: ProviderApprovalResponse): Promise<void>;
   respondToUserInput?(response: ProviderUserInputResponse): Promise<void>;
+  /** Native permission choices for this task, without changing harness-wide defaults. */
+  getSessionPermissions?(providerSessionId: string): Promise<ProviderSessionPermissions>;
+  setSessionPermission?(providerSessionId: string, controlId: string, value: string): Promise<ProviderSessionPermissions>;
   /**
    * Keeps live session/update notifications flowing without reloading complete
    * history. Returning false asks the client to retain its bounded history-poll

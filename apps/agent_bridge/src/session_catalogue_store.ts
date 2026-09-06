@@ -13,6 +13,8 @@ import { JsonFileStore } from "./persistence.js";
 export const maximumSessionCatalogueEntries = 500;
 
 interface SessionCatalogueEntry {
+  readonly userStopped?: boolean;
+  readonly interruptedAt?: string;
   readonly id: string;
   readonly hostId: string;
   readonly providerId: string;
@@ -45,6 +47,8 @@ interface PendingWrite {
 
 const stateKeys = new Set(["version", "sessions"]);
 const entryKeys = new Set([
+  "userStopped",
+  "interruptedAt",
   "id",
   "hostId",
   "providerId",
@@ -155,6 +159,8 @@ function parseEntry(value: unknown, expectedHostId: string): SessionCatalogueEnt
   const relationship = parseRelationship(value.relationship, expectedHostId);
   const agentNickname = optionalString(value.agentNickname, "agentNickname", 256);
   const agentRole = optionalString(value.agentRole, "agentRole", 256);
+  if (value.userStopped !== undefined && typeof value.userStopped !== "boolean") throw new Error("Session catalogue stop state is invalid");
+  const interruptedAt = optionalTimestamp(value.interruptedAt, "interruptedAt");
 
   return {
     id,
@@ -175,6 +181,8 @@ function parseEntry(value: unknown, expectedHostId: string): SessionCatalogueEnt
     ...(relationship !== undefined ? { relationship } : {}),
     ...(agentNickname !== undefined ? { agentNickname } : {}),
     ...(agentRole !== undefined ? { agentRole } : {}),
+    ...(value.userStopped === true ? { userStopped: true } : {}),
+    ...(interruptedAt !== undefined ? { interruptedAt } : {}),
   };
 }
 
@@ -211,6 +219,8 @@ function entryFromSession(session: RemoteSession, expectedHostId: string): Sessi
       ...(session.relationship !== undefined ? { relationship: session.relationship } : {}),
       ...(session.agentNickname !== undefined ? { agentNickname: session.agentNickname } : {}),
       ...(session.agentRole !== undefined ? { agentRole: session.agentRole } : {}),
+      ...(session.nativeMetadata.tethoqUserStopped === true ? { userStopped: true } : {}),
+      ...(typeof session.nativeMetadata.tethoqInterruptedAt === "string" ? { interruptedAt: session.nativeMetadata.tethoqInterruptedAt } : {}),
     }, expectedHostId);
   } catch {
     // One malformed provider row must not prevent valid catalogue rows from
@@ -232,14 +242,18 @@ function persistedState(sessions: readonly RemoteSession[], expectedHostId: stri
 }
 
 function hydratedSession(entry: SessionCatalogueEntry): RemoteSession {
+  const { userStopped, interruptedAt, ...session } = entry;
   return {
-    ...entry,
+    ...session,
     // A catalogue is evidence that the task exists, not evidence that it is
     // still running or waiting for the user after this process restarted.
     state: "unknown",
     needsApproval: false,
     stale: true,
-    nativeMetadata: {},
+    nativeMetadata: {
+      ...(userStopped === true ? { tethoqUserStopped: true } : {}),
+      ...(interruptedAt !== undefined ? { tethoqInterruptedAt: interruptedAt } : {}),
+    },
   };
 }
 

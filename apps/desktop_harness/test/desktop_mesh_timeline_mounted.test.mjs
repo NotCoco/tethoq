@@ -114,7 +114,7 @@ test("mounted Mesh child row settles and opens only its exact child by pointer o
           const missing = await resolveTimelineSubagentSession("mesh-parent", "missing-child", [], async () => [sibling, exactChild]);
           check(missing === null, "a missing child id must not fabricate a partial task");
 
-          const { mapMessages } = await import("./src/renderer/src/bridge.ts");
+          const { mapMessages, eventToTimeline } = await import("./src/renderer/src/bridge.ts");
           const mesh = {
             delegationId: "mesh-turn",
             targets: [
@@ -226,6 +226,31 @@ test("mounted Mesh child row settles and opens only its exact child by pointer o
           check(detailSize < primarySize, "secondary child detail should remain quieter than the action label");
           check(getComputedStyle(row.querySelector("strong")).animationName === "none", "the settled spawn label must never shimmer");
           check(row.getBoundingClientRect().width <= 720 && row.getBoundingClientRect().height >= 42, "the row should keep a compact full-width target");
+          const crossTaskMessage = eventToTimeline({
+            eventId: "remote-message", sessionId: "mesh-parent", providerId: "codex", type: "message.completed",
+            occurredAt: "2026-09-03T10:59:55.000Z",
+            payload: { role: "user", messageId: "remote-message", text: "Please confirm the final build is ready.", origin: {
+              kind: "cross_session", envelopeId: "remote_verified", sourceSessionId: "integration-task", sourceTitle: "Final integration and verification",
+            } },
+          });
+          const stoppedHost = host.cloneNode(false);
+          document.body.append(stoppedHost);
+          host.style.display = "none";
+          const stoppedRoot = createRoot(stoppedHost);
+          stoppedRoot.render(<ChatTimeline timeline={[crossTaskMessage, { ...childRow("completed"), childInterruptedAt: "2026-09-03T11:00:01.000Z" }]}
+            providerId="opencode" active={false} reasoningDisplay="expanded" onOpenSubagent={onOpenSubagent} />);
+          await settle();
+          const stopped = stoppedHost.querySelector(".spawned-subagent-row");
+          check(stopped?.dataset.childState === "stopped" && stopped.querySelector(".spawned-subagent-state")?.textContent?.trim() === "stopped", "confirmed interruption must visibly say stopped");
+          check(!stopped.hasAttribute("aria-busy") && !stopped.querySelector(".spinner"), "a stopped child must have no running presentation");
+          const origin = stoppedHost.querySelector(".message-origin");
+          const cleanBody = stoppedHost.querySelector(".message-user .message-body");
+          check(origin?.textContent?.includes("Final integration and verification"), "a live cross-task message must show its sender");
+          check(origin.getBoundingClientRect().bottom <= cleanBody.getBoundingClientRect().top, "sender attribution must sit above the message body");
+          check(cleanBody.textContent === "Please confirm the final build is ready." && !document.body.textContent.includes("TETHOQ_REMOTE_MESSAGE_V1"), "routing metadata leaked into the readable message");
+          window.__meshQaStoppedReady = true;
+          await new Promise((resolve) => { const wait = () => window.__meshQaStoppedCaptured === true ? resolve() : setTimeout(wait, 10); wait(); });
+          stoppedRoot.unmount(); stoppedHost.remove(); host.style.display = "";
           root.render(<ChatTimeline
             timeline={[childRow("completed"), user, reasoning, answer,
               { ...user, id: "later-user", delegationId: "later-mesh", body: "A later request", mesh: undefined },
@@ -260,14 +285,12 @@ test("mounted Mesh child row settles and opens only its exact child by pointer o
         true,
       );
       app.whenReady().then(async () => {
-        const window = new BrowserWindow({ show: false, x: -10000, y: -10000, width: 840, height: 520, backgroundColor: "#10100f", webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false } });
+        const window = new BrowserWindow({ show: false, width: 840, height: 520, backgroundColor: "#10100f", webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false, offscreen: true } });
         await window.loadFile(process.argv[2]);
         window.webContents.debugger.attach("1.3");
-        window.showInactive();
         const screenshotPath = process.env.TETHOQ_MESH_QA_SCREENSHOT;
-        // The window is shown offscreen so it owns a real compositor surface:
-        // a never-shown window keeps returning its first painted frame, which
-        // would let a stale "running" pixel pose as the settled state.
+        // Offscreen rendering supplies fresh compositor frames without showing
+        // a test window or disturbing the user's active application.
         const capture = async (suffix) => {
           if (!screenshotPath) return;
           await new Promise((resolve) => setTimeout(resolve, 150));
@@ -280,6 +303,9 @@ test("mounted Mesh child row settles and opens only its exact child by pointer o
         await waitFor(window, "window.__meshQaCollapsedReady === true || window.__meshQaResult !== undefined");
         await capture("-collapsed");
         await window.webContents.executeJavaScript("window.__meshQaCollapsedCaptured = true", true);
+        await waitFor(window, "window.__meshQaStoppedReady === true || window.__meshQaResult !== undefined");
+        await capture("-stopped");
+        await window.webContents.executeJavaScript("window.__meshQaStoppedCaptured = true", true);
         await waitFor(window, "window.__meshQaVisualReady === true || window.__meshQaResult !== undefined");
         const earlyResult = await window.webContents.executeJavaScript("window.__meshQaResult", true);
         if (earlyResult) {

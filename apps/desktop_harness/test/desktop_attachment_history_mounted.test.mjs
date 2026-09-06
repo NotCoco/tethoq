@@ -755,6 +755,8 @@ test("a continued Codex rollout with a multi-megabyte image reaches one mounted 
           app.setPath("userData", join(${JSON.stringify(outputDirectory)}, "profile"));
           app.whenReady().then(async () => {
             await bridge.start();
+            // This history fixture does not forward catalogue events to the renderer.
+            await bridge.bootstrapSessions();
             ipcMain.handle("tethoq:request", async (_event, type, payload = {}) => {
               const sequence = ++requestIndex;
               const requestId = "request-" + sequence;

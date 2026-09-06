@@ -120,7 +120,7 @@ export interface TranscriptionSourceDescriptor {
   };
 }
 
-export const sessionRelationshipKinds = ["handoff", "branch", "subagent", "side_chat"] as const;
+export const sessionRelationshipKinds = ["handoff", "branch", "subagent", "side_chat", "model_switch"] as const;
 export type SessionRelationshipKind = (typeof sessionRelationshipKinds)[number];
 
 export const sessionKinds = ["task", "side_chat", "internal"] as const;
@@ -548,6 +548,7 @@ export interface DelegationChild {
   readonly modelId?: string;
   readonly reasoningEffort?: string;
   readonly state: SessionState;
+  readonly interruptedAt?: string;
   readonly error?: string;
 }
 
@@ -558,6 +559,7 @@ export interface DelegationTask {
   readonly state: DelegationState;
   readonly createdAt: string;
   readonly updatedAt: string;
+  readonly interruptedAt?: string;
   readonly children: readonly DelegationChild[];
   /** Present only for turns whose selected targets are dispatched by the parent model. */
   readonly orchestration?: "parent";

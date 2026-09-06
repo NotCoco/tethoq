@@ -66,6 +66,20 @@ test("an unchanged session still accepts canonical refresh state", () => {
   assert.equal(merged[0], refreshed);
 });
 
+test("confirmed interruption rejects stale working snapshots and accepts a newer resumed turn", () => {
+  const interruptedAt = "2026-09-06T12:00:00.000Z";
+  const stopped = session({ state: "idle", updatedAt: interruptedAt, interruptedAt });
+  const stale = session({ state: "working", updatedAt: "2026-09-06T11:59:59.000Z" });
+  assert.strictEqual(mergeRefreshedSessions([stopped], [stale])[0], stopped);
+  const resumed = session({ state: "working", updatedAt: "2026-09-06T12:00:01.000Z" });
+  const reopened = mergeAuthoritativeOpenedSession(stopped, resumed);
+  assert.equal(reopened.state, "working");
+  assert.equal(reopened.interruptedAt, undefined);
+  const confirmed = mergeAuthoritativeOpenedSession(stale, stopped);
+  assert.equal(confirmed.state, "idle");
+  assert.equal(confirmed.interruptedAt, interruptedAt);
+});
+
 test("an authoritative opened task retires stale activity without losing local organisation", () => {
   const current = session({
     providerId: "codex",

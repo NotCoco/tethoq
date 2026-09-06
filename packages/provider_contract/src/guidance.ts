@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { visibleContextTransferText } from "../../protocol/src/context_visibility.js";
 import type { WorkflowReference } from "../../protocol/src/index.js";
 import type { SendMessageRequest } from "./types.js";
 
@@ -62,7 +63,7 @@ export function isProviderContinuationContent(value: string): boolean {
 
 /** Keeps fallback control guidance out of normalized user-visible history. */
 export function stripProviderPromptGuidance(value: string): string {
-  const visible = withoutResponseGuidance(value);
+  const visible = visibleContextTransferText(withoutResponseGuidance(value));
   const control = visible.trim();
   return control.startsWith(hiddenControlStart) && control.endsWith(hiddenControlEnd) ? "" : visible;
 }

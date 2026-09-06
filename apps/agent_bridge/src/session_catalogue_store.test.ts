@@ -66,6 +66,21 @@ test("session catalogue persists only bounded display identity and hydrates as u
   assert.equal(restored.providerStatus, undefined);
 });
 
+test("session catalogue retains explicit Stop across restart and clears it on resume", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "tethoq-session-catalogue-stop-"));
+  t.after(async () => await rm(directory, { recursive: true, force: true }));
+  const path = join(directory, "session-catalogue.json");
+  const hostId = "catalogue-host";
+  const store = new SessionCatalogueStore(path, hostId);
+  const stopped = { ...session(hostId, "stopped"), nativeMetadata: { tethoqUserStopped: true, tethoqInterruptedAt: "2026-09-06T12:00:00.000Z" } };
+  store.scheduleWrite([stopped]);
+  await store.flush();
+  assert.deepEqual((await store.read())[0]?.nativeMetadata, stopped.nativeMetadata);
+  store.scheduleWrite([{ ...stopped, nativeMetadata: { tethoqUserStopped: false, tethoqInterruptedAt: null } }]);
+  await store.flush();
+  assert.deepEqual((await store.read())[0]?.nativeMetadata, {});
+});
+
 test("session catalogue ignores corrupt, unexpected, and cross-host cache data", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "tethoq-session-catalogue-corrupt-"));
   t.after(async () => await rm(directory, { recursive: true, force: true }));

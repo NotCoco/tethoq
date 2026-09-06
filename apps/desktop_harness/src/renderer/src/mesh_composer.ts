@@ -4,6 +4,16 @@ import type { MeshTarget } from "./Composer";
 // requests retain plain text and separate target positions.
 const markerPattern = /[\uE000-\uF8FF]/gu;
 
+/** Only the @ token at a collapsed caret is eligible; email/URL text is prose. */
+export function meshMentionAtCaret(value: string, caret: number) {
+  if (caret < 0 || caret > value.length) return null;
+  const match = /(?:^|[\s\uE000-\uF8FF])@([\p{L}\p{N}_.:/-]*)$/u.exec(value.slice(0, caret));
+  if (!match) return null;
+  const query = match[1]!;
+  const suffix = /^[\p{L}\p{N}_.:/-]*/u.exec(value.slice(caret))![0];
+  return { start: caret - query.length - 1, end: caret + suffix.length, query };
+}
+
 export function meshTargetRoute({ providerId, modelId, reasoningEffort }: MeshTarget) {
   return { providerId, ...(modelId ? { modelId } : {}), ...(reasoningEffort ? { reasoningEffort } : {}) };
 }

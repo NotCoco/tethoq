@@ -21,7 +21,11 @@ export function HarnessConnections({ snapshot, bootstrap, selected, onSelect, on
   const guide = HARNESS_GUIDES.find((item) => item.id === selected) ?? HARNESS_GUIDES.find((item) => item.id === "other")!;
   const provider = snapshot.providers.find((item) => item.id === guide.id);
   const issue = issues.find((item) => item.providerId === guide.id);
-  const prompt = harnessSetupPrompt(guide.id, { ...(bootstrap ? { connectorDirectory: bootstrap.connectors.directory, platform: bootstrap.app.platform } : {}) });
+  const prompt = harnessSetupPrompt(guide.id, bootstrap ? {
+    connectorDirectory: bootstrap.connectors.directory,
+    platform: bootstrap.app.platform,
+    ...(!isBrowserPreview ? { packaged: bootstrap.app.packaged } : {}),
+  } : {});
   const ready = provider?.state === "online" && provider.authenticated && !issue;
   const state = guide.id === "other" ? "Connector setup" : issue ? "Tool setup needs attention" : ready ? "Connected" : provider?.detected ? "Check sign-in or connection" : "Not connected";
   const copy = async () => {
@@ -54,7 +58,7 @@ export function HarnessConnections({ snapshot, bootstrap, selected, onSelect, on
       </div>
       <details className="harness-setup-details"><summary>Connection details &amp; setup prompt</summary>
         {guide.command ? <p>Protocol launch: <code>{guide.command} {guide.args?.join(" ")}</code></p> : null}
-        <p>{guide.tools}</p><p>Give this prompt to a coding agent with access to your Tethoq checkout. It includes the connection contract, tool wiring and verification steps.</p>
+        <p>{guide.tools}</p><p>Give this prompt to a coding agent with access to this computer. {bootstrap && !isBrowserPreview ? bootstrap.app.packaged ? "It includes setup instructions for your installed app." : "It includes setup instructions for your source checkout." : "It asks the agent to identify your installation before setup."}</p>
         <textarea aria-label={`${guide.name} setup prompt`} readOnly value={prompt} spellCheck={false} />
       </details>
     </div>

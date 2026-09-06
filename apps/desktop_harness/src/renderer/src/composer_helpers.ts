@@ -62,8 +62,9 @@ export const composerSlashCommands: readonly ComposerSlashCommand[] = [
   {
     id: "goal",
     command: "/goal",
-    description: "Set or manage this task's goal",
+    description: "Send the next message as this task's goal",
   },
+  { id: "permission", command: "/permission", description: "Choose this task’s harness permissions" },
   {
     id: "ears",
     command: "/ears",

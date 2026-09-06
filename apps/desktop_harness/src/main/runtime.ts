@@ -564,6 +564,7 @@ export class DesktopRuntime {
         }),
         new CodexAdapter({
           hostId: this.#config.hostId,
+          permissionStatePath: join(dirname(this.#configPath), "codex-task-permissions.json"),
           ...(codexCommand !== undefined ? { command: codexCommand } : {}),
           ...(codexArgs !== undefined ? { commandArgs: codexArgs } : {}),
           localActivity: { retirementStatePath: join(dirname(this.#configPath), "codex-activity-retirements.json") },

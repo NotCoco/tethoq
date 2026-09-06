@@ -29,6 +29,7 @@ function sameSession(left: Session, right: Session): boolean {
     && left.providerId === right.providerId
     && left.title === right.title
     && left.state === right.state
+    && left.interruptedAt === right.interruptedAt
     && left.project === right.project
     && left.workingDirectory === right.workingDirectory
     && left.preview === right.preview
@@ -64,7 +65,8 @@ export function mergeRefreshedSessions(
     if (!existing) return session;
     if (preserveExisting?.(session.id) === true) return existing;
     const keepEffort = isAmbiguousSelectionValue(session.effort) && !isAmbiguousSelectionValue(existing.effort);
-    const existingTerminal = existing.state === "completed" || existing.state === "failed";
+    const existingTerminal = existing.state === "completed" || existing.state === "failed"
+      || existing.state === "idle" && existing.interruptedAt !== undefined;
     const incomingLive = session.state === "working" || session.state === "needs_approval" || session.state === "needs_input";
     if (existingTerminal && incomingLive) {
       const existingUpdatedAt = Date.parse(existing.updatedAt);
@@ -119,6 +121,7 @@ export function mergeAuthoritativeOpenedSession(current: Session, opened: Sessio
   if (opened.providerStatus === undefined) delete candidate.providerStatus;
   if (opened.externalWriter !== true) delete candidate.externalWriter;
   if (opened.previewKind === undefined) delete candidate.previewKind;
+  if (opened.interruptedAt === undefined) delete candidate.interruptedAt;
   return mergeRefreshedSessions([current], [candidate], () => true, () => false)[0] ?? current;
 }
 

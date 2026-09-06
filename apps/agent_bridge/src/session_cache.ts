@@ -2,12 +2,15 @@ import type { JsonObject, RemoteSession } from "../../../packages/protocol/src/i
 import type { SessionSelection } from "./session_selection_store.js";
 
 const bridgeNativeMetadataKeys = [
+  "tethoqUserStopped",
+  "tethoqInterruptedAt",
   "relationshipKind",
   "relationshipSourceSessionId",
   "relationshipStrategy",
   "tethoqHandoffSummary",
   "tethoqHandoffPrompt",
   "tethoqHandoffPending",
+  "tethoqModelSwitchSummary",
   "tethoqBranchBootstrap",
   "tethoqBranchPending",
   "tethoqSessionKind",

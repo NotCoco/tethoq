@@ -204,6 +204,8 @@ test("IPC request routing is allowlisted and provider targets are validated", as
   assert.ok(allowed.includes("session.goal.get"));
   assert.ok(allowed.includes("session.goal.set"));
   assert.ok(allowed.includes("session.goal.clear"));
+  assert.ok(allowed.includes("session.permissions.get"));
+  assert.ok(allowed.includes("session.permissions.set"));
   assert.ok(allowed.includes("session.context.clear_threshold"));
   assert.ok(allowed.includes("wallet.get"));
   assert.ok(allowed.includes("wallet.configure"));

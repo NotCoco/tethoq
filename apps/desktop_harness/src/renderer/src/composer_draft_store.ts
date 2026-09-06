@@ -7,7 +7,7 @@ export interface ComposerDraftStores {
   attachments: Record<string, readonly ComposerAttachment[]>;
   workflows: Record<string, readonly WorkflowAttachment[]>;
   annotations: Record<string, readonly ResponseAnnotation[]>;
-  modes: Record<string, "queue" | "steer">;
+  modes: Record<string, "queue" | "steer" | "goal">;
   meshTargets: Record<string, readonly MeshTarget[]>;
 }
 

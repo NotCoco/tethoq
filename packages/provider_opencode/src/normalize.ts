@@ -207,6 +207,20 @@ function openCodeToolPresentation(tool: string, input: Record<string, unknown>, 
   const displayPath = filePath === undefined ? undefined : singleLineToolText(filePath);
   const displayCommand = command === undefined ? undefined : singleLineToolText(command);
 
+  if (normalizedTool === "question") {
+    const questions = Array.isArray(input.questions) ? input.questions.filter(isRecord) : [];
+    const prompts = questions.flatMap((question) => {
+      if (typeof question.question !== "string" || !question.question.trim()) return [];
+      const choices = Array.isArray(question.options) ? question.options.filter(isRecord).flatMap((option) =>
+        typeof option.label === "string" ? [`- ${option.label}${typeof option.description === "string" && option.description ? `: ${option.description}` : ""}`] : []) : [];
+      return [[question.question, ...choices].join("\n")];
+    });
+    return {
+      name: "Question",
+      body: [...prompts, output?.trim() || (status === "running" ? "Waiting for your answer." : emptyToolResult(status))].join("\n\n"),
+    };
+  }
+
   if (/\b(?:edit|patch|replace|modify|update)\b/u.test(normalizedTool) && displayPath) {
     const detail = [
       `File: ${filePath}`,

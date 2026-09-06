@@ -1,3 +1,4 @@
+import { QuestionCard } from "./QuestionCard";
 import { forwardRef, useCallback, useEffect, useId, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
 import { flushSync } from "react-dom";
 import { meshTargetRoute, moveMeshTargets } from "./mesh_composer";
@@ -10,6 +11,7 @@ import {
   eventClearsProviderStatus,
   demoBrowserState,
   isBrowserPreview,
+  isDeliveryUnknownError,
   loadInitialSnapshot,
   listChildSessions,
   listSessions,
@@ -21,6 +23,7 @@ import {
   mapSessionGoal,
   loadSessionTimelinePage,
   providerStatusValue,
+  reconcileSubagentTimeline,
   watchSession,
   unwatchSession,
   reconnectProvider,
@@ -82,10 +85,8 @@ import {
   FolderIcon,
   GlobeIcon,
   PlusIcon,
-  QuestionIcon,
   RefreshIcon,
   SearchIcon,
-  SendIcon,
   ShieldIcon,
   StopIcon,
   DownloadIcon,
@@ -245,6 +246,7 @@ function replaceSession(sessions: Session[], sessionId: string, update: SessionU
     if (session.id !== sessionId) return session;
     const { providerStatus, schedule, ...rest } = update;
     const merged = { ...session, ...rest };
+    if (rest.state !== undefined && rest.state !== "idle") delete merged.interruptedAt;
     const withSchedule = schedule === null
       ? (() => { const { schedule: _removed, ...withoutSchedule } = merged; return withoutSchedule; })()
       : schedule ? { ...merged, schedule } : merged;
@@ -318,7 +320,7 @@ function derivedSession(value: Record<string, unknown>, source: Session): Sessio
   const relationship = value.relationship && typeof value.relationship === "object" && !Array.isArray(value.relationship)
     ? value.relationship as Record<string, unknown>
     : undefined;
-  const relationshipKind = relationship && typeof relationship.kind === "string" && ["handoff", "branch", "subagent", "side_chat"].includes(relationship.kind)
+  const relationshipKind = relationship && typeof relationship.kind === "string" && ["handoff", "branch", "subagent", "side_chat", "model_switch"].includes(relationship.kind)
     ? relationship.kind as Session["relationshipKind"]
     : undefined;
   const relationshipSourceSessionId = relationship && typeof relationship.sourceSessionId === "string" && relationship.sourceSessionId
@@ -568,6 +570,7 @@ type SideChatDraftUpdate = SideChatDraft | ((current: SideChatDraft) => SideChat
 interface DraftMaterializationResult {
   readonly session: Session;
   readonly firstInstructionIncluded: boolean;
+  readonly timeline?: readonly TimelineItem[];
 }
 
 interface DraftMaterializationRecord {
@@ -614,9 +617,8 @@ function App() {
   // previous turn cannot suppress the task-list spinner, reasoning shimmer, or
   // Stop/queue controls for the newer work.
   const workingBoundaryBySession = useRef(new Map<string, SessionWorkingBoundary>());
-  // Stop is a user-owned visual terminal boundary. Keep provider truth and
-  // partial output flowing underneath, but do not let late same-turn events
-  // reacquire spinners or shimmer while the interrupt request settles.
+  // Confirmed interruptions suppress stale same-turn presentation. An in-flight
+  // Stop request must keep displaying provider state until it is acknowledged.
   const stopPresentationSessionIdsRef = useRef(new Set<string>());
   const [stopPresentationSessionIds, setStopPresentationSessionIds] = useState<ReadonlySet<string>>(() => new Set());
   const setStopPresentation = useCallback((sessionId: string, active: boolean) => {
@@ -744,7 +746,7 @@ function App() {
   const composerAttachments = useRef<Record<string, readonly ComposerAttachment[]>>({});
   const composerWorkflowAttachments = useRef<Record<string, readonly WorkflowAttachment[]>>({});
   const composerAnnotations = useRef<Record<string, readonly ResponseAnnotation[]>>({});
-  const composerModes = useRef<Record<string, "queue" | "steer">>({});
+  const composerModes = useRef<Record<string, "queue" | "steer" | "goal">>({});
   const composerMeshTargets = useRef<Record<string, readonly MeshTarget[]>>({});
   const composerDelegationDrafts = useRef<Record<string, DelegationDraft>>({});
   const composerScheduleAttempts = useRef<Record<string, DraftScheduleAttemptRecord>>({});
@@ -2032,7 +2034,10 @@ function App() {
           if (event.type === "agent.completed" || event.type === "agent.interrupted" || event.type === "agent.error") {
             if (event.type === "agent.completed" && agentCompletionActions.get(eventIndex) !== "apply") continue;
             const state: SessionState = event.type === "agent.completed" ? "completed" : event.type === "agent.interrupted" ? "idle" : "failed";
-            next.sessions = replaceSession(next.sessions, event.sessionId, { state, providerStatus: null, updatedAt: event.occurredAt });
+            next.sessions = replaceSession(next.sessions, event.sessionId, {
+              state, providerStatus: null, updatedAt: event.occurredAt,
+              ...(event.type === "agent.interrupted" ? { interruptedAt: event.occurredAt } : {}),
+            });
             // Not every harness closes its rows: OpenCode ends a turn with an idle
             // event and never sends message.completed. Settling here is what stops
             // a finished answer from shimmering until the user clicks it.
@@ -2160,17 +2165,17 @@ function App() {
     try {
       const dirty = hiddenTimelineDirtySessionIds.current.has(sessionId);
       const generation = liveTimelineGenerationBySession.current.get(sessionId) ?? 0;
-      const page = await loadTimelinePage(sessionId, undefined, HISTORY_PAGE_LIMIT, dirty);
+      const page = await loadTimelinePage(sessionId, undefined, HISTORY_PAGE_LIMIT, force || dirty);
       const observed = snapshotRef.current;
       const recentItems = reconcileTimelinePage(page.items, observed?.timelines[sessionId] ?? alreadyLoaded ?? []);
       const refreshIsCurrent = () => (liveTimelineGenerationBySession.current.get(sessionId) ?? 0) === generation;
-      seedWorkingBoundary(dirty && refreshIsCurrent()
+      seedWorkingBoundary((force || dirty) && refreshIsCurrent()
         ? page.session ?? observed?.sessions.find((session) => session.id === sessionId)
         : observed?.sessions.find((session) => session.id === sessionId) ?? page.session, recentItems);
       setSnapshot((current) => {
         if (!current) return current;
         hiddenTimelineDirtySessionIds.current.delete(sessionId);
-        const sessions = dirty && refreshIsCurrent()
+        const sessions = (force || dirty) && refreshIsCurrent()
           ? applyOpenedSessionRefresh(current.sessions, page.session)
           : applyOpenedSessionPreview(current.sessions, page.session);
         return { ...current, sessions, timelines: { ...current.timelines, [sessionId]: reconcileTimelinePage(page.items, current.timelines[sessionId] ?? []) } };
@@ -2358,42 +2363,6 @@ function App() {
     if (initialSendError !== undefined) notify(initialSendError, "error");
   }, [notify, openSideChatPanel]);
 
-  const createContextHandoff = useCallback(async (parentSessionId: string, customNote: string) => {
-    const source = snapshotRef.current?.sessions.find((session) => session.id === parentSessionId && !isSideChatSession(session));
-    if (!source) throw new Error("The parent task is no longer available.");
-    const trimmedNote = customNote.trim();
-    // Use the side-chat model so the same model prepares the pickup prompt with
-    // the parent's full context, while the main conversation stays untouched.
-    const response = await request("side_chat.create", { parentSessionId });
-    if (!response.session || typeof response.session !== "object" || Array.isArray(response.session)) throw new Error("Bridge did not return the side chat.");
-    const next = derivedSession(response.session as Record<string, unknown>, source);
-    const sideChat: Session = { ...next, sessionKind: "side_chat", parentSessionId, preview: trimmedNote ? `Handoff: ${trimmedNote.slice(0, 120)}` : "Context handoff pickup prompt" };
-    setSnapshot((current) => current ? { ...current, sessions: [sideChat, ...current.sessions.filter((session) => session.id !== sideChat.id)] } : current);
-    const marker: TimelineItem = {
-      id: `local-handoff-${Date.now()}`,
-      presentationId: `local-handoff-${Date.now()}`,
-      kind: "tool",
-      title: trimmedNote ? "Custom context handoff" : "Context handoff",
-      body: trimmedNote,
-      detail: sideChat.id,
-      timestamp: new Date().toISOString(),
-      state: "completed",
-    };
-    setSnapshot((current) => {
-      if (!current) return current;
-      const existing = current.timelines[parentSessionId] ?? [];
-      if (existing.some((item) => item.presentationId === marker.presentationId)) return current;
-      return { ...current, timelines: { ...current.timelines, [parentSessionId]: [...existing, marker] } };
-    });
-    try {
-      await request("session.send_message", { sessionId: sideChat.id, content: buildContextHandoffInstruction(trimmedNote) });
-    } catch (error) {
-      notify(error instanceof Error ? error.message : String(error), "error");
-      return;
-    }
-    notify(trimmedNote ? "Custom handoff prompt requested in a side chat" : "Handoff prompt requested in a side chat");
-  }, [notify]);
-
   const promoteSideChat = useCallback(async (sessionId: string) => {
     const selectedAtStart = selectedSessionIdRef.current;
     const viewAtStart = viewRef.current;
@@ -2488,6 +2457,43 @@ function App() {
     });
     return true;
   }, []);
+
+  const createContextHandoff = useCallback(async (parentSessionId: string, customNote: string) => {
+    const source = snapshotRef.current?.sessions.find((session) => session.id === parentSessionId && !isSideChatSession(session));
+    if (!source) throw new Error("The parent task is no longer available.");
+    const trimmedNote = customNote.trim();
+    const content = buildContextHandoffInstruction(trimmedNote);
+    const response = await request("side_chat.create", { parentSessionId });
+    if (!response.session || typeof response.session !== "object" || Array.isArray(response.session)) throw new Error("Bridge did not return the side chat.");
+    const next = derivedSession(response.session as Record<string, unknown>, source);
+    const sideChat: Session = { ...next, sessionKind: "side_chat", parentSessionId };
+    const timestamp = new Date().toISOString();
+    const id = `local-handoff-${crypto.randomUUID()}`;
+    const promptId = `local-${Date.now()}`;
+    const prompt: TimelineItem = { id: promptId, presentationId: promptId, kind: "user", body: content, timestamp, state: "completed" };
+    const marker: TimelineItem = { id, presentationId: id, kind: "tool", title: trimmedNote ? "Custom context handoff" : "Context handoff", body: trimmedNote, detail: sideChat.id, timestamp, state: "completed" };
+    beginSideChatSend(sideChat.id);
+    setSnapshot((current) => current ? {
+      ...current,
+      sessions: [{ ...sideChat, state: "working", preview: content, updatedAt: timestamp }, ...current.sessions.filter((session) => session.id !== sideChat.id)],
+      timelines: {
+        ...current.timelines,
+        [parentSessionId]: [...(current.timelines[parentSessionId] ?? []), marker],
+        [sideChat.id]: mergeAcceptedComposerRow(current.timelines[sideChat.id] ?? [], prompt, new Set()),
+      },
+    } : current);
+    const parentElement = document.querySelector<HTMLElement>(`[data-session-id="${CSS.escape(parentSessionId)}"]`);
+    const bounds = parentElement?.getBoundingClientRect();
+    openSideChatPanel(sideChat.id, { x: bounds?.right ?? 248, y: bounds ? bounds.top + bounds.height / 2 : Math.max(110, window.innerHeight - 210) });
+    try {
+      await request("session.send_message", { sessionId: sideChat.id, content });
+    } catch (error) {
+      if (!isDeliveryUnknownError(error)) rollbackSideChatSend(sideChat.id, prompt.id, timestamp, sideChat, { content, attachments: [] });
+      notify(error instanceof Error ? error.message : String(error), "error");
+    } finally {
+      finishSideChatSend(sideChat.id);
+    }
+  }, [beginSideChatSend, finishSideChatSend, notify, openSideChatPanel, rollbackSideChatSend]);
 
   const updateSideChatAnchor = useCallback((sessionId: string, anchor: SideChatAnchor) => {
     setOpenSideChats((current) => current.map((item) => item.id === sessionId && (item.anchor.x !== anchor.x || item.anchor.y !== anchor.y) ? { ...item, anchor } : item));
@@ -2694,8 +2700,8 @@ function App() {
       const existing = snapshotRef.current?.sessions.find((session) => session.id === resolvedSessionId);
       if (existing) return Promise.resolve({ session: existing, firstInstructionIncluded: false });
     }
-    const source = snapshotRef.current?.sessions.find((session) => session.id === input.draftSessionId && session.draft === true);
-    if (!source) return Promise.reject(new Error("This draft is no longer available."));
+    const source = snapshotRef.current?.sessions.find((session) => session.id === input.draftSessionId);
+    if (!source || (!source.draft && source.providerId === input.providerId)) return Promise.reject(new Error("This task is no longer available for creation or a model switch."));
     if (!input.workingDirectory.trim()) return Promise.reject(new Error("Choose a project folder before starting this task."));
     const modelFields = {
       ...(!isAmbiguousSelectionValue(input.modelId) ? { modelId: input.modelId } : {}),
@@ -2708,6 +2714,19 @@ function App() {
       || "New task";
     let record: DraftMaterializationRecord;
     const promise = (async (): Promise<DraftMaterializationResult> => {
+      if (!source.draft) {
+        const response = await request("session.switch_model", {
+          sessionId: source.id,
+          providerId: input.providerId,
+          modelId: input.modelId,
+          ...(input.effort ? { reasoningEffort: input.effort } : {}),
+          requestId: input.requestId!,
+        });
+        if (!response.session || typeof response.session !== "object" || Array.isArray(response.session)) throw new Error("The coding tool did not return the continued task");
+        const next = derivedSession(response.session as Record<string, unknown>, source);
+        const page = await loadTimelinePage(next.id);
+        return { session: next, firstInstructionIncluded: false, timeline: page.items };
+      }
       const response = await request("session.create", {
         providerId: input.providerId,
         workingDirectory: input.workingDirectory,
@@ -2729,7 +2748,7 @@ function App() {
       if (composerDraftMaterializations.current.get(input.draftSessionId) === record) composerDraftMaterializations.current.delete(input.draftSessionId);
     });
     return promise;
-  }, [resolveComposerDraftSessionId]);
+  }, [loadTimelinePage, resolveComposerDraftSessionId]);
 
   const commitDraftMaterialization = useCallback((input: DraftSessionMaterializeInput, result: DraftMaterializationResult, presentation: {
     readonly acceptedItem?: TimelineItem;
@@ -2747,6 +2766,9 @@ function App() {
       composerDraftSessionAliases.current[input.draftSessionId] = sessionId;
       moveTaskOverride(input.draftSessionId, sessionId);
       rebindComposerDraftState(composerDraftStore, input.draftSessionId, sessionId, retainedDraft);
+      // A different harness starts a fresh native turn; an old Steer mode cannot
+      // steer that idle session. Later turns can use its ordinary task controls.
+      if (result.session.relationshipKind === "model_switch" && composerDraftStore.modes[sessionId] === "steer") composerDraftStore.modes[sessionId] = "queue";
       delete composerDelegationDrafts.current[input.draftSessionId];
       if (retainedDelegationDraft && composerDelegationDrafts.current[sessionId] === undefined) composerDelegationDrafts.current[sessionId] = retainedDelegationDraft;
       setQueueingBySession((current) => {
@@ -2773,7 +2795,10 @@ function App() {
       const draftTimeline = timelines[input.draftSessionId] ?? [];
       const providerTimeline = timelines[sessionId] ?? [];
       delete timelines[input.draftSessionId];
-      let combinedTimeline = providerTimeline.reduce((combined, item) => mergeTimeline(combined, item), [...draftTimeline]);
+      const transferredTimeline = result.timeline;
+      let combinedTimeline = transferredTimeline !== undefined
+        ? [...transferredTimeline]
+        : providerTimeline.reduce((combined, item) => mergeTimeline(combined, item), [...draftTimeline]);
       if (presentation.acceptedItem) {
         combinedTimeline = presentation.accepted === false
           ? rollbackOptimisticComposerRow(combinedTimeline, presentation.acceptedItem.presentationId ?? presentation.acceptedItem.id)
@@ -2825,6 +2850,7 @@ function App() {
   const createDraftSend = useCallback(async (input: DraftSessionSendInput) => {
     const materializeInput: DraftSessionMaterializeInput = {
       draftSessionId: input.draftSessionId,
+      ...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
       providerId: input.providerId,
       workingDirectory: input.workingDirectory,
       modelId: input.modelId,
@@ -2837,7 +2863,7 @@ function App() {
       ...(!isAmbiguousSelectionValue(input.modelId) ? { modelId: input.modelId } : {}),
       ...(!isAmbiguousSelectionValue(input.effort) ? { reasoningEffort: input.effort.toLowerCase() } : {}),
     };
-    const separatedFirstTurn = input.attachmentIds.length > 0 || input.workflowIds.length > 0;
+    const separatedFirstTurn = input.attachmentIds.length > 0 || input.workflowIds.length > 0 || input.goalObjective !== undefined;
     const result = await beginDraftMaterialization(materializeInput, separatedFirstTurn ? undefined : {
       content: input.content,
       title,
@@ -2852,6 +2878,7 @@ function App() {
           ...(input.attachmentIds.length ? { attachmentIds: [...input.attachmentIds] } : {}),
           ...(input.workflowIds.length ? { workflowIds: [...input.workflowIds] } : {}),
           ...(input.simplify !== undefined ? { simplify: input.simplify } : {}),
+          ...(input.goalObjective !== undefined ? { goal: { objective: input.goalObjective } } : {}),
         });
       } catch (error) {
         composerDraftRestoreTargets.current[input.draftSessionId] = result.session.id;
@@ -2860,8 +2887,9 @@ function App() {
       }
     }
     delete composerDraftRestoreTargets.current[input.draftSessionId];
+    if (input.goalObjective !== undefined) composerDraftStore.modes[resolveComposerDraftSessionId(input.draftSessionId)] = "queue";
     commitDraftMaterialization(materializeInput, result, { acceptedItem: input.optimisticItem, accepted: true, state: "working", preview: visibleInput });
-  }, [beginDraftMaterialization, commitDraftMaterialization]);
+  }, [beginDraftMaterialization, commitDraftMaterialization, composerDraftStore, resolveComposerDraftSessionId]);
 
   const retainDraftScheduleAttempt = useCallback((input: DraftSessionScheduleInput): DraftSessionScheduleInput => {
     const existing = composerScheduleAttempts.current[input.draftSessionId];
@@ -3034,7 +3062,7 @@ function App() {
   // interruption controls. Task-list status is a separate, visible fact once
   // that task's transcript has been loaded.
   const presentedOrganizedSessions = useMemo(() => organizedSessions.map((session) => {
-    if (stopPresentationSessionIds.has(session.id)) {
+    if (stopPresentationSessionIds.has(session.id) || session.state === "idle" && session.interruptedAt !== undefined) {
       return session.state === "idle" ? session : { ...session, state: "idle" as const };
     }
     const timeline = snapshot?.timelines[session.id];
@@ -3250,7 +3278,7 @@ function App() {
             snapshot={snapshot}
             session={selectedSession}
             workingBoundary={workingBoundaryBySession.current.get(selectedSession.id)}
-            stopPresentationActive={stopPresentationSessionIds.has(selectedSession.id)}
+            stopPresentationActive={stopPresentationSessionIds.has(selectedSession.id) || selectedSession.state === "idle" && selectedSession.interruptedAt !== undefined}
             onStopPresentation={setStopPresentation}
             onBack={() => setListCollapsed(false)}
             onBrowser={() => setView("browser")}
@@ -4409,7 +4437,7 @@ export function TaskDetailsControl({ session, providers, liveVisionStatus, readL
 function Workspace({ snapshot, session, workingBoundary, stopPresentationActive, onStopPresentation, onBack, onBrowser, onLinkOpen, onManageWorkflow, onDraftSelectionChange, onCreateDraftSend, onMaterializeDraft, pendingComposerAction, onPendingComposerActionConsumed, onCreateDraftSchedule, draftScheduleAttempt, onRetainDraftScheduleAttempt, onDraftDirectory, initialDraft, onDraftChange, initialAttachments, onAttachmentsChange, initialWorkflowAttachments, onWorkflowAttachmentsChange, initialAnnotations, onAnnotationsChange, initialMode, onModeChange, initialMeshTargets, onMeshTargetsChange, initialDelegationDraft, onDelegationDraftChange, draftRestoreRevision, onRestoreFailedSubmission, onDerivedSession, onRetryQueuedNewTaskDelivery, onOpenChild, onOpenParent, notify, updateSnapshot, onAttentionMutation, onPrepareTurnResume, onHydrateProviderModels, timelineWindow, onLoadOlder, reasoningDisplay, agentDefaults, ears, onEarsChange, experimental, foreignSubagentsEnabled, sessionForeignSubagents, onSessionForeignSubagents, onInstantSession, onCreateSideChat, onContextHandoff, queueRevision, queueingEnabled, onQueueingEnabledChange, reportedCompaction, visionStatus, readVisionStatus }: {
   snapshot: DesktopSnapshot; session: Session; workingBoundary?: SessionWorkingBoundary | undefined; stopPresentationActive: boolean; onStopPresentation: (sessionId: string, active: boolean) => void; onBack: () => void; onBrowser: () => void; onLinkOpen: (url: string) => void; onManageWorkflow: (id?: string) => void;
   onDraftSelectionChange: (selection: DraftModelSelection) => void; onCreateDraftSend: (input: DraftSessionSendInput) => Promise<void>; onMaterializeDraft: (input: DraftSessionMaterializeInput, action: ComposerTaskAction) => Promise<void>; pendingComposerAction: PendingComposerAction | null; onPendingComposerActionConsumed: (requestId: string) => void; onCreateDraftSchedule: (input: DraftSessionScheduleInput) => Promise<void>; draftScheduleAttempt: DraftSessionScheduleAttemptState | null; onRetainDraftScheduleAttempt: (input: DraftSessionScheduleInput) => DraftSessionScheduleInput; onDraftDirectory: () => void;
-  handoffSummary?: string | undefined; initialDraft: string; onDraftChange: (value: string) => void; initialAttachments: readonly ComposerAttachment[]; onAttachmentsChange: (value: readonly ComposerAttachment[]) => void; initialWorkflowAttachments: readonly WorkflowAttachment[]; onWorkflowAttachmentsChange: (value: readonly WorkflowAttachment[]) => void; initialAnnotations: readonly ResponseAnnotation[]; onAnnotationsChange: (value: readonly ResponseAnnotation[]) => void; initialMode: "queue" | "steer"; onModeChange: (value: "queue" | "steer") => void; initialMeshTargets: readonly MeshTarget[]; onMeshTargetsChange: (value: readonly MeshTarget[]) => void; initialDelegationDraft: DelegationDraft | undefined; onDelegationDraftChange: (value: DelegationDraft | null) => void; draftRestoreRevision: number; onRestoreFailedSubmission: (submitted: ComposerDraftSnapshot) => ComposerDraftSnapshot; onDerivedSession: (value: Record<string, unknown>, summary?: string, draft?: string, queuedNewTask?: QueuedNewTaskPresentation) => void;
+  handoffSummary?: string | undefined; initialDraft: string; onDraftChange: (value: string) => void; initialAttachments: readonly ComposerAttachment[]; onAttachmentsChange: (value: readonly ComposerAttachment[]) => void; initialWorkflowAttachments: readonly WorkflowAttachment[]; onWorkflowAttachmentsChange: (value: readonly WorkflowAttachment[]) => void; initialAnnotations: readonly ResponseAnnotation[]; onAnnotationsChange: (value: readonly ResponseAnnotation[]) => void; initialMode: "queue" | "steer" | "goal"; onModeChange: (value: "queue" | "steer" | "goal") => void; initialMeshTargets: readonly MeshTarget[]; onMeshTargetsChange: (value: readonly MeshTarget[]) => void; initialDelegationDraft: DelegationDraft | undefined; onDelegationDraftChange: (value: DelegationDraft | null) => void; draftRestoreRevision: number; onRestoreFailedSubmission: (submitted: ComposerDraftSnapshot) => ComposerDraftSnapshot; onDerivedSession: (value: Record<string, unknown>, summary?: string, draft?: string, queuedNewTask?: QueuedNewTaskPresentation) => void;
   onRetryQueuedNewTaskDelivery: (deliveryId: string) => void;
   onOpenChild: (session: Session) => void;
   onOpenParent: (parentSessionId: string) => void;
@@ -4520,7 +4548,10 @@ function Workspace({ snapshot, session, workingBoundary, stopPresentationActive,
       window.removeEventListener("focus", wake);
     };
   }, [session?.draft, session?.id, session?.schedule?.status, session?.state, updateContextCompaction]);
-  const timeline = session ? snapshot.timelines[session.id] : undefined;
+  const storedTimeline = snapshot.timelines[session.id];
+  const timeline = useMemo(() => storedTimeline
+    ? reconcileSubagentTimeline(session.id, storedTimeline, snapshot.sessions)
+    : undefined, [session.id, snapshot.sessions, storedTimeline]);
   const continueTask = async () => {
     if (continuingSessions.current.has(session.id)
       || !stopPresentationActive && sessionPresentsLiveTurn(session, timeline ?? [], workingBoundary)) return false;
@@ -4592,22 +4623,10 @@ function Workspace({ snapshot, session, workingBoundary, stopPresentationActive,
   const directAnnotationAudio = providerAcceptsDirectAudio(session.providerId) && modelAcceptsDirectAudio(sessionModel);
   const canInterrupt = provider?.capabilities.includes("Interrupt") === true;
   const interruptSession = async () => {
-    onStopPresentation(session.id, true);
     try {
       await request("session.interrupt", { sessionId: session.id });
-      updateSnapshot((current) => current ? { ...current, sessions: replaceSession(current.sessions, session.id, { state: "idle" }) } : current);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      // The harness reporting no turn is proof this task is not running: a delegating
-      // parent stays marked working after its hand-off turn ends, which is what left a
-      // stop button on a task that had nothing to stop. Settle the state instead of
-      // showing the reader an error about a turn they never started.
-      if (/no active .* turn/iu.test(message)) {
-        updateSnapshot((current) => current ? { ...current, sessions: replaceSession(current.sessions, session.id, { state: "idle" }) } : current);
-        onStopPresentation(session.id, false);
-        return;
-      }
-      onStopPresentation(session.id, false);
       notify(message, "error");
     }
   };
@@ -5334,15 +5353,15 @@ const Conversation = forwardRef<ConversationHandle, {
           notify("Approval response sent");
         } catch (error) { notify(error instanceof Error ? error.message : String(error), "error"); }
       }} />)}
-      {inputs.map((input) => <InputCard key={input.id} request={input} onSubmit={async (answer) => {
+      {inputs.map((input) => <QuestionCard key={input.id} request={input} onLinkOpen={onLinkOpen} onSubmit={async (answers) => {
         try {
           const commitResumeBoundary = prepareTurnResume();
-          await request("user_input.respond", { requestId: input.id, answers: { [input.answerKey]: [answer] }, respondedAt: new Date().toISOString() });
+          await request("user_input.respond", { requestId: input.id, answers, respondedAt: new Date().toISOString() });
           commitResumeBoundary();
           onAttentionMutation();
-          updateSnapshot((current) => current ? { ...current, inputRequests: current.inputRequests.filter((item) => item.id !== input.id), sessions: replaceSession(current.sessions, session.id, { state: "working" }) } : current);
+          updateSnapshot((current) => current ? { ...current, inputRequests: current.inputRequests.filter((item) => item.id !== input.id), sessions: current.sessions.map((item) => item.id === session.id && item.state === "needs_input" ? { ...item, state: "working" } : item) } : current);
           notify("Answer sent");
-        } catch (error) { notify(error instanceof Error ? error.message : String(error), "error"); }
+        } catch (error) { notify(error instanceof Error ? error.message : String(error), "error"); throw error; }
       }} />)}
       <div className="conversation-tail-spacer" ref={tailSpacer} aria-hidden="true" />
     </div>
@@ -5354,11 +5373,6 @@ function ApprovalCard({ approval, onRespond }: { approval: ApprovalRequest; onRe
   return <article className="request-card approval-card"><div className="request-icon"><ShieldIcon /></div><div className="request-content"><p className="eyebrow">Permission required</p><h3>{approval.title}</h3><p>{approval.reason}</p>{approval.command ? <pre><TerminalIcon />{approval.command}</pre> : null}<dl>{approval.directory ? <><dt>Directory</dt><dd>{approval.directory}</dd></> : null}{approval.files?.length ? <><dt>Files</dt><dd>{approval.files.join(", ")}</dd></> : null}</dl><div className="request-actions">{approval.choices.map((choice) => <Button key={choice.id} variant={choice.kind === "approve" ? "primary" : "secondary"} disabled={busy} onClick={async () => { setBusy(true); await onRespond(choice.id); setBusy(false); }}>{choice.label}</Button>)}</div></div></article>;
 }
 
-function InputCard({ request: input, onSubmit }: { request: InputRequest; onSubmit: (answer: string) => Promise<void> }) {
-  const [answer, setAnswer] = useState("");
-  const [busy, setBusy] = useState(false);
-  return <article className="request-card input-card"><div className="request-icon"><QuestionIcon /></div><div className="request-content"><p className="eyebrow">Your input is needed</p><h3>{input.title}</h3><p>{input.prompt}</p>{input.options ? <div className="input-options">{input.options.map((option) => <button key={option} className={answer === option ? "selected" : ""} onClick={() => setAnswer(option)}>{option}{answer === option ? <CheckIcon /> : null}</button>)}</div> : <textarea value={answer} onChange={(event) => setAnswer(event.target.value)} placeholder="Type your answer…" rows={3}/>}<div className="request-actions"><Button variant="primary" disabled={!answer.trim() || busy} onClick={async () => { setBusy(true); await onSubmit(answer.trim()); setBusy(false); }}>Submit answer <SendIcon /></Button></div></div></article>;
-}
 
 function Dashboard({ snapshot, runtimeConnectionState, sessions, onOpen, onNew, onProvider }: { snapshot: DesktopSnapshot; runtimeConnectionState: RuntimeConnectionPresentation; sessions: readonly Session[]; onOpen: (id: string) => void; onNew: () => void; onProvider: (id: ProviderFilterSelection) => void }) {
   const working = sessions.filter((session) => session.state === "working");

@@ -30,6 +30,9 @@ export class UserInputRegistry {
     expiresAt?: string,
   ): UserInputRequest {
     if (adapter.respondToUserInput === undefined) throw new Error(`${adapter.providerId} emitted user input but cannot accept a response`);
+    const existing = [...this.#pending.values()].find((entry) => entry.adapter.providerId === adapter.providerId
+      && entry.normalized.sessionId === globalSessionId && entry.providerRequestId === providerRequestId);
+    if (existing !== undefined) return existing.normalized;
     const requestId = `input_${randomUUID()}`;
     const normalized: UserInputRequest = {
       requestId,
@@ -77,6 +80,17 @@ export class UserInputRegistry {
       removed.push(entry.normalized);
     }
     return removed;
+  }
+
+  /** Includes an in-flight response so a concurrent snapshot cannot briefly
+   * clear a session while its provider is still consuming the answer. */
+  public clearProviderRequest(sessionId: string, providerRequestId: string): UserInputRequest | undefined {
+    for (const [id, entry] of this.#pending) {
+      if (entry.normalized.sessionId !== sessionId || entry.providerRequestId !== providerRequestId) continue;
+      this.#pending.delete(id);
+      return entry.normalized;
+    }
+    return undefined;
   }
 
   /** Includes an in-flight response so a concurrent snapshot cannot briefly

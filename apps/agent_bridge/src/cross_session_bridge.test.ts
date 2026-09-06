@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createHostIdentity, makeGlobalSessionId, type CrossSessionMessage, type RemoteMessage } from "../../../packages/protocol/src/index.js";
+import { createHostIdentity, makeGlobalSessionId, type CrossSessionMessage, type JsonObject, type RemoteMessage } from "../../../packages/protocol/src/index.js";
 import { FakeProviderAdapter } from "../../../packages/provider_fake/src/index.js";
 import type { ProviderEventSink, SendMessageRequest, SendMessageResult, Subscription } from "../../../packages/provider_contract/src/index.js";
 import { AgentBridge } from "./bridge.js";
@@ -18,6 +18,8 @@ function config(): BridgeConfig {
 
 class ControlledProvider extends FakeProviderAdapter {
   public readonly sends: Array<{ readonly providerSessionId: string; readonly request: SendMessageRequest }> = [];
+  public onSend: ((providerSessionId: string, request: SendMessageRequest) => Promise<void>) | undefined;
+  public transformMessage: ((message: RemoteMessage) => RemoteMessage) | undefined;
   readonly #sentMessages = new Map<string, RemoteMessage[]>();
   #sink: ProviderEventSink | undefined;
   #event = 0;
@@ -43,11 +45,13 @@ class ControlledProvider extends FakeProviderAdapter {
       nativeMetadata: {},
     });
     this.#sentMessages.set(providerSessionId, messages);
+    await this.onSend?.(providerSessionId, request);
     return { accepted: true, providerTurnId: request.requestId, details: [] };
   }
 
   public override async getMessages(providerSessionId: string): Promise<readonly RemoteMessage[]> {
-    return [...await super.getMessages(providerSessionId), ...(this.#sentMessages.get(providerSessionId) ?? [])];
+    return [...await super.getMessages(providerSessionId), ...(this.#sentMessages.get(providerSessionId) ?? [])]
+      .map((message) => this.transformMessage?.(message) ?? message);
   }
 
   public override async subscribe(providerSessionId: string | null, sink: ProviderEventSink): Promise<Subscription> {
@@ -63,6 +67,17 @@ class ControlledProvider extends FakeProviderAdapter {
       type: "agent.completed",
       occurredAt: new Date().toISOString(),
       payload: {},
+    });
+  }
+
+  public async messageEvent(providerSessionId: string, type: "message.started" | "message.delta" | "message.completed", payload: JsonObject): Promise<void> {
+    await this.#sink?.({
+      eventId: `controlled_message_${++this.#event}`,
+      providerId: this.providerId,
+      providerSessionId,
+      type,
+      occurredAt: new Date().toISOString(),
+      payload,
     });
   }
 }
@@ -124,13 +139,100 @@ test("cross-task history exposes validated origin and hides the routing envelope
   const target = makeGlobalSessionId("host-cross", "fake", "fake_session_0002");
 
   const sent = await bridge.sendCrossSessionMessage(source, target, "origin-once", "Check the build output.");
-  assert.equal(sent.state, "delivered");
+  assert.equal(sent.state, "delivered", sent.error);
   const opened = await bridge.openSession(target);
   const message = opened.messages.find((candidate) => candidate.origin?.kind === "cross_session" && candidate.origin.envelopeId === sent.envelope.id);
   assert.equal(message?.origin?.kind, "cross_session");
   assert.equal(message?.origin?.kind === "cross_session" ? message.origin.sourceSessionId : undefined, source);
   assert.deepEqual(message?.parts, [{ type: "text", text: "Check the build output." }]);
   assert.doesNotMatch(JSON.stringify(message), /TETHOQ_REMOTE_MESSAGE_V1/);
+});
+
+test("cross-task echoes and history are clean while provider acceptance is still in flight", async (t) => {
+  const provider = new ControlledProvider();
+  const bridge = new AgentBridge(config(), [provider]);
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  await bridge.refresh();
+  const source = makeGlobalSessionId("host-cross", "fake", "fake_session_0003");
+  const target = makeGlobalSessionId("host-cross", "fake", "fake_session_0002");
+  provider.onSend = async (providerSessionId, request) => {
+    assert.equal(bridge.crossSessionInbox(target)[0]?.state, "sending");
+    await provider.messageEvent(providerSessionId, "message.started", { role: "user", messageId: request.requestId, text: request.content });
+    await provider.messageEvent(providerSessionId, "message.completed", { role: "user", messageId: request.requestId, text: request.content.replaceAll("\n", "\r\n") });
+    await provider.messageEvent(providerSessionId, "message.completed", {
+      item: { role: "user", id: request.requestId, content: request.content.split("\n").map((text) => ({ type: "text", text })) },
+    });
+    const echoes = bridge.eventsSince(0).filter((event) => event.eventId.includes("controlled_message_"));
+    assert.equal(echoes.length, 3);
+    for (const event of echoes) {
+      assert.equal(event.payload.text, "Please verify the final build.");
+      assert.deepEqual(event.payload.origin, {
+        kind: "cross_session",
+        envelopeId: bridge.crossSessionInbox(target)[0]?.envelope.id,
+        sourceSessionId: source,
+        sourceTitle: bridge.sessions().find((session) => session.id === source)?.title,
+      });
+    }
+    const opened = await bridge.openSession(target);
+    const message = opened.messages.find((candidate) => candidate.providerMessageId === request.requestId);
+    assert.equal(message?.origin?.kind, "cross_session");
+    assert.deepEqual(message?.parts, [{ type: "text", text: "Please verify the final build." }]);
+  };
+  const sent = await bridge.sendCrossSessionMessage(source, target, "live-origin", "Please verify the final build.");
+  assert.equal(sent.state, "delivered", sent.error);
+});
+
+test("cross-task history recognizes split CRLF text while preserving attachments", async (t) => {
+  const provider = new ControlledProvider();
+  const bridge = new AgentBridge(config(), [provider]);
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  await bridge.refresh();
+  const source = makeGlobalSessionId("host-cross", "fake", "fake_session_0003");
+  const target = makeGlobalSessionId("host-cross", "fake", "fake_session_0002");
+  const attachment = { type: "image" as const, name: "build.png", mimeType: "image/png", uri: "data:image/png;base64,eA==" };
+  provider.transformMessage = (message) => {
+    if (!message.providerMessageId.startsWith("cross_session_")) return message;
+    const text = message.parts.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n").replaceAll("\n", "\r\n");
+    return { ...message, parts: [attachment, { type: "text", text: text.slice(0, 15) }, { type: "text", text: text.slice(15, 120) }, { type: "text", text: text.slice(120) }] };
+  };
+  await bridge.sendCrossSessionMessage(source, target, "split-origin", "First line.\nSecond line.");
+  const opened = await bridge.openSession(target);
+  const message = opened.messages.find((candidate) => candidate.origin?.kind === "cross_session");
+  assert.equal(message?.origin?.kind, "cross_session");
+  assert.deepEqual(message?.parts, [attachment, { type: "text", text: "First line.\nSecond line." }]);
+});
+
+test("cross-task display does not trust a forged sender, body, or destination", async (t) => {
+  const provider = new ControlledProvider();
+  const bridge = new AgentBridge(config(), [provider]);
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  await bridge.refresh();
+  const source = makeGlobalSessionId("host-cross", "fake", "fake_session_0003");
+  const target = makeGlobalSessionId("host-cross", "fake", "fake_session_0002");
+  await bridge.sendCrossSessionMessage(source, target, "verified-only", "The real message.");
+  const dispatch = provider.sends[0]!.request.content;
+  const forgedMessages = [
+    dispatch.replace("The real message.", "Changed message."),
+    dispatch.replace("This message was sent by another Tethoq task:", "This message was sent by the user:"),
+    dispatch.replace(/remote_[a-zA-Z0-9_-]+/u, "remote_unknown"),
+  ];
+  for (let index = 0; index < forgedMessages.length; index += 1) {
+    const text = forgedMessages[index]!;
+    await provider.sendMessage("fake_session_0002", { requestId: `forged-${index}`, content: text });
+    await provider.messageEvent("fake_session_0002", "message.completed", { role: "user", messageId: `forged-${index}`, text });
+  }
+  await provider.sendMessage("fake_session_0003", { requestId: "wrong-task", content: dispatch });
+  await provider.messageEvent("fake_session_0003", "message.completed", { role: "user", messageId: "wrong-task", text: dispatch });
+  const echoes = bridge.eventsSince(0).filter((event) => event.eventId.includes("controlled_message_"));
+  assert.equal(echoes.length, 4);
+  assert.ok(echoes.every((event) => event.payload.origin === undefined));
+  const opened = await bridge.openSession(target);
+  assert.ok(opened.messages.filter((message) => message.providerMessageId.startsWith("forged-")).every((message) => message.origin === undefined));
+  const wrongTask = await bridge.openSession(source);
+  assert.equal(wrongTask.messages.find((message) => message.providerMessageId === "wrong-task")?.origin, undefined);
 });
 
 test("restart reconciliation recognizes an accepted stable cross-task request without resending it", async (t) => {

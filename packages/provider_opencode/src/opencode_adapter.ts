@@ -15,6 +15,8 @@ import {
   type ProviderDetection,
   type ProviderEvent,
   type ProviderEventSink,
+  type ProviderSessionPermissions,
+  type ProviderUserInputResponse,
   type SendMessageRequest,
   type SendMessageResult,
   type Subscription,
@@ -78,7 +80,7 @@ const capabilities: ProviderCapabilities = {
   commandEvents: true,
   fileChanges: true,
   approvals: true,
-  userInput: false,
+  userInput: true,
   interrupt: true,
   modelEnumeration: true,
   projectAssociation: true,
@@ -95,6 +97,16 @@ const capabilities: ProviderCapabilities = {
 interface PendingPermission {
   readonly sessionId: string;
   readonly nativePermissionId: string;
+}
+
+interface PendingQuestion {
+  readonly sessionId: string;
+  readonly nativeRequestId: string;
+  readonly source: "primary" | "secondary";
+  readonly directory: string | undefined;
+  readonly questions: readonly JsonObject[];
+  readonly payload: JsonObject;
+  resolving: boolean;
 }
 
 interface GuardAbortGeneration {
@@ -190,6 +202,7 @@ const defaultActivitySafetyPollIntervalMs = 30_000;
 const defaultNativeStatusPollIntervalMs = 1_500;
 /** A dead server cannot hold the activity reconciler behind the general 30s HTTP timeout. */
 const nativeStatusRequestTimeoutMs = 1_500;
+const questionRecoveryIntervalMs = 10_000;
 /** Allow a full model compaction, while bounding both transport and completion. */
 const compactionRequestTimeoutMs = 10 * 60_000;
 /** Provider events are immediate; this bounded history read only recovers a missed event. */
@@ -239,6 +252,12 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   readonly #now: () => Date;
   readonly #events = new ProviderEventHub();
   readonly #permissions = new Map<string, PendingPermission>();
+  readonly #questions = new Map<string, PendingQuestion>();
+  readonly #questionDirectories = new Set<string | undefined>();
+  readonly #questionRecoveries = new Map<string, Promise<void>>();
+  #questionRevision = 0;
+  #nextQuestionRecoveryAt = 0;
+  #questionDiscovery: Promise<void> | undefined;
   readonly #abort = new AbortController();
   readonly #activityReader: OpenCodeActivityReader;
   readonly #sessionIndexReader: OpenCodeSessionIndexReader;
@@ -330,6 +349,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     this.#compactionTimeoutMs = options.compactionTimeoutMs ?? compactionRequestTimeoutMs;
     this.#hostId = options.hostId;
     this.#directory = options.directory;
+    this.#questionDirectories.add(options.directory);
     this.#now = options.now ?? (() => new Date());
     this.#activityReader = options.activityReader ?? (
       options.localActivity === undefined || options.localActivity === false
@@ -560,11 +580,11 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   }
 
   /** `undefined` means the unscoped list, which OpenCode answers with the global project. */
-  private async sessionListDirectories(): Promise<readonly (string | undefined)[]> {
+  private async sessionListDirectories(signal?: AbortSignal): Promise<readonly (string | undefined)[]> {
     // A pinned directory is an explicit scope from the host; honour it verbatim.
     if (this.#directory !== undefined) return [this.#directory];
     try {
-      const value = await this.#client.request<unknown>("GET", "/project", {});
+      const value = await this.#client.request<unknown>("GET", "/project", { ...(signal === undefined ? {} : { signal }) });
       const worktrees = (Array.isArray(value) ? value : [])
         .map((entry) => (isRecord(entry) && typeof entry.worktree === "string" ? entry.worktree : undefined))
         .filter((worktree): worktree is string => worktree !== undefined && worktree !== "" && worktree !== "/");
@@ -687,6 +707,10 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       this.#client.request<unknown>("GET", `/session/${encodeURIComponent(providerSessionId)}`, { query: this.query() }),
       this.sessionStatuses().catch((): undefined => undefined),
     ]);
+    if (this.#eventLoop !== null && isRecord(session) && typeof session.directory === "string") {
+      this.#questionDirectories.add(session.directory);
+      void this.recoverPendingQuestions("primary", session.directory);
+    }
     if (statusSnapshot !== undefined) await this.reconcileNativeStatusSnapshot(statusSnapshot);
     const normalized = normalizeOpenCodeSession(this.#hostId, session, this.resolvedStatus(
       providerSessionId,
@@ -1114,7 +1138,16 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
 
   public async subscribe(providerSessionId: string | null, sink: ProviderEventSink): Promise<Subscription> {
     const subscription = this.#events.subscribe(providerSessionId, sink);
+    const pendingQuestions = [...this.#questions.entries()];
     this.ensureEventLoop();
+    for (const [providerRequestId, pending] of pendingQuestions) {
+      if ((providerSessionId !== null && providerSessionId !== pending.sessionId) || this.#questions.get(providerRequestId) !== pending) continue;
+      await sink({
+        eventId: `opencode_event_${this.#eventNamespace}_${++this.#eventCounter}`,
+        providerId: this.providerId, providerSessionId: pending.sessionId,
+        type: "user_input.requested", occurredAt: this.#now().toISOString(), payload: pending.payload,
+      });
+    }
     return subscription;
   }
 
@@ -1127,6 +1160,53 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       body: { response: response.choiceId === "approve" ? "once" : "reject" },
     });
     this.#permissions.delete(response.providerRequestId);
+  }
+
+  public async respondToUserInput(response: ProviderUserInputResponse): Promise<void> {
+    const pending = this.#questions.get(response.providerRequestId);
+    if (pending === undefined || pending.resolving) {
+      throw new ProviderAdapterError(this.providerId, "USER_INPUT_NOT_FOUND", "OpenCode question is stale or already being answered", false);
+    }
+    const answers = pending.questions.map((question) => openCodeQuestionAnswer(question, response.answers));
+    const client = pending.source === "secondary" ? this.#secondaryClient : this.#client;
+    if (client === undefined) throw new ProviderAdapterError(this.providerId, "USER_INPUT_NOT_FOUND", "The OpenCode server that asked this question is no longer connected", false);
+    pending.resolving = true;
+    try {
+      await client.request("POST", `/question/${encodeURIComponent(pending.nativeRequestId)}/reply`, {
+        query: this.query(pending.directory),
+        body: { answers },
+      });
+    } catch (error) {
+      pending.resolving = false;
+      throw error;
+    }
+    // The server can publish its reply before the HTTP response arrives.
+    if (this.#questions.get(response.providerRequestId) === pending) {
+      this.#questionRevision += 1;
+      await this.resolveQuestion(response.providerRequestId, pending.sessionId, "answered");
+    }
+  }
+
+  public async getSessionPermissions(providerSessionId: string): Promise<ProviderSessionPermissions> {
+    const session = await this.#client.request<unknown>("GET", `/session/${encodeURIComponent(providerSessionId)}`, { query: this.query() });
+    return openCodeSessionPermissions(session, providerSessionId);
+  }
+
+  public async setSessionPermission(providerSessionId: string, controlId: string, value: string): Promise<ProviderSessionPermissions> {
+    if (controlId !== "tool_permissions" || (value !== "ask" && value !== "allow" && value !== "deny")) {
+      throw new ProviderAdapterError(this.providerId, "PERMISSION_VALUE_INVALID", "Choose Ask, Allow, or Deny for this task's tools", false);
+    }
+    const path = `/session/${encodeURIComponent(providerSessionId)}`;
+    const current = await this.#client.request<unknown>("GET", path, { query: this.query() });
+    openCodeSessionPermissions(current, providerSessionId);
+    const directory = isRecord(current) && typeof current.directory === "string" ? current.directory : this.#directory;
+    // OpenCode 1.18.21 appends these rules; the last matching rule wins.
+    // Sending only the new override retains existing provider-managed rules.
+    const updated = await this.#client.request<unknown>("PATCH", path, {
+      query: this.query(directory),
+      body: { permission: [{ permission: "*", pattern: "*", action: value }] },
+    });
+    return openCodeSessionPermissions(updated, providerSessionId);
   }
 
   public async dispose(): Promise<void> {
@@ -1145,6 +1225,8 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       this.#nativeStatusLoop?.catch(() => undefined),
       this.#nativeStatusReconcileTail.catch(() => undefined),
       this.#initialActivitySnapshot?.catch(() => undefined),
+      this.#questionDiscovery,
+      ...this.#questionRecoveries.values(),
       ...[...this.#primaryReconnectRefreshes].map(async (refresh) => await refresh.catch(() => undefined)),
     ]);
     this.#activityReader.close();
@@ -1155,6 +1237,10 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     this.#partTypes.clear();
     this.#messageRoles.clear();
     this.#reportedSelections.clear();
+    this.#permissions.clear();
+    this.#questions.clear();
+    this.#questionDirectories.clear();
+    this.#questionRecoveries.clear();
     this.#nativeStates.clear();
     this.#nativeStatuses.clear();
     this.#nativeEventRevisionBySession.clear();
@@ -1180,6 +1266,110 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
 
   private query(directory = this.#directory): Readonly<Record<string, string | undefined>> {
     return { directory };
+  }
+
+  private discoverPendingQuestions(): void {
+    if (this.#disposed || this.#questionDiscovery !== undefined) return;
+    this.#nextQuestionRecoveryAt = this.#now().getTime() + questionRecoveryIntervalMs;
+    const discovery = (async () => {
+      const initial = this.recoverPendingQuestions("primary", this.#directory);
+      const directories = await this.sessionListDirectories(this.#abort.signal);
+      if (this.#disposed) return;
+      for (const directory of directories) this.#questionDirectories.add(directory);
+      await Promise.all([initial, ...[...this.#questionDirectories].flatMap((directory) => [
+        this.recoverPendingQuestions("primary", directory),
+        ...(this.#secondaryClient === undefined ? [] : [this.recoverPendingQuestions("secondary", directory)]),
+      ])]);
+    })().catch(() => undefined);
+    this.#questionDiscovery = discovery;
+    void discovery.finally(() => {
+      if (this.#questionDiscovery === discovery) this.#questionDiscovery = undefined;
+    });
+  }
+
+  private recoverPendingQuestions(source: "primary" | "secondary", directory = this.#directory): Promise<void> {
+    if (this.#disposed) return Promise.resolve();
+    const client = source === "secondary" ? this.#secondaryClient : this.#client;
+    if (client === undefined) return Promise.resolve();
+    const key = JSON.stringify([source, directory ?? null]);
+    const existing = this.#questionRecoveries.get(key);
+    if (existing !== undefined) return existing;
+    const revision = this.#questionRevision;
+    const connection = this.#primaryConnectionGeneration;
+    const refresh = (async () => {
+      const value = await client.request<unknown>("GET", "/question", {
+        query: this.query(directory),
+        signal: source === "secondary" ? this.#secondaryAbort.signal : this.#abort.signal,
+        timeoutMs: nativeStatusRequestTimeoutMs,
+      });
+      if (this.#disposed || revision !== this.#questionRevision || !Array.isArray(value)
+        || (source === "primary" && connection !== this.#primaryConnectionGeneration)) return;
+      const present = new Set<string>();
+      for (const request of value) {
+        if (revision !== this.#questionRevision) return;
+        if (!isRecord(request) || typeof request.id !== "string") continue;
+        present.add(`opencode_question_${request.id}`);
+        await this.publishQuestion(request, source, directory);
+      }
+      // Questions are in-memory provider requests. A successful current list
+      // also retires requests answered elsewhere or cancelled during an outage.
+      for (const [providerRequestId, pending] of this.#questions) {
+        if (revision !== this.#questionRevision) return;
+        if (pending.source !== source || pending.directory !== directory || present.has(providerRequestId)) continue;
+        await this.resolveQuestion(providerRequestId, pending.sessionId, "cancelled");
+      }
+    })().catch(() => undefined);
+    this.#questionRecoveries.set(key, refresh);
+    void refresh.finally(() => {
+      if (this.#questionRecoveries.get(key) === refresh) this.#questionRecoveries.delete(key);
+    });
+    return refresh;
+  }
+
+  private async publishQuestion(request: Record<string, unknown>, source: "primary" | "secondary", directory: string | undefined, nativeEvent?: JsonObject): Promise<void> {
+    if (typeof request.id !== "string" || typeof request.sessionID !== "string"
+      || !Array.isArray(request.questions) || request.questions.length === 0
+      || !request.questions.every((question) => isRecord(question) && typeof question.question === "string")) return;
+    const sessionId = request.sessionID;
+    if (source === "primary" && (this.#terminalCleanupGenerations.has(sessionId)
+      || this.#guardAbortGenerations.get(sessionId)?.outcome === "confirmed")) return;
+    const providerRequestId = `opencode_question_${request.id}`;
+    if (this.#questions.has(providerRequestId)) return;
+    const questions: JsonObject[] = request.questions.map((question, index) => ({ ...asJsonObject(question), id: `question_${index}` }));
+    const first = questions[0]!;
+    const payload: JsonObject = {
+      providerRequestId,
+      title: typeof first.header === "string" ? first.header : "OpenCode needs input",
+      question: first.question!,
+      questionId: first.id!,
+      questions,
+    };
+    this.#questions.set(providerRequestId, {
+      sessionId, nativeRequestId: request.id, source, directory, questions, payload, resolving: false,
+    });
+    this.#questionDirectories.add(directory);
+    if (source === "primary") {
+      this.#emptyUnknownSequences.delete(sessionId);
+      this.#settledOwnedSessions.delete(sessionId);
+      this.cancelPendingOwnedCompletion(sessionId);
+      this.#nativeStates.set(sessionId, "working");
+      this.clearDisconnectedSession(sessionId);
+    } else {
+      this.#secondaryActive.add(sessionId);
+    }
+    await this.emit({ providerSessionId: sessionId, type: "user_input.requested", payload, ...(nativeEvent === undefined ? {} : { nativeEvent }) });
+  }
+
+  private async resolveQuestion(providerRequestId: string, sessionId: string, reason: "answered" | "cancelled", nativeEvent?: JsonObject): Promise<void> {
+    const pending = this.#questions.get(providerRequestId);
+    if (pending !== undefined && pending.sessionId !== sessionId) return;
+    this.#questions.delete(providerRequestId);
+    await this.emit({
+      providerSessionId: sessionId,
+      type: "user_input.resolved",
+      payload: { providerRequestId, reason },
+      ...(nativeEvent === undefined ? {} : { nativeEvent }),
+    });
   }
 
   private async preparePromptAttachments(
@@ -1268,6 +1458,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
         this.#eventLoop = null;
         if (!this.#disposed && this.#abort.signal.aborted === false) this.ensureEventLoop();
       });
+      this.discoverPendingQuestions();
     }
     if (this.#activityLoop === null) {
       this.ensureActivityChangeWatch();
@@ -1307,6 +1498,13 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
         await this.reconcileNativeStatusSnapshot(snapshot);
       }
       if (!this.#abort.signal.aborted) await this.recoverTerminalResponses();
+      if (!this.#abort.signal.aborted && this.#now().getTime() >= this.#nextQuestionRecoveryAt) {
+        this.#nextQuestionRecoveryAt = this.#now().getTime() + questionRecoveryIntervalMs;
+        for (const directory of this.#questionDirectories) {
+          void this.recoverPendingQuestions("primary", directory);
+          if (this.#secondaryClient !== undefined) void this.recoverPendingQuestions("secondary", directory);
+        }
+      }
       if (!this.#primaryEventStreamDisconnected && this.#disconnectedActiveSessionIds.size > 0
         && this.#primaryReconnectRefreshes.size === 0) {
         this.startPrimaryReconnectRefresh(this.#primaryConnectionGeneration);
@@ -1800,7 +1998,10 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
           if (this.#secondaryAbort.signal.aborted) return;
           const global = isRecord(event) && isRecord(event.payload) ? event : { payload: event };
           const payload = isRecord(global.payload) ? global.payload : {};
-          if (payload.type === "server.connected") continue;
+          if (payload.type === "server.connected") {
+            this.discoverPendingQuestions();
+            continue;
+          }
           backoff.reset();
           await this.handleEvent(event, "secondary");
         }
@@ -1828,7 +2029,10 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       this.signalCompactionLifecycle(sessionId);
     }
 
-    if (type === "server.connected") return await this.emit({ ...base, type: "provider.connected", payload: {} });
+    if (type === "server.connected") {
+      this.discoverPendingQuestions();
+      return await this.emit({ ...base, type: "provider.connected", payload: {} });
+    }
     if (type === "session.created") return await this.emit({ ...base, type: "session.created", payload: asJsonObject(properties) });
     if (type === "session.updated") return await this.emit({ ...base, type: "session.updated", payload: sessionUpdatePayload(this.#hostId, properties) });
     if (type === "session.status") {
@@ -2160,6 +2364,18 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
           ...(messageId !== undefined ? { messageId } : {}),
         },
       });
+    }
+    if (type === "question.asked") {
+      this.#questionRevision += 1;
+      const eventDirectory = isRecord(value) ? value.directory : undefined;
+      const directory = typeof eventDirectory === "string" && eventDirectory !== "global" ? eventDirectory : this.#directory;
+      return await this.publishQuestion(properties, source, directory, base.nativeEvent);
+    }
+    if (type === "question.replied" || type === "question.rejected") {
+      this.#questionRevision += 1;
+      if (typeof properties.requestID !== "string" || sessionId === undefined) return;
+      return await this.resolveQuestion(`opencode_question_${properties.requestID}`, sessionId,
+        type === "question.replied" ? "answered" : "cancelled", base.nativeEvent);
     }
     if (type === "permission.updated" || type === "permission.asked") {
       const permission = type === "permission.asked" ? properties : properties;
@@ -2960,6 +3176,12 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   }
 
   private async emit(input: Omit<ProviderEvent, "eventId" | "providerId" | "occurredAt">): Promise<void> {
+    if (input.providerSessionId !== undefined && (input.type === "agent.interrupted" || input.type === "agent.completed" || input.type === "agent.error")) {
+      this.#questionRevision += 1;
+      for (const [providerRequestId, pending] of this.#questions) {
+        if (pending.sessionId === input.providerSessionId) await this.resolveQuestion(providerRequestId, pending.sessionId, "cancelled");
+      }
+    }
     if (input.type !== "provider.connected" && input.type !== "provider.disconnected") {
       this.#sessionListSnapshotGeneration += 1;
       this.#sessionListSnapshots.clear();
@@ -3053,6 +3275,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
 
   private activityDerivedState(providerSessionId: string, normalizedState: RemoteSession["state"]): RemoteSession["state"] {
     if (this.#primaryEventStreamDisconnected || this.#disconnectedActiveSessionIds.has(providerSessionId)) return "disconnected";
+    if ([...this.#questions.values()].some((question) => question.sessionId === providerSessionId)) return "needs_input";
     if (normalizedState === "failed" || normalizedState === "needs_approval" || normalizedState === "needs_input") return normalizedState;
     if (this.#activePrompts.has(providerSessionId) || this.#activePromptMessageIds.has(providerSessionId)) return "working";
     if (this.isSettledOwnedSession(providerSessionId)) return "idle";
@@ -3387,7 +3610,46 @@ function isOpenCodeAbortError(value: unknown): boolean {
 function primaryEventCarriesActivityState(type: string): boolean {
   return type === "session.status" || type === "session.idle" || type === "session.error"
     || type === "message.updated" || type === "message.part.updated" || type === "message.part.delta"
-    || type === "permission.updated" || type === "permission.asked" || type === "command.executed";
+    || type === "permission.updated" || type === "permission.asked" || type === "question.asked" || type === "command.executed";
+}
+
+function openCodeQuestionAnswer(question: JsonObject, answers: JsonObject): readonly string[] {
+  const value = answers[String(question.id)];
+  const answer = typeof value === "string" ? [value]
+    : Array.isArray(value) ? value
+      : isRecord(value) && Array.isArray(value.answers) ? value.answers : undefined;
+  if (answer === undefined || answer.length === 0 || answer.some((entry) => typeof entry !== "string" || entry.trim().length === 0)
+    || (question.multiple !== true && answer.length > 1)) {
+    throw new ProviderAdapterError("opencode", "USER_INPUT_INVALID", `Answer ${typeof question.header === "string" ? question.header : String(question.id)} before continuing`, false);
+  }
+  const labels = Array.isArray(question.options) ? question.options.flatMap((option) => isRecord(option) && typeof option.label === "string" ? [option.label] : []) : [];
+  if (question.custom === false && answer.some((entry) => !labels.includes(entry as string))) {
+    throw new ProviderAdapterError("opencode", "USER_INPUT_INVALID", "Choose one of the options offered by OpenCode", false);
+  }
+  return answer as string[];
+}
+
+function openCodeSessionPermissions(value: unknown, sessionId: string): ProviderSessionPermissions {
+  if (!isRecord(value) || value.id !== sessionId || (value.permission !== undefined && !Array.isArray(value.permission))) {
+    throw new ProviderAdapterError("opencode", "PERMISSIONS_UNAVAILABLE", "OpenCode did not return this task's permission rules", false);
+  }
+  const rules = Array.isArray(value.permission) ? value.permission : [];
+  const last = rules.at(-1);
+  const action = isRecord(last) && last.permission === "*" && last.pattern === "*"
+    && (last.action === "ask" || last.action === "allow" || last.action === "deny") ? last.action : undefined;
+  const current = action ?? (rules.length === 0 ? "default" : "custom");
+  return {
+    controls: [{
+      id: "tool_permissions", label: "Tool permissions", description: "Tool access for this task.", value: current,
+      options: [
+        ...(current === "default" ? [{ value: "default", label: "Provider settings (current)", disabled: true }] : []),
+        ...(current === "custom" ? [{ value: "custom", label: "Custom rules (current)", disabled: true }] : []),
+        { value: "ask", label: "Ask before tools" },
+        { value: "allow", label: "Allow tools" },
+        { value: "deny", label: "Deny tools" },
+      ],
+    }],
+  };
 }
 
 function toolEventType(part: Record<string, unknown>): "tool.started" | "tool.completed" {

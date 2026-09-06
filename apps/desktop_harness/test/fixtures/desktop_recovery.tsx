@@ -12,7 +12,12 @@ window.tethoqDesktop = {
         ? {ok:false, error:{message:error,code:'qa_rejected'},payload:{}}
         : {ok:true,payload:{}}); });
     }
-    if (type === 'session.interrupt') qa.calls.push({type,payload});
+    if (type === 'session.interrupt') {
+      qa.calls.push({type,payload});
+      if (qa.deferInterrupt) return new Promise(resolve => { qa.pendingInterrupt = (error?: string) => resolve(error
+        ? {ok:false,error:{message:error,code:'qa_rejected'},payload:{}}
+        : {ok:true,payload:{}}); });
+    }
     return {ok:true,payload:{messages:[],targets:[],models:[],vision:{sessionId:'qa-session',primaryModelSupportsImageInput:false}}};
   }, selectImages: async () => [], selectFiles: async () => [],
 };
@@ -42,6 +47,7 @@ function Fixture() {
   const [boundary,setBoundary] = useState(undefined);
   const [display,setDisplay] = useState('compact');
   const [notifications,setNotifications] = useState([]);
+  const [restoreRevision,setRestoreRevision] = useState(0);
   qa.snapshot = snapshot; qa.draft = draft; qa.attachments = attachments; qa.stop = stop;
   qa.stage = (scenario) => {
     qa.calls = []; qa.notifications = []; setNotifications([]); setBoundary(undefined);
@@ -57,6 +63,14 @@ function Fixture() {
   qa.reasoning = () => setSnapshot(s => ({...s,timelines:{[session.id]:[...s.timelines[session.id],{...thought,id:'resumed-reasoning',timestamp:stamp()}]}}));
   qa.repeatFailure = () => setSnapshot(s => ({...s,timelines:{[session.id]:[...s.timelines[session.id],{...interrupted,id:'later-interruption',timestamp:stamp()}]}}));
   qa.display = setDisplay;
+  qa.stageStop = () => {
+    qa.calls = []; qa.notifications = []; qa.deferInterrupt = true;
+    setNotifications([]); setStop(false); setBoundary(undefined); setDraft(''); setAttachments([]);
+    setRestoreRevision(value=>value+1);
+    setSnapshot({...original,sessions:[{...session,state:'working'}],timelines:{[session.id]:[user,{...thought,state:'running'}]}});
+  };
+  qa.confirmStop = () => setSnapshot(s=>({...s,sessions:[{...s.sessions[0],state:'idle',interruptedAt:stamp()}],
+    timelines:{[session.id]:[user,thought,{...interrupted,id:'confirmed-stop-'+(++qa.scenario),state:'failed',timestamp:stamp()}]}}));
   return <><Workspace snapshot={snapshot} session={snapshot.sessions[0]} workingBoundary={boundary}
     stopPresentationActive={stop} onStopPresentation={(_id,value)=>setStop(value)}
     onPrepareTurnResume={() => { const b=captureSessionWorkingBoundary(qa.snapshot.timelines[session.id]); return ()=>setBoundary(b); }}
@@ -66,7 +80,7 @@ function Fixture() {
     initialDraft={draft} onDraftChange={setDraft} initialAttachments={attachments} onAttachmentsChange={setAttachments}
     initialWorkflowAttachments={[]} onWorkflowAttachmentsChange={noop} initialAnnotations={[]} onAnnotationsChange={noop}
     initialMode="queue" onModeChange={noop} initialMeshTargets={[]} onMeshTargetsChange={noop} onDelegationDraftChange={noop}
-    draftRestoreRevision={0} onRestoreFailedSubmission={x=>x} onDerivedSession={noop} onRetryQueuedNewTaskDelivery={noop}
+    draftRestoreRevision={restoreRevision} onRestoreFailedSubmission={x=>x} onDerivedSession={noop} onRetryQueuedNewTaskDelivery={noop}
     onOpenChild={noop} onOpenParent={noop} notify={(text)=>{qa.notifications.push(text);setNotifications(a=>[...a,text]);}}
     updateSnapshot={setSnapshot} onAttentionMutation={noop} onHydrateProviderModels={async()=>{}}
     timelineWindow={{revealStart:0,loadingOlder:false}} reasoningDisplay={display} agentDefaults={{}} ears={{enabled:false,mode:'transcribe'}} onEarsChange={async()=>{}}
