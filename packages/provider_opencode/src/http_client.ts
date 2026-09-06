@@ -32,11 +32,11 @@ export class OpenCodeHttpClient {
   public async request<T>(
     method: string,
     path: string,
-    options: { readonly body?: unknown; readonly query?: Readonly<Record<string, string | number | boolean | undefined>>; readonly signal?: AbortSignal } = {},
+    options: { readonly body?: unknown; readonly query?: Readonly<Record<string, string | number | boolean | undefined>>; readonly signal?: AbortSignal; readonly timeoutMs?: number } = {},
   ): Promise<T> {
     const url = this.url(path, options.query);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error("OpenCode request timed out")), this.#requestTimeoutMs);
+    const timer = setTimeout(() => controller.abort(new Error("OpenCode request timed out")), options.timeoutMs ?? this.#requestTimeoutMs);
     const forwardAbort = () => controller.abort(options.signal?.reason);
     options.signal?.addEventListener("abort", forwardAbort, { once: true });
     try {

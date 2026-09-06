@@ -34,8 +34,11 @@ import {
   type LocalOpenHandlerId,
   type LocalOpenState,
   type PreferencesAction,
+  type MobileConnectionAction,
 } from "../shared/desktop_api.js";
 import type { DesktopRuntime } from "./runtime.js";
+import { HARNESS_GUIDES } from "../shared/harness_setup.js";
+import type { MobileConnectionManager } from "./mobile_connection.js";
 import type { DesktopPreferencesStore } from "./preferences.js";
 import type { LiveSessionManager } from "./live_session/manager.js";
 import { detectLocalOpenHandlers, existingLocalTarget, openExistingLocalTarget, publicLocalOpenHandlers } from "./local_open.js";
@@ -62,6 +65,7 @@ const ALLOWED_REQUESTS = new Set([
   "wallet.get",
   "wallet.configure",
   "vision.targets",
+  "sessions.bootstrap",
   "sessions.refresh",
   "sessions.list",
   "session.open",
@@ -70,7 +74,11 @@ const ALLOWED_REQUESTS = new Set([
   "session.image.get",
   "session.children",
   "session.context.get",
+  "session.goal.get",
+  "session.goal.set",
+  "session.goal.clear",
   "session.context.set_threshold",
+  "session.context.clear_threshold",
   "session.context.compact",
   "session.context_handoff",
   "session.branch",
@@ -81,7 +89,13 @@ const ALLOWED_REQUESTS = new Set([
   "session.vision.configure",
   "session.vision.ask",
   "session.create",
+  "scheduled_task.list",
+  "scheduled_task.create",
+  "scheduled_task.cancel",
+  "scheduled_task.run_now",
+  "scheduled_task.retry",
   "session.send_message",
+  "session.continue",
   "session.steer_message",
   "session.edit_message",
   "session.interrupt",
@@ -90,8 +104,10 @@ const ALLOWED_REQUESTS = new Set([
   "message_queue.edit",
   "message_queue.deliver",
   "message_queue.move_to_new_task",
+  "message_queue.deliver_new_task",
   "message_queue.cancel",
   "delegation.list",
+  "delegation.prepare",
   "delegation.start",
   "attachment.upload.begin",
   "attachment.upload.chunk",
@@ -126,11 +142,13 @@ export interface RegisterDesktopIpcOptions {
     goForward(tabId: string): Promise<unknown> | unknown;
     reload(tabId: string): Promise<unknown> | unknown;
     stop(tabId: string): Promise<unknown> | unknown;
+    setMuted(tabId: string, muted: boolean): Promise<unknown> | unknown;
     setBounds(bounds: { x: number; y: number; width: number; height: number }): void;
     setVisible(visible: boolean): void;
     setVisibleForSession?(visible: boolean, sessionId?: string): Promise<BrowserWorkspaceState>;
     focus(): void;
-    openOverlay(bounds: { x: number; y: number; width: number; height: number }): Promise<string>;
+    prepareOverlay(bounds: { x: number; y: number; width: number; height: number }): Promise<{ readonly snapshot: string; readonly token: number }>;
+    openOverlay(token: number): void;
     closeOverlay(): void;
     resolvePermission(requestId: string, allow: boolean, rememberForSession?: boolean): void;
     clearProfileData(): Promise<unknown>;
@@ -154,6 +172,7 @@ export interface RegisterDesktopIpcOptions {
   };
   readonly preferences: DesktopPreferencesStore;
   readonly liveSession?: LiveSessionManager;
+  readonly mobileConnection: MobileConnectionManager;
 }
 
 export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => void {
@@ -204,7 +223,10 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
     const allowedProviderIds = options.allowedProviderIds();
     validateProviderTarget(payload, type === "wallet.get" || type === "wallet.configure" ? new Set([...allowedProviderIds, "direct"]) : allowedProviderIds);
     const requestId = input.requestId === undefined ? undefined : nonEmptyString(input.requestId, "request ID", 160);
-    if (type === "provider.reconnect" && payload.providerId === "opencode") await runtime.ensureOpenCode();
+    if (type === "provider.reconnect" && typeof payload.providerId === "string") {
+      await runtime.setupProviderTools(payload.providerId);
+      if (payload.providerId === "opencode") await runtime.ensureOpenCode();
+    }
     return await runtime.request(type, payload, requestId);
   });
   handle(IPC_CHANNELS.selectDirectory, async (_event, value: unknown) => {
@@ -280,6 +302,12 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
     await shell.openExternal(url);
   });
   handle(IPC_CHANNELS.showWindow, () => { showWindow(window); });
+  handle(IPC_CHANNELS.openHarnessSetupPage, async (_event, value: unknown) => {
+    const input = record(value, "harness setup");
+    const guide = HARNESS_GUIDES.find((item) => item.id === input.providerId);
+    if (!guide?.documentation.startsWith("https://")) throw new Error("Harness setup page is unavailable");
+    await shell.openExternal(guide.documentation);
+  });
   handle(IPC_CHANNELS.hideWindow, () => { window.hide(); });
   handle(IPC_CHANNELS.openCodeStatus, () => runtime.openCode.status());
   handle(IPC_CHANNELS.restartOpenCode, async () => await runtime.restartOpenCode());
@@ -300,13 +328,18 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
       case "forward": await options.browser.goForward(action.tabId); break;
       case "reload": await options.browser.reload(action.tabId); break;
       case "stop": await options.browser.stop(action.tabId); break;
+      case "set-muted": await options.browser.setMuted(action.tabId, action.muted); break;
       case "set-bounds": options.browser.setBounds(action.bounds); break;
       case "set-visible":
         if (options.browser.setVisibleForSession !== undefined) return await options.browser.setVisibleForSession(action.visible, action.sessionId);
         options.browser.setVisible(action.visible);
         break;
       case "focus": options.browser.focus(); break;
-      case "open-overlay": return { ...options.browser.getState(), overlaySnapshotDataUrl: await options.browser.openOverlay(action.bounds) };
+      case "prepare-overlay": {
+        const prepared = await options.browser.prepareOverlay(action.bounds);
+        return { ...options.browser.getState(), overlaySnapshotDataUrl: prepared.snapshot, overlayToken: prepared.token };
+      }
+      case "open-overlay": options.browser.openOverlay(action.token); break;
       case "close-overlay": options.browser.closeOverlay(); break;
       case "clear-profile": await options.browser.clearProfileData(); break;
       case "clear-download-history": options.browser.clearDownloadHistory(); break;
@@ -341,6 +374,9 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
     switch (action.type) {
       case "set-experimental-features": return await options.preferences.setExperimentalFeatures(action.enabled);
       case "set-reasoning-display": return await options.preferences.setReasoningDisplay(action.value);
+      case "set-task-list-mode": return await options.preferences.setTaskListMode(action.value);
+      case "save-project": return await options.preferences.saveProject(action.directory);
+      case "use-project": return await options.preferences.useProject(action.directory);
       case "set-close-action": return await options.preferences.setCloseAction(action.value);
       case "set-launch-at-login": return await options.preferences.setLaunchAtLogin(action.value);
       case "set-alerts": return await options.preferences.setAlerts(action.value);
@@ -355,6 +391,7 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
       }
       case "clear-global-agents": return await options.preferences.setGlobalAgentsPath(null);
       case "set-task-override": return await options.preferences.setTaskOverride(action.sessionId, action.override);
+      case "move-task-override": return await options.preferences.moveTaskOverride(action.fromSessionId, action.toSessionId);
       case "set-agent-default": return await options.preferences.setAgentDefault(action.providerId, {
         modelId: action.modelId,
         ...(action.reasoningEffort ? { reasoningEffort: action.reasoningEffort } : {}),
@@ -380,6 +417,12 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
       case "evidence": return await options.liveSession.evidence(action);
     }
   });
+  handle(IPC_CHANNELS.mobileConnectionGetState, async () => await options.mobileConnection.refreshState());
+  handle(IPC_CHANNELS.mobileConnectionAction, async (_event, value: unknown) => {
+    const action = validateMobileConnectionAction(value);
+    if (action.type === "start") return await options.mobileConnection.startPairing();
+    return await options.mobileConnection.revoke(action.connectionId);
+  });
   if (process.env.TETHOQ_PACKAGED_SMOKE === "1") {
     handle(IPC_CHANNELS.smokeQuit, () => {
       setImmediate(() => app.quit());
@@ -399,6 +442,10 @@ function validateBrowserAction(value: unknown): BrowserAction {
   const type = nonEmptyString(input.type, "browser action type", 40);
   if (type === "create-tab") return { type, ...(input.input === undefined ? {} : { input: nonEmptyString(input.input, "address", 8_192) }), ...(typeof input.activate === "boolean" ? { activate: input.activate } : {}) };
   if (["activate-tab", "close-tab", "back", "forward", "reload", "stop"].includes(type)) return { type: type as "activate-tab", tabId: nonEmptyString(input.tabId, "tab ID", 160) };
+  if (type === "set-muted") {
+    if (typeof input.muted !== "boolean") throw new Error("Browser tab mute state must be true or false");
+    return { type, tabId: nonEmptyString(input.tabId, "tab ID", 160), muted: input.muted };
+  }
   if (type === "navigate") return { type, tabId: nonEmptyString(input.tabId, "tab ID", 160), input: nonEmptyString(input.input, "address", 8_192) };
   if (type === "set-visible") return {
     type,
@@ -410,10 +457,14 @@ function validateBrowserAction(value: unknown): BrowserAction {
     const number = (entry: unknown, name: string): number => { if (typeof entry !== "number" || !Number.isFinite(entry)) throw new Error(`${name} is invalid`); return Math.round(entry); };
     return { type, bounds: { x: number(bounds.x, "x"), y: number(bounds.y, "y"), width: Math.max(1, number(bounds.width, "width")), height: Math.max(1, number(bounds.height, "height")) } };
   }
-  if (type === "open-overlay") {
+  if (type === "prepare-overlay") {
     const bounds = record(input.bounds, "browser overlay bounds");
     const number = (entry: unknown, name: string): number => { if (typeof entry !== "number" || !Number.isFinite(entry)) throw new Error(`${name} is invalid`); return Math.round(entry); };
     return { type, bounds: { x: number(bounds.x, "x"), y: number(bounds.y, "y"), width: Math.max(1, number(bounds.width, "width")), height: Math.max(1, number(bounds.height, "height")) } };
+  }
+  if (type === "open-overlay") {
+    if (typeof input.token !== "number" || !Number.isSafeInteger(input.token) || input.token < 1) throw new Error("browser overlay token is invalid");
+    return { type, token: input.token };
   }
   if (["focus", "clear-profile", "clear-download-history", "close-overlay"].includes(type)) return { type: type as "focus" };
   if (type === "permission") return { type, requestId: nonEmptyString(input.requestId, "permission request ID", 160), allow: input.allow === true, ...(typeof input.rememberForSession === "boolean" ? { rememberForSession: input.rememberForSession } : {}) };
@@ -457,6 +508,13 @@ function validatePreferencesAction(value: unknown): PreferencesAction {
     if (input.value !== "compact" && input.value !== "expanded") throw new Error("The reasoning display setting must be compact or expanded");
     return { type: "set-reasoning-display", value: input.value };
   }
+  if (input.type === "set-task-list-mode") {
+    if (input.value !== "recent" && input.value !== "project") throw new Error("The task list mode must be recent or project");
+    return { type: "set-task-list-mode", value: input.value };
+  }
+  if (input.type === "save-project" || input.type === "use-project") {
+    return { type: input.type, directory: nonEmptyString(input.directory, "project folder", 32_768) };
+  }
   if (input.type === "set-close-action") {
     if (input.value !== "tray" && input.value !== "quit") throw new Error("The close setting must be tray or quit");
     return { type: "set-close-action", value: input.value };
@@ -481,6 +539,11 @@ function validatePreferencesAction(value: unknown): PreferencesAction {
       ...(patch.archived === undefined ? {} : { archived: patch.archived === true }),
     };
     return { type: "set-task-override", sessionId, override };
+  }
+  if (input.type === "move-task-override") {
+    const fromSessionId = nonEmptyString(input.fromSessionId, "source task ID", 400).trim();
+    const toSessionId = nonEmptyString(input.toSessionId, "destination task ID", 400).trim();
+    return { type: "move-task-override", fromSessionId, toSessionId };
   }
   if (input.type === "set-agent-default") {
     const providerId = nonEmptyString(input.providerId, "provider ID", 160).trim();
@@ -524,6 +587,15 @@ function validateLiveSessionAction(value: unknown): LiveSessionAction {
     return { type, utteranceId: nonEmptyString(input.utteranceId, "utterance ID", 160), startedAtWallMs, endedAtWallMs };
   }
   throw new Error("Unknown live session action");
+}
+
+function validateMobileConnectionAction(value: unknown): MobileConnectionAction {
+  const input = record(value, "mobile connection action");
+  if (input.type === "start") return { type: "start" };
+  if (input.type === "revoke") {
+    return { type: "revoke", connectionId: nonEmptyString(input.connectionId, "phone connection ID", 160) };
+  }
+  throw new Error("Unknown mobile connection action");
 }
 
 export function validateProviderTarget(payload: JsonObject, allowedProviderIds: ReadonlySet<string>): void {

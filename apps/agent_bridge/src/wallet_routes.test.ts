@@ -55,9 +55,17 @@ test("wallet routes configure an encrypted direct key without echoing it to clie
     assert.equal((selectedEndpoint.payload.wallet as JsonObject).endpointName, "OpenAI API");
     assert.equal((selectedEndpoint.payload.wallet as JsonObject).apiKeyConfigured, false);
 
+    const cleared = await request("wallet.configure", { providerId: "direct", endpointId: "zai", clearBalance: true });
+    assert.equal(cleared.ok, true);
+    assert.equal((cleared.payload.wallet as JsonObject).balance, undefined);
+
     const invalid = await request("wallet.configure", { providerId: "direct", endpointId: "zai", setBalance: "12" });
     assert.equal(invalid.ok, false);
     assert.match(invalid.error?.message ?? "", /setBalance must be a finite number/);
+
+    const invalidClear = await request("wallet.configure", { providerId: "direct", endpointId: "zai", clearBalance: "yes" });
+    assert.equal(invalidClear.ok, false);
+    assert.match(invalidClear.error?.message ?? "", /clearBalance must be a boolean/);
   } finally {
     await bridge.dispose();
     await rm(root, { recursive: true, force: true });

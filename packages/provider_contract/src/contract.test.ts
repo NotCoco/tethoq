@@ -92,6 +92,20 @@ function pagedAdapter(repeatCursor = false): AgentProviderAdapter {
 test("pagination helper retrieves the complete index", async () => {
   const result = await collectAllSessionPages(pagedAdapter(), { limit: 2 });
   assert.equal(result.pages, 2);
+  assert.equal(result.authoritative, true);
+  assert.deepEqual(result.sessions.map((item) => item.providerSessionId), ["1", "2", "3"]);
+});
+
+test("pagination helper preserves a provider's incomplete-catalogue signal", async () => {
+  const adapter = pagedAdapter();
+  const result = await collectAllSessionPages({
+    ...adapter,
+    listSessions: async (options): Promise<PaginatedSessions> => {
+      const page = await adapter.listSessions(options);
+      return { ...page, authoritative: options?.cursor === undefined ? false : true };
+    },
+  }, { limit: 2 });
+  assert.equal(result.authoritative, false);
   assert.deepEqual(result.sessions.map((item) => item.providerSessionId), ["1", "2", "3"]);
 });
 

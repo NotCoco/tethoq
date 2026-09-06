@@ -4,6 +4,7 @@ import type {
   BrowserAgentActionResult,
   BrowserAgentPageSnapshot,
   BrowserAgentScreenshot,
+  BrowserAgentWorkspaceSnapshot,
   BrowserTabState,
   BrowserWorkspaceManager,
   BrowserWorkspaceState,
@@ -13,22 +14,25 @@ const MAX_TOOL_STRING = 20_000;
 const MAX_QUESTION = 2_000;
 const BROWSER_TOOL_NAMES = new Set([
   "browser_get_state", "browser_open", "browser_navigate", "browser_inspect",
-  "browser_click", "browser_type", "browser_scroll", "browser_capture",
+  "browser_inspect_all", "browser_click", "browser_type", "browser_scroll",
+  "browser_capture", "browser_activate", "browser_close", "browser_back",
+  "browser_forward", "browser_reload", "browser_stop", "browser_set_muted",
 ]);
 
 export const browserToolDefinitions: readonly ClientToolDefinition[] = [
   {
     name: "browser_get_state",
-    description: "List the tabs in this session's isolated Tethoq browser and identify the active tab.",
+    description: "Read this session's isolated Tethoq browser lifecycle state plus a bounded semantic snapshot of the active page. Use browser_inspect_all only when content from every tab is needed.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
     name: "browser_open",
-    description: "Open an HTTP(S) address or web search in a new tab in this session's isolated Tethoq browser.",
+    description: "Open an HTTP(S) address or web search in a new background tab without changing the user's selected tab.",
     inputSchema: {
       type: "object",
       properties: {
         url_or_search: { type: "string", minLength: 1, maxLength: 8192, description: "An HTTP(S) URL, hostname, or search query." },
+        activate: { type: "boolean", default: false, description: "Prefer false. True switches the user's visible browser tab to the new page." },
       },
       required: ["url_or_search"],
       additionalProperties: false,
@@ -49,10 +53,21 @@ export const browserToolDefinitions: readonly ClientToolDefinition[] = [
   },
   {
     name: "browser_inspect",
-    description: "Read bounded visible page text and get semantic references for visible links, buttons, and fields. Inspect again after navigation or major page changes.",
+    description: "Read bounded visible page text and semantic references for every visible link, button, field, and other actionable control. Inspect again after navigation or major page changes.",
     inputSchema: {
       type: "object",
       properties: { tab_id: { type: "string", description: "Optional tab ID from browser_get_state." } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "browser_inspect_all",
+    description: "Read bounded visible text and semantic controls from every browser tab. Use browser_get_state for lightweight lifecycle/audio state and this when the task needs cross-tab page content.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        max_text_per_tab: { type: "integer", minimum: 250, maximum: MAX_TOOL_STRING, default: 2500, description: "Visible-text limit per tab. The whole result is additionally bounded." },
+      },
       additionalProperties: false,
     },
   },
@@ -109,6 +124,74 @@ export const browserToolDefinitions: readonly ClientToolDefinition[] = [
       additionalProperties: false,
     },
   },
+  {
+    name: "browser_activate",
+    description: "Make a specified browser tab the active tab.",
+    inputSchema: {
+      type: "object",
+      properties: { tab_id: { type: "string", description: "Tab ID from browser_get_state." } },
+      required: ["tab_id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "browser_close",
+    description: "Close a specified browser tab.",
+    inputSchema: {
+      type: "object",
+      properties: { tab_id: { type: "string", description: "Tab ID from browser_get_state." } },
+      required: ["tab_id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "browser_back",
+    description: "Go back in a browser tab's history.",
+    inputSchema: {
+      type: "object",
+      properties: { tab_id: { type: "string", description: "Optional tab ID from browser_get_state." } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "browser_forward",
+    description: "Go forward in a browser tab's history.",
+    inputSchema: {
+      type: "object",
+      properties: { tab_id: { type: "string", description: "Optional tab ID from browser_get_state." } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "browser_reload",
+    description: "Reload a browser tab.",
+    inputSchema: {
+      type: "object",
+      properties: { tab_id: { type: "string", description: "Optional tab ID from browser_get_state." } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "browser_stop",
+    description: "Stop loading a browser tab.",
+    inputSchema: {
+      type: "object",
+      properties: { tab_id: { type: "string", description: "Optional tab ID from browser_get_state." } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "browser_set_muted",
+    description: "Mute or unmute audio for a browser tab.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tab_id: { type: "string", description: "Optional tab ID from browser_get_state." },
+        muted: { type: "boolean", default: true },
+      },
+      additionalProperties: false,
+    },
+  },
 ] as const;
 
 export interface BrowserAgentWorkspace {
@@ -122,6 +205,14 @@ export interface BrowserAgentWorkspace {
   typeForAgent(ref: string, text: string, submit?: boolean, tabId?: string): Promise<BrowserAgentActionResult>;
   scrollForAgent(deltaX: number, deltaY: number, tabId?: string): Promise<BrowserAgentActionResult>;
   captureForAgent(tabId?: string): Promise<BrowserAgentScreenshot>;
+  activateTab(tabId: string): BrowserTabState;
+  closeTab(tabId: string): Promise<BrowserWorkspaceState>;
+  goBack(tabId: string): BrowserTabState;
+  goForward(tabId: string): BrowserTabState;
+  reload(tabId: string): BrowserTabState;
+  stop(tabId: string): BrowserTabState;
+  setMuted(tabId: string, muted: boolean): BrowserTabState;
+  inspectAllForAgent(options?: { readonly maxTextPerTab?: number }): Promise<BrowserAgentWorkspaceSnapshot>;
 }
 
 export type BrowserAgentCaptureHandler = (
@@ -162,11 +253,22 @@ export class BrowserAgentTools {
     try {
       if (tool === "browser_get_state") {
         assertKnownKeys(input, []);
-        return stateJson(this.#workspace.getState());
+        const state = this.#workspace.getState();
+        if (state.activeTabId === null) return stateJson(state, null, null);
+        try {
+          const activePage = await this.#workspace.inspectForAgent(state.activeTabId);
+          return stateJson(this.#workspace.getState(), activePage, null);
+        } catch (error: unknown) {
+          const message = error instanceof Error ? error.message : "The active page could not be inspected";
+          return stateJson(this.#workspace.getState(), null, boundedErrorText(message));
+        }
       }
       if (tool === "browser_open") {
-        assertKnownKeys(input, ["url_or_search"]);
-        const tab = await this.#workspace.createTab({ url: requiredString(input, "url_or_search", 8_192) }, true);
+        assertKnownKeys(input, ["url_or_search", "activate"]);
+        const tab = await this.#workspace.createTab(
+          { url: requiredString(input, "url_or_search", 8_192) },
+          optionalBoolean(input, "activate") ?? false,
+        );
         return tabJson(tab);
       }
       if (tool === "browser_navigate") {
@@ -178,6 +280,11 @@ export class BrowserAgentTools {
       if (tool === "browser_inspect") {
         assertKnownKeys(input, ["tab_id"]);
         return jsonValue(await this.#workspace.inspectForAgent(optionalString(input, "tab_id", 100)));
+      }
+      if (tool === "browser_inspect_all") {
+        assertKnownKeys(input, ["max_text_per_tab"]);
+        const maxTextPerTab = optionalInteger(input, "max_text_per_tab");
+        return jsonValue(await this.#workspace.inspectAllForAgent(maxTextPerTab === undefined ? {} : { maxTextPerTab }));
       }
       if (tool === "browser_click") {
         assertKnownKeys(input, ["tab_id", "ref"]);
@@ -208,6 +315,30 @@ export class BrowserAgentTools {
         if (this.#onCapture !== undefined) return await this.#onCapture(parentSessionId, capture, question);
         return jsonValue(capture);
       }
+      if (tool === "browser_activate") {
+        assertKnownKeys(input, ["tab_id"]);
+        return tabJson(this.#workspace.activateTab(requiredString(input, "tab_id", 100)));
+      }
+      if (tool === "browser_close") {
+        assertKnownKeys(input, ["tab_id"]);
+        await this.#workspace.closeTab(requiredString(input, "tab_id", 100));
+        return stateJson(this.#workspace.getState());
+      }
+      if (["browser_back", "browser_forward", "browser_reload", "browser_stop"].includes(tool)) {
+        assertKnownKeys(input, ["tab_id"]);
+        const state = this.#workspace.getState();
+        const tabId = optionalString(input, "tab_id", 100) ?? requireActiveTab(state);
+        if (tool === "browser_back") return tabJson(this.#workspace.goBack(tabId));
+        if (tool === "browser_forward") return tabJson(this.#workspace.goForward(tabId));
+        if (tool === "browser_reload") return tabJson(this.#workspace.reload(tabId));
+        return tabJson(this.#workspace.stop(tabId));
+      }
+      if (tool === "browser_set_muted") {
+        assertKnownKeys(input, ["tab_id", "muted"]);
+        const state = this.#workspace.getState();
+        const tabId = optionalString(input, "tab_id", 100) ?? requireActiveTab(state);
+        return tabJson(this.#workspace.setMuted(tabId, optionalBoolean(input, "muted") ?? true));
+      }
       throw new Error("Unsupported browser tool");
     } finally {
       this.#workspace.finishAgentActivity();
@@ -215,12 +346,42 @@ export class BrowserAgentTools {
   }
 }
 
-function stateJson(state: BrowserWorkspaceState): JsonValue {
-  return {
+function stateJson(
+  state: BrowserWorkspaceState,
+  activePage?: BrowserAgentPageSnapshot | null,
+  activePageError?: string | null,
+): JsonValue {
+  const result: JsonObject = {
     active_tab_id: state.activeTabId,
     visible: state.visible,
     tabs: state.tabs.map((tab) => tabJsonObject(tab)),
+    downloads: state.downloads.map((download) => ({
+      id: download.id,
+      tab_id: download.tabId,
+      filename: download.filename,
+      url: download.url,
+      state: download.state,
+      mime_type: download.mimeType,
+      received_bytes: download.receivedBytes,
+      total_bytes: download.totalBytes,
+      bytes_per_second: download.bytesPerSecond,
+      paused: download.paused,
+      started_at: download.startedAt,
+      finished_at: download.finishedAt,
+    })),
+    pending_permissions: state.pendingPermissions.map((permission) => ({
+      id: permission.id,
+      tab_id: permission.tabId,
+      permission: permission.permission,
+      origin: permission.origin,
+      requesting_url: permission.requestingUrl,
+      requested_at: permission.requestedAt,
+    })),
+    permission_decisions: state.permissionDecisions.map((decision) => ({ ...decision })),
   };
+  if (activePage !== undefined) result.active_page = activePage === null ? null : jsonValue(activePage);
+  if (activePageError !== undefined) result.active_page_error = activePageError;
+  return result;
 }
 
 function tabJson(tab: BrowserTabState): JsonValue {
@@ -237,6 +398,8 @@ function tabJsonObject(tab: BrowserTabState): JsonObject {
     can_go_forward: tab.canGoForward,
     crashed: tab.crashed,
     error: tab.error,
+    muted: tab.muted,
+    audible: tab.audible,
   };
 }
 

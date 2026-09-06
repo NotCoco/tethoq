@@ -11,8 +11,10 @@ import {
   type EarsSettings,
   type LocalOpenHandlerId,
   type TaskOverride,
+  type TaskListMode,
 } from "../shared/desktop_api.js";
 import { defaultEarsSettings, normalizeEarsSettings } from "../../../../packages/protocol/src/ears.js";
+import { normalizeProjectDirectory, normalizeSavedProjectDirectories } from "../shared/project_directories.js";
 
 export const DESKTOP_PREFERENCES_VERSION = 1 as const;
 
@@ -22,6 +24,9 @@ export interface DesktopPreferences {
   readonly experimentalFeatures: boolean;
   /** Local presentation only. This never changes a provider's reasoning effort. */
   readonly reasoningDisplay: "compact" | "expanded";
+  /** Persisted task-rail organisation. */
+  readonly taskListMode: TaskListMode;
+  readonly savedProjectDirectories: readonly string[];
   /** Local handler used for task folders and paths surfaced in transcripts. */
   readonly localOpenHandlerId: LocalOpenHandlerId;
   /** Window close behaviour. Tray is the default so running work survives a stray close. */
@@ -36,7 +41,7 @@ export interface DesktopPreferences {
   readonly globalAgentsPath: string | null;
   /** User-owned task name, pin, and archive state keyed by session ID. */
   readonly taskOverrides: Readonly<Record<string, TaskOverride>>;
-  /** Master gate for spawning subagents on a different provider/harness. Off by default so cross-harness spawns stay opt-in. */
+  /** Backwards-compatible persisted mirror of the experimental-features gate. */
   readonly allowForeignSubagents: boolean;
   /** Per-session opt-in/opt-out recorded explicitly by the user; absence means "follow the default". */
   readonly foreignSubagentOverrides: Readonly<Record<string, boolean>>;
@@ -119,10 +124,13 @@ function validateForeignSubagentOverrides(value: unknown): Readonly<Record<strin
 
 export function validateDesktopPreferences(value: unknown): DesktopPreferences {
   const input = typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const experimentalFeatures = input.experimentalFeatures === true;
   return {
     version: DESKTOP_PREFERENCES_VERSION,
-    experimentalFeatures: input.experimentalFeatures === true,
+    experimentalFeatures,
     reasoningDisplay: input.reasoningDisplay === "expanded" ? "expanded" : "compact",
+    taskListMode: input.taskListMode === "project" ? "project" : "recent",
+    savedProjectDirectories: normalizeSavedProjectDirectories(input.savedProjectDirectories),
     localOpenHandlerId: typeof input.localOpenHandlerId === "string" && LOCAL_OPEN_HANDLER_IDS.has(input.localOpenHandlerId as LocalOpenHandlerId)
       ? input.localOpenHandlerId as LocalOpenHandlerId
       : "system",
@@ -142,7 +150,9 @@ export function validateDesktopPreferences(value: unknown): DesktopPreferences {
       ? resolve(input.globalAgentsPath)
       : null,
     taskOverrides: validateTaskOverrides(input.taskOverrides),
-    allowForeignSubagents: input.allowForeignSubagents === true,
+    // Kept in the persisted shape for backwards compatibility. Experimental
+    // features are now the single master gate for cross-tool sub-agents.
+    allowForeignSubagents: experimentalFeatures,
     foreignSubagentOverrides: validateForeignSubagentOverrides(input.foreignSubagentOverrides),
     ears: normalizeEarsSettings(input.ears),
   };
@@ -173,7 +183,7 @@ export class DesktopPreferencesStore {
 
   public static async load(path: string): Promise<DesktopPreferencesStore> {
     const store = new JsonFileStore(path, validateDesktopPreferences);
-    const defaults: DesktopPreferences = { version: DESKTOP_PREFERENCES_VERSION, experimentalFeatures: false, reasoningDisplay: "compact", localOpenHandlerId: "system", closeAction: "tray", launchAtLogin: "off", alerts: "all", agentDefaults: {}, globalAgentsPath: null, taskOverrides: {}, allowForeignSubagents: false, foreignSubagentOverrides: {}, ears: defaultEarsSettings };
+    const defaults: DesktopPreferences = { version: DESKTOP_PREFERENCES_VERSION, experimentalFeatures: false, reasoningDisplay: "compact", taskListMode: "recent", savedProjectDirectories: [], localOpenHandlerId: "system", closeAction: "tray", launchAtLogin: "off", alerts: "all", agentDefaults: {}, globalAgentsPath: null, taskOverrides: {}, allowForeignSubagents: false, foreignSubagentOverrides: {}, ears: defaultEarsSettings };
     const value = await store.read(defaults);
     const validated = validateDesktopPreferences(value);
     if (JSON.stringify(validated) !== JSON.stringify(value)) await store.write(validated);
@@ -199,11 +209,40 @@ export class DesktopPreferencesStore {
   }
 
   public async setExperimentalFeatures(enabled: boolean): Promise<DesktopPreferences> {
-    return await this.#commit({ ...this.#value, experimentalFeatures: enabled === true });
+    const experimentalFeatures = enabled === true;
+    let foreignSubagentOverrides = this.#value.foreignSubagentOverrides;
+    if (this.#value.allowForeignSubagents && !experimentalFeatures && Object.values(foreignSubagentOverrides).includes(true)) {
+      const flipped: Record<string, boolean> = {};
+      for (const [sessionId, override] of Object.entries(foreignSubagentOverrides)) flipped[sessionId] = override && false;
+      foreignSubagentOverrides = flipped;
+    }
+    return await this.#commit({
+      ...this.#value,
+      experimentalFeatures,
+      allowForeignSubagents: experimentalFeatures,
+      foreignSubagentOverrides,
+    });
   }
 
   public async setReasoningDisplay(value: "compact" | "expanded"): Promise<DesktopPreferences> {
     return await this.#commit({ ...this.#value, reasoningDisplay: value });
+  }
+
+  public async setTaskListMode(value: TaskListMode): Promise<DesktopPreferences> {
+    if (value !== "recent" && value !== "project") throw new Error("The task list mode is invalid");
+    return await this.#commit({ ...this.#value, taskListMode: value });
+  }
+
+  public async saveProject(directory: string): Promise<DesktopPreferences> {
+    if (!isAbsolute(directory) || /[\u0000-\u001f\u007f]/u.test(directory)) throw new Error("Choose an absolute project folder");
+    const savedProjectDirectories = normalizeSavedProjectDirectories([resolve(directory), ...this.#value.savedProjectDirectories]);
+    return await this.#commit({ ...this.#value, savedProjectDirectories });
+  }
+
+  public async useProject(directory: string): Promise<DesktopPreferences> {
+    const key = normalizeProjectDirectory(directory);
+    const saved = this.#value.savedProjectDirectories.find((candidate) => normalizeProjectDirectory(candidate) === key);
+    return saved ? await this.saveProject(saved) : this.#value;
   }
 
   /**
@@ -213,14 +252,7 @@ export class DesktopPreferencesStore {
    * touches stored values.
    */
   public async setAllowForeignSubagents(enabled: boolean): Promise<DesktopPreferences> {
-    const allowForeignSubagents = enabled === true;
-    let foreignSubagentOverrides = this.#value.foreignSubagentOverrides;
-    if (this.#value.allowForeignSubagents && !allowForeignSubagents && Object.values(foreignSubagentOverrides).includes(true)) {
-      const flipped: Record<string, boolean> = {};
-      for (const [sessionId, override] of Object.entries(foreignSubagentOverrides)) flipped[sessionId] = override && false;
-      foreignSubagentOverrides = flipped;
-    }
-    return await this.#commit({ ...this.#value, allowForeignSubagents, foreignSubagentOverrides });
+    return await this.setExperimentalFeatures(enabled);
   }
 
   /**
@@ -245,13 +277,13 @@ export class DesktopPreferencesStore {
    * user has not judged explicitly default to allowed.
    */
   public sessionMaySpawnForeignSubagents(sessionId: string): boolean {
-    if (!this.#value.allowForeignSubagents) return false;
+    if (!this.#value.experimentalFeatures) return false;
     return this.#value.foreignSubagentOverrides[sessionId] ?? true;
   }
 
   /** The per-session control only has meaning while the master gate is on. */
   public foreignSubagentControlVisible(): boolean {
-    return this.#value.allowForeignSubagents;
+    return this.#value.experimentalFeatures;
   }
 
   public async setLocalOpenHandler(value: LocalOpenHandlerId): Promise<DesktopPreferences> {
@@ -289,6 +321,22 @@ export class DesktopPreferencesStore {
       if (keys.length >= MAX_TASK_OVERRIDES) for (const stale of keys.slice(0, keys.length - MAX_TASK_OVERRIDES + 1)) delete taskOverrides[stale];
       taskOverrides[sessionId] = merged;
     }
+    return await this.#commit({ ...this.#value, taskOverrides });
+  }
+
+  /** Moves a local draft's complete organisation state onto its provider-created task ID. */
+  public async moveTaskOverride(fromSessionIdValue: string, toSessionIdValue: string): Promise<DesktopPreferences> {
+    const fromSessionId = preferenceString(fromSessionIdValue, MAX_SESSION_ID_CHARACTERS);
+    const toSessionId = preferenceString(toSessionIdValue, MAX_SESSION_ID_CHARACTERS);
+    if (!fromSessionId || !toSessionId) throw new Error("The task is invalid");
+    if (fromSessionId === toSessionId) return this.#value;
+    const source = this.#value.taskOverrides[fromSessionId];
+    if (!source) return this.#value;
+    const taskOverrides: Record<string, TaskOverride> = { ...this.#value.taskOverrides };
+    const moved = normalizeTaskOverride({ ...taskOverrides[toSessionId], ...source });
+    delete taskOverrides[fromSessionId];
+    delete taskOverrides[toSessionId];
+    if (moved) taskOverrides[toSessionId] = moved;
     return await this.#commit({ ...this.#value, taskOverrides });
   }
 

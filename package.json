@@ -11,6 +11,8 @@
     "packages/*"
   ],
   "scripts": {
+    "setup:desktop": "npm ci && npm ci --prefix apps/desktop_harness",
+    "start": "npm --prefix apps/desktop_harness run dev",
     "clean": "node scripts/clean.mjs",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",

@@ -64,6 +64,15 @@ must also preserve the library's corresponding-source, relinking, installation,
 and reverse-engineering-for-debugging rights described in those licenses. See
 `third_party/libuiohook/README.md` for the reproducible source and rebuild path.
 
+## PDF text extraction
+
+The OpenCode PDF fallback uses `unpdf` 1.8.1, copyright Johann Schopplich and
+contributors, under the MIT License (https://github.com/unjs/unpdf). Its
+serverless PDF parser includes code derived from Mozilla PDF.js under the
+Apache License 2.0 (https://github.com/mozilla/pdf.js). These components are
+used only to extract bounded text locally when a selected model does not
+advertise native PDF input.
+
 ## Direct API services
 
 The built-in Direct API entry is Tethoq-authored client code, not redistributed

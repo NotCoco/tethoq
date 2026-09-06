@@ -47,6 +47,31 @@ test("a working session settles through an unknown listing once its turn is no l
   assert.equal(busy.get("host/fake/session-one")?.state, "working", "an in-flight turn must not be downgraded");
 });
 
+test("an uncontested direct provider read settles stale working state", () => {
+  const cache = new SessionCache({ preserveWorking: () => true });
+  cache.upsert(session("working"));
+  const baseline = cache.get("host/fake/session-one");
+
+  assert.equal(cache.reconcileAuthoritative(session("idle", {
+    lastActivityAt: "2026-08-10T11:00:00.000Z",
+  }), baseline), true);
+  assert.equal(cache.get("host/fake/session-one")?.state, "idle",
+    "a direct provider read must not use cached working state as circular proof of live work");
+});
+
+test("a provider event that lands during a direct read wins over its late response", () => {
+  const cache = new SessionCache({ preserveWorking: () => true });
+  cache.upsert(session("idle"));
+  const baseline = cache.get("host/fake/session-one");
+
+  cache.updateState("host/fake/session-one", "working", false, "2026-08-10T12:00:00.000Z");
+  assert.equal(cache.reconcileAuthoritative(session("idle", {
+    lastActivityAt: "2026-08-10T11:00:00.000Z",
+  }), baseline), false);
+  assert.equal(cache.get("host/fake/session-one")?.state, "working");
+  assert.equal(cache.get("host/fake/session-one")?.lastActivityAt, "2026-08-10T12:00:00.000Z");
+});
+
 test("provider status follows canonical refreshes and supports an explicit clear", () => {
   const cache = new SessionCache();
   const retry = {
@@ -205,6 +230,21 @@ test("a remembered selection is forgotten once the session leaves the provider l
   assert.equal(cache.get("host/fake/session-one")?.reasoningEffort, "high");
 });
 
+test("a partial provider page never deletes cached sessions before authoritative reconciliation", () => {
+  const cache = new SessionCache();
+  const newest = session("idle", { id: "host/fake/newest", providerSessionId: "newest" });
+  const older = session("idle", { id: "host/fake/older", providerSessionId: "older" });
+  const removed = session("idle", { id: "host/fake/removed", providerSessionId: "removed" });
+  cache.upsert(older);
+  cache.upsert(removed);
+
+  cache.mergeProviderPage("fake", [newest]);
+  assert.deepEqual(cache.all().map((item) => item.providerSessionId).sort(), ["newest", "older", "removed"]);
+
+  cache.reconcileProvider("fake", [newest, older]);
+  assert.deepEqual(cache.all().map((item) => item.providerSessionId).sort(), ["newest", "older"]);
+});
+
 test("a level learned from the harness is kept so the next start is not blind", () => {
   const written: Array<Readonly<Record<string, unknown>>> = [];
   const cache = new SessionCache({ onSelectionsChange: (selections) => written.push(selections) });
@@ -215,6 +255,22 @@ test("a level learned from the harness is kept so the next start is not blind", 
   assert.equal(cache.knownSelections()["host/fake/session-one"]?.reasoningEffort, "xhigh");
   assert.equal(cache.knownSelections()["host/fake/session-one"]?.source, "reported");
   assert.ok(written.length > 0);
+});
+
+test("provider catalogue reconciliation publishes one complete selection snapshot", () => {
+  const written: Array<Readonly<Record<string, unknown>>> = [];
+  const cache = new SessionCache({ onSelectionsChange: (selections) => written.push(selections) });
+  const sessions = Array.from({ length: 750 }, (_, index) => session("idle", {
+    id: `host/fake/session-${index}`,
+    providerSessionId: `session-${index}`,
+    modelId: `model-${index % 3}`,
+    reasoningEffort: index % 2 === 0 ? "high" : "medium",
+  }));
+
+  cache.reconcileProvider("fake", sessions);
+
+  assert.equal(written.length, 1, "a bulk catalogue must not persist one growing snapshot per session");
+  assert.equal(Object.keys(written[0] ?? {}).length, sessions.length);
 });
 
 test("a restart shows the last level the harness reported, before any chat is opened", () => {
@@ -241,4 +297,17 @@ test("a level changed inside the harness replaces the remembered one", () => {
 
   assert.equal(cache.get("host/fake/session-one")?.reasoningEffort, "low");
   assert.equal(cache.knownSelections()["host/fake/session-one"]?.reasoningEffort, "low");
+});
+
+test("an explicit native-default report clears a previous level on the same model", () => {
+  const cache = new SessionCache();
+  cache.upsert(session("idle", { modelId: "opencode-go/glm-5.3-flash", reasoningEffort: "max" }));
+
+  cache.rememberReportedSelection("host/fake/session-one", {
+    modelId: "opencode-go/glm-5.3-flash",
+    reasoningEffort: "default",
+  });
+
+  assert.equal(cache.get("host/fake/session-one")?.reasoningEffort, "default");
+  assert.equal(cache.knownSelections()["host/fake/session-one"]?.reasoningEffort, "default");
 });

@@ -1,26 +1,50 @@
 /**
  * Stops a running Tethoq app as gracefully as possible.
  *
- * A plain taskkill never reaches before-quit, so the desktop cannot stop its
- * managed OpenCode server. The orphan keeps holding port 4096, the next launch
- * treats it as an external server, and live events for later sessions can end
- * up streaming from a different server than the one the app is subscribed to.
- * The preferred path asks the running instance to quit cleanly (`--quit-other`
- * routes through the ordinary quit flow, which stops the managed server), and
- * only falls back to a forced kill when the instance does not exit in time.
+ * A plain taskkill never reaches before-quit, so the preferred path asks the
+ * running workspace instance to hand off cleanly. That route preserves an
+ * active managed OpenCode server for the replacement Tethoq generation. The
+ * forced fallback targets only the exact Tethoq executable processes and never
+ * `/T`-kills their provider descendants. The query is path-locked: a similarly
+ * named installed app is never a target.
  */
 const { spawn, spawnSync } = require("node:child_process");
 const path = require("node:path");
 
-const exe = path.join(__dirname, "..", "release", "win-unpacked", "Tethoq.exe");
+const exe = path.resolve(path.join(__dirname, "..", "release", "win-unpacked", "Tethoq.exe"));
+
+function processRows() {
+  if (process.platform !== "win32") return [];
+  const target = exe.replaceAll("'", "''");
+  const script = [
+    `$target = '${target}'`,
+    "Get-CimInstance Win32_Process | Where-Object { $_.Name -ieq 'Tethoq.exe' -and $_.ExecutablePath -ieq $target } | Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress",
+  ].join("; ");
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", script], {
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  if (result.status !== 0 || !result.stdout?.trim()) return [];
+  try {
+    const parsed = JSON.parse(result.stdout);
+    return (Array.isArray(parsed) ? parsed : [parsed]).filter((row) => Number.isInteger(Number(row?.ProcessId)));
+  } catch {
+    // An unprovable process query must never degrade into a broad name match.
+    return [];
+  }
+}
+
+function roots(rows) {
+  const ids = new Set(rows.map((row) => Number(row.ProcessId)));
+  return rows.filter((row) => !ids.has(Number(row.ParentProcessId)));
+}
+
+function hasDebugPort(row, debugPort) {
+  return new RegExp(`(?:^|\\s)--remote-debugging-port=${Number(debugPort)}(?:\\s|$)`, "u").test(row.CommandLine ?? "");
+}
 
 function running() {
-  const result = spawnSync("powershell.exe", [
-    "-NoProfile",
-    "-Command",
-    "Get-Process -Name Tethoq -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id",
-  ], { encoding: "utf8", windowsHide: true });
-  return (result.stdout ?? "").split(/\s+/u).map((value) => Number.parseInt(value, 10)).filter((value) => Number.isInteger(value));
+  return processRows().map((row) => Number(row.ProcessId));
 }
 
 function waitForExit(timeoutMs) {
@@ -31,20 +55,30 @@ function waitForExit(timeoutMs) {
   return running().length === 0;
 }
 
-function forceKill() {
-  for (const id of running()) {
-    spawnSync("taskkill.exe", ["/PID", String(id), "/T", "/F"], { windowsHide: true });
+function forceKill(rows) {
+  for (const row of [...rows].reverse()) {
+    spawnSync("taskkill.exe", ["/PID", String(row.ProcessId), "/F"], { windowsHide: true });
   }
   return waitForExit(8_000);
 }
 
-function stopTethoq() {
-  if (running().length === 0) return true;
+function stopTethoq(options = {}) {
+  const rows = processRows();
+  const runningRoots = roots(rows);
+  if (runningRoots.length === 0) return true;
+  // A QA run supplies its debug port. Refuse to touch a visible/user-launched
+  // workspace instance or an ambiguous process tree; only the exact QA root
+  // carrying that port may be closed.
+  if (options.debugPort !== undefined && (runningRoots.length !== 1 || !hasDebugPort(runningRoots[0], options.debugPort))) return false;
   // A secondary instance never shows a window; the running instance hears the
   // argument through the single-instance lock and quits cleanly.
-  spawn(exe, ["--quit-other"], { detached: true, stdio: "ignore" }).unref();
+  spawn(exe, ["--quit-other"], { detached: true, stdio: "ignore", windowsHide: true }).unref();
   if (waitForExit(12_000)) return true;
-  return forceKill();
+  // Re-query before the fallback. The quit helper can inherit the
+  // single-instance lock while the original process is shutting down, so the
+  // original snapshot may no longer include the exact Tethoq process that now
+  // owns the app. Killing only the stale snapshot leaves that helper running.
+  return forceKill(processRows());
 }
 
 if (require.main === module) {

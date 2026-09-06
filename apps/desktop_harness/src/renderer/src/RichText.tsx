@@ -1,11 +1,11 @@
-import { isValidElement, memo, useMemo, useRef, type ReactNode } from "react";
+import { isValidElement, memo, useMemo, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown, { defaultUrlTransform, type Components, type UrlTransform } from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import { copyText } from "./clipboard";
 import { CopyIcon } from "./icons";
 import { LocalPathAction, type LocalOpenLocation } from "./LocalOpen";
-import { isLocalVideoPath, localMediaPathFromUrl, localMediaUrl } from "@shared/local_media";
+import { isLocalImagePath, isLocalVideoPath, localMediaPathFromUrl, localMediaUrl } from "@shared/local_media";
 
 export interface RichTextImage {
   dataUrl: string;
@@ -142,11 +142,11 @@ function remarkLocalPaths() {
   };
 }
 
-/** Keep Markdown links useful without allowing executable or local-file URLs. */
+/** Keep Markdown links useful without exposing executable or raw local-file URLs. */
 export const safeMarkdownUrl: UrlTransform = (value, key) => {
   if (key === "src") {
-    const localVideo = localLocationFromHref(value);
-    if (localVideo && isLocalVideoPath(localVideo.path)) return localMediaUrl(localVideo.path);
+    const localMedia = localLocationFromHref(value);
+    if (localMedia && (isLocalVideoPath(localMedia.path) || isLocalImagePath(localMedia.path))) return localMediaUrl(localMedia.path);
     return markdownImageUrl(value) ?? "";
   }
   if (key === "href" && localLocationFromHref(value)) return value;
@@ -210,20 +210,77 @@ function LocalVideoPreview({ location, label, title }: { location: LocalOpenLoca
   </span>;
 }
 
-export const RichText = memo(function RichText({ children, onImageOpen, onLinkOpen }: {
+function RichImagePreview({ source, name, alt, title, onOpen }: {
+  source: string;
+  name: string;
+  alt?: string | undefined;
+  title?: string | undefined;
+  onOpen: () => void;
+}) {
+  const [failedSource, setFailedSource] = useState<string | null>(null);
+  if (failedSource === source) return <span className="rich-image-unavailable">{name}</span>;
+  return <button type="button" className="rich-text-image" aria-label={`Expand ${name}`} onClick={onOpen}>
+    <img src={source} alt={alt ?? ""} title={title} referrerPolicy="no-referrer" onError={() => setFailedSource(source)} />
+  </button>;
+}
+
+interface InlineContentNode {
+  type: string;
+  value?: string;
+  children?: InlineContentNode[];
+  tagName?: string;
+  properties?: Record<string, string>;
+}
+
+function inlineContentPlugin(markers: readonly string[]) {
+  return () => (tree: InlineContentNode): void => {
+    const visit = (node: InlineContentNode): void => {
+      if (!node.children) return;
+      node.children = node.children.flatMap((child) => {
+        if (child.type !== "text" || !child.value || !markers.some((marker) => child.value!.includes(marker))) {
+          visit(child);
+          return [child];
+        }
+        const parts: InlineContentNode[] = [];
+        let text = "";
+        for (const character of child.value) {
+          if (!markers.includes(character)) { text += character; continue; }
+          if (text) parts.push({ type: "text", value: text });
+          text = "";
+          parts.push({ type: "element", tagName: "span", properties: { "data-inline-content": character }, children: [] });
+        }
+        if (text) parts.push({ type: "text", value: text });
+        return parts;
+      });
+    };
+    visit(tree);
+  };
+}
+
+export const RichText = memo(function RichText({ children, onImageOpen, onLinkOpen, inlineContent }: {
   children: string;
   onImageOpen?: ((image: RichTextImage) => void) | undefined;
   onLinkOpen?: ((url: string) => void) | undefined;
+  inlineContent?: Readonly<Record<string, ReactNode>>;
 }) {
   const imageOpen = useRef(onImageOpen);
   const linkOpen = useRef(onLinkOpen);
   imageOpen.current = onImageOpen;
   linkOpen.current = onLinkOpen;
+  const inline = useRef(inlineContent);
+  inline.current = inlineContent;
+  const markerKey = Object.keys(inlineContent ?? {}).join("");
+  const inlinePlugins = useMemo(() => markerKey ? [inlineContentPlugin([...markerKey])] : [], [markerKey]);
   // ReactMarkdown treats each renderer function as a component type. Recreating
   // this map on an unrelated session-list refresh unmounted every media element,
   // briefly collapsed videos to their pre-metadata height, then expanded them
   // again. Stable renderers keep playback and intrinsic geometry intact.
   const components = useMemo<Components>(() => ({
+    span: ({ children: text, node }) => {
+      const marker = node?.properties?.["data-inline-content"];
+      return typeof marker === "string" && inline.current?.[marker] !== undefined
+        ? inline.current[marker] : <span>{text}</span>;
+    },
     pre: ({ children: code }) => <CodeBlock>{code}</CodeBlock>,
     a: ({ children: label, href, title }) => {
       const local = href ? localLocationFromHref(href) : null;
@@ -236,17 +293,16 @@ export const RichText = memo(function RichText({ children, onImageOpen, onLinkOp
     },
     table: ({ children: tableChildren }) => <div className="rich-table-scroll"><table>{tableChildren}</table></div>,
     img: ({ src, alt, title }) => {
-      const localVideoPath = typeof src === "string" ? localMediaPathFromUrl(src) : null;
-      if (localVideoPath) return <LocalVideoPreview location={{ path: localVideoPath }} label={alt} title={title} />;
-      const safeSource = markdownImageUrl(typeof src === "string" ? src : "");
+      const source = typeof src === "string" ? src : "";
+      const localMediaPath = localMediaPathFromUrl(source);
+      if (localMediaPath && isLocalVideoPath(localMediaPath)) return <LocalVideoPreview location={{ path: localMediaPath }} label={alt} title={title} />;
+      const safeSource = localMediaPath && isLocalImagePath(localMediaPath) ? source : markdownImageUrl(source);
       const name = alt?.trim() || title?.trim() || "Image";
       if (!safeSource) return alt ? <span className="rich-image-unavailable">{alt}</span> : null;
-      return <button type="button" className="rich-text-image" aria-label={`Expand ${name}`} onClick={() => imageOpen.current?.({ dataUrl: safeSource, name })}>
-        <img src={safeSource} alt={alt ?? ""} title={title} referrerPolicy="no-referrer" />
-      </button>;
+      return <RichImagePreview source={safeSource} name={name} alt={alt} title={title} onOpen={() => imageOpen.current?.({ dataUrl: safeSource, name })} />;
     },
   }), []);
   return <div className="rich-text">
-    <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks, remarkLocalPaths]} skipHtml urlTransform={safeMarkdownUrl} components={components}>{children}</ReactMarkdown>
+    <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks, remarkLocalPaths]} rehypePlugins={inlinePlugins} skipHtml urlTransform={safeMarkdownUrl} components={components}>{children}</ReactMarkdown>
   </div>;
 });

@@ -9,7 +9,7 @@
  * and repacks it, which takes seconds instead of a full repackage.
  */
 const { spawnSync } = require("node:child_process");
-const { cpSync, existsSync, mkdtempSync, renameSync, rmSync, statSync } = require("node:fs");
+const { cpSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync } = require("node:fs");
 const { tmpdir } = require("node:os");
 const path = require("node:path");
 const { stopTethoq } = require("./stop-unpacked.cjs");
@@ -18,6 +18,7 @@ const harness = path.join(__dirname, "..");
 const outDirectory = path.join(harness, "out");
 const resources = path.join(harness, "release", "win-unpacked", "resources");
 const asarPath = path.join(resources, "app.asar");
+const providerAssets = path.join(harness, "..", "agent_bridge", "assets");
 const skipBuild = process.argv.includes("--no-build");
 
 function fail(message) {
@@ -40,6 +41,15 @@ if (!existsSync(outDirectory)) fail(`No build output at ${outDirectory}.`);
 // halfway and leave a torn archive.
 if (!stopTethoq()) {
   fail("Tethoq is still running; close it and try again.");
+}
+
+for (const [provider, sourceName, targetName] of [
+  ["opencode", "uar_mesh.txt", "uar_mesh.txt"],
+  ["pi", "tethoq_tools.txt", "tethoq_tools.txt"],
+]) {
+  const targetDirectory = path.join(resources, "provider-tools", provider);
+  mkdirSync(targetDirectory, { recursive: true });
+  cpSync(path.join(providerAssets, provider, sourceName), path.join(targetDirectory, targetName));
 }
 
 const asar = require(path.join(harness, "node_modules", "@electron", "asar"));

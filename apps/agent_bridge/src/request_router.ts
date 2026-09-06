@@ -4,6 +4,7 @@ import {
   normalizeSimplifySettings,
   parseSimplifyCommand,
   simplifyDeveloperInstructions,
+  sessionGoalStatuses,
   validateApprovalResponse,
   validateSessionTransferRequest,
   validateUserInputResponse,
@@ -11,16 +12,27 @@ import {
   type ConfigureWalletRequest,
   type EventReplaySlice,
   type JsonObject,
+  type DelegationPresentationSegment,
   type DelegationTarget,
   type RemoteMessage,
   type RemoteSession,
   type RequestEnvelope,
   type ResponseEnvelope,
   type WorkflowReference,
+  parseGlobalSessionId,
 } from "../../../packages/protocol/src/index.js";
-import type { AuthRequest, CreateSessionOptions, MessageAttachment, SendMessageRequest } from "../../../packages/provider_contract/src/index.js";
-import { AgentBridge } from "./bridge.js";
+import {
+  ProviderAdapterError,
+  type AuthRequest,
+  type CreateSessionOptions,
+  type MessageAttachment,
+  type SendMessageRequest,
+} from "../../../packages/provider_contract/src/index.js";
+import { AgentBridge, messageAnchorCursor } from "./bridge.js";
 import { RequestLedger } from "../../../packages/protocol/src/index.js";
+import { maxScheduledTaskListPayloadBytes, scheduledTaskListPayloadBytes } from "./scheduled_task_store.js";
+import { recordStartupProfile } from "./startup_profile.js";
+import { maxMessageAttachments } from "./attachment_uploads.js";
 
 export type DesktopProcessState = "running" | "stopped" | "starting";
 
@@ -51,6 +63,12 @@ function stringField(value: Record<string, unknown>, field: string): string {
   return result;
 }
 
+function textField(value: Record<string, unknown>, field: string): string {
+  const result = value[field];
+  if (typeof result !== "string") throw new Error(`${field} must be a string`);
+  return result;
+}
+
 function messageContentField(value: Record<string, unknown>, hasNonTextContent: boolean): string {
   const result = value.content;
   if (typeof result !== "string" || (result.length === 0 && !hasNonTextContent)) {
@@ -67,12 +85,19 @@ function stringArray(value: unknown, field: string, maximum: number): readonly s
   return value;
 }
 
+function messageAttachmentIds(value: unknown): readonly string[] {
+  if (!Array.isArray(value) || value.length > maxMessageAttachments || !value.every((entry) => typeof entry === "string" && entry.length > 0)) {
+    throw new Error(`You can attach up to ${maxMessageAttachments} files to one message`);
+  }
+  return value;
+}
+
 function requireEmptyPayload(value: JsonObject, requestType: string): void {
   if (Object.keys(value).length !== 0) throw new Error(`${requestType} does not accept any payload fields`);
 }
 
 function queuedMessageInput(input: Record<string, unknown>, requestId: string) {
-  const attachmentIds = input.attachmentIds === undefined ? undefined : stringArray(input.attachmentIds, "attachmentIds", 4);
+  const attachmentIds = input.attachmentIds === undefined ? undefined : messageAttachmentIds(input.attachmentIds);
   const workflows = input.workflows === undefined ? undefined : workflowReferences(input.workflows);
   return {
     requestId,
@@ -152,6 +177,60 @@ function delegationTargets(value: unknown): readonly DelegationTarget[] {
         : {}),
     };
   });
+}
+
+function delegationPresentationSegments(value: unknown): readonly DelegationPresentationSegment[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 32) {
+    throw new Error("presentationSegments must contain between one and 32 ordered segments");
+  }
+  return value.map((entry): DelegationPresentationSegment => {
+    const segment = record(entry, "delegation presentation segment");
+    if (segment.type === "text" && typeof segment.text === "string") {
+      return { type: "text", text: segment.text };
+    }
+    if (segment.type === "mesh" && Number.isSafeInteger(segment.targetIndex) && (segment.targetIndex as number) >= 0) {
+      return { type: "mesh", targetIndex: segment.targetIndex as number };
+    }
+    throw new Error("delegation presentation segment is invalid");
+  });
+}
+
+function legacyDelegationPresentation(
+  prompt: string,
+  targetCount: number,
+): readonly DelegationPresentationSegment[] {
+  return [
+    ...Array.from({ length: targetCount }, (_, targetIndex) => ({ type: "mesh" as const, targetIndex })),
+    ...(prompt.length > 0 ? [{ type: "text" as const, text: prompt }] : []),
+  ];
+}
+
+function scheduledCommandTokenMatch(value: string, command: string): RegExpExecArray | null {
+  const escaped = command.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  return new RegExp(`(^|\\s)${escaped}(?=$|\\s)`, "iu").exec(value);
+}
+
+function removeScheduledCommandToken(value: string, command: string): string {
+  let result = value;
+  for (;;) {
+    const match = scheduledCommandTokenMatch(result, command);
+    if (!match) return result;
+    const tokenStart = match.index + (match[1]?.length ?? 0);
+    const tokenEnd = tokenStart + command.length;
+    let before = result.slice(0, tokenStart);
+    let after = result.slice(tokenEnd);
+    if (!before.trim()) after = after.replace(/^\s/u, "");
+    else if (!after.trim()) before = before.replace(/\s$/u, "");
+    else if (/\s$/u.test(before) && /^\s/u.test(after)) after = after.replace(/^\s/u, "");
+    result = `${before}${after}`;
+  }
+}
+
+function scheduledTaskContent(value: string, targets: readonly DelegationTarget[] | undefined): string {
+  const withoutSchedule = removeScheduledCommandToken(value, "/schedule");
+  const containsMesh = scheduledCommandTokenMatch(withoutSchedule, "/mesh") !== null;
+  if (containsMesh && targets === undefined) throw new Error("Choose at least one Mesh target before scheduling this task");
+  return targets === undefined ? withoutSchedule : removeScheduledCommandToken(withoutSchedule, "/mesh");
 }
 
 function visionProxySelection(value: unknown) {
@@ -297,12 +376,25 @@ function clipText(value: string | undefined, maximum = 24_000): string | undefin
   return `${value.slice(0, maximum)}\n… output shortened on this device`;
 }
 
+/** Keep only presentation semantics; provider diagnostics remain private. */
+function clientMessageMetadata(message: RemoteMessage): JsonObject {
+  const phase = message.nativeMetadata.phase;
+  return phase === "commentary" || phase === "final_answer" ? { phase } : {};
+}
+
 function compactMessage(
   message: RemoteMessage,
   rememberImage?: (message: RemoteMessage, partIndex: number, uri: string, mimeType?: string, name?: string) => string | undefined,
 ): Omit<RemoteMessage, "nativeMetadata"> & { readonly nativeMetadata: JsonObject } {
-  const clean = { ...message, nativeMetadata: {} };
-  if (Buffer.byteLength(JSON.stringify(clean), "utf8") <= clientMessageBudgetBytes) return clean;
+  const nativeMetadata = clientMessageMetadata(message);
+  const clean = { ...message, nativeMetadata };
+  // Register inline images lazily even when the rest of the message fits the
+  // normal budget. Serializing a base64 image into every page needlessly copies
+  // megabytes through the renderer transport and leaves the same payload live
+  // in more than one process. The retrieval callback keeps the widget usable.
+  const hasInlineImage = rememberImage !== undefined && message.parts.some((part) =>
+    part.type === "image" && part.uri?.startsWith("data:") === true);
+  if (!hasInlineImage && Buffer.byteLength(JSON.stringify(clean), "utf8") <= clientMessageBudgetBytes) return clean;
   const parts = message.parts.slice(0, 16).map((part, partIndex) => {
     if (part.type === "text" || part.type === "reasoning") return { ...part, text: clipText(part.text) ?? "" };
     if (part.type === "tool") {
@@ -319,11 +411,13 @@ function compactMessage(
     }
     if (part.type === "image" && part.uri?.startsWith("data:") === true) {
       const retrievalId = rememberImage?.(message, partIndex, part.uri, part.mimeType, part.name);
-      return { type: part.type, ...(part.mimeType !== undefined ? { mimeType: part.mimeType } : {}), ...(part.name !== undefined ? { name: part.name } : {}), ...(retrievalId !== undefined ? { retrievalId } : {}) };
+      return retrievalId === undefined
+        ? part
+        : { type: part.type, ...(part.mimeType !== undefined ? { mimeType: part.mimeType } : {}), ...(part.name !== undefined ? { name: part.name } : {}), retrievalId };
     }
     return part;
   });
-  return { ...message, parts, nativeMetadata: {} };
+  return { ...message, parts, nativeMetadata };
 }
 
 export function clientMessagePage(
@@ -345,7 +439,11 @@ export function clientMessagePage(
   const pageStart = nextCursor === null ? 0 : Number.parseInt(nextCursor, 10);
   return {
     messages: kept,
-    nextCursor: dropped > 0 ? String(pageStart + dropped) : nextCursor,
+    nextCursor: dropped > 0
+      ? Number.isInteger(pageStart)
+        ? String(pageStart + dropped)
+        : kept[0] !== undefined ? messageAnchorCursor(kept[0].id) : nextCursor
+      : nextCursor,
   };
 }
 
@@ -415,11 +513,15 @@ export class BridgeRequestRouter {
       return this.response(request, false, {}, {
         code: error instanceof DesktopLifecycleError
           ? error.code
+          : error instanceof ProviderAdapterError
+            ? error.code
           : error instanceof Error && error.name === "ProtocolValidationError"
             ? "INVALID_REQUEST"
             : "BRIDGE_REQUEST_FAILED",
         message: error instanceof Error ? error.message : String(error),
-        retryable: error instanceof DesktopLifecycleError ? error.retryable : false,
+        retryable: error instanceof DesktopLifecycleError || error instanceof ProviderAdapterError
+          ? error.retryable
+          : false,
       });
     }
   }
@@ -468,9 +570,12 @@ export class BridgeRequestRouter {
         const input = record(payload, "payload");
         const endpointId = stringField(input, "endpointId");
         if (input.apiKey !== undefined && typeof input.apiKey !== "string") throw new Error("apiKey must be a string");
+        if (input.validateApiKey !== undefined && typeof input.validateApiKey !== "boolean") throw new Error("validateApiKey must be a boolean");
         if (input.clearApiKey !== undefined && typeof input.clearApiKey !== "boolean") throw new Error("clearApiKey must be a boolean");
+        if (input.clearBalance !== undefined && typeof input.clearBalance !== "boolean") throw new Error("clearBalance must be a boolean");
         if (input.setBalance !== undefined && (typeof input.setBalance !== "number" || !Number.isFinite(input.setBalance))) throw new Error("setBalance must be a finite number");
         if (input.addBalance !== undefined && (typeof input.addBalance !== "number" || !Number.isFinite(input.addBalance))) throw new Error("addBalance must be a finite number");
+        if (input.clearBalance === true && (input.setBalance !== undefined || input.addBalance !== undefined)) throw new Error("clearBalance cannot be combined with a balance update");
         let customEndpoint: ConfigureWalletRequest["customEndpoint"];
         if (input.customEndpoint !== undefined) {
           const custom = record(input.customEndpoint, "customEndpoint");
@@ -487,7 +592,9 @@ export class BridgeRequestRouter {
         const configure: ConfigureWalletRequest = {
           endpointId,
           ...(typeof input.apiKey === "string" ? { apiKey: input.apiKey } : {}),
+          ...(typeof input.validateApiKey === "boolean" ? { validateApiKey: input.validateApiKey } : {}),
           ...(typeof input.clearApiKey === "boolean" ? { clearApiKey: input.clearApiKey } : {}),
+          ...(typeof input.clearBalance === "boolean" ? { clearBalance: input.clearBalance } : {}),
           ...(typeof input.setBalance === "number" && Number.isFinite(input.setBalance) ? { setBalance: input.setBalance } : {}),
           ...(typeof input.addBalance === "number" && Number.isFinite(input.addBalance) ? { addBalance: input.addBalance } : {}),
           ...(customEndpoint !== undefined ? { customEndpoint } : {}),
@@ -495,10 +602,14 @@ export class BridgeRequestRouter {
         return toJson({ wallet: await this.bridge.configureWallet(stringField(input, "providerId"), configure) });
       }
       case "vision.targets":
-        return toJson({ targets: await this.bridge.visionProxyTargets() });
+        return toJson(await this.bridge.visionProxyTargets());
       case "sessions.refresh": {
         const refreshed = await this.bridge.refresh();
         return toJson({ ...refreshed, sessions: refreshed.sessions.map((session) => clientSession(session)) });
+      }
+      case "sessions.bootstrap": {
+        const bootstrapped = await this.bridge.bootstrapSessions();
+        return toJson({ ...bootstrapped, sessions: bootstrapped.sessions.map((session) => clientSession(session)) });
       }
       case "sessions.list":
         return toJson({ sessions: this.bridge.sessions().map((session) => clientSession(session)) });
@@ -529,8 +640,7 @@ export class BridgeRequestRouter {
       }
       case "session.watch": {
         const input = record(payload, "payload");
-        await this.bridge.watchSession(stringField(input, "sessionId"));
-        return {};
+        return { incremental: await this.bridge.watchSession(stringField(input, "sessionId")) };
       }
       case "session.unwatch": {
         const input = record(payload, "payload");
@@ -538,17 +648,48 @@ export class BridgeRequestRouter {
         return {};
       }
       case "session.open": {
+        const startedAt = Date.now();
         const input = record(payload, "payload");
+        const sessionId = stringField(input, "sessionId");
         const cursor = typeof input.cursor === "string" ? input.cursor : undefined;
         const limit = typeof input.limit === "number" && Number.isInteger(input.limit) ? input.limit : 40;
-        const opened = await this.bridge.openSession(stringField(input, "sessionId"), cursor, limit, input.refresh === true);
+        const profile = {
+          providerId: parseGlobalSessionId(sessionId).providerId,
+          hasCursor: cursor !== undefined,
+          refresh: input.refresh === true,
+          limit,
+        };
+        recordStartupProfile({ type: "session-open", phase: "begin", ...profile });
+        const opened = await this.bridge.openSession(sessionId, cursor, limit, input.refresh === true);
+        recordStartupProfile({
+          type: "session-open",
+          phase: "bridge.end",
+          ...profile,
+          durationMs: Date.now() - startedAt,
+          messageCount: opened.messages.length,
+        });
         const page = clientMessagePage(opened.messages, opened.nextCursor, (message, partIndex, uri, mimeType, name) =>
           this.#images.remember(opened.session.id, message.id, partIndex, uri, mimeType, name));
-        return toJson({
+        recordStartupProfile({
+          type: "session-open",
+          phase: "client-page.end",
+          ...profile,
+          durationMs: Date.now() - startedAt,
+          messageCount: page.messages.length,
+        });
+        const response = toJson({
           ...opened,
           session: clientSession(opened.session),
           ...page,
         });
+        recordStartupProfile({
+          type: "session-open",
+          phase: "serialize.end",
+          ...profile,
+          durationMs: Date.now() - startedAt,
+          messageCount: page.messages.length,
+        });
+        return response;
       }
       case "session.image.get": {
         const input = record(payload, "payload");
@@ -575,15 +716,40 @@ export class BridgeRequestRouter {
       }
       case "session.vision.ask": {
         const input = record(payload, "payload");
-        return toJson(await this.bridge.askVisionProxy(
+        const result = await this.bridge.askVisionProxy(
           stringField(input, "sessionId"),
           stringField(input, "question"),
           input.attachments === undefined ? undefined : messageAttachments(input.attachments),
-        ));
+        );
+        return toJson({ observation: result.observation });
       }
       case "session.context.get": {
         const input = record(payload, "payload");
         return toJson({ context: await this.bridge.sessionContext(stringField(input, "sessionId")) });
+      }
+      case "session.goal.get": {
+        const input = record(payload, "payload");
+        return toJson({ goal: await this.bridge.sessionGoal(stringField(input, "sessionId")) });
+      }
+      case "session.goal.set": {
+        const input = record(payload, "payload");
+        if (input.objective !== undefined && typeof input.objective !== "string") throw new Error("objective must be a string");
+        if (input.status !== undefined && (typeof input.status !== "string" || !sessionGoalStatuses.includes(input.status as never))) {
+          throw new Error("status is not a recognized goal state");
+        }
+        if (input.tokenBudget !== undefined && input.tokenBudget !== null
+          && (typeof input.tokenBudget !== "number" || !Number.isSafeInteger(input.tokenBudget))) {
+          throw new Error("tokenBudget must be a whole number or null");
+        }
+        return toJson({ goal: await this.bridge.setSessionGoal(stringField(input, "sessionId"), {
+          ...(typeof input.objective === "string" ? { objective: input.objective } : {}),
+          ...(typeof input.status === "string" ? { status: input.status as (typeof sessionGoalStatuses)[number] } : {}),
+          ...(input.tokenBudget === null || typeof input.tokenBudget === "number" ? { tokenBudget: input.tokenBudget } : {}),
+        }) });
+      }
+      case "session.goal.clear": {
+        const input = record(payload, "payload");
+        return toJson(await this.bridge.clearSessionGoal(stringField(input, "sessionId")));
       }
       case "session.context.set_threshold": {
         const input = record(payload, "payload");
@@ -600,6 +766,10 @@ export class BridgeRequestRouter {
           ),
         });
       }
+      case "session.context.clear_threshold": {
+        const input = record(payload, "payload");
+        return toJson({ context: await this.bridge.clearSessionCompactionThreshold(stringField(input, "sessionId")) });
+      }
       case "session.context.compact": {
         const input = record(payload, "payload");
         const sessionId = stringField(input, "sessionId");
@@ -610,13 +780,36 @@ export class BridgeRequestRouter {
         const parentSessionId = typeof payload.parentSessionId === "string" ? payload.parentSessionId : undefined;
         return toJson({ delegations: this.bridge.delegations(parentSessionId) });
       }
+      case "delegation.prepare": {
+        const input = record(payload, "payload");
+        const targets = delegationTargets(input.targets);
+        return toJson(await this.bridge.prepareDelegation(
+          stringField(input, "parentSessionId"),
+          textField(input, "prompt"),
+          targets,
+          delegationPresentationSegments(input.presentationSegments),
+          requestId,
+          {
+            ...(typeof input.modelId === "string" && input.modelId.trim() ? { modelId: input.modelId.trim() } : {}),
+            ...(typeof input.reasoningEffort === "string" && input.reasoningEffort.trim()
+              ? { reasoningEffort: input.reasoningEffort.trim() }
+              : {}),
+          },
+        ));
+      }
       case "delegation.start": {
         const input = record(payload, "payload");
-        return toJson({ delegation: await this.bridge.startDelegation(
-          stringField(input, "parentSessionId"),
-          stringField(input, "prompt"),
-          delegationTargets(input.targets),
-        ) });
+        const parentSessionId = stringField(input, "parentSessionId");
+        const prompt = textField(input, "prompt");
+        const targets = delegationTargets(input.targets);
+        const prepared = await this.bridge.prepareDelegation(
+          parentSessionId,
+          prompt,
+          targets,
+          legacyDelegationPresentation(prompt, targets.length),
+          requestId,
+        );
+        return toJson({ delegation: prepared.delegation });
       }
       case "session.create": {
         const input = record(payload, "payload");
@@ -632,6 +825,51 @@ export class BridgeRequestRouter {
           ...(first?.developerInstructions !== undefined ? { firstInstructionDeveloperInstructions: first.developerInstructions } : {}),
         };
         return toJson({ session: clientSession(await this.bridge.createSession(stringField(input, "providerId"), options)) });
+      }
+      case "scheduled_task.list": {
+        const sessionId = payload.sessionId === undefined ? undefined : stringField(payload, "sessionId");
+        // Started rows are retained only as a bounded local audit. The renderer
+        // needs actionable schedules, and sending completed prompts on every
+        // session refresh would turn that audit into repeated large IPC traffic.
+        const tasks = this.bridge.scheduledTasks(sessionId).filter((task) => task.status !== "started" && task.status !== "cancelled");
+        if (scheduledTaskListPayloadBytes(tasks) > maxScheduledTaskListPayloadBytes) {
+          throw new Error("Scheduled-task list exceeds the secure transport limit");
+        }
+        return toJson({ tasks });
+      }
+      case "scheduled_task.create": {
+        const input = record(payload, "payload");
+        const meshTargets = input.meshTargets === undefined ? undefined : delegationTargets(input.meshTargets);
+        const task = await this.bridge.createScheduledTask({
+          requestId,
+          providerId: stringField(input, "providerId"),
+          workingDirectory: stringField(input, "workingDirectory"),
+          title: stringField(input, "title"),
+          content: scheduledTaskContent(stringField(input, "content"), meshTargets),
+          runAt: stringField(input, "runAt"),
+          ...(typeof input.modelId === "string" ? { modelId: input.modelId } : {}),
+          ...(typeof input.reasoningEffort === "string" ? { reasoningEffort: input.reasoningEffort } : {}),
+          ...(meshTargets !== undefined ? { meshTargets } : {}),
+        });
+        return toJson({ task });
+      }
+      case "scheduled_task.cancel": {
+        const input = record(payload, "payload");
+        return toJson({ task: await this.bridge.cancelScheduledTask(stringField(input, "scheduledTaskId")) });
+      }
+      case "scheduled_task.run_now": {
+        const input = record(payload, "payload");
+        return toJson({ task: await this.bridge.runScheduledTaskNow(stringField(input, "scheduledTaskId")) });
+      }
+      case "scheduled_task.retry": {
+        const input = record(payload, "payload");
+        if (input.runAt !== undefined && typeof input.runAt !== "string") {
+          throw new Error("runAt must be a string");
+        }
+        return toJson({ task: await this.bridge.retryScheduledTask(
+          stringField(input, "scheduledTaskId"),
+          typeof input.runAt === "string" ? { runAt: input.runAt } : {},
+        ) });
       }
       case "session.context_handoff": {
         const input = validateSessionTransferRequest(payload);
@@ -661,11 +899,19 @@ export class BridgeRequestRouter {
         const result = await this.bridge.promoteSideChat(stringField(input, "sessionId"));
         return toJson({ ...result, session: clientSession(result.session) });
       }
+      case "session.continue": {
+        const input = record(payload, "payload");
+        return toJson(await this.bridge.continueSession(stringField(input, "sessionId"), {
+          requestId,
+          ...(typeof input.modelId === "string" ? { modelId: input.modelId } : {}),
+          ...(typeof input.reasoningEffort === "string" ? { reasoningEffort: input.reasoningEffort } : {}),
+        }));
+      }
       case "session.send_message": {
         const input = record(payload, "payload");
         const attachmentIds = input.attachmentIds === undefined
           ? undefined
-          : stringArray(input.attachmentIds, "attachmentIds", 4);
+          : messageAttachmentIds(input.attachmentIds);
         if (attachmentIds !== undefined && input.attachments !== undefined) {
           throw new Error("session.send_message accepts attachmentIds or inline attachments, not both");
         }
@@ -687,7 +933,7 @@ export class BridgeRequestRouter {
       }
       case "message_queue.list": {
         const sessionId = payload.sessionId === undefined ? undefined : stringField(payload, "sessionId");
-        return toJson({ messages: this.bridge.queuedMessages(sessionId) });
+        return toJson({ messages: await this.bridge.refreshQueuedMessages(sessionId) });
       }
       case "message_queue.enqueue": {
         const input = record(payload, "payload");
@@ -712,14 +958,19 @@ export class BridgeRequestRouter {
       }
       case "message_queue.move_to_new_task": {
         const input = record(payload, "payload");
-        return toJson({ session: clientSession(await this.bridge.moveQueuedMessageToNewTask(
+        const result = await this.bridge.moveQueuedMessageToNewTask(
           stringField(input, "messageId"),
           {
             providerId: stringField(input, "providerId"),
             modelId: stringField(input, "modelId"),
             ...(typeof input.reasoningEffort === "string" ? { reasoningEffort: input.reasoningEffort } : {}),
           },
-        )) });
+        );
+        return toJson({ session: clientSession(result.session), delivery: result.delivery });
+      }
+      case "message_queue.deliver_new_task": {
+        const input = record(payload, "payload");
+        return toJson({ delivery: await this.bridge.deliverQueuedMessageToNewTask(stringField(input, "deliveryId")) });
       }
       case "session.steer_message": {
         const input = record(payload, "payload");

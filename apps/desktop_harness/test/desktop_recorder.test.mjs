@@ -296,6 +296,42 @@ test("typing keeps every key code but throttles expensive foreground context", a
   assert.equal(contextCalls, 1);
 });
 
+test("keyboard records repeat, hold duration, orphaned releases, and interrupted stop releases without text", async (t) => {
+  const value = await fixture(t);
+  await value.manager.start({ privacyConsent: true });
+
+  value.hook.emit("keydown", { keycode: 30, key: "A", repeat: false, alt: false, ctrl: false, meta: false, shift: false });
+  value.time.advance(120);
+  value.hook.emit("keydown", { keycode: 30, key: "A", repeat: true, alt: false, ctrl: false, meta: false, shift: false });
+  value.time.advance(230);
+  value.hook.emit("keyup", { keycode: 30, key: "A", repeat: false, alt: false, ctrl: false, meta: false, shift: false });
+  value.time.advance(10);
+  value.hook.emit("keyup", { keycode: 48, key: "B", repeat: false, alt: false, ctrl: false, meta: false, shift: false });
+  value.hook.emit("keydown", { keycode: 42, key: "Shift", repeat: false, alt: false, ctrl: false, meta: false, shift: true });
+  value.time.advance(40);
+
+  const staged = await value.manager.stop("user");
+  const events = (await readFile(staged.eventsPath, "utf8")).trim().split("\n").map(JSON.parse);
+  const keys = events.filter((event) => event.type === "key-down" || event.type === "key-up");
+  assert.equal(keys.length, 6);
+  assert.equal(keys[0].key, "A");
+  assert.equal(keys[0].repeat, false);
+  assert.equal(keys[0].textCaptured, false);
+  assert.equal(keys[1].repeat, true);
+  assert.equal(keys[1].repeatIndex, 1);
+  assert.equal(keys[1].downEventId, keys[0].eventId);
+  assert.equal(keys[2].holdDurationMs, 350);
+  assert.equal(keys[2].repeatCount, 1);
+  assert.equal(keys[2].interrupted, false);
+  assert.equal(keys[3].orphaned, true);
+  assert.equal(keys[5].key, "Shift");
+  assert.equal(keys[5].holdDurationMs, 40);
+  assert.equal(keys[5].interrupted, true);
+  assert.equal(keys[5].interruptionReason, "user");
+  assert.ok(keys.every((event) => event.textCaptured === false));
+  assert.ok(keys.every((event) => !("text" in event) && !("character" in event) && !("clipboard" in event)));
+});
+
 test("recorder bounds drag path memory under long mouse movement bursts", async (t) => {
   const value = await fixture(t);
   await value.manager.dispose();

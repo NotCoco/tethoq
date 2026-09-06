@@ -59,6 +59,10 @@ test("ACP session state is derived only from explicit native status metadata", (
     ["active", "working"],
     ["busy", "working"],
     ["retry", "working"],
+    ["completed", "completed"],
+    ["complete", "completed"],
+    ["success", "completed"],
+    [{ type: "succeeded" }, "completed"],
     ["error", "failed"],
   ] as const) {
     assert.equal(normalizeAcpSession("host_1", { ...session, status }).state, expected);

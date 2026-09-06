@@ -9,6 +9,13 @@ import {
 test("dictation uses an explicit Tethoq credential and the official transcription model", async () => {
   const apiKey = ["test", "tethoq", "openai", "key"].join("-");
   let request: { readonly url: string; readonly init: RequestInit | undefined } | undefined;
+  let requestedTimeoutMs: number | undefined;
+  const originalTimeout = AbortSignal.timeout;
+  const requestSignal = new AbortController().signal;
+  AbortSignal.timeout = (milliseconds) => {
+    requestedTimeoutMs = milliseconds;
+    return requestSignal;
+  };
   const transcriber = new OpenAiDictationTranscriber({
     apiKey,
     fetch: async (url, init) => {
@@ -21,14 +28,21 @@ test("dictation uses an explicit Tethoq credential and the official transcriptio
   });
   const bytes = Buffer.alloc(2_000, 7);
 
-  const result = await transcriber.transcribe({
-    name: "dictation.wav",
-    mimeType: "audio/wav",
-    byteLength: bytes.byteLength,
-    dataBase64: bytes.toString("base64"),
-  }, { dictionary: ["OpenCode", "PostgreSQL", "OpenCode"] });
+  let result: { readonly text: string };
+  try {
+    result = await transcriber.transcribe({
+      name: "dictation.wav",
+      mimeType: "audio/wav",
+      byteLength: bytes.byteLength,
+      dataBase64: bytes.toString("base64"),
+    }, { dictionary: ["OpenCode", "PostgreSQL", "OpenCode"] });
+  } finally {
+    AbortSignal.timeout = originalTimeout;
+  }
 
   assert.equal(result.text, "OpenCode and PostgreSQL");
+  assert.equal(requestedTimeoutMs, 12 * 60_000);
+  assert.equal(request?.init?.signal, requestSignal);
   assert.equal(request?.url, "https://api.openai.com/v1/audio/transcriptions");
   const headers = new Headers(request?.init?.headers);
   assert.equal(headers.get("authorization"), `Bearer ${apiKey}`);
@@ -91,7 +105,7 @@ test("transcription source discovery reports readiness without leaking credentia
       label: "OpenAI speech-to-text",
       status: "ready",
       batch: true,
-      maxAudioBytes: 4 * 1024 * 1024,
+      maxAudioBytes: 25 * 1024 * 1024,
     },
     {
       id: "xai-stt",
@@ -110,6 +124,38 @@ test("transcription source discovery reports readiness without leaking credentia
   assert.match(serialized, /xAI API key/);
 });
 
+test("OpenAI dictation accepts audio beyond the obsolete 4 MiB limit", async () => {
+  let requests = 0;
+  const transcriber = new OpenAiDictationTranscriber({
+    apiKey: "test-openai",
+    fetch: async () => {
+      requests += 1;
+      return new Response(JSON.stringify({ text: "Long recording" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  const bytes = Buffer.alloc((4 * 1024 * 1024) + 1, 7);
+
+  const result = await transcriber.transcribe({
+    name: "long-dictation.wav",
+    mimeType: "audio/wav",
+    byteLength: bytes.byteLength,
+    dataBase64: bytes.toString("base64"),
+  });
+
+  assert.equal(result.text, "Long recording");
+  assert.equal(requests, 1);
+  await assert.rejects(() => transcriber.transcribe({
+    name: "too-large.wav",
+    mimeType: "audio/wav",
+    byteLength: (25 * 1024 * 1024) + 1,
+    dataBase64: "",
+  }), /between 1 KiB and 25 MiB/);
+  assert.equal(requests, 1);
+});
+
 test("dictation credentials are checked before becoming active", async () => {
   const requests: string[] = [];
   const registry = defaultTranscriptionSourceRegistry({
@@ -121,8 +167,8 @@ test("dictation credentials are checked before becoming active", async () => {
     },
   });
 
-  await registry.validateCredential("openai-stt", "sk-test-openai-key");
-  registry.setCredential("openai-stt", "sk-test-openai-key");
+  await registry.validateCredential("openai-stt", "test-openai");
+  registry.setCredential("openai-stt", "test-openai");
   assert.equal(registry.list().find((source) => source.id === "openai-stt")?.status, "ready");
   assert.deepEqual(requests, ["https://api.openai.com/v1/models"]);
 

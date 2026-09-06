@@ -79,7 +79,9 @@ export function boundSelections(
 
 export class SessionSelectionStore {
   readonly #store: JsonFileStore<SessionSelectionState>;
-  #tail: Promise<void> = Promise.resolve();
+  #pendingSelections: Readonly<Record<string, SessionSelection>> | undefined;
+  #drain: Promise<void> | undefined;
+  #writeFailure: { readonly error: unknown } | undefined;
 
   public constructor(path: string) {
     this.#store = new JsonFileStore(path, validate);
@@ -90,11 +92,52 @@ export class SessionSelectionStore {
   }
 
   public scheduleWrite(selections: Readonly<Record<string, SessionSelection>>): void {
-    const state: SessionSelectionState = { version: 1, selections: boundSelections(selections) };
-    this.#tail = this.#tail.then(() => this.#store.write(state));
+    // Selection discovery can report hundreds of sessions in one catalogue
+    // reconciliation. Only the newest complete snapshot matters; retaining a
+    // Promise and full record for every intermediate session makes startup
+    // memory grow quadratically and rewrites the same file hundreds of times.
+    this.#pendingSelections = boundSelections(selections);
+    this.#writeFailure = undefined;
+    this.ensureDrain();
   }
 
   public async flush(): Promise<void> {
-    await this.#tail;
+    while (this.#pendingSelections !== undefined || this.#drain !== undefined) {
+      if (this.#writeFailure !== undefined) throw this.#writeFailure.error;
+      this.ensureDrain();
+      if (this.#drain !== undefined) await this.#drain;
+    }
+    if (this.#writeFailure !== undefined) throw this.#writeFailure.error;
+  }
+
+  private ensureDrain(): void {
+    if (this.#drain !== undefined || this.#pendingSelections === undefined || this.#writeFailure !== undefined) return;
+    this.#drain = Promise.resolve()
+      .then(async () => await this.drainWrites())
+      .catch((error: unknown) => {
+        // Keep the latest state pending and surface the failure from flush;
+        // never silently claim shutdown persistence completed.
+        this.#writeFailure = { error };
+      })
+      .finally(() => {
+        this.#drain = undefined;
+        if (this.#pendingSelections !== undefined && this.#writeFailure === undefined) this.ensureDrain();
+      });
+  }
+
+  private async drainWrites(): Promise<void> {
+    while (this.#pendingSelections !== undefined) {
+      const selections = this.#pendingSelections;
+      this.#pendingSelections = undefined;
+      const state: SessionSelectionState = { version: 1, selections };
+      try {
+        await this.#store.write(state);
+      } catch (error) {
+        // A newer snapshot subsumes this one. Otherwise retain this snapshot so
+        // a later schedule/flush can retry rather than dropping the final state.
+        if (this.#pendingSelections === undefined) this.#pendingSelections = selections;
+        throw error;
+      }
+    }
   }
 }

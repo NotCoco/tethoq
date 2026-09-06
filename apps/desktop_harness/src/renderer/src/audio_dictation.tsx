@@ -89,10 +89,7 @@ export class Mp3DictationRecorder {
       const now = performance.now();
       if (now - this.#lastLevelAt >= 50) {
         this.#lastLevelAt = now;
-        let sum = 0;
-        for (let index = 0; index < input.length; index += 1) sum += input[index]! * input[index]!;
-        const level = Math.min(1, Math.sqrt(sum / input.length) * 4);
-        this.#onLevel(level);
+        this.#onLevel(microphoneSignalLevel(input));
       }
     };
     source.connect(processor);
@@ -152,6 +149,72 @@ export class Mp3DictationRecorder {
       this.#stream.getTracks().forEach((track) => track.stop());
       this.#stream = null;
     }
+    if (this.#context && this.#context.state !== "closed") void this.#context.close().catch(() => undefined);
+    this.#context = null;
+  }
+}
+
+/**
+ * Converts a microphone time-domain window into the normalized level used by
+ * the live trace. This is deliberately signal-derived: silence stays at zero
+ * and louder speech moves the line farther from its centre.
+ */
+export function microphoneSignalLevel(samples: Float32Array): number {
+  if (samples.length === 0) return 0;
+  let sum = 0;
+  for (let index = 0; index < samples.length; index += 1) sum += samples[index]! * samples[index]!;
+  return Math.min(1, Math.sqrt(sum / samples.length) * 4);
+}
+
+/**
+ * Reads levels from an existing microphone stream without recording or
+ * altering it. API transcription keeps MediaRecorder as its capture path; this
+ * monitor only gives that path the same real live trace as MP3 recording.
+ */
+export class MicrophoneLevelMonitor {
+  readonly #onLevel: (level: number) => void;
+  #context: AudioContext | null = null;
+  #source: MediaStreamAudioSourceNode | null = null;
+  #analyser: AnalyserNode | null = null;
+  #frame: number | null = null;
+  #lastLevelAt = 0;
+
+  public constructor(onLevel: (level: number) => void) {
+    this.#onLevel = onLevel;
+  }
+
+  public async start(stream: MediaStream): Promise<void> {
+    this.stop();
+    const context = new AudioContext();
+    this.#context = context;
+    if (context.state === "suspended") await context.resume();
+    const source = context.createMediaStreamSource(stream);
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 2048;
+    source.connect(analyser);
+    this.#source = source;
+    this.#analyser = analyser;
+    const samples = new Float32Array(analyser.fftSize);
+    const sample = () => {
+      if (this.#analyser !== analyser) return;
+      analyser.getFloatTimeDomainData(samples);
+      const now = performance.now();
+      if (now - this.#lastLevelAt >= 50) {
+        this.#lastLevelAt = now;
+        this.#onLevel(microphoneSignalLevel(samples));
+      }
+      this.#frame = requestAnimationFrame(sample);
+    };
+    this.#frame = requestAnimationFrame(sample);
+  }
+
+  public stop(): void {
+    if (this.#frame !== null) cancelAnimationFrame(this.#frame);
+    this.#frame = null;
+    this.#source?.disconnect();
+    this.#source = null;
+    this.#analyser?.disconnect();
+    this.#analyser = null;
     if (this.#context && this.#context.state !== "closed") void this.#context.close().catch(() => undefined);
     this.#context = null;
   }
@@ -277,6 +340,7 @@ export function AudioTraceCanvas({ live = false, peaks, progress = 0, className 
   useEffect(() => {
     const target = canvas.current;
     if (!target) return undefined;
+    let liveLevelListener: ((level: number) => void) | null = null;
     const draw = () => {
       const context = target.getContext("2d");
       const parent = target.parentElement;
@@ -342,6 +406,7 @@ export function AudioTraceCanvas({ live = false, peaks, progress = 0, className 
         liveLevels.current.push(Math.max(0.02, Math.min(1, level)));
         if (liveLevels.current.length > 220) liveLevels.current.shift();
       };
+      liveLevelListener = onLevel;
       liveTraceLevels.listeners.add(onLevel);
       liveFrame.current = requestAnimationFrame(animate);
       if (reducedMotion) {
@@ -351,13 +416,14 @@ export function AudioTraceCanvas({ live = false, peaks, progress = 0, className 
         const interval = window.setInterval(draw, 400);
         return () => {
           window.clearInterval(interval);
+          window.removeEventListener("resize", draw);
           liveTraceLevels.listeners.delete(onLevel);
         };
       }
     }
     return () => {
       window.removeEventListener("resize", draw);
-      liveTraceLevels.listeners.clear();
+      if (liveLevelListener) liveTraceLevels.listeners.delete(liveLevelListener);
       if (liveFrame.current !== null) cancelAnimationFrame(liveFrame.current);
       liveFrame.current = null;
     };

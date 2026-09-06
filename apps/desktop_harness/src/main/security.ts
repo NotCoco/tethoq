@@ -24,10 +24,12 @@ export function hardenSession(session: Session): void {
   });
   session.webRequest.onHeadersReceived((details, callback) => {
     const headers = { ...details.responseHeaders };
+    const nonce = process.env.TETHOQ_DEV_CSP_NONCE;
+    const nonceSource = nonce && /^[A-Za-z0-9+/]{24}$/u.test(nonce) ? ` 'nonce-${nonce}'` : "";
     headers["Content-Security-Policy"] = [
       process.env.ELECTRON_RENDERER_URL === undefined
-        ? "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http://localhost:* http://127.0.0.1:* http://[::1]:*; connect-src 'none'; font-src 'self'; media-src 'self' blob: tethoq-media:; worker-src 'none'"
-        : "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http://localhost:* http://127.0.0.1:* http://[::1]:*; connect-src 'self' ws:; font-src 'self'; media-src 'self' blob: tethoq-media:; worker-src 'none'",
+        ? "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: tethoq-media: http://localhost:* http://127.0.0.1:* http://[::1]:*; connect-src 'none'; font-src 'self'; media-src 'self' blob: tethoq-media:; worker-src blob:"
+        : `default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; script-src 'self' 'unsafe-eval'${nonceSource}; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: tethoq-media: http://localhost:* http://127.0.0.1:* http://[::1]:*; connect-src 'self' ws:; font-src 'self'; media-src 'self' blob: tethoq-media:; worker-src blob:`,
     ];
     headers["X-Content-Type-Options"] = ["nosniff"];
     headers["Referrer-Policy"] = ["no-referrer"];

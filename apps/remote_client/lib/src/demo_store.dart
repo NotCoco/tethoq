@@ -83,7 +83,7 @@ class DemoRemoteAppStore extends RemoteAppStore {
           status: 'ready',
           setupEnvironmentVariable: 'TETHOQ_OPENAI_API_KEY',
           supportsBatch: true,
-          maxAudioBytes: 4194304,
+          maxAudioBytes: 26214400,
           credentialLabel: 'OpenAI API key',
           credentialSetupUrl: 'https://platform.openai.com/api-keys',
         ),
@@ -477,6 +477,7 @@ class DemoRemoteAppStore extends RemoteAppStore {
   Future<List<RemoteModel>> loadModels(
     String providerId, {
     bool force = false,
+    bool surfaceErrors = true,
   }) async {
     final models = <RemoteModel>[
       RemoteModel(
@@ -511,6 +512,22 @@ class DemoRemoteAppStore extends RemoteAppStore {
   }
 
   @override
+  Future<VisionProxyStatus> loadVisionProxy(String sessionId) async {
+    final cached = visionBySession[sessionId];
+    if (cached != null) return cached;
+    final session = sessions.where((item) => item.id == sessionId).firstOrNull;
+    final status = VisionProxyStatus(
+      sessionId: sessionId,
+      primaryModelId: session?.modelId,
+      primaryModelSupportsImageInput:
+          session?.providerId == 'codex' ? true : null,
+    );
+    visionBySession[sessionId] = status;
+    notifyListeners();
+    return status;
+  }
+
+  @override
   Future<List<RemoteSession>> loadChildSessions(String parentSessionId) async =>
       childSessionsFor(parentSessionId);
 
@@ -536,7 +553,7 @@ class DemoRemoteAppStore extends RemoteAppStore {
   }
 
   @override
-  Future<void> cancelEars() async {}
+  Future<void> cancelEars([String? sessionId]) async {}
 
   @override
   Future<void> sendMessage(
@@ -665,6 +682,7 @@ class DemoRemoteAppStore extends RemoteAppStore {
       modelId: message.modelId,
       reasoningEffort: message.reasoningEffort,
       error: message.error,
+      retryable: message.retryable,
     );
     queuedMessages[message.id] = updated;
     notifyListeners();
@@ -814,8 +832,11 @@ class DemoRemoteAppStore extends RemoteAppStore {
   }
 
   @override
-  Future<String> transcribeDictation(List<int> waveBytes,
-          {String? sourceId}) async =>
+  Future<String> transcribeDictation(
+    List<int> waveBytes, {
+    required String sessionId,
+    String? sourceId,
+  }) async =>
       'Demo dictation transcript';
 
   @override

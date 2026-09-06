@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { CURRENT_PROTOCOL_VERSION, createHostIdentity, type JsonObject, type RequestEnvelope } from "../../../packages/protocol/src/index.js";
+import { CURRENT_PROTOCOL_VERSION, createHostIdentity, type JsonObject, type RemoteMessage, type RequestEnvelope } from "../../../packages/protocol/src/index.js";
 import { FakeProviderAdapter } from "../../../packages/provider_fake/src/index.js";
-import type { SendMessageRequest, SendMessageResult } from "../../../packages/provider_contract/src/index.js";
+import {
+  ProviderAdapterError,
+  type SendMessageRequest,
+  type SendMessageResult,
+} from "../../../packages/provider_contract/src/index.js";
 import type { BridgeConfig } from "./config.js";
 import { AgentBridge } from "./bridge.js";
 import { BridgeRequestRouter } from "./request_router.js";
@@ -33,6 +37,7 @@ function request(hostId: string, requestId: string, type: string, payload: JsonO
 
 class NativeBranchFakeProvider extends FakeProviderAdapter {
   public readonly branchCalls: string[] = [];
+  public readonly sentSessionIds: string[] = [];
 
   public async branchSession(providerSessionId: string) {
     this.branchCalls.push(providerSessionId);
@@ -41,6 +46,31 @@ class NativeBranchFakeProvider extends FakeProviderAdapter {
       workingDirectory: source.workingDirectory ?? "C:\\workspace",
       title: `Native branch of ${source.title}`,
     });
+  }
+
+  public override async sendMessage(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
+    this.sentSessionIds.push(providerSessionId);
+    return await super.sendMessage(providerSessionId, request);
+  }
+}
+
+class HugeHistoryFakeProvider extends FakeProviderAdapter {
+  public override async getMessages(providerSessionId: string): Promise<readonly RemoteMessage[]> {
+    const existing = await super.getMessages(providerSessionId);
+    const source = await this.getSession(providerSessionId);
+    return [
+      ...existing,
+      {
+        id: `${source.id}/huge-history`,
+        sessionId: source.id,
+        providerMessageId: "huge-history",
+        role: "assistant",
+        createdAt: "2026-09-02T00:00:00.000Z",
+        status: "completed",
+        parts: [{ type: "text", text: `Recent checkout retry notes. ${"x".repeat(1_300_000)}` }],
+        nativeMetadata: {},
+      },
+    ];
   }
 }
 
@@ -52,7 +82,7 @@ class ObservedSendFakeProvider extends FakeProviderAdapter {
     this.sentContents.push(request.content);
     if (this.failNextSend) {
       this.failNextSend = false;
-      throw new Error("Simulated handoff send failure");
+      throw new ProviderAdapterError(this.providerId, "NOT_DELIVERED", "Simulated handoff send failure", true);
     }
     return await super.sendMessage(providerSessionId, request);
   }
@@ -211,6 +241,26 @@ test("generic branch fallback shows copied history before sending and injects it
   assert.match(nestedContent, /Seed message for fixture 1/);
 });
 
+test("side chat creation compactly snapshots a transcript that exceeds the generic bootstrap budget", async (t) => {
+  const provider = new HugeHistoryFakeProvider({ hostId: "host-side-chat-compact", providerId: "side-chat-compact", sessionCount: 1 });
+  const bridge = new AgentBridge(bridgeConfig("host-side-chat-compact", provider.providerId), [provider]);
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  await bridge.refresh();
+  const source = bridge.sessions()[0];
+  assert.ok(source);
+
+  const result = await bridge.createSideChat(source.id, "Explain the retry path.");
+  const bootstrap = result.session.nativeMetadata.tethoqBranchBootstrap;
+  assert.equal(typeof bootstrap, "string");
+  assert.ok(Buffer.byteLength(String(bootstrap), "utf8") <= 1_000_000);
+  assert.match(String(bootstrap), /TETHOQ_BRANCH_TRANSCRIPT_BOOTSTRAP_V1/);
+  assert.match(String(bootstrap), /bounded snapshot|Recent checkout retry notes/);
+  assert.doesNotMatch(String(bootstrap), /generic bootstrap limit/);
+  assert.equal(result.session.sessionKind, "side_chat");
+  assert.equal(result.copiedMessageCount > 0, true);
+});
+
 test("native branch adapters are preferred and do not receive a transcript bootstrap", async (t) => {
   const provider = new NativeBranchFakeProvider({ hostId: "host-branch-native", providerId: "native", sessionCount: 1 });
   const bridge = new AgentBridge(bridgeConfig("host-branch-native", provider.providerId), [provider]);
@@ -229,6 +279,9 @@ test("native branch adapters are preferred and do not receive a transcript boots
     sourceSessionId: source.id,
     strategy: "native",
   });
+  await bridge.sendMessage(result.session.id, { requestId: "native-branch-first-send", content: "Continue in the branch." });
+  assert.deepEqual(provider.sentSessionIds, [result.session.providerSessionId]);
+  assert.notEqual(provider.sentSessionIds[0], source.providerSessionId);
 });
 
 test("request router exposes the handoff and branch wire responses and reports validation errors", async (t) => {

@@ -45,6 +45,18 @@ test("the older bare JSON annotation envelope reopens as compact annotation data
   assert.equal(parsed.annotations[0].annotation, "Make this clearer.");
 });
 
+test("selection-only annotations stay widgets and never expose their transport envelope", () => {
+  const wire = `# Response annotations:\nInstructions that belong to the transport.\n[{"text":"Codex Desktop writer"}]\n\n## My request:\nDoes this require Codex Desktop?`;
+  const parsed = annotations.parseResponseAnnotations(wire);
+
+  assert.equal(parsed.body, "Does this require Codex Desktop?");
+  assert.deepEqual(parsed.annotations.map(({ text, annotation }) => ({ text, annotation })), [
+    { text: "Codex Desktop writer", annotation: "" },
+  ]);
+  assert.equal(annotations.visibleResponseAnnotationBody(wire), "Does this require Codex Desktop?");
+  assert.doesNotMatch(parsed.body, /Response annotations|Codex Desktop writer|My request/u);
+});
+
 test("ordinary prose that mentions annotations remains ordinary prose", () => {
   const text = "Documentation example: # Response annotations: and ## My request:";
   assert.equal(annotations.parseResponseAnnotations(text), null);
@@ -76,24 +88,35 @@ test("annotation-only optimistic rows reconcile with their provider echo", () =>
 });
 
 test("desktop annotation controls are wired as complete interactions", async () => {
-  const [app, chat, composer] = await Promise.all([
+  const [app, chat, composer, styles] = await Promise.all([
     readFile(join(appRoot, "src", "renderer", "src", "App.tsx"), "utf8"),
     readFile(join(appRoot, "src", "renderer", "src", "ChatTimeline.tsx"), "utf8"),
     readFile(join(appRoot, "src", "renderer", "src", "Composer.tsx"), "utf8"),
+    readFile(join(appRoot, "src", "renderer", "src", "styles.css"), "utf8"),
   ]);
 
+  // Annotating is asked for by right-clicking a selection. A bare selection
+  // must not summon the action on its own, so no pointer-release route exists.
+  assert.doesNotMatch(chat, /onPointerUp=\{item\.kind === "assistant"/u);
+  assert.doesNotMatch(chat, /annotation-selection-action/u);
+  assert.doesNotMatch(styles, /annotation-selection-action/u);
   assert.match(chat, /onContextMenu=\{item\.kind === "assistant"/u);
   assert.match(chat, /<AnnotationIcon \/>Annotate/u);
+  assert.match(chat, /className="annotation-context-menu"/u);
+  // A keyboard context menu reports no pointer position; the menu still lands
+  // on the answer instead of the window corner.
+  assert.match(chat, /event\.clientX > 0 \? event\.clientX : bounds\.left \+ 24/u);
   assert.match(chat, /<MessageAnnotationBadges annotations=\{item\.annotations\}/u);
   assert.match(composer, /className="composer-annotation-edit"/u);
   assert.match(composer, /className="composer-annotation-remove"/u);
   assert.match(composer, /serializeResponseAnnotations\(messageContent, submissionAnnotations, outgoingAudio\.length - annotationAudioCount\)/u);
-  assert.match(composer, /sendAfterDictationRevision\.current = dictationCommitRevision \+ 1;[\s\S]*dictationControl\.current\?\.stop\(\)/u);
+  assert.match(composer, /sendAfterDictation\.current = true;[\s\S]*dictationControl\.current\?\.stop\(\)/u);
   assert.match(composer, /setPhase\("transcribing"\);[\s\S]*const audio = await recorder\.stop\(\)[\s\S]*onSettled\?\.\(committed\)[\s\S]*setPhase\("idle"\)/u);
   assert.match(composer, /visibleOutgoingAudio = outgoingAudio\.filter/u);
-  assert.match(composer, /optimisticAnnotations = submissionAnnotations\.map/u);
+  assert.match(composer, /acceptedAnnotations = submissionAnnotations\.map/u);
   assert.match(composer, /\? \{ id: annotation\.id, text: annotation\.text, annotation: appendTranscript/u);
   assert.match(app, /const emptyResponseAnnotations:[^\n]+Object\.freeze\(\[\]\)/u);
-  assert.match(app, /initialAnnotations=\{composerAnnotations\[selectedSession\?\.id \?\? ""\] \?\? emptyResponseAnnotations\}/u);
-  assert.match(app, /onAnnotateSelection=\{\(text, anchor\) => setAnnotationRequest/u);
+  assert.match(app, /initialAnnotations=\{composerAnnotations\.current\[selectedSession\?\.id \?\? ""\] \?\? emptyResponseAnnotations\}/u);
+  assert.match(app, /const annotateTimelineSelection = useCallback/u);
+  assert.match(app, /onAnnotateSelection=\{annotateTimelineSelection\}/u);
 });

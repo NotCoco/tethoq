@@ -28,6 +28,7 @@ const CHANNELS = {
   localOpenHandlers: 'tethoq:local-open-handlers',
   openLocalTarget: 'tethoq:open-local-target',
   openDictationSetupPage: 'tethoq:open-dictation-setup-page',
+  openHarnessSetupPage: 'tethoq:open-harness-setup-page',
   showWindow: 'tethoq:show-window',
   hideWindow: 'tethoq:hide-window',
   rendererReady: 'tethoq:renderer-ready',
@@ -51,6 +52,9 @@ const CHANNELS = {
   liveSessionEvent: 'tethoq:live-session-event',
   liveSessionGetState: 'tethoq:live-session-get-state',
   liveSessionAction: 'tethoq:live-session-action',
+  mobileConnectionState: 'tethoq:mobile-connection-state',
+  mobileConnectionGetState: 'tethoq:mobile-connection-get-state',
+  mobileConnectionAction: 'tethoq:mobile-connection-action',
 };
 
 function subscribe(channel, listener) {
@@ -71,6 +75,7 @@ const api = Object.freeze({
   localOpenHandlers: () => ipcRenderer.invoke(CHANNELS.localOpenHandlers),
   openLocalTarget: (target) => ipcRenderer.invoke(CHANNELS.openLocalTarget, target),
   openDictationSetupPage: (sourceId) => ipcRenderer.invoke(CHANNELS.openDictationSetupPage, { sourceId }),
+  openHarnessSetupPage: (providerId) => ipcRenderer.invoke(CHANNELS.openHarnessSetupPage, { providerId }),
   showWindow: () => ipcRenderer.invoke(CHANNELS.showWindow),
   hideWindow: () => ipcRenderer.invoke(CHANNELS.hideWindow),
   notifyReady: () => { ipcRenderer.send(CHANNELS.rendererReady); },
@@ -85,6 +90,8 @@ const api = Object.freeze({
   preferencesAction: (action) => ipcRenderer.invoke(CHANNELS.preferencesAction, action),
   liveSessionState: () => ipcRenderer.invoke(CHANNELS.liveSessionGetState),
   liveSessionAction: (action) => ipcRenderer.invoke(CHANNELS.liveSessionAction, action),
+  mobileConnectionState: () => ipcRenderer.invoke(CHANNELS.mobileConnectionGetState),
+  mobileConnectionAction: (action) => ipcRenderer.invoke(CHANNELS.mobileConnectionAction, action),
   onEventBatch: (listener) => subscribe(CHANNELS.eventBatch, listener),
   onRuntimeState: (listener) => subscribe(CHANNELS.runtimeState, listener),
   onBrowserState: (listener) => subscribe(CHANNELS.browserState, listener),
@@ -94,6 +101,7 @@ const api = Object.freeze({
   onPreferencesState: (listener) => subscribe(CHANNELS.preferencesState, listener),
   onLiveSessionState: (listener) => subscribe(CHANNELS.liveSessionState, listener),
   onLiveSessionEvent: (listener) => subscribe(CHANNELS.liveSessionEvent, listener),
+  onMobileConnectionState: (listener) => subscribe(CHANNELS.mobileConnectionState, listener),
 });
 
 contextBridge.exposeInMainWorld('tethoqDesktop', api);

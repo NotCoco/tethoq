@@ -436,8 +436,12 @@ export class RelayServer {
     const hostPublicKeyPem = this.verifyHostAttach(attach, existing);
     if (existing === undefined && this.#rooms.size >= this.#options.maxRooms) throw new Error("Relay is at room capacity");
     if (existing !== undefined) {
-      existing.host.close(1012, "Host tunnel replaced");
+      const previousHost = existing.host;
       existing.host = connection;
+      // WebSocket close callbacks may run synchronously. Publish the replacement
+      // first so closing the superseded tunnel cannot announce a false outage to
+      // every still-connected device.
+      previousHost.close(1012, "Host tunnel replaced");
       // The host is the authority, so its latest list replaces whatever this
       // process happened to be holding.
       existing.revokedDeviceIds = new Set(attach.revokedDeviceIds ?? []);

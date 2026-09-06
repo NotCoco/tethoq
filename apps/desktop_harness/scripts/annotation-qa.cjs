@@ -74,8 +74,8 @@ async function openTask(window, title) {
   await waitFor(window, `document.querySelector('.workspace textarea[aria-label="Message"]')`, `Task did not open: ${title}`);
 }
 
-async function openAnnotationEditor(window, selectedText) {
-  await evaluate(window, `(() => {
+async function openAnnotationEditor(window, selectedText, actionCapture) {
+  const releasePoint = await evaluate(window, `(() => {
     const body = [...document.querySelectorAll('.message-assistant .message-body')].find((candidate) => candidate.textContent?.includes(${JSON.stringify(selectedText)}));
     if (!(body instanceof HTMLElement)) throw new Error('Assistant text not found');
     const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
@@ -90,24 +90,35 @@ async function openAnnotationEditor(window, selectedText) {
       selection.removeAllRanges();
       selection.addRange(range);
       const bounds = range.getBoundingClientRect();
-      body.dispatchEvent(new MouseEvent('contextmenu', {
-        bubbles: true,
-        cancelable: true,
-        clientX: Math.round(bounds.left + Math.min(bounds.width, 30)),
-        clientY: Math.round(bounds.bottom),
-      }));
-      return;
+      const point = {
+        x: Math.round(bounds.left + Math.min(bounds.width, 30)),
+        y: Math.round(bounds.bottom),
+      };
+      body.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2, clientX: point.x, clientY: point.y }));
+      return point;
     }
     throw new Error('Selected text node not found');
   })()`);
-  await waitFor(window, `document.querySelector('.annotation-context-menu button')`, 'Annotate context action did not open');
-  await click(window, '.annotation-context-menu button');
+  const actionSelector = '.annotation-context-menu';
+  await waitFor(window, `document.querySelector(${JSON.stringify(actionSelector + ' button')})`, 'Annotate context action did not open');
+  const actionBounds = await evaluate(window, `(() => {
+    const value = document.querySelector(${JSON.stringify(actionSelector)})?.getBoundingClientRect();
+    return value ? { left: value.left, top: value.top, right: value.right, bottom: value.bottom } : null;
+  })()`);
+  const viewport = await evaluate(window, `({ width: innerWidth, height: innerHeight })`);
+  assert.ok(actionBounds, 'Annotate context action has no bounds');
+  assert.ok(actionBounds.left >= 0 && actionBounds.top >= 0 && actionBounds.right <= viewport.width && actionBounds.bottom <= viewport.height, 'Annotate context action escaped the viewport');
+  // The menu is anchored at the right-click, not floated above the pointer.
+  assert.ok(actionBounds.bottom >= releasePoint.y, 'The annotation menu did not anchor at the right-click');
+  if (actionCapture) await capture(window, actionCapture);
+  // Copy sits first in this menu, so the editor must be opened by name.
+  await click(window, `${actionSelector} button[aria-label="Annotate selected response"]`);
   await waitFor(window, `document.querySelector('.annotation-editor textarea')`, 'Annotation editor did not open');
 }
 
-async function addAnnotation(window, selectedText, comment, editorCapture) {
+async function addAnnotation(window, selectedText, comment, editorCapture, actionCapture) {
   const previousCount = await evaluate(window, `document.querySelectorAll('.composer-annotation-chip').length`);
-  await openAnnotationEditor(window, selectedText);
+  await openAnnotationEditor(window, selectedText, actionCapture);
   await setTextarea(window, '.annotation-editor textarea', comment);
   const editorBounds = await evaluate(window, `(() => { const value = document.querySelector('.annotation-editor')?.getBoundingClientRect(); return value ? { left: value.left, top: value.top, right: value.right, bottom: value.bottom } : null; })()`);
   assert.ok(editorBounds && editorBounds.left >= 0 && editorBounds.top >= 0 && editorBounds.right <= await evaluate(window, 'innerWidth') && editorBounds.bottom <= await evaluate(window, 'innerHeight'), 'Annotation editor is clipped by the viewport');
@@ -115,6 +126,37 @@ async function addAnnotation(window, selectedText, comment, editorCapture) {
   await click(window, '.annotation-editor-send');
   await waitFor(window, `!document.querySelector('.annotation-editor')`, 'Annotation editor did not close after add');
   await waitFor(window, `document.querySelectorAll('.composer-annotation-chip').length === ${previousCount + 1}`, 'Annotation chip did not reach the composer');
+}
+
+async function annotationChipLayout(window) {
+  return evaluate(window, `(() => {
+    const chip = document.querySelector('.composer-annotation-chip:first-child');
+    const main = chip?.querySelector('.composer-annotation-main');
+    const text = main?.querySelector('span');
+    if (!(chip instanceof HTMLElement) || !(main instanceof HTMLElement) || !(text instanceof HTMLElement)) return null;
+    const bounds = (node) => {
+      const value = node.getBoundingClientRect();
+      return { left: value.left, right: value.right };
+    };
+    const chipBounds = bounds(chip);
+    const escaping = [...chip.querySelectorAll(':scope > button, .composer-annotation-main > *')]
+      .filter((node) => {
+        const value = bounds(node);
+        return value.left < chipBounds.left - 1 || value.right > chipBounds.right + 1;
+      })
+      .map((node) => node.className || node.tagName);
+    const style = getComputedStyle(text);
+    return {
+      chip: chipBounds,
+      main: bounds(main),
+      text: bounds(text),
+      textClientWidth: text.clientWidth,
+      textScrollWidth: text.scrollWidth,
+      overflow: style.overflow,
+      textOverflow: style.textOverflow,
+      escaping,
+    };
+  })()`);
 }
 
 async function capture(window, name) {
@@ -166,12 +208,19 @@ async function createWindow(width, height) {
 
 async function runNormalFlow() {
   const window = await createWindow(1100, 760);
-  const firstText = 'I listened to your recording.';
+  const firstText = 'I listened to your recording. The plan is to ship the direct-audio dictate option only for models whose input modalities include audio, and to keep the MP3 out of the visible message text.';
   const secondText = 'keep the MP3 out of the visible message text.';
 
-  await addAnnotation(window, firstText, 'Make this sentence clearer.', 'normal-annotation-editor');
+  await addAnnotation(window, firstText, 'Make this sentence clearer.', 'normal-annotation-editor', 'normal-context-action');
   await addAnnotation(window, secondText, 'Explain why this matters.');
   assert.equal(await evaluate(window, `document.querySelectorAll('.composer-annotation-chip').length`), 2);
+
+  const chipLayout = await annotationChipLayout(window);
+  assert.ok(chipLayout, 'Long annotation chip was not rendered');
+  assert.ok(chipLayout.textScrollWidth > chipLayout.textClientWidth, 'Long annotation text did not exercise clipping');
+  assert.equal(chipLayout.overflow, 'hidden');
+  assert.equal(chipLayout.textOverflow, 'ellipsis');
+  assert.deepEqual(chipLayout.escaping, []);
 
   await click(window, '.composer-annotation-chip:first-child .composer-annotation-main');
   assert.match(await evaluate(window, `document.querySelector('.composer-annotation-detail')?.textContent ?? ''`), /Make this sentence clearer/u);
@@ -201,7 +250,7 @@ async function runNormalFlow() {
 
   await click(window, '.message-user:last-of-type .message-annotation button');
   const detail = await evaluate(window, `document.querySelector('.message-user:last-of-type .message-annotation-detail')?.textContent ?? ''`);
-  assert.match(detail, /I listened to your recording\./u);
+  assert.match(detail, /input modalities include audio/u);
   assert.match(detail, /Explain this in plain English\./u);
   await clickInput(window, '.message-user:last-of-type .message-annotation-detail');
   assert.ok(await evaluate(window, `Boolean(document.querySelector('.message-user:last-of-type .message-annotation-detail'))`), 'Clicking inside sent annotation detail closed it');
@@ -222,7 +271,7 @@ async function runNormalFlow() {
 async function runCompactFlow() {
   const window = await createWindow(760, 480);
   const selected = 'The plan is to ship the direct-audio dictate option';
-  await addAnnotation(window, selected, 'Keep this note compact.', 'compact-annotation-editor');
+  await addAnnotation(window, selected, 'Keep this note compact.', 'compact-annotation-editor', 'compact-context-action');
   await setTextarea(window, '.workspace textarea[aria-label="Message"]', 'Also add a short example.');
   await capture(window, 'compact-composer-chip');
 

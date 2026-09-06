@@ -28,6 +28,95 @@ process.on("exit", () => { void rm(outputDirectory, { recursive: true, force: tr
 
 const host = { id: "desktop_connector_test", name: "Test host", version: "0.1.0", platform: "windows" };
 
+test("connector send and steer carry private guidance without changing visible history", async () => {
+  const requests = [];
+  const privateGuidance = "Tethoq fallback goal: keep the migration narrowly scoped.";
+  const manifest = {
+    id: "community.capture",
+    name: "Capture Connector",
+    capabilities: { steering: true },
+  };
+  const client = {
+    request: async (method, params) => {
+      requests.push({ method, params });
+      if (method === "session.messages.list") {
+        return [{
+          id: "visible-user-message",
+          sessionId: params.sessionId,
+          role: "user",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          completedAt: "2026-01-01T00:00:01.000Z",
+          parts: [{ type: "text", text: "visible prompt" }],
+          status: "completed",
+        }];
+      }
+      return { accepted: true, turnId: `${method}-turn`, details: [] };
+    },
+    shutdown: async () => undefined,
+  };
+  const adapter = new connectors.ExternalConnectorAdapter(host.id, manifest, client);
+  try {
+    await adapter.sendMessage("session-1", { requestId: "send-1", content: "visible prompt", developerInstructions: privateGuidance });
+    assert.equal(typeof adapter.steerMessage, "function");
+    await adapter.steerMessage("session-1", { requestId: "steer-1", content: "visible steer", developerInstructions: privateGuidance });
+    await adapter.sendMessage("session-1", { requestId: "send-plain", content: "ordinary prompt" });
+
+    assert.deepEqual(requests.slice(0, 3), [
+      { method: "session.message.send", params: { sessionId: "session-1", requestId: "send-1", content: "visible prompt", developerInstructions: privateGuidance } },
+      { method: "session.message.steer", params: { sessionId: "session-1", requestId: "steer-1", content: "visible steer", developerInstructions: privateGuidance } },
+      { method: "session.message.send", params: { sessionId: "session-1", requestId: "send-plain", content: "ordinary prompt" } },
+    ]);
+
+    const history = await adapter.getMessages("session-1");
+    assert.equal(history[0].parts[0].text, "visible prompt");
+    assert.equal(JSON.stringify(history).includes(privateGuidance), false);
+  } finally {
+    await adapter.dispose();
+  }
+});
+
+test("connector host tools stay bound to dispatched sessions and helper isolation", async () => {
+  const requests = [];
+  const executions = [];
+  let nextSession = 0;
+  const adapter = new connectors.ExternalConnectorAdapter(host.id, {
+    id: "community.tooling", name: "Tooling", capabilities: { steering: true },
+  }, {
+    request: async (method, params) => {
+      requests.push({ method, params });
+      if (method === "session.create") return { id: `native-${++nextSession}`, title: "Test", state: "idle", needsApproval: false, lastActivityAt: new Date().toISOString() };
+      return { accepted: true, details: [] };
+    },
+    shutdown: async () => {},
+  });
+  const definition = { name: "browser_snapshot", description: "Inspect", inputSchema: { type: "object" } };
+  adapter.configureClientTooling({
+    definitions: [definition],
+    execute: async (...args) => { executions.push(args); return { content: [{ type: "text", text: "actual result" }] }; },
+  });
+  const call = { sessionId: "native-1", name: definition.name, input: {} };
+  await assert.rejects(adapter.executeHostTool(call), /not enabled/);
+  const session = await adapter.createSession({ workingDirectory: repositoryRoot });
+  await assert.rejects(adapter.executeHostTool(call), /not enabled/);
+  await adapter.sendMessage(session.providerSessionId, { requestId: "turn-1", content: "Inspect" });
+  assert.deepEqual(requests.at(-1).params.clientTools, [definition]);
+  assert.deepEqual(await adapter.executeHostTool(call), { content: [{ type: "text", text: "actual result" }] });
+  assert.deepEqual(executions[0], ["community.tooling", "native-1", "browser_snapshot", {}]);
+  await assert.rejects(adapter.executeHostTool({ ...call, sessionId: "another-session" }), /not enabled/);
+  await assert.rejects(adapter.executeHostTool({ ...call, name: "unexposed" }), /not enabled/);
+  await assert.rejects(adapter.executeHostTool({ ...call, input: [] }), /Invalid/);
+  await adapter.steerMessage(session.providerSessionId, { requestId: "turn-2", content: "No browser", clientToolOverrides: { browser_snapshot: false } });
+  assert.deepEqual(requests.at(-1).params.clientTools, []);
+  await assert.rejects(adapter.executeHostTool(call), /not enabled/);
+  const helper = await adapter.createSession({ workingDirectory: repositoryRoot, clientTools: "none", metadata: { internalPurpose: "vision_proxy" } });
+  assert.equal(requests.at(-1).params.mcpServers, "none");
+  await adapter.sendMessage(helper.providerSessionId, { requestId: "helper-1", content: "Describe" });
+  assert.deepEqual(requests.at(-1).params.clientTools, []);
+  await assert.rejects(adapter.executeHostTool({ ...call, sessionId: helper.providerSessionId }), /not enabled/);
+  await adapter.dispose();
+  await assert.rejects(adapter.executeHostTool(call), /not enabled/);
+});
+
 test("stale app-owned connector runtime snapshots are removed without touching recent ones", async () => {
   const temporaryDirectory = join(outputDirectory, "runtime-cleanup");
   const stale = join(temporaryDirectory, "tethoq-connector-runtime-stale");
@@ -103,6 +192,40 @@ test("external echo connector is discovered, enumerates models, runs a session, 
   await subscription.unsubscribe();
   await registry.dispose();
   await assert.rejects(() => adapter.detect(), /closed|exited/i);
+});
+
+test("approved connector completes a host tool round trip over the real JSONL process transport", async () => {
+  const directory = await resetConnectorFixture();
+  await writeFile(join(directory, "connector.js"), `
+import { readFile } from "node:fs/promises";
+import { serveConnector } from "@tethoq/connector-sdk";
+const manifest = JSON.parse(await readFile(new URL("./tethoq.connector.json", import.meta.url), "utf8"));
+serveConnector({ manifest, handlers: {
+  detect: () => ({ available: true, details: [] }),
+  getAuthStatus: () => ({ authenticated: true, canAuthenticate: false, details: [] }),
+  createSession: () => ({ id: "wire-session", title: "Tool test", state: "idle", needsApproval: false, lastActivityAt: new Date().toISOString() }),
+  sendMessage: async (params, context) => {
+    const tool = params.clientTools[0];
+    const result = await context.executeHostTool({ sessionId: params.sessionId, name: tool.name, input: { probe: true } });
+    return { accepted: true, details: [JSON.stringify(result)] };
+  },
+} });
+`);
+  await approveInstalledConnector(directory);
+  const registry = await connectors.loadDesktopConnectors({ rootDirectory: connectorRoot, trustStorePath, host });
+  try {
+    assert.equal(registry.adapters.length, 1, JSON.stringify(registry.state.diagnostics));
+    const adapter = registry.adapters[0];
+    const calls = [];
+    adapter.configureClientTooling({
+      definitions: [{ name: "browser_snapshot", description: "Inspect", inputSchema: { type: "object" } }],
+      execute: async (...args) => { calls.push(args); return { observation: "fixture page", count: 7 }; },
+    });
+    const session = await adapter.createSession({ workingDirectory: repositoryRoot });
+    const response = await adapter.sendMessage(session.providerSessionId, { requestId: "wire-1", content: "Inspect" });
+    assert.deepEqual(JSON.parse(response.details[0]), { observation: "fixture page", count: 7 });
+    assert.deepEqual(calls, [["community.echo", "wire-session", "browser_snapshot", { probe: true }]]);
+  } finally { await registry.dispose(); }
 });
 
 test("bad connectors are rejected independently and connector identities stay provider-neutral", async () => {

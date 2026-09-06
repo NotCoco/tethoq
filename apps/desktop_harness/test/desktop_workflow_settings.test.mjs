@@ -51,6 +51,8 @@ test("capture details lazy-load a named screenshot slider and full preview", asy
   assert.match(component, /role="list"/);
   assert.match(component, /<small>\{screenshot\.name\}<\/small>/);
   assert.match(component, /role="dialog" aria-modal="true" aria-label=\{`Preview/);
+  assert.match(component, /lightboxRef\.current\?\.querySelector<HTMLElement>\('button\[aria-label="Close screenshot preview"\]'\)\?\.focus\(\)/);
+  assert.match(component, /target\.isConnected && target\.focus\(\)/);
   assert.match(component, /aria-label="Previous screenshot"/);
   assert.match(component, /aria-label="Next screenshot"/);
   assert.match(styles, /\.workflow-screenshot-strip \{[\s\S]*?grid-auto-flow: column;[\s\S]*?scroll-snap-type: inline mandatory;/);

@@ -90,6 +90,8 @@ function WorkflowScreenshotGallery({ workflow, onListScreenshots, onLoadScreensh
   const [canSlideBack, setCanSlideBack] = useState(false);
   const [canSlideForward, setCanSlideForward] = useState(false);
   const stripRef = useRef<HTMLDivElement>(null);
+  const lightboxRef = useRef<HTMLDivElement>(null);
+  const returnFocus = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -134,6 +136,19 @@ function WorkflowScreenshotGallery({ workflow, onListScreenshots, onLoadScreensh
     return () => { active = false; window.removeEventListener("keydown", onKeyDown); };
   }, [onLoadScreenshot, screenshots, selected, workflow.id]);
 
+  useEffect(() => {
+    if (selected) {
+      returnFocus.current ??= document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      const frame = requestAnimationFrame(() => lightboxRef.current?.querySelector<HTMLElement>('button[aria-label="Close screenshot preview"]')?.focus());
+      return () => cancelAnimationFrame(frame);
+    }
+    const target = returnFocus.current;
+    returnFocus.current = null;
+    if (!target) return;
+    const frame = requestAnimationFrame(() => target.isConnected && target.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [selected]);
+
   const selectSibling = (offset: -1 | 1) => {
     if (!selected || !screenshots?.length) return;
     const current = screenshots.findIndex((item) => item.frameId === selected.screenshot.frameId);
@@ -154,7 +169,7 @@ function WorkflowScreenshotGallery({ workflow, onListScreenshots, onLoadScreensh
     <div className="workflow-screenshot-strip" ref={stripRef} role="list" onScroll={updateSlideState}>
       {screenshots.map((screenshot) => <WorkflowScreenshotThumbnail key={screenshot.frameId} workflowId={workflow.id} screenshot={screenshot} stripRef={stripRef} onLoadScreenshot={onLoadScreenshot} onOpen={(preview) => setSelected(preview ? { screenshot, preview } : { screenshot })} />)}
     </div>
-    {selected ? <div className="workflow-screenshot-lightbox" role="dialog" aria-modal="true" aria-label={`Preview ${selected.screenshot.name}`} onMouseDown={(event) => { if (event.target === event.currentTarget) setSelected(null); }}>
+    {selected ? <div ref={lightboxRef} className="workflow-screenshot-lightbox" role="dialog" aria-modal="true" aria-label={`Preview ${selected.screenshot.name}`} onMouseDown={(event) => { if (event.target === event.currentTarget) setSelected(null); }}>
       <button className="workflow-screenshot-lightbox-close" type="button" aria-label="Close screenshot preview" onClick={() => setSelected(null)}><XIcon /></button>
       {screenshots.length > 1 ? <button className="workflow-screenshot-lightbox-previous" type="button" aria-label="Previous screenshot" onClick={() => selectSibling(-1)}><ChevronRightIcon /></button> : null}
       <figure>

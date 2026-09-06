@@ -16,6 +16,8 @@ typedef BridgeWebSocketConnector<T> = Future<T> Function(
     Uri uri, HttpClient? customClient);
 typedef BridgeDohQuery = Future<List<InternetAddress>> Function(
     Uri endpoint, String host, int recordType);
+typedef BridgeSecureSealer = Future<JsonMap> Function(
+    SecureChannel channel, String plaintext);
 
 const Duration _dohTimeout = Duration(seconds: 5);
 const Duration _resolvedConnectionTimeout = Duration(seconds: 5);
@@ -340,13 +342,16 @@ class BridgeTransport {
     required this.security,
     BridgeDnsResolver? dnsResolver,
     BridgeWebSocketConnector<WebSocket>? socketConnector,
+    BridgeSecureSealer? secureSealer,
   })  : _dnsResolver = dnsResolver ?? resolveTryCloudflareWithDoh,
-        _socketConnector = socketConnector ?? _connectWebSocket;
+        _socketConnector = socketConnector ?? _connectWebSocket,
+        _secureSealer = secureSealer ?? _sealSecureFrame;
 
   final BridgeEndpoint endpoint;
   final DeviceSecurity security;
   final BridgeDnsResolver _dnsResolver;
   final BridgeWebSocketConnector<WebSocket> _socketConnector;
+  final BridgeSecureSealer _secureSealer;
   final StreamController<BridgeConnectionState> _states =
       StreamController<BridgeConnectionState>.broadcast();
   final StreamController<AgentEvent> _events =
@@ -358,17 +363,28 @@ class BridgeTransport {
   WebSocket? _socket;
   Future<void>? _connecting;
   Timer? _reconnectTimer;
+  int _connectGeneration = 0;
+  int _socketGeneration = 0;
   BridgeConnectionState _state = BridgeConnectionState.disconnected;
   bool _disposed = false;
   SecureChannel? _secure;
+
   /// Inbound frames are handled one at a time. Decryption is asynchronous, and
   /// a secure channel refuses a frame that arrives out of order, so overlapping
   /// handlers would reject perfectly good traffic.
   Future<void> _inbound = Future<void>.value();
-  /// Set once this computer has proved it supports encryption. A later
-  /// connection that silently drops the offer is treated as an attacker
-  /// stripping it, not as an older bridge.
+
+  /// Counter allocation, encryption, and socket insertion are one ordered
+  /// operation. Otherwise a later encryption can finish first and put a higher
+  /// counter on the wire before the frame that precedes it.
+  Future<void> _secureOutbound = Future<void>.value();
+
+  /// Loaded from secure storage before a socket is opened. A missing marker
+  /// preserves compatibility with a paired bridge that predates encryption;
+  /// once a signed offer is verified, the marker is persisted and later
+  /// connections fail closed if the offer disappears.
   bool _encryptionExpected = false;
+  bool _encryptionExpectationLoaded = false;
   Completer<void>? _handshake;
 
   /// True while this connection is encrypted end to end with the computer.
@@ -390,8 +406,74 @@ class BridgeTransport {
 
   Future<void> connect() {
     if (_disposed) return Future<void>.error(StateError('Transport is closed'));
-    if (_socket?.readyState == WebSocket.open) return Future<void>.value();
-    return _connecting ??= _open().whenComplete(() => _connecting = null);
+    if (_state == BridgeConnectionState.online &&
+        _socket?.readyState == WebSocket.open) {
+      return Future<void>.value();
+    }
+    final existing = _connecting;
+    if (existing != null) return existing;
+    // An open WebSocket is not application-ready until the host greeting and
+    // encryption negotiation have completed. If no connect operation owns an
+    // open non-online socket, retire it rather than treating it as usable.
+    final staleSocket = _socket;
+    if (staleSocket?.readyState == WebSocket.open) {
+      _socket = null;
+      _secure = null;
+      _interruptHandshake(const BridgeRequestException(
+        'CONNECTION_REPLACED',
+        'Bridge connection was replaced before it became ready',
+        retryable: true,
+      ));
+      unawaited(_closeSocketQuietly(
+        staleSocket!,
+        WebSocketStatus.goingAway,
+        'Connection was not ready',
+      ));
+    }
+    final generation = ++_connectGeneration;
+    late final Future<void> operation;
+    operation = _open(generation).whenComplete(() {
+      if (identical(_connecting, operation)) _connecting = null;
+    });
+    _connecting = operation;
+    return operation;
+  }
+
+  /// Checks a socket immediately after the app returns to the foreground.
+  /// A healthy connection is retained; a stale socket or a queued reconnect
+  /// backoff is replaced without making the user wait for its timer.
+  Future<bool> resumeFromBackground({
+    Duration probeTimeout = const Duration(seconds: 2),
+  }) async {
+    if (_disposed) throw StateError('Transport is closed');
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+
+    final socket = _socket;
+    final socketGeneration = _socketGeneration;
+    if (_state == BridgeConnectionState.online &&
+        socket != null &&
+        socket.readyState == WebSocket.open) {
+      try {
+        await request(
+          'host.get',
+          const <String, Object?>{},
+          signed: endpoint.pairedHost != null,
+          requestId: randomId('resume-probe'),
+          timeout: probeTimeout,
+        );
+        if (_isCurrentSocket(socket, socketGeneration) &&
+            _state == BridgeConnectionState.online) {
+          return false;
+        }
+      } on Object {
+        if (_disposed) return false;
+      }
+    }
+
+    if (_disposed) return false;
+    await _reconnectImmediately();
+    return !_disposed && _state == BridgeConnectionState.online;
   }
 
   Future<JsonMap> request(
@@ -429,10 +511,24 @@ class BridgeTransport {
     final pending = _PendingRequest(
         envelope: envelope, signed: signed, completer: completer, timer: timer);
     _pending[id] = pending;
-    if (_socket?.readyState == WebSocket.open) {
-      await _send(pending);
-    } else {
-      await connect();
+    try {
+      if (_state == BridgeConnectionState.online &&
+          _socket?.readyState == WebSocket.open) {
+        await _send(pending);
+      } else {
+        await connect();
+      }
+    } on Object catch (error, stackTrace) {
+      // A failed connection must not leave this request queued for the automatic
+      // reconnect. The caller has already been told it failed and may retry it,
+      // so sending the old request later could perform the action twice.
+      if (identical(_pending[id], pending)) {
+        _pending.remove(id);
+        pending.timer.cancel();
+        if (!pending.completer.isCompleted) {
+          pending.completer.completeError(error, stackTrace);
+        }
+      }
     }
     return completer.future;
   }
@@ -471,8 +567,11 @@ class BridgeTransport {
   Future<void> close() async {
     if (_disposed) return;
     _disposed = true;
+    _connectGeneration += 1;
+    _connecting = null;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
+    _interruptHandshake(StateError('Transport closed'));
     _setState(BridgeConnectionState.closed);
     for (final pending in _pending.values) {
       pending.timer.cancel();
@@ -480,44 +579,72 @@ class BridgeTransport {
         pending.completer.completeError(StateError('Transport closed'));
     }
     _pending.clear();
-    await _socket?.close(WebSocketStatus.normalClosure, 'Client closed');
+    final socket = _socket;
     _socket = null;
+    _secure = null;
+    if (socket != null) {
+      await socket.close(WebSocketStatus.normalClosure, 'Client closed');
+    }
     await _states.close();
     await _events.close();
     await _replayGaps.close();
   }
 
-  Future<void> _open() async {
+  Future<void> _open(int connectGeneration) async {
     _setState(_reconnectAttempt == 0
         ? BridgeConnectionState.connecting
         : BridgeConnectionState.reconnecting);
+    WebSocket? openedSocket;
+    int? openedSocketGeneration;
     try {
+      await _loadEncryptionExpectation();
+      if (_disposed || connectGeneration != _connectGeneration) return;
       final uri = validateBridgeEndpointUrl(endpoint.url);
       final socket = await connectWithTryCloudflareDnsFallback<WebSocket>(
         uri,
         connector: _socketConnector,
         resolver: _dnsResolver,
       );
-      if (_disposed) {
+      openedSocket = socket;
+      if (_disposed || connectGeneration != _connectGeneration) {
         await socket.close();
         return;
       }
+      final socketGeneration = ++_socketGeneration;
+      openedSocketGeneration = socketGeneration;
       _socket = socket;
       _secure = null;
+      _inbound = Future<void>.value();
       final handshake = Completer<void>();
       _handshake = handshake;
       socket.pingInterval = const Duration(seconds: 15);
       socket.listen(
         (Object? data) {
-          _inbound = _inbound.then((_) => _receive(data)).catchError((Object _) {});
+          if (!_isCurrentSocket(socket, socketGeneration)) return;
+          _inbound = _inbound.then((_) async {
+            if (!_isCurrentSocket(socket, socketGeneration)) return;
+            await _receive(data, socket, socketGeneration);
+          }).catchError((Object _) {});
         },
-        onDone: _disconnected,
-        onError: (Object error, StackTrace stackTrace) => _disconnected(),
+        onDone: () => _disconnected(socket, socketGeneration),
+        onError: (Object error, StackTrace stackTrace) => _disconnected(
+          socket,
+          socketGeneration,
+          error: error,
+          stackTrace: stackTrace,
+        ),
         cancelOnError: false,
       );
       final relayToken = endpoint.relayToken;
       final pairedHost = endpoint.pairedHost;
       if (relayToken != null) {
+        final proof = pairedHost == null
+            ? null
+            : await signRelayDeviceAttach(host: pairedHost, token: relayToken);
+        if (connectGeneration != _connectGeneration ||
+            !_isCurrentSocket(socket, socketGeneration)) {
+          return;
+        }
         socket.add(jsonEncode(<String, Object?>{
           'type': 'relay.attach',
           'role': 'device',
@@ -526,9 +653,7 @@ class BridgeTransport {
           'deviceId': endpoint.deviceId,
           // The shared room token cannot show which device this is, so the
           // relay is given the host-signed credential and a fresh signature.
-          if (pairedHost != null)
-            'proof': await signRelayDeviceAttach(
-                host: pairedHost, token: relayToken),
+          if (proof != null) 'proof': proof,
         }));
       }
       // Announcing the device makes the relay create the host session, so the
@@ -540,15 +665,68 @@ class BridgeTransport {
         'deviceId': endpoint.deviceId,
       }));
       await _awaitHandshake(handshake);
+      if (connectGeneration != _connectGeneration ||
+          !_isCurrentSocket(socket, socketGeneration) ||
+          socket.readyState != WebSocket.open) {
+        throw const BridgeRequestException(
+          'CONNECTION_CLOSED',
+          'Bridge connection closed during its handshake',
+          retryable: true,
+        );
+      }
+      _reconnectTimer?.cancel();
+      _reconnectTimer = null;
       _reconnectAttempt = 0;
       _setState(BridgeConnectionState.online);
       for (final pending in _pending.values.toList(growable: false)) {
-        await _send(pending);
+        if (connectGeneration != _connectGeneration ||
+            !_isCurrentSocket(socket, socketGeneration)) {
+          return;
+        }
+        try {
+          await _send(pending);
+        } on Object catch (error, stackTrace) {
+          // One request can fail while being signed without invalidating the
+          // socket or an earlier request already sent on it. Complete only the
+          // exact failed entry; callers share this connection future.
+          final requestId = pending.envelope['requestId'];
+          if (requestId is String && identical(_pending[requestId], pending)) {
+            _pending.remove(requestId);
+            pending.timer.cancel();
+            if (!pending.completer.isCompleted) {
+              pending.completer.completeError(error, stackTrace);
+            }
+          }
+        }
       }
-    } on Object {
+    } on Object catch (error, stackTrace) {
+      final socket = openedSocket;
+      final socketGeneration = openedSocketGeneration;
+      if (socket != null &&
+          socketGeneration != null &&
+          _isCurrentSocket(socket, socketGeneration)) {
+        _socket = null;
+        _secure = null;
+        _interruptHandshake(error, stackTrace);
+        unawaited(_closeSocketQuietly(
+          socket,
+          WebSocketStatus.goingAway,
+          'Connection attempt failed',
+        ));
+      }
+      if (_disposed || connectGeneration != _connectGeneration) return;
       _scheduleReconnect();
-      rethrow;
+      Error.throwWithStackTrace(error, stackTrace);
     }
+  }
+
+  Future<void> _loadEncryptionExpectation() async {
+    if (_encryptionExpectationLoaded) return;
+    final host = endpoint.pairedHost;
+    if (host != null) {
+      _encryptionExpected = await security.readSecureTransportRequired(host);
+    }
+    _encryptionExpectationLoaded = true;
   }
 
   static Future<WebSocket> _connectWebSocket(
@@ -574,25 +752,69 @@ class BridgeTransport {
   }
 
   Future<void> _send(_PendingRequest pending) async {
+    if (!_isLivePending(pending)) return;
     final socket = _socket;
-    if (socket == null || socket.readyState != WebSocket.open) return;
+    if (socket == null || !_isReadySocket(socket, _socketGeneration)) {
+      return;
+    }
+    final socketGeneration = _socketGeneration;
     Object message = pending.envelope;
     if (pending.signed) {
       final host = endpoint.pairedHost;
       if (host == null)
         throw StateError('Paired host disappeared before signing');
       final signed = await security.signAction(host, pending.envelope);
+      if (!_isLivePending(pending)) return;
       message = <String, Object?>{'kind': 'signed_action', 'signed': signed};
+    }
+    if (!_isLivePending(pending) || !_isReadySocket(socket, socketGeneration)) {
+      return;
     }
     final channel = _secure;
     if (channel != null) {
-      socket.add(jsonEncode(await channel.seal(jsonEncode(message))));
+      await _serializeSecureSend(() async {
+        if (!_isLivePending(pending) ||
+            !_isReadySocket(socket, socketGeneration) ||
+            !identical(_secure, channel)) {
+          return;
+        }
+        final sealed = await _secureSealer(channel, jsonEncode(message));
+        if (!_isLivePending(pending) ||
+            !_isReadySocket(socket, socketGeneration) ||
+            !identical(_secure, channel)) {
+          return;
+        }
+        socket.add(jsonEncode(sealed));
+      });
+      return;
+    }
+    if (!_isLivePending(pending) || !_isReadySocket(socket, socketGeneration)) {
       return;
     }
     socket.add(jsonEncode(message));
   }
 
-  Future<void> _receive(Object? raw) async {
+  Future<void> _serializeSecureSend(Future<void> Function() send) {
+    final operation = _secureOutbound.then((_) => send());
+    _secureOutbound = operation.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace __) {},
+    );
+    return operation;
+  }
+
+  bool _isLivePending(_PendingRequest pending) {
+    final requestId = pending.envelope['requestId'];
+    return requestId is String && identical(_pending[requestId], pending);
+  }
+
+  static Future<JsonMap> _sealSecureFrame(
+          SecureChannel channel, String plaintext) =>
+      channel.seal(plaintext);
+
+  Future<void> _receive(
+      Object? raw, WebSocket socket, int socketGeneration) async {
+    if (!_isCurrentSocket(socket, socketGeneration)) return;
     if (raw is! String) return;
     Object? decoded;
     try {
@@ -605,15 +827,20 @@ class BridgeTransport {
       final channel = _secure;
       if (channel == null) return;
       try {
-        value = jsonMap(jsonDecode(await channel.open(value)),
-            name: 'transport message');
+        final opened = await channel.open(value);
+        if (!_isCurrentSocket(socket, socketGeneration)) return;
+        value = jsonMap(jsonDecode(opened), name: 'transport message');
       } on Object {
         return;
       }
       if (value['kind'] == 'secure_established') return;
-    } else if (_secure != null && value['kind'] != null) {
-      // The channel is live, so a readable application message did not come
-      // from the computer. Drop it rather than trusting it.
+    } else if (_secure != null &&
+        value['type'] != 'relay.attached' &&
+        value['type'] != 'relay.host_offline') {
+      // Once the channel is live, every application message from the computer
+      // must be authenticated by it. Only relay control notices remain on the
+      // outer connection; a plaintext transport.error could otherwise fail an
+      // arbitrary pending request after the handshake.
       return;
     }
     if (value['type'] == 'relay.attached') return;
@@ -622,8 +849,8 @@ class BridgeTransport {
       return;
     }
     if (value['type'] == 'transport.error') {
-      if (_pending.isNotEmpty) {
-        final requestId = _pending.keys.first;
+      final requestId = optionalString(value, 'requestId');
+      if (requestId != null) {
         final pending = _pending.remove(requestId);
         pending?.timer.cancel();
         if (pending != null && !pending.completer.isCompleted) {
@@ -643,55 +870,93 @@ class BridgeTransport {
     } else if (kind == 'event') {
       _handleEventEnvelope(value);
     } else if (kind == 'hello') {
-      await _negotiateEncryption(value);
-      _setState(BridgeConnectionState.online);
+      await _negotiateEncryption(value, socket, socketGeneration);
     }
   }
 
   /// Agrees a key with the computer using the identity stored at pairing. A
   /// greeting without an offer is only accepted from a computer that has never
   /// shown it can encrypt.
-  Future<void> _negotiateEncryption(JsonMap hello) async {
+  Future<void> _negotiateEncryption(
+      JsonMap hello, WebSocket socket, int socketGeneration) async {
+    if (!_isCurrentSocket(socket, socketGeneration)) return;
     if (_secure != null) return;
     final host = endpoint.pairedHost;
     SecureHandshakeOffer? offer;
     try {
       offer = SecureHandshakeOffer.tryParse(hello['encryption']);
-    } on SecureTransportException {
-      offer = null;
+    } on Object catch (error) {
+      await _failHandshake(
+        BridgeRequestException(
+          'ENCRYPTION_FAILED',
+          error is SecureTransportException
+              ? error.message
+              : 'This computer sent an invalid encryption offer. Nothing was sent.',
+          retryable: false,
+        ),
+        socket,
+        socketGeneration,
+      );
+      return;
+    }
+    if (hello['encryption'] != null && offer == null) {
+      await _failHandshake(
+        const BridgeRequestException(
+          'ENCRYPTION_FAILED',
+          'This computer sent an invalid encryption offer. Nothing was sent.',
+          retryable: false,
+        ),
+        socket,
+        socketGeneration,
+      );
+      return;
     }
     if (offer == null || host == null) {
       if (offer == null && _encryptionExpected) {
         // Refusing to continue is the point: this is what a relay stripping
         // the offer looks like, and falling back hands it the plain text.
-        await _failHandshake(const BridgeRequestException(
-          'ENCRYPTION_REQUIRED',
-          'This computer previously used an encrypted connection and did not '
-              'this time. Nothing was sent.',
-          retryable: false,
-        ));
+        await _failHandshake(
+          const BridgeRequestException(
+            'ENCRYPTION_REQUIRED',
+            'This computer previously used an encrypted connection and did not '
+                'this time. Nothing was sent.',
+            retryable: false,
+          ),
+          socket,
+          socketGeneration,
+        );
         return;
       }
-      _finishHandshake();
+      if (_isCurrentSocket(socket, socketGeneration)) _finishHandshake();
       return;
     }
     try {
       final result = await acceptSecureHandshake(offer: offer, host: host);
-      _socket?.add(jsonEncode(result.accept));
-      _secure = result.channel;
+      if (!_isCurrentSocket(socket, socketGeneration)) return;
+      // Make the verified capability durable before this connection can become
+      // application-ready. A storage failure therefore closes the handshake
+      // instead of leaving a restart able to downgrade it.
+      await security.markSecureTransportRequired(host);
+      if (!_isCurrentSocket(socket, socketGeneration)) return;
       _encryptionExpected = true;
+      socket.add(jsonEncode(result.accept));
+      _secure = result.channel;
     } on Object catch (error) {
-      await _failHandshake(BridgeRequestException(
-        'ENCRYPTION_FAILED',
-        error is SecureTransportException
-            ? error.message
-            : 'This computer could not prove its encryption key. '
-                'Nothing was sent.',
-        retryable: false,
-      ));
+      await _failHandshake(
+        BridgeRequestException(
+          'ENCRYPTION_FAILED',
+          error is SecureTransportException
+              ? error.message
+              : 'This phone could not save the secure connection requirement. '
+                  'Nothing was sent.',
+          retryable: false,
+        ),
+        socket,
+        socketGeneration,
+      );
       return;
     }
-    _finishHandshake();
+    if (_isCurrentSocket(socket, socketGeneration)) _finishHandshake();
   }
 
   void _finishHandshake() {
@@ -700,13 +965,15 @@ class BridgeTransport {
     if (handshake != null && !handshake.isCompleted) handshake.complete();
   }
 
-  Future<void> _failHandshake(BridgeRequestException reason) async {
+  Future<void> _failHandshake(BridgeRequestException reason, WebSocket socket,
+      int socketGeneration) async {
+    if (!_isCurrentSocket(socket, socketGeneration)) return;
     final handshake = _handshake;
     _handshake = null;
     if (handshake != null && !handshake.isCompleted) {
       handshake.completeError(reason);
     }
-    await _socket?.close(WebSocketStatus.policyViolation, 'Encryption refused');
+    await socket.close(WebSocketStatus.policyViolation, 'Encryption refused');
   }
 
   void _handleResponse(JsonMap response) {
@@ -716,8 +983,13 @@ class BridgeTransport {
     if (pending == null) return;
     pending.timer.cancel();
     if (response['ok'] == true) {
-      pending.completer
-          .complete(jsonMap(response['payload'], name: 'response payload'));
+      final payload = response['payload'];
+      // The acknowledgement is authoritative even if an older or faulty host
+      // omits its result body. Completing successfully also prevents callers
+      // from retrying an action that the host has already accepted.
+      pending.completer.complete(payload is Map<Object?, Object?>
+          ? jsonMap(payload, name: 'response payload')
+          : const <String, Object?>{});
       return;
     }
     final error = response['error'] is Map<Object?, Object?>
@@ -764,14 +1036,77 @@ class BridgeTransport {
     if (!_replayGaps.isClosed) _replayGaps.add(null);
   }
 
-  void _disconnected() {
-    if (_disposed) return;
+  void _disconnected(
+    WebSocket socket,
+    int socketGeneration, {
+    Object? error,
+    StackTrace? stackTrace,
+  }) {
+    if (_disposed || !_isCurrentSocket(socket, socketGeneration)) return;
     _socket = null;
     // Session keys belong to one socket. The next connection agrees fresh ones,
     // which is what keeps past traffic unreadable if a key ever leaks.
     _secure = null;
-    _finishHandshake();
+    _interruptHandshake(
+      error ??
+          const BridgeRequestException(
+            'CONNECTION_CLOSED',
+            'Bridge connection closed during its handshake',
+            retryable: true,
+          ),
+      stackTrace,
+    );
     _scheduleReconnect();
+  }
+
+  bool _isCurrentSocket(WebSocket socket, int socketGeneration) =>
+      identical(_socket, socket) && _socketGeneration == socketGeneration;
+
+  bool _isReadySocket(WebSocket socket, int socketGeneration) =>
+      _state == BridgeConnectionState.online &&
+      socket.readyState == WebSocket.open &&
+      _isCurrentSocket(socket, socketGeneration);
+
+  void _interruptHandshake(Object error, [StackTrace? stackTrace]) {
+    final handshake = _handshake;
+    _handshake = null;
+    if (handshake != null && !handshake.isCompleted) {
+      handshake.completeError(error, stackTrace ?? StackTrace.current);
+    }
+  }
+
+  Future<void> _reconnectImmediately() async {
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _connectGeneration += 1;
+    _connecting = null;
+    final socket = _socket;
+    _socket = null;
+    _secure = null;
+    _interruptHandshake(const BridgeRequestException(
+      'CONNECTION_REPLACED',
+      'Bridge connection was replaced after the app resumed',
+      retryable: true,
+    ));
+    if (socket != null) {
+      unawaited(_closeSocketQuietly(
+        socket,
+        WebSocketStatus.goingAway,
+        'App resumed',
+      ));
+    }
+    _reconnectAttempt = max(1, _reconnectAttempt);
+    _setState(BridgeConnectionState.reconnecting);
+    await connect();
+  }
+
+  Future<void> _closeSocketQuietly(
+      WebSocket socket, int code, String reason) async {
+    try {
+      await socket.close(code, reason);
+    } on Object {
+      // The replacement connection owns recovery; the old socket is best effort.
+    }
   }
 
   void _scheduleReconnect() {

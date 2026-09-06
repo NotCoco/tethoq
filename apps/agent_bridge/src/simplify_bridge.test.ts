@@ -24,6 +24,10 @@ class SimplifyProvider extends FakeProviderAdapter {
     super({ hostId: bridgeConfig.hostId, providerId: "fake", sessionCount: 3 });
   }
 
+  public override hasActiveTurn(_providerSessionId: string): boolean {
+    return true;
+  }
+
   public override async createSession(options: CreateSessionOptions) {
     this.creates.push(options);
     return await super.createSession(options);

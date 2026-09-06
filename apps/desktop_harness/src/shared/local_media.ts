@@ -1,6 +1,19 @@
 export const LOCAL_MEDIA_SCHEME = "tethoq-media";
 
-const LOCAL_VIDEO_EXTENSIONS = [".mp4", ".webm", ".m4v", ".mov"] as const;
+const LOCAL_IMAGE_TYPES = [
+  [".png", "image/png"],
+  [".jpg", "image/jpeg"],
+  [".jpeg", "image/jpeg"],
+  [".gif", "image/gif"],
+  [".webp", "image/webp"],
+] as const;
+
+const LOCAL_VIDEO_TYPES = [
+  [".mp4", "video/mp4"],
+  [".webm", "video/webm"],
+  [".m4v", "video/x-m4v"],
+  [".mov", "video/quicktime"],
+] as const;
 
 export type LocalMediaRange =
   | { readonly kind: "full" }
@@ -9,7 +22,17 @@ export type LocalMediaRange =
 
 export function isLocalVideoPath(path: string): boolean {
   const lower = path.toLowerCase();
-  return LOCAL_VIDEO_EXTENSIONS.some((extension) => lower.endsWith(extension));
+  return LOCAL_VIDEO_TYPES.some(([extension]) => lower.endsWith(extension));
+}
+
+export function isLocalImagePath(path: string): boolean {
+  const lower = path.toLowerCase();
+  return LOCAL_IMAGE_TYPES.some(([extension]) => lower.endsWith(extension));
+}
+
+export function localMediaContentType(path: string): string | null {
+  const lower = path.toLowerCase();
+  return [...LOCAL_IMAGE_TYPES, ...LOCAL_VIDEO_TYPES].find(([extension]) => lower.endsWith(extension))?.[1] ?? null;
 }
 
 export function localMediaUrl(path: string): string {
@@ -22,6 +45,34 @@ export function localMediaPathFromUrl(value: string): string | null {
     if (url.protocol !== `${LOCAL_MEDIA_SCHEME}:` || url.hostname !== "local" || url.search || url.hash) return null;
     const encodedPath = url.pathname.slice(1);
     return encodedPath ? decodeURIComponent(encodedPath) : null;
+  } catch {
+    return null;
+  }
+}
+
+function absoluteLocalPath(value: string): string | null {
+  if (!value || value.length > 32_768 || value.includes("\0")) return null;
+  if (/^[a-z]:[\\/]/iu.test(value)) return value;
+  return value.startsWith("/") && !value.startsWith("//") ? value : null;
+}
+
+/** Converts a provider-supplied local reference without ever admitting a network share. */
+export function localMediaPathFromReference(value: string): string | null {
+  const encodedMediaPath = localMediaPathFromUrl(value);
+  if (encodedMediaPath !== null) return absoluteLocalPath(encodedMediaPath);
+  if (/^file:/iu.test(value)) {
+    try {
+      const url = new URL(value);
+      if (url.protocol !== "file:" || (url.hostname !== "" && url.hostname !== "localhost") || url.search || url.hash) return null;
+      let path = decodeURIComponent(url.pathname);
+      if (/^\/[a-z]:\//iu.test(path)) path = path.slice(1);
+      return absoluteLocalPath(path);
+    } catch {
+      return null;
+    }
+  }
+  try {
+    return absoluteLocalPath(decodeURIComponent(value));
   } catch {
     return null;
   }

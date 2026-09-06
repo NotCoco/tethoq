@@ -13,7 +13,7 @@ export interface ParsedSimplifyCommand {
   readonly content: string;
 }
 
-const simplifyCommand = /(^|[\s([{:;,])\/simplify\b[,:;.!?]?/giu;
+const simplifyCommand = /(^|[\s([{:;,])\/simplify(?=$|\s|[,:;.!?](?:\s|$))[,:;.!?]?/giu;
 
 export function normalizeSimplifySettings(value: unknown): SimplifySettings {
   const source = typeof value === "object" && value !== null && !Array.isArray(value)

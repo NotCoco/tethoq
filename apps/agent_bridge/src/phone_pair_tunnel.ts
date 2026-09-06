@@ -44,6 +44,7 @@ export interface PhonePairTunnelReadinessOptions {
   readonly timeoutMs?: number;
   readonly retryDelayMs?: number;
   readonly socketAttemptTimeoutMs?: number;
+  readonly signal?: AbortSignal;
 }
 
 export async function startPhonePairTunnel(
@@ -51,13 +52,14 @@ export async function startPhonePairTunnel(
   command = tethoqEnvironmentValue(process.env, "TETHOQ_CLOUDFLARED_COMMAND") ?? "cloudflared",
   readinessOptions: PhonePairTunnelReadinessOptions = {},
 ): Promise<PhonePairTunnel> {
+  throwIfAborted(readinessOptions.signal);
   const child = spawn(command, ["tunnel", "--url", originUrl, "--no-autoupdate"], {
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
 
   try {
-    const publicHttpUrl = await waitForQuickTunnelUrl(child);
+    const publicHttpUrl = await waitForQuickTunnelUrl(child, readinessOptions.signal);
     await waitForQuickTunnelReadiness(publicHttpUrl, child, readinessOptions);
     return {
       publicWebSocketBaseUrl: publicHttpUrl.replace(/^https:/, "wss:"),
@@ -69,7 +71,7 @@ export async function startPhonePairTunnel(
   }
 }
 
-export function waitForQuickTunnelUrl(child: TunnelChild): Promise<string> {
+export function waitForQuickTunnelUrl(child: TunnelChild, signal?: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
     let settled = false;
     let recentOutput = "";
@@ -82,6 +84,7 @@ export function waitForQuickTunnelUrl(child: TunnelChild): Promise<string> {
       child.stderr.off("data", onData);
       child.off("error", onError);
       child.off("exit", onExit);
+      signal?.removeEventListener("abort", onAbort);
       if (error !== undefined) reject(error);
       else resolve(url!);
     };
@@ -94,10 +97,13 @@ export function waitForQuickTunnelUrl(child: TunnelChild): Promise<string> {
     const onExit = (code: number | null) => finish(new Error(
       `cloudflared exited before creating a tunnel (code ${code ?? "unknown"})${recentOutput.trim() === "" ? "" : `: ${recentOutput.trim()}`}`,
     ));
+    const onAbort = () => finish(abortReason(signal!));
     child.stdout.on("data", onData);
     child.stderr.on("data", onData);
     child.once("error", onError);
     child.once("exit", onExit);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted === true) onAbort();
   });
 }
 
@@ -111,6 +117,8 @@ export async function waitForQuickTunnelReadiness(
   const socketAttemptTimeout = options.socketAttemptTimeoutMs ?? webSocketAttemptTimeoutMs;
   const fetchDns = options.fetch ?? defaultTunnelFetch;
   const socketFactory = options.socketFactory ?? defaultTunnelProbeSocketFactory;
+  const externalSignal = options.signal;
+  throwIfAborted(externalSignal);
   const publicUrl = new URL(publicHttpUrl);
   const webSocketUrl = new URL("/bridge", publicUrl);
   webSocketUrl.protocol = "wss:";
@@ -131,8 +139,11 @@ export async function waitForQuickTunnelReadiness(
     childError = new Error(`cloudflared exited while verifying the public phone tunnel (code ${code ?? "unknown"})`);
     controller.abort(childError);
   };
+  const onExternalAbort = () => controller.abort(abortReason(externalSignal!));
   child.once("error", onError);
   child.once("exit", onExit);
+  externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
+  if (externalSignal?.aborted === true) onExternalAbort();
 
   try {
     if (child.exitCode !== null || child.killed) {
@@ -167,6 +178,7 @@ export async function waitForQuickTunnelReadiness(
     clearTimeout(timeout);
     child.off("error", onError);
     child.off("exit", onExit);
+    externalSignal?.removeEventListener("abort", onExternalAbort);
     if (!controller.signal.aborted) controller.abort();
   }
 }
@@ -387,8 +399,8 @@ function abortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error("Public phone tunnel readiness check was cancelled");
 }
 
-function throwIfAborted(signal: AbortSignal): void {
-  if (signal.aborted) throw abortReason(signal);
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) throw abortReason(signal);
 }
 
 function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {

@@ -34,6 +34,7 @@ class RemoteSession {
     required this.lastActivityAt,
     required this.needsApproval,
     required this.stale,
+    this.externalWriter,
     this.project,
     this.workingDirectory,
     this.preview,
@@ -70,6 +71,9 @@ class RemoteSession {
               DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
       needsApproval: json['needsApproval'] == true,
       stale: json['stale'] == true,
+      externalWriter: json['externalWriter'] is bool
+          ? json['externalWriter']! as bool
+          : null,
       project: optionalString(json, 'project'),
       workingDirectory: optionalString(json, 'workingDirectory'),
       preview: optionalString(json, 'preview'),
@@ -96,6 +100,7 @@ class RemoteSession {
     DateTime? lastActivityAt,
     bool? needsApproval,
     bool? stale,
+    bool? externalWriter,
     String? project,
     String? workingDirectory,
     String? preview,
@@ -119,6 +124,7 @@ class RemoteSession {
         lastActivityAt: lastActivityAt ?? this.lastActivityAt,
         needsApproval: needsApproval ?? this.needsApproval,
         stale: stale ?? this.stale,
+        externalWriter: externalWriter ?? this.externalWriter,
         project: project ?? this.project,
         workingDirectory: workingDirectory ?? this.workingDirectory,
         preview: preview ?? this.preview,
@@ -143,6 +149,7 @@ class RemoteSession {
   final DateTime lastActivityAt;
   final bool needsApproval;
   final bool stale;
+  final bool? externalWriter;
   final String? project;
   final String? workingDirectory;
   final String? preview;
@@ -235,6 +242,105 @@ class SessionUsageTotals {
   final int? totalTokens;
   final double? cost;
   final String? currency;
+}
+
+class SessionGoal {
+  const SessionGoal({
+    required this.sessionId,
+    required this.objective,
+    required this.status,
+    required this.source,
+    required this.tokenBudget,
+    required this.tokensUsed,
+    required this.timeUsedSeconds,
+    required this.createdAt,
+    required this.updatedAt,
+    required this.revision,
+  });
+
+  factory SessionGoal.fromJson(Object? value) {
+    final json = jsonMap(value, name: 'session goal');
+    final status = requireString(json, 'status');
+    if (!const <String>{
+      'active',
+      'paused',
+      'blocked',
+      'usageLimited',
+      'budgetLimited',
+      'complete'
+    }.contains(status)) {
+      throw const FormatException('Session goal status is invalid');
+    }
+    final objectiveValue = requireString(json, 'objective');
+    final objective = objectiveValue.trim();
+    if (objective.isEmpty || objectiveValue.length > 4000) {
+      throw const FormatException(
+          'Session goal objective must contain between 1 and 4000 characters');
+    }
+    final source = requireString(json, 'source');
+    if (source != 'native' && source != 'tethoq') {
+      throw const FormatException('Session goal source is invalid');
+    }
+    int nonNegativeInteger(String key) {
+      final value = json[key];
+      if (value is! num ||
+          !value.isFinite ||
+          value != value.roundToDouble() ||
+          value < 0 ||
+          value > 9007199254740991) {
+        throw FormatException(
+            'Session goal $key must be a non-negative integer');
+      }
+      return value.toInt();
+    }
+
+    int? positiveIntegerOrNull(String key) {
+      final value = json[key];
+      if (value == null) return null;
+      if (value is! num ||
+          !value.isFinite ||
+          value != value.roundToDouble() ||
+          value <= 0 ||
+          value > 9007199254740991) {
+        throw FormatException(
+            'Session goal $key must be a positive integer or null');
+      }
+      return value.toInt();
+    }
+
+    DateTime timestamp(String key) {
+      final value = json[key];
+      final parsed = value is String ? DateTime.tryParse(value) : null;
+      if (parsed == null) {
+        throw FormatException('Session goal $key must be a valid timestamp');
+      }
+      return parsed;
+    }
+
+    return SessionGoal(
+      sessionId: requireString(json, 'sessionId'),
+      objective: objective,
+      status: status,
+      source: source,
+      tokenBudget: positiveIntegerOrNull('tokenBudget'),
+      tokensUsed: nonNegativeInteger('tokensUsed'),
+      timeUsedSeconds: nonNegativeInteger('timeUsedSeconds'),
+      createdAt: timestamp('createdAt'),
+      updatedAt: timestamp('updatedAt'),
+      revision: nonNegativeInteger('revision'),
+    );
+  }
+
+  final String sessionId;
+  final String objective;
+  final String status;
+  final String source;
+  final int? tokenBudget;
+  final int tokensUsed;
+  final int timeUsedSeconds;
+  final DateTime createdAt;
+  final DateTime updatedAt;
+  final int revision;
 }
 
 class SessionContextState {
@@ -384,6 +490,8 @@ class ContentPart {
             'Agent activity';
       case 'workflow':
         return '';
+      case 'mesh':
+        return optionalString(data, 'text') ?? '';
       default:
         return data.toString();
     }
@@ -529,6 +637,7 @@ class RemoteQueuedMessage {
     this.modelId,
     this.reasoningEffort,
     this.error,
+    this.retryable = true,
   });
 
   factory RemoteQueuedMessage.fromJson(Object? value) {
@@ -545,6 +654,7 @@ class RemoteQueuedMessage {
       modelId: optionalString(json, 'modelId'),
       reasoningEffort: optionalString(json, 'reasoningEffort'),
       error: optionalString(json, 'error'),
+      retryable: json['retryable'] != false,
     );
   }
 
@@ -557,6 +667,7 @@ class RemoteQueuedMessage {
   final String? modelId;
   final String? reasoningEffort;
   final String? error;
+  final bool retryable;
 }
 
 class RemoteMessage {
@@ -567,10 +678,11 @@ class RemoteMessage {
     required this.createdAt,
     required this.parts,
     required this.status,
+    String? presentationId,
     this.editable = false,
     this.providerMessageId,
     this.origin,
-  });
+  }) : presentationId = presentationId ?? id;
 
   factory RemoteMessage.fromJson(Object? value) {
     final json = jsonMap(value, name: 'message');
@@ -596,6 +708,10 @@ class RemoteMessage {
   final DateTime createdAt;
   final List<ContentPart> parts;
   final String status;
+
+  /// Local render identity only; never use this in place of [id] or
+  /// [providerMessageId] for bridge operations.
+  final String presentationId;
   final bool editable;
   final String? providerMessageId;
   final RemoteMessageOrigin? origin;
@@ -707,8 +823,10 @@ class RemoteModel {
   final List<String> inputModalities;
   final JsonMap nativeMetadata;
 
-  String? get sourceProviderId => optionalString(nativeMetadata, 'sourceProviderId');
-  String? get sourceProviderName => optionalString(nativeMetadata, 'sourceProviderName');
+  String? get sourceProviderId =>
+      optionalString(nativeMetadata, 'sourceProviderId');
+  String? get sourceProviderName =>
+      optionalString(nativeMetadata, 'sourceProviderName');
 
   String get routeProviderName {
     if (providerId != 'opencode') return providerId;
@@ -716,7 +834,8 @@ class RemoteModel {
   }
 
   String? get routeCarrierName {
-    if (providerId != 'opencode' || routeProviderName.toLowerCase() == 'opencode') return null;
+    if (providerId != 'opencode' ||
+        routeProviderName.toLowerCase() == 'opencode') return null;
     return 'OpenCode';
   }
 
@@ -725,16 +844,20 @@ class RemoteModel {
       : '$routeProviderName via $routeCarrierName';
 
   List<ReasoningEffortOption> get reasoningEfforts {
-    final advertised = jsonList(nativeMetadata['supportedReasoningEfforts'])
-        .followedBy(jsonList(nativeMetadata['reasoningEfforts']))
-        .followedBy(jsonList(nativeMetadata['thoughtLevels']))
-        .followedBy(jsonList(nativeMetadata['thought_levels']))
+    final advertised = <Object?>[
+      ...jsonList(nativeMetadata['supportedReasoningEfforts']),
+      ...jsonList(nativeMetadata['reasoningEfforts']),
+      ...jsonList(nativeMetadata['thoughtLevels']),
+      ...jsonList(nativeMetadata['thought_levels']),
+    ]
         .map(ReasoningEffortOption.fromJson)
         .where((option) => _isConcreteReasoningEffort(option.id))
         .toList();
-    if (advertised.isNotEmpty) return List<ReasoningEffortOption>.unmodifiable(advertised);
-    return List<ReasoningEffortOption>.unmodifiable(_knownReasoningEfforts(providerId, id, displayName)
-        .map((effort) => ReasoningEffortOption(id: effort)));
+    if (advertised.isNotEmpty)
+      return List<ReasoningEffortOption>.unmodifiable(advertised);
+    return List<ReasoningEffortOption>.unmodifiable(
+        _knownReasoningEfforts(providerId, id, displayName)
+            .map((effort) => ReasoningEffortOption(id: effort)));
   }
 
   String? get defaultReasoningEffort {
@@ -846,13 +969,15 @@ bool _isConcreteReasoningEffort(String value) {
       normalized != 'unspecified';
 }
 
-String _knownReasoningHaystack(String providerId, String modelId, String displayName) =>
+String _knownReasoningHaystack(
+        String providerId, String modelId, String displayName) =>
     '$providerId $modelId $displayName'.toLowerCase();
 
 List<String> _knownReasoningEfforts(
     String providerId, String modelId, String displayName) {
   final haystack = _knownReasoningHaystack(providerId, modelId, displayName);
-  if (haystack.contains('non-reasoning') || haystack.contains('non_reasoning')) {
+  if (haystack.contains('non-reasoning') ||
+      haystack.contains('non_reasoning')) {
     return const <String>[];
   }
   if (RegExp(r'grok[- .]?4\.6').hasMatch(haystack)) {
@@ -869,8 +994,8 @@ List<String> _knownReasoningEfforts(
 
 bool _usesCodexLightLabel(
     String? providerId, String? modelId, String? displayName) {
-  final haystack =
-      _knownReasoningHaystack(providerId ?? '', modelId ?? '', displayName ?? '');
+  final haystack = _knownReasoningHaystack(
+      providerId ?? '', modelId ?? '', displayName ?? '');
   if (haystack.contains('grok')) return false;
   if (providerId == 'codex') return true;
   return RegExp(r'gpt[- .]?5\.6').hasMatch(haystack);
@@ -1058,7 +1183,6 @@ class VisionProxyStatus {
     required this.primaryModelSupportsImageInput,
     this.primaryModelId,
     this.configured,
-    this.helperSessionId,
   });
 
   factory VisionProxyStatus.fromJson(Object? value) {
@@ -1073,7 +1197,6 @@ class VisionProxyStatus {
       configured: json['configured'] == null
           ? null
           : VisionProxySelection.fromJson(json['configured']),
-      helperSessionId: optionalString(json, 'helperSessionId'),
     );
   }
 
@@ -1081,7 +1204,6 @@ class VisionProxyStatus {
   final String? primaryModelId;
   final bool? primaryModelSupportsImageInput;
   final VisionProxySelection? configured;
-  final String? helperSessionId;
 }
 
 class DelegationSelection {
@@ -1192,6 +1314,47 @@ class RemoteDelegationChild {
   final String? error;
 }
 
+class RemoteMeshPresentationSegment {
+  const RemoteMeshPresentationSegment._({
+    required this.type,
+    this.text,
+    this.targetIndex,
+  });
+
+  factory RemoteMeshPresentationSegment.text(String text) =>
+      RemoteMeshPresentationSegment._(type: 'text', text: text);
+
+  factory RemoteMeshPresentationSegment.mesh(int targetIndex) =>
+      RemoteMeshPresentationSegment._(
+        type: 'mesh',
+        targetIndex: targetIndex,
+      );
+
+  factory RemoteMeshPresentationSegment.fromJson(Object? value) {
+    final json = jsonMap(value, name: 'Mesh presentation segment');
+    final type = requireString(json, 'type');
+    if (type == 'text') {
+      return RemoteMeshPresentationSegment.text(
+          optionalString(json, 'text') ?? '');
+    }
+    final targetIndex = json['targetIndex'];
+    if (type == 'mesh' && targetIndex is num && targetIndex.isFinite) {
+      return RemoteMeshPresentationSegment.mesh(targetIndex.toInt());
+    }
+    throw const FormatException('Mesh presentation segment is invalid');
+  }
+
+  final String type;
+  final String? text;
+  final int? targetIndex;
+
+  JsonMap toJson() => <String, Object?>{
+        'type': type,
+        if (text != null) 'text': text,
+        if (targetIndex != null) 'targetIndex': targetIndex,
+      };
+}
+
 class RemoteDelegationTask {
   const RemoteDelegationTask({
     required this.id,
@@ -1201,6 +1364,10 @@ class RemoteDelegationTask {
     required this.createdAt,
     required this.updatedAt,
     required this.children,
+    this.targets = const <DelegationSelection>[],
+    this.presentationSegments = const <RemoteMeshPresentationSegment>[],
+    this.orchestration,
+    this.parentTurnId,
     this.error,
   });
 
@@ -1216,6 +1383,14 @@ class RemoteDelegationTask {
       children: jsonList(json['children'])
           .map(RemoteDelegationChild.fromJson)
           .toList(growable: false),
+      targets: jsonList(json['targets'])
+          .map(DelegationSelection.fromJson)
+          .toList(growable: false),
+      presentationSegments: jsonList(json['presentationSegments'])
+          .map(RemoteMeshPresentationSegment.fromJson)
+          .toList(growable: false),
+      orchestration: optionalString(json, 'orchestration'),
+      parentTurnId: optionalString(json, 'parentTurnId'),
       error: optionalString(json, 'error'),
     );
   }
@@ -1227,6 +1402,10 @@ class RemoteDelegationTask {
   final DateTime createdAt;
   final DateTime updatedAt;
   final List<RemoteDelegationChild> children;
+  final List<DelegationSelection> targets;
+  final List<RemoteMeshPresentationSegment> presentationSegments;
+  final String? orchestration;
+  final String? parentTurnId;
   final String? error;
 }
 
@@ -1294,6 +1473,7 @@ class ApprovalRequest {
     this.reason,
     this.command,
     this.workingDirectory,
+    this.expiresAt,
   });
 
   factory ApprovalRequest.fromJson(Object? value) {
@@ -1315,6 +1495,8 @@ class ApprovalRequest {
       reason: optionalString(json, 'reason'),
       command: optionalString(json, 'command'),
       workingDirectory: optionalString(json, 'workingDirectory'),
+      expiresAt:
+          DateTime.tryParse(optionalString(json, 'expiresAt') ?? '')?.toUtc(),
     );
   }
 
@@ -1328,6 +1510,10 @@ class ApprovalRequest {
   final String? reason;
   final String? command;
   final String? workingDirectory;
+  final DateTime? expiresAt;
+
+  bool isExpired([DateTime? now]) =>
+      expiresAt != null && !expiresAt!.isAfter((now ?? DateTime.now()).toUtc());
 }
 
 class UserInputRequest {

@@ -20,6 +20,7 @@ import {
   ProviderAdapterError,
   ProviderEventHub,
   providerDeveloperInstructions,
+  stripProviderPromptGuidance,
   type AgentProviderAdapter,
   type AuthRequest,
   type AuthResult,
@@ -39,7 +40,33 @@ import {
 
 type DirectProtocol = "responses" | "chat_completions";
 const maximumApiResponseBytes = 32 * 1024 * 1024;
+const maximumErrorResponseBytes = 64 * 1024;
 const maximumOutputImageBytes = 25 * 1024 * 1024;
+// OpenCode Go/Zen route requests from the same conversation to the same
+// provider for prompt caching. They require a stable per-conversation
+// `x-opencode-session` header (enforced from 2026-09-06) and use the client
+// name for attribution. See https://opencode.ai/docs/go/
+const openCodeClientName = "tethoq";
+const openCodeClientUserAgent = "tethoq/0.1.0";
+
+function isOpenCodeCloudEndpoint(definition: EndpointDefinition): boolean {
+  try {
+    const hostname = new URL(definition.baseUrl).hostname.toLowerCase();
+    if (hostname === "opencode.ai" || hostname.endsWith(".opencode.ai")) return true;
+  } catch {
+    // Fall through to the provider-id check below.
+  }
+  const ids = [definition.id.toLowerCase(), (definition.openCodeProviderId ?? "").toLowerCase()];
+  return ids.some((id) => id.includes("opencode-go") || id.includes("opencode-zen") || id === "zen" || id.startsWith("zen:") || id.startsWith("zen/"));
+}
+
+function openCodeRoutingHeaders(definition: EndpointDefinition, sessionId?: string): Record<string, string> {
+  if (!isOpenCodeCloudEndpoint(definition)) return {};
+  return {
+    "x-opencode-client": openCodeClientName,
+    ...(sessionId !== undefined ? { "x-opencode-session": sessionId } : {}),
+  };
+}
 
 interface ModelSeed {
   readonly id: string;
@@ -196,7 +223,20 @@ const staticEndpoints: readonly EndpointDefinition[] = [
     ],
   },
   { id: "openrouter", name: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", protocol: "chat_completions", apiKeyEnvironment: "OPENROUTER_API_KEY", models: [] },
-  { id: "xai", name: "xAI API", baseUrl: "https://api.x.ai/v1", protocol: "chat_completions", apiKeyEnvironment: "XAI_API_KEY", models: [] },
+  {
+    id: "xai",
+    name: "xAI API",
+    baseUrl: "https://api.x.ai/v1",
+    protocol: "chat_completions",
+    apiKeyEnvironment: "XAI_API_KEY",
+    // Existing Tethoq installations used GROK_API_KEY for the same first-party
+    // xAI credential. Accept both names so EYES becomes available immediately
+    // instead of asking the user to duplicate a working secret.
+    apiKeyEnvironmentAliases: ["GROK_API_KEY"],
+    models: [
+      { id: "grok-4.6", name: "Grok 4.6", contextWindow: 500_000, inputModalities: ["text", "image"], inputPricePerToken: 2 / 1_000_000, outputPricePerToken: 6 / 1_000_000 },
+    ],
+  },
   { id: "deepseek", name: "DeepSeek API", baseUrl: "https://api.deepseek.com/v1", protocol: "chat_completions", apiKeyEnvironment: "DEEPSEEK_API_KEY", models: [] },
   { id: "groq", name: "Groq API", baseUrl: "https://api.groq.com/openai/v1", protocol: "chat_completions", apiKeyEnvironment: "GROQ_API_KEY", models: [] },
   { id: "mistral", name: "Mistral API", baseUrl: "https://api.mistral.ai/v1", protocol: "chat_completions", apiKeyEnvironment: "MISTRAL_API_KEY", models: [] },
@@ -412,7 +452,7 @@ function validateState(value: unknown): DirectState {
 export class DirectApiProviderAdapter implements AgentProviderAdapter {
   public readonly providerId = "direct";
   public readonly displayName = "Direct API";
-  public readonly sessionCreationFeatures = { hiddenDeveloperInstructions: true, ephemeralSessions: false, selectableClientTools: true } as const;
+  public readonly sessionCreationFeatures = { hiddenDeveloperInstructions: true, ephemeralSessions: false, selectableClientTools: true, visionToolIsolation: true } as const;
   readonly #hostId: string;
   readonly #statePath: string;
   readonly #key: Buffer;
@@ -490,18 +530,26 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
     let providerBalance: number | undefined;
     if (definition.usageUrl !== undefined && key !== undefined) {
       try {
-        const response = await this.fetchJson(definition.usageUrl, key, { method: "GET" }, 5_000);
+        const response = await this.fetchJson(definition.usageUrl, key, { method: "GET" }, 5_000, openCodeRoutingHeaders(definition));
         providerBalance = isObject(response) ? finiteNumber(response.credits) : undefined;
       } catch {
         // Balance reporting is optional and must not prevent chatting.
       }
     }
     const balance = providerBalance ?? (entry?.balance === undefined ? undefined : Math.max(0, entry.balance - entry.spent));
+    const apiKeyName = `${definition.name.replace(/\s+API$/iu, "")} API key`;
+    const detail = key === undefined
+      ? `${apiKeyName} is required and not configured`
+      : providerBalance !== undefined
+        ? `${apiKeyName} is configured; provider balance was reported`
+        : entry?.balance !== undefined
+          ? `${apiKeyName} is configured with a local spend cap`
+          : `${apiKeyName} is configured`;
     return {
       providerId: this.providerId,
       kind: "user_api",
       label: "User API wallet",
-      detail: providerBalance !== undefined ? `${definition.name} provider credit is being used` : `${definition.name} API key and local spend budget are being used`,
+      detail,
       endpointId,
       endpointName: definition.name,
       currency: "USD",
@@ -509,7 +557,7 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
       ...(entry?.spent !== undefined ? { spent: entry.spent } : {}),
       apiKeyConfigured: key !== undefined,
       apiKeyLabel: apiKeyLabel(definition),
-      ...(key === undefined ? { caution: `Enter a ${definition.name} API key to use this model` } : balance === undefined ? { caution: "No provider balance API is available; add an optional local spend budget if desired" } : {}),
+      ...(key === undefined ? { caution: `Add the ${apiKeyName} before using this model` } : balance === undefined ? { caution: "No provider balance API is available; add an optional local spend budget if desired" } : {}),
       availableEndpoints: definitions.map((endpoint) => ({
         id: endpoint.id,
         name: endpoint.name,
@@ -519,8 +567,19 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
   }
 
   public async configureWallet(request: ConfigureWalletRequest): Promise<ProviderWalletStatus> {
+    this.assertActive();
     const endpointId = request.endpointId.trim();
     if (!/^[a-z0-9][a-z0-9._-]{1,63}$/u.test(endpointId)) throw new Error("Endpoint ID must use 2-64 lowercase letters, numbers, dots, dashes, or underscores");
+    if (request.clearBalance === true && (request.setBalance !== undefined || request.addBalance !== undefined)) throw new Error("clearBalance cannot be combined with a balance update");
+    if (request.validateApiKey === true) {
+      if (request.customEndpoint !== undefined) throw new Error("New custom endpoints cannot be verified before they are saved");
+      const apiKey = request.apiKey?.trim();
+      if (apiKey === undefined || apiKey.length < 8 || apiKey.length > 8_192 || apiKey.includes("\0")) throw new Error("API key length is invalid");
+      const state = await this.state();
+      const definition = (await this.definitions(state)).find((candidate) => candidate.id === endpointId);
+      if (definition === undefined) throw new Error(`Unknown direct API endpoint ${endpointId}`);
+      await this.validateApiKey(definition, apiKey);
+    }
     await this.mutate(async (state) => {
       let definition = (await this.definitions(state)).find((candidate) => candidate.id === endpointId);
       if (request.customEndpoint !== undefined) {
@@ -545,7 +604,7 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
       const originChanged = request.customEndpoint !== undefined && previousDefinition !== undefined
         && (previousDefinition.baseUrl !== definition.baseUrl || previousDefinition.protocol !== definition.protocol);
       const environmentKey = this.environmentApiKey(definition);
-      if (environmentKey !== undefined && (request.apiKey !== undefined || request.clearApiKey === true)) {
+      if (environmentKey !== undefined && request.clearApiKey === true) {
         throw new Error(`${environmentKey.name} is set in the environment; update or remove it there`);
       }
       if (environmentKey !== undefined && originChanged) {
@@ -562,8 +621,11 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
         current.encryptedApiKey = this.encrypt(endpointId, apiKey);
       }
       if (request.clearApiKey === true) delete current.encryptedApiKey;
-      if (request.setBalance !== undefined) current.balance = this.balanceValue(request.setBalance);
-      if (request.addBalance !== undefined) current.balance = this.balanceValue((current.balance ?? 0) + request.addBalance);
+      if (request.clearBalance === true) delete current.balance;
+      else {
+        if (request.setBalance !== undefined) current.balance = this.balanceValue(request.setBalance);
+        if (request.addBalance !== undefined) current.balance = this.balanceValue((current.balance ?? 0) + request.addBalance);
+      }
       this.#modelsCache.delete(endpointId);
     });
     return await this.getWalletStatus(directModelId(endpointId, (await this.requireDefinition(endpointId, await this.state())).models[0]?.id ?? "default"));
@@ -669,7 +731,8 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
       if (selectedModel?.contextWindow === undefined) delete session.contextWindow;
       else session.contextWindow = selectedModel.contextWindow;
       session.messages.push(user);
-      session.preview = request.content;
+      const visibleContent = stripProviderPromptGuidance(request.content);
+      if (visibleContent.trim()) session.preview = visibleContent;
       session.updatedAt = now;
       session.state = "working";
     });
@@ -782,7 +845,7 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
         ...(tools.length > 0 ? { tools } : {}),
         ...(request.reasoningEffort !== undefined && request.reasoningEffort.toLowerCase() !== "default" ? { reasoning_effort: request.reasoningEffort.toLowerCase() } : {}),
       };
-      const value = await this.fetchJson(endpointUrl(definition.baseUrl, "chat/completions"), key, { method: "POST", body: JSON.stringify(body) }, 180_000);
+      const value = await this.fetchJson(endpointUrl(definition.baseUrl, "chat/completions"), key, { method: "POST", body: JSON.stringify(body) }, 180_000, openCodeRoutingHeaders(definition, session.id));
       const root = isObject(value) ? value : {};
       usage = mergeUsage(usage, parseUsage(root.usage));
       const choices = Array.isArray(root.choices) ? root.choices : [];
@@ -832,7 +895,7 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
         ...(tools.length > 0 ? { tools } : {}),
         ...(request.reasoningEffort !== undefined && request.reasoningEffort.toLowerCase() !== "default" ? { reasoning: { effort: request.reasoningEffort.toLowerCase() } } : {}),
       };
-      const value = await this.fetchJson(endpointUrl(definition.baseUrl, "responses"), key, { method: "POST", body: JSON.stringify(body) }, 180_000);
+      const value = await this.fetchJson(endpointUrl(definition.baseUrl, "responses"), key, { method: "POST", body: JSON.stringify(body) }, 180_000, openCodeRoutingHeaders(definition, session.id));
       const root = isObject(value) ? value : {};
       usage = mergeUsage(usage, parseResponsesUsage(root.usage));
       const output = Array.isArray(root.output) ? root.output : [];
@@ -871,12 +934,22 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
     }
     await this.emit({ type: "tool.started", providerSessionId: session.id, payload: { name, callId, input } });
     try {
-      const output = await tooling.execute(this.providerId, session.id, name, input);
+      const output = await tooling.execute(this.providerId, session.id, name, input, {
+        callId,
+        lifecycleOwner: "provider",
+      });
       await this.emit({ type: "tool.completed", providerSessionId: session.id, payload: { name, callId, status: "completed", output } });
       return output;
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const eyesFailure = isDirectEyesTool(name);
+      const message = eyesFailure
+        ? safeDirectEyesToolError(error)
+        : error instanceof Error ? error.message : String(error);
       await this.emit({ type: "tool.completed", providerSessionId: session.id, payload: { name, callId, status: "failed", error: message } });
+      // Tool failures are valid model input. In particular, returning a safe
+      // EYES failure lets the parent model explain the problem and suggest a
+      // different visual model instead of crashing the entire parent turn.
+      if (eyesFailure) return { error: message };
       throw error;
     }
   }
@@ -885,14 +958,18 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
     const cached = this.#modelsCache.get(definition.id);
     if (cached !== undefined && cached.expiresAt > Date.now()) return cached.models;
     const key = this.apiKey(definition, state);
-    const seeds = definition.models.map((seed) => this.listedModel(definition, seed, key !== undefined));
+    const seeds = (verified: boolean) => definition.models.map((seed) =>
+      this.listedModel(definition, seed, key !== undefined, verified));
     // Catalog discovery is credential-gated so opening Tethoq never probes a
     // third-party endpoint merely to populate the initial model picker.
-    if (key === undefined) return seeds;
+    if (key === undefined) return seeds(false);
     try {
-      const value = await this.fetchJson(endpointUrl(definition.baseUrl, "models"), key, { method: "GET" }, 8_000);
+      const value = await this.fetchJson(endpointUrl(definition.baseUrl, "models"), key, { method: "GET" }, 8_000, openCodeRoutingHeaders(definition));
       const root = isObject(value) ? value : {};
-      const data = Array.isArray(root.data) ? root.data : [];
+      if (!Array.isArray(root.data)) throw new Error("Model catalogue response is invalid");
+      const data = root.data;
+      const discoveredModelIds = new Set(data.flatMap((entry) =>
+        isObject(entry) && typeof entry.id === "string" ? [entry.id] : []));
       const discovered = data.flatMap((entry): ListedModel[] => {
         if (!isObject(entry) || typeof entry.id !== "string") return [];
         const architecture = isObject(entry.architecture) ? entry.architecture : {};
@@ -907,17 +984,26 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
           name: typeof entry.name === "string" ? entry.name : entry.id,
           ...(integer(entry.context_length ?? entry.context_window) !== undefined ? { contextWindow: integer(entry.context_length ?? entry.context_window)! } : {}),
           inputModalities: modalities,
-        }, key !== undefined)];
+        }, true, true)];
       });
-      const combined = dedupeModels([...seeds, ...discovered]);
+      const verifiedSeeds = definition.models.map((seed) =>
+        this.listedModel(definition, seed, true, discoveredModelIds.has(seed.id)));
+      const combined = dedupeModels([...verifiedSeeds, ...discovered]);
       this.#modelsCache.set(definition.id, { expiresAt: Date.now() + 5 * 60_000, models: combined });
       return combined;
     } catch {
-      return seeds;
+      // Keep the ordinary catalogue usable, but mark these seed rows as
+      // unverified so EYES never claims a failed/unauthorized endpoint is ready.
+      return seeds(false);
     }
   }
 
-  private listedModel(definition: EndpointDefinition, seed: ModelSeed, keyConfigured: boolean): ListedModel {
+  private listedModel(
+    definition: EndpointDefinition,
+    seed: ModelSeed,
+    keyConfigured: boolean,
+    apiKeyVerified: boolean,
+  ): ListedModel {
     const inputModalities = seed.inputModalities ?? ["text"];
     return {
       model: {
@@ -932,6 +1018,7 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
           sourceProviderName: definition.name,
           walletKind: "user_api",
           apiKeyConfigured: keyConfigured,
+          apiKeyVerified,
           apiKeyLabel: apiKeyLabel(definition),
           protocol: definition.protocol,
           ...(seed.contextWindow !== undefined ? { contextWindow: seed.contextWindow } : {}),
@@ -977,11 +1064,13 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
 
   private apiKey(definition: EndpointDefinition, state: DirectState): string | undefined {
     if (definition.openCodeProviderId !== undefined) return this.#openCodeKeys.get(definition.openCodeProviderId);
-    const environment = this.environmentApiKey(definition);
-    if (environment !== undefined) return environment.value;
     const encrypted = state.endpoints[definition.id]?.encryptedApiKey;
-    if (encrypted === undefined) return undefined;
-    try { return this.decrypt(definition.id, encrypted); } catch { return undefined; }
+    // A key explicitly saved in Tethoq must replace an inherited environment
+    // key, otherwise validation succeeds but subsequent EYES calls use the old key.
+    if (encrypted !== undefined) {
+      try { return this.decrypt(definition.id, encrypted); } catch { return undefined; }
+    }
+    return this.environmentApiKey(definition)?.value;
   }
 
   private environmentApiKey(definition: EndpointDefinition): { readonly name: string; readonly value: string } | undefined {
@@ -1067,9 +1156,10 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
   }
 
   private remoteMessage(session: StoredSession, message: StoredMessage): RemoteMessage {
+    const text = message.role === "user" ? stripProviderPromptGuidance(message.text) : message.text;
     const parts: ContentPart[] = [
       ...(message.reasoning === undefined ? [] : [{ type: "reasoning" as const, text: message.reasoning, redacted: false }]),
-      ...(message.text === "" ? [] : [{ type: "text" as const, text: message.text }]),
+      ...(text === "" ? [] : [{ type: "text" as const, text }]),
       ...(message.images ?? []).map((image): ContentPart => ({
         type: "image",
         uri: storedImageUri(image),
@@ -1100,7 +1190,7 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
     };
   }
 
-  private async fetchJson(url: string, apiKey: string | undefined, init: RequestInit, timeoutMs: number): Promise<unknown> {
+  private async fetchJson(url: string, apiKey: string | undefined, init: RequestInit, timeoutMs: number, extraHeaders: Readonly<Record<string, string>> = {}): Promise<unknown> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -1109,17 +1199,97 @@ export class DirectApiProviderAdapter implements AgentProviderAdapter {
         signal: controller.signal,
         headers: {
           Accept: "application/json",
+          "User-Agent": openCodeClientUserAgent,
+          ...extraHeaders,
           ...(init.body === undefined ? {} : { "Content-Type": "application/json" }),
           ...(apiKey === undefined ? {} : { Authorization: `Bearer ${apiKey}` }),
           ...(init.headers ?? {}),
         },
       });
       if (!response.ok) {
-        await response.body?.cancel().catch(() => undefined);
+        const rejectedCredential = response.status === 400
+          ? await responseClearlyRejectsCredential(response)
+          : false;
+        if (response.status !== 400) await response.body?.cancel().catch(() => undefined);
+        if (response.status === 401 || response.status === 403 || rejectedCredential) {
+          throw new ProviderAdapterError(
+            this.providerId,
+            "AUTH_INVALID_OR_UNAVAILABLE",
+            "The API key for this model is invalid or unavailable. Check the key and try again.",
+            false,
+          );
+        }
+        if (response.status === 429) {
+          throw new ProviderAdapterError(
+            this.providerId,
+            "USAGE_LIMIT_OR_RATE_LIMIT",
+            "This model has reached an API usage limit or is temporarily rate-limited. Check the provider account or try again later.",
+            true,
+          );
+        }
         throw new Error(`API request failed (${response.status})`);
       }
       const text = await boundedResponseText(response, maximumApiResponseBytes);
       return text === "" ? {} : JSON.parse(text) as unknown;
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new ProviderAdapterError(
+          this.providerId,
+          "REQUEST_TIMEOUT",
+          "The API request timed out before the model finished.",
+          true,
+          { cause: error },
+        );
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async validateApiKey(definition: EndpointDefinition, apiKey: string): Promise<void> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8_000);
+    try {
+      const response = await this.#fetch(endpointUrl(definition.baseUrl, "models"), {
+        method: "GET",
+        signal: controller.signal,
+        headers: { Accept: "application/json", "User-Agent": openCodeClientUserAgent, ...openCodeRoutingHeaders(definition), Authorization: `Bearer ${apiKey}` },
+      });
+      if (response.ok) {
+        try {
+          const text = await boundedResponseText(response, maximumApiResponseBytes);
+          const value = text === "" ? undefined : JSON.parse(text) as unknown;
+          if (!isObject(value) || !Array.isArray(value.data)) throw new Error("Model catalogue response is invalid");
+          return;
+        } catch (error) {
+          throw new ProviderAdapterError(
+            this.providerId,
+            "AUTH_VALIDATION_UNAVAILABLE",
+            `${definition.name} returned an invalid model catalogue. Nothing was saved.`,
+            true,
+            { cause: error },
+          );
+        }
+      }
+      const rejectedCredential = response.status === 400
+        ? await responseClearlyRejectsCredential(response)
+        : false;
+      if (response.status !== 400) await response.body?.cancel().catch(() => undefined);
+      if (response.status === 401 || response.status === 403 || rejectedCredential) {
+        throw new ProviderAdapterError(this.providerId, "AUTH_INVALID", `${definition.name} did not accept that API key. Nothing was saved.`, false);
+      }
+      throw new ProviderAdapterError(this.providerId, "AUTH_VALIDATION_UNAVAILABLE", `${definition.name} could not verify the API key right now (${response.status}). Nothing was saved.`, true);
+    } catch (error) {
+      if (error instanceof ProviderAdapterError) throw error;
+      const timedOut = controller.signal.aborted;
+      throw new ProviderAdapterError(
+        this.providerId,
+        "AUTH_VALIDATION_UNAVAILABLE",
+        `${definition.name} could not be reached to verify the API key${timedOut ? " before the timeout" : ""}. Nothing was saved.`,
+        true,
+        { cause: error },
+      );
     } finally {
       clearTimeout(timer);
     }
@@ -1270,7 +1440,10 @@ function parseToolArguments(value: unknown): JsonObject {
 
 async function boundedResponseText(response: Response, maximumBytes: number): Promise<string> {
   const reported = Number(response.headers.get("content-length"));
-  if (Number.isFinite(reported) && reported > maximumBytes) throw new Error(`API response exceeds the ${maximumBytes}-byte limit`);
+  if (Number.isFinite(reported) && reported > maximumBytes) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new Error(`API response exceeds the ${maximumBytes}-byte limit`);
+  }
   if (response.body === null) return "";
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -1286,6 +1459,48 @@ async function boundedResponseText(response: Response, maximumBytes: number): Pr
     chunks.push(next.value);
   }
   return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8");
+}
+
+async function responseClearlyRejectsCredential(response: Response): Promise<boolean> {
+  try {
+    const text = await boundedResponseText(response, maximumErrorResponseBytes);
+    return responseErrorTextCandidates(text).some(clearlyRejectsCredential);
+  } catch {
+    await response.body?.cancel().catch(() => undefined);
+    return false;
+  }
+}
+
+function responseErrorTextCandidates(text: string): readonly string[] {
+  let value: unknown;
+  try {
+    value = JSON.parse(text) as unknown;
+  } catch {
+    return [text];
+  }
+  if (typeof value === "string") return [value];
+  if (!isObject(value)) return [text];
+  const candidates: string[] = [];
+  const appendKnownFields = (record: Record<string, unknown>): void => {
+    for (const field of ["message", "detail", "code", "type", "reason", "status"] as const) {
+      if (typeof record[field] === "string") candidates.push(record[field]);
+    }
+  };
+  const error = value.error;
+  if (typeof error === "string") candidates.push(error);
+  else if (isObject(error)) appendKnownFields(error);
+  appendKnownFields(value);
+  return candidates.length > 0 ? candidates : [text];
+}
+
+function clearlyRejectsCredential(value: string): boolean {
+  const normalized = value.toLowerCase().replace(/[_-]+/gu, " ").replace(/\s+/gu, " ").trim();
+  const rejectedBeforeCredential = /(?:^|[^a-z0-9])(?:invalid|incorrect|malformed|expired|revoked|rejected|denied|unauthori[sz]ed|not accepted|not valid|failed)(?:\s+(?:provided|supplied))?\s+(?:api\s*keys?(?:\s+credentials?)?|credentials?|auth(?:entication|ori[sz]ation)?(?:\s+tokens?)?)(?=$|[^a-z0-9])/u;
+  const credentialBeforeRejection = /(?:^|[^a-z0-9])(?:api\s*keys?(?:\s+credentials?)?|credentials?|auth(?:entication|ori[sz]ation)?(?:\s+tokens?)?)(?:\s+(?:provided|supplied))?(?:\s+(?:has(?: been)?|have(?: been)?|is|was|are|were))?\s+(?:invalid|incorrect|malformed|expired|revoked|rejected|denied|unauthori[sz]ed|not accepted|not valid|failed)(?=$|[^a-z0-9])/u;
+  const explicitAuthenticationFailure = /(?:^|[^a-z0-9])(?:failed\s+to\s+auth(?:enticate|ori[sz]e)|auth(?:entication|ori[sz]ation)\s+(?:error|failure))(?=$|[^a-z0-9])/u;
+  return rejectedBeforeCredential.test(normalized) ||
+    credentialBeforeRejection.test(normalized) ||
+    explicitAuthenticationFailure.test(normalized);
 }
 
 function parseUsage(value: unknown): SessionTokenUsage {
@@ -1320,6 +1535,29 @@ function mergeUsage(current: SessionTokenUsage, next: SessionTokenUsage): Sessio
 function pricedCost(usage: SessionTokenUsage, pricing: Pick<ListedModel, "inputPricePerToken" | "outputPricePerToken">): number | undefined {
   if (pricing.inputPricePerToken === undefined && pricing.outputPricePerToken === undefined) return undefined;
   return (usage.inputTokens ?? 0) * (pricing.inputPricePerToken ?? 0) + (usage.outputTokens ?? 0) * (pricing.outputPricePerToken ?? 0);
+}
+
+function isDirectEyesTool(name: string): boolean {
+  const normalized = name.toLowerCase().replace(/[-\s]+/gu, "_");
+  return normalized === "ask_eyes" || normalized.endsWith("_ask_eyes")
+    || normalized === "tethoq_turn_support" || normalized.endsWith("_tethoq_turn_support");
+}
+
+function safeDirectEyesToolError(error: unknown): string {
+  const normalized = (error instanceof Error ? `${error.name} ${error.message}` : String(error)).toLowerCase().slice(0, 24_000);
+  if (/\b(?:429|quota|rate[_ -]?limit|usage[_ -]?limit|resource[_ -]?exhausted|insufficient (?:balance|credit)|billing)\b/u.test(normalized)) {
+    return "EYES could not use the selected model because its usage limit was reached or it is temporarily rate-limited. Check the provider account or choose another EYES model.";
+  }
+  if (/\b(?:401|403|unauthori[sz]ed|forbidden|api[_ -]?key|credential|auth(?:entication|ori[sz]ation)?)\b/u.test(normalized)) {
+    return "EYES could not use the selected model because its API key is missing, invalid, or no longer accepted. Update the key in EYES settings and try again.";
+  }
+  if (/\b(?:timed? out|timeout|deadline)\b/u.test(normalized)) {
+    return "EYES did not finish inspecting the image. Try again or choose another EYES model.";
+  }
+  if (/\b(?:abort(?:ed)?|cancel(?:led|ed)?|interrupt(?:ed)?)\b/u.test(normalized)) {
+    return "EYES was interrupted before it finished inspecting the image. Try again when you are ready.";
+  }
+  return "EYES could not inspect the image. Try again or choose another EYES model.";
 }
 
 function dedupeModels(models: readonly ListedModel[]): readonly ListedModel[] {

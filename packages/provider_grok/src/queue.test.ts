@@ -1,22 +1,22 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { grokQueueEditParams, grokQueueRemoveParams, isGrokQueueChangedMethod, parseGrokQueueChanged } from "./queue.js";
+import { grokQueueEditParams, grokQueueInterjectParams, grokQueueRemoveParams, isGrokQueueChangedMethod, parseGrokQueueChanged } from "./queue.js";
 
 test("Grok queue/changed snapshots keep prompt entries and drop non-prompt rows", () => {
   const snapshot = parseGrokQueueChanged({
     sessionId: "session-1",
     runningPromptId: "running-1",
     entries: [
-      { id: "q1", kind: "prompt", text: "Inspect the parser" },
+      { id: "q1", version: 7, kind: "prompt", text: "Inspect the parser" },
       { id: "tool-1", kind: "tool", text: "hidden" },
       { text: "Follow up without an id" },
     ],
   }, new Date("2026-08-17T12:00:00.000Z"));
   assert.equal(snapshot?.sessionId, "session-1");
   assert.equal(snapshot?.runningPromptId, "running-1");
-  assert.deepEqual(snapshot?.entries.map((entry) => [entry.id, entry.content]), [
-    ["q1", "Inspect the parser"],
-    ["grok-queue-2", "Follow up without an id"],
+  assert.deepEqual(snapshot?.entries.map((entry) => [entry.id, entry.content, entry.version]), [
+    ["q1", "Inspect the parser", 7],
+    ["grok-queue-2", "Follow up without an id", 0],
   ]);
 });
 
@@ -27,5 +27,11 @@ test("Grok queue mutation params use the native ACP spellings", () => {
     sessionId: "session-1",
     id: "q1",
     newText: "Revised",
+  });
+  assert.deepEqual(grokQueueInterjectParams("session-1", "q1", 7, "Steer here"), {
+    sessionId: "session-1",
+    id: "q1",
+    expectedVersion: 7,
+    newText: "Steer here",
   });
 });

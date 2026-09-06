@@ -21,6 +21,7 @@ qa-artifacts/
 # Local runtime, test, and browser state
 .runtime/
 .tmp-appserver-schema/
+/.tmp-*
 .playwright-cli/
 tmp/
 work/
@@ -53,8 +54,9 @@ TETHOQ_ACCOUNT_CREDENTIALS.md
 *.dump
 
 # Local, non-repository working files belong here
-/local-artifacts/
-/apps/desktop_harness/local-artifacts/
+local-artifacts/
+TETHOQ_UI_FEEDBACK_LEDGER*.json
+TETHOQ_UI_DOCTRINE*.md
 
 # Operating-system metadata
 .DS_Store

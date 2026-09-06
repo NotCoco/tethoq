@@ -1,6 +1,7 @@
 export * from "./bridge.js";
 export * from "./refresh.js";
 export * from "./session_cache.js";
+export * from "./session_catalogue_store.js";
 export * from "./approvals.js";
 export * from "./config.js";
 export * from "./persistence.js";
@@ -13,4 +14,6 @@ export * from "./dictation_credentials.js";
 export * from "./providers.js";
 export * from "./pairing_store.js";
 export * from "./cross_session_store.js";
+export * from "./vision_proxy_store.js";
+export * from "./client_tool_failure_store.js";
 export * from "./desktop_lifecycle.js";

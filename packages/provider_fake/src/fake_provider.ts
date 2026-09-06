@@ -10,6 +10,7 @@ import {
 import {
   ProviderAdapterError,
   ProviderEventHub,
+  stripProviderPromptGuidance,
   type AgentProviderAdapter,
   type AuthStatus,
   type CreateSessionOptions,
@@ -200,6 +201,7 @@ export class FakeProviderAdapter implements AgentProviderAdapter {
     if (prior !== undefined) return prior;
     const session = this.requireSession(providerSessionId);
     const now = this.#now().toISOString();
+    const visibleContent = stripProviderPromptGuidance(request.content);
     const userMessage: RemoteMessage = {
       id: `${this.providerId}/${request.requestId}`,
       sessionId: makeGlobalSessionId(this.#hostId, this.providerId, providerSessionId),
@@ -207,13 +209,13 @@ export class FakeProviderAdapter implements AgentProviderAdapter {
       role: "user",
       createdAt: now,
       completedAt: now,
-      parts: [{ type: "text", text: request.content }],
+      parts: visibleContent ? [{ type: "text", text: visibleContent }] : [],
       status: "completed",
       nativeMetadata: {},
     };
     this.#messages.get(providerSessionId)?.push(userMessage);
     session.state = "working";
-    session.preview = request.content;
+    if (visibleContent.trim()) session.preview = visibleContent;
     session.updatedAt = now;
     const result: SendMessageResult = { accepted: true, providerTurnId: `turn_${randomUUID()}`, details: [] };
     this.#requestResults.set(request.requestId, result);
@@ -269,7 +271,11 @@ export class FakeProviderAdapter implements AgentProviderAdapter {
     pending.resolve(response.answers);
   }
 
-  public async requestUserInput(providerSessionId: string, prompt = "Which fixture path should continue?"): Promise<Record<string, unknown>> {
+  public async requestUserInput(
+    providerSessionId: string,
+    prompt = "Which fixture path should continue?",
+    expiresAt?: string,
+  ): Promise<Record<string, unknown>> {
     this.assertOnline();
     this.requireSession(providerSessionId);
     const providerRequestId = `input_${randomUUID()}`;
@@ -278,7 +284,11 @@ export class FakeProviderAdapter implements AgentProviderAdapter {
       void this.emit({
         type: "user_input.requested",
         providerSessionId,
-        payload: { providerRequestId, request: { title: "Fixture input", prompt, schema: { type: "object" } } },
+        payload: {
+          providerRequestId,
+          request: { title: "Fixture input", prompt, schema: { type: "object" } },
+          ...(expiresAt !== undefined ? { expiresAt } : {}),
+        },
       });
     });
   }

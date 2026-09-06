@@ -3,9 +3,14 @@ import { randomUUID } from "node:crypto";
 import test from "node:test";
 import {
   CURRENT_PROTOCOL_VERSION,
+  SecureChannel,
+  acceptSecureHandshake,
   createDeviceIdentity,
   createHostIdentity,
+  parseSecureFrame,
+  parseSecureHandshakeOffer,
   signDeviceAction,
+  signRelayDeviceAttach,
   type JsonObject,
   type RequestEnvelope,
   type SignedCredential,
@@ -93,6 +98,35 @@ async function connect(url: string): Promise<{ readonly socket: WebSocket; reado
     socket.addEventListener("error", () => { clearTimeout(timer); reject(new Error("Bridge connection failed")); }, { once: true });
   });
   return { socket, inbox };
+}
+
+async function connectSecure(
+  url: string,
+  config: Pick<BridgeConfig, "hostId" | "identity">,
+  device: ReturnType<typeof createDeviceIdentity>,
+  credential: SignedCredential,
+): Promise<{ readonly socket: WebSocket; readonly inbox: MessageInbox }> {
+  const connection = await connect(url);
+  const hello = await connection.inbox.nextWhere((value) => isRecord(value) && value.kind === "hello");
+  assert.ok(isRecord(hello));
+  const offer = parseSecureHandshakeOffer(hello.encryption);
+  assert.ok(offer !== null);
+  const handshake = acceptSecureHandshake({
+    offer,
+    hostId: config.hostId,
+    hostPublicKeyPem: config.identity.publicKeyPem,
+    deviceId: device.deviceId,
+    devicePrivateKeyPem: device.privateKeyPem,
+    credential,
+  });
+  const phone = new SecureChannel(handshake.keys, "device");
+  connection.socket.send(JSON.stringify(handshake.accept));
+  const confirmationWire = await connection.inbox.nextWhere((value) => isRecord(value) && value.kind === "secure");
+  const confirmationFrame = parseSecureFrame(confirmationWire);
+  assert.ok(confirmationFrame !== null);
+  const confirmation = JSON.parse(phone.open(confirmationFrame)) as unknown;
+  assert.ok(isRecord(confirmation) && confirmation.kind === "secure_established");
+  return connection;
 }
 
 async function waitFor(predicate: () => boolean, message: string, timeoutMs = 3_000): Promise<void> {
@@ -235,6 +269,341 @@ test("direct bridge transport gates event replay until a signed request is verif
   const healthPayload = await health.json() as unknown;
   assert.ok(isRecord(healthPayload));
   assert.deepEqual(healthPayload, { ok: true });
+});
+
+test("direct bridge presence tracks authenticated devices without overlap flapping", async (context) => {
+  const config: BridgeConfig = {
+    version: 1,
+    hostId: "host_direct_presence",
+    displayName: "Direct presence host",
+    identity: createHostIdentity(),
+    enabledProviders: [],
+  };
+  const bridge = new AgentBridge(config, []);
+  await bridge.start();
+  const device = createDeviceIdentity("device_direct_presence");
+  const pairing = bridge.startPairing();
+  const credential = bridge.confirmPairing({
+    pairingId: pairing.pairingId,
+    secret: pairing.secret,
+    shortCode: pairing.shortCode,
+    deviceId: device.deviceId,
+    devicePublicKeyPem: device.publicKeyPem,
+  });
+  const credentialId = bridge.pairedDevices()[0]!.credentialId;
+  const server = new BridgeSocketServer(bridge, { host: "127.0.0.1", port: 0, heartbeatIntervalMs: 60_000 });
+  await server.listen();
+  const address = server.address();
+  assert.ok(address !== null && typeof address === "object");
+  const url = `ws://127.0.0.1:${address.port}/bridge`;
+  const presenceSnapshots: string[][] = [];
+  const stopWatchingPresence = server.onConnectedDevicesChanged(() => {
+    presenceSnapshots.push([...server.connectedDeviceIds()]);
+  });
+  const sockets: WebSocket[] = [];
+  context.after(async () => {
+    stopWatchingPresence();
+    for (const socket of sockets) socket.close();
+    await server.close();
+    await bridge.dispose();
+  });
+
+  assert.equal(bridge.pairedDevices().length, 1);
+  assert.deepEqual(server.connectedDeviceIds(), []);
+
+  const unauthenticated = await connect(url);
+  sockets.push(unauthenticated.socket);
+  await unauthenticated.inbox.nextWhere((value) => isRecord(value) && value.kind === "hello");
+  unauthenticated.socket.send(JSON.stringify({ kind: "hello", role: "device", deviceId: device.deviceId }));
+  unauthenticated.socket.send(JSON.stringify(request(config.hostId, "host.get", "request_unauthenticated_presence", {})));
+  await unauthenticated.inbox.nextWhere((value) => isRecord(value) && value.type === "transport.error");
+  assert.deepEqual(server.connectedDeviceIds(), []);
+  assert.deepEqual(presenceSnapshots, []);
+  unauthenticated.socket.close();
+
+  const first = await connectSecure(url, config, device, credential);
+  sockets.push(first.socket);
+  assert.deepEqual(server.connectedDeviceIds(), [device.deviceId]);
+  assert.deepEqual(presenceSnapshots, [[device.deviceId]]);
+
+  const second = await connectSecure(url, config, device, credential);
+  sockets.push(second.socket);
+  assert.deepEqual(server.connectedDeviceIds(), [device.deviceId]);
+  assert.deepEqual(presenceSnapshots, [[device.deviceId]], "a second socket for one phone must not change presence");
+
+  first.socket.close();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.deepEqual(server.connectedDeviceIds(), [device.deviceId]);
+  assert.deepEqual(presenceSnapshots, [[device.deviceId]], "closing one overlapping socket must keep the phone online");
+
+  second.socket.close();
+  await waitFor(() => server.connectedDeviceIds().length === 0, "the final direct socket to disconnect");
+  assert.deepEqual(presenceSnapshots, [[device.deviceId], []]);
+
+  const replacement = await connectSecure(url, config, device, credential);
+  sockets.push(replacement.socket);
+  assert.deepEqual(server.connectedDeviceIds(), [device.deviceId]);
+  const replacementClosed = new Promise<number>((resolve) => {
+    replacement.socket.addEventListener("close", (event) => resolve(event.code), { once: true });
+  });
+  assert.equal(bridge.revokeDevice(credentialId), true);
+  await waitFor(() => server.connectedDeviceIds().length === 0, "revocation to clear direct presence");
+  assert.equal(await replacementClosed, 1008);
+  assert.deepEqual(presenceSnapshots, [[device.deviceId], [], [device.deviceId], []]);
+});
+
+test("direct post-handshake errors stay encrypted and correlate the decoded request", async (context) => {
+  const config: BridgeConfig = {
+    version: 1,
+    hostId: "host_secure_error",
+    displayName: "Secure error host",
+    identity: createHostIdentity(),
+    enabledProviders: [],
+  };
+  const bridge = new AgentBridge(config, []);
+  await bridge.start();
+  const device = createDeviceIdentity("device_secure_error");
+  const pairing = bridge.startPairing();
+  const credential = bridge.confirmPairing({
+    pairingId: pairing.pairingId,
+    secret: pairing.secret,
+    shortCode: pairing.shortCode,
+    deviceId: device.deviceId,
+    devicePublicKeyPem: device.publicKeyPem,
+  });
+  const server = new BridgeSocketServer(bridge, { host: "127.0.0.1", port: 0, heartbeatIntervalMs: 60_000 });
+  await server.listen();
+  const address = server.address();
+  assert.ok(address !== null && typeof address === "object");
+  const connection = await connect(`ws://127.0.0.1:${address.port}/bridge`);
+  context.after(async () => {
+    connection.socket.close();
+    await server.close();
+    await bridge.dispose();
+  });
+
+  const hello = await connection.inbox.nextWhere((value) => isRecord(value) && value.kind === "hello");
+  assert.ok(isRecord(hello));
+  const offer = parseSecureHandshakeOffer(hello.encryption);
+  assert.ok(offer !== null);
+  const handshake = acceptSecureHandshake({
+    offer,
+    hostId: config.hostId,
+    hostPublicKeyPem: config.identity.publicKeyPem,
+    deviceId: device.deviceId,
+    devicePrivateKeyPem: device.privateKeyPem,
+    credential,
+  });
+  const phone = new SecureChannel(handshake.keys, "device");
+  connection.socket.send(JSON.stringify(handshake.accept));
+  const confirmationWire = await connection.inbox.nextWhere((value) => isRecord(value) && value.kind === "secure");
+  const confirmationFrame = parseSecureFrame(confirmationWire);
+  assert.ok(confirmationFrame !== null);
+  const confirmation = JSON.parse(phone.open(confirmationFrame)) as unknown;
+  assert.ok(isRecord(confirmation) && confirmation.kind === "secure_established");
+
+  const rejectedRequest = request(config.hostId, "host.get", "request_secure_rejected", {});
+  const signed = signDeviceAction({
+    credential,
+    action: JSON.parse(JSON.stringify(rejectedRequest)) as JsonObject,
+    devicePrivateKeyPem: device.privateKeyPem,
+  });
+  const invalidSignature = `${signed.signature.startsWith("A") ? "B" : "A"}${signed.signature.slice(1)}`;
+  const rejectedFrame = phone.seal(JSON.stringify({
+    kind: "signed_action",
+    signed: { ...signed, signature: invalidSignature },
+  }));
+  connection.socket.send(JSON.stringify(rejectedFrame));
+
+  const errorWire = await connection.inbox.nextWhere((value) => isRecord(value) && value.kind === "secure");
+  assert.equal(JSON.stringify(errorWire).includes("request_secure_rejected"), false);
+  assert.equal(JSON.stringify(errorWire).includes("transport.error"), false);
+  const errorFrame = parseSecureFrame(errorWire);
+  assert.ok(errorFrame !== null);
+  const transportError = JSON.parse(phone.open(errorFrame)) as unknown;
+  assert.ok(isRecord(transportError));
+  assert.equal(transportError.type, "transport.error");
+  assert.equal(transportError.requestId, rejectedRequest.requestId);
+  assert.match(String(transportError.message), /signature/u);
+
+  connection.socket.send(JSON.stringify(phone.seal("not json")));
+  const uncorrelatedWire = await connection.inbox.nextWhere((value) => isRecord(value) && value.kind === "secure");
+  const uncorrelatedFrame = parseSecureFrame(uncorrelatedWire);
+  assert.ok(uncorrelatedFrame !== null);
+  const uncorrelatedError = JSON.parse(phone.open(uncorrelatedFrame)) as unknown;
+  assert.ok(isRecord(uncorrelatedError));
+  assert.equal(uncorrelatedError.type, "transport.error");
+  assert.equal("requestId" in uncorrelatedError, false);
+});
+
+test("direct self-revoke is acknowledged before the phone connection closes", async (context) => {
+  const config: BridgeConfig = {
+    version: 1,
+    hostId: "host_secure_self_revoke",
+    displayName: "Secure self-revoke host",
+    identity: createHostIdentity(),
+    enabledProviders: [],
+  };
+  const bridge = new AgentBridge(config, []);
+  await bridge.start();
+  const device = createDeviceIdentity("device_secure_self_revoke");
+  const pairing = bridge.startPairing();
+  const credential = bridge.confirmPairing({
+    pairingId: pairing.pairingId,
+    secret: pairing.secret,
+    shortCode: pairing.shortCode,
+    deviceId: device.deviceId,
+    devicePublicKeyPem: device.publicKeyPem,
+  });
+  const credentialId = bridge.pairedDevices()[0]!.credentialId;
+  const server = new BridgeSocketServer(bridge, { host: "127.0.0.1", port: 0, heartbeatIntervalMs: 60_000 });
+  await server.listen();
+  const address = server.address();
+  assert.ok(address !== null && typeof address === "object");
+  const connection = await connect(`ws://127.0.0.1:${address.port}/bridge`);
+  context.after(async () => {
+    connection.socket.close();
+    await server.close();
+    await bridge.dispose();
+  });
+
+  const hello = await connection.inbox.nextWhere((value) => isRecord(value) && value.kind === "hello");
+  assert.ok(isRecord(hello));
+  const offer = parseSecureHandshakeOffer(hello.encryption);
+  assert.ok(offer !== null);
+  const handshake = acceptSecureHandshake({
+    offer,
+    hostId: config.hostId,
+    hostPublicKeyPem: config.identity.publicKeyPem,
+    deviceId: device.deviceId,
+    devicePrivateKeyPem: device.privateKeyPem,
+    credential,
+  });
+  const phone = new SecureChannel(handshake.keys, "device");
+  connection.socket.send(JSON.stringify(handshake.accept));
+  const confirmationWire = await connection.inbox.nextWhere((value) => isRecord(value) && value.kind === "secure");
+  const confirmationFrame = parseSecureFrame(confirmationWire);
+  assert.ok(confirmationFrame !== null);
+  const confirmation = JSON.parse(phone.open(confirmationFrame)) as unknown;
+  assert.ok(isRecord(confirmation) && confirmation.kind === "secure_established");
+
+  const closed = new Promise<number>((resolve) => {
+    connection.socket.addEventListener("close", (event) => resolve(event.code), { once: true });
+  });
+  const revokeRequest = request(config.hostId, "device.revoke", "request_secure_self_revoke", { credentialId });
+  const signed = signDeviceAction({
+    credential,
+    action: JSON.parse(JSON.stringify(revokeRequest)) as JsonObject,
+    devicePrivateKeyPem: device.privateKeyPem,
+  });
+  connection.socket.send(JSON.stringify(phone.seal(JSON.stringify({ kind: "signed_action", signed }))));
+
+  const responseWire = await connection.inbox.nextWhere((value) => isRecord(value) && value.kind === "secure");
+  const responseFrame = parseSecureFrame(responseWire);
+  assert.ok(responseFrame !== null, "the phone must receive its encrypted acknowledgement");
+  const response = JSON.parse(phone.open(responseFrame)) as unknown;
+  assert.ok(isRecord(response));
+  assert.equal(response.requestId, revokeRequest.requestId);
+  assert.equal(response.ok, true);
+  assert.deepEqual(response.payload, { revoked: true });
+  assert.deepEqual(bridge.pairedDevices(), []);
+  assert.equal(await closed, 1008);
+});
+
+test("relay post-handshake errors stay encrypted and correlated", async (context) => {
+  const config: BridgeConfig = {
+    version: 1,
+    hostId: "host_relay_secure_error",
+    displayName: "Relay secure error host",
+    identity: createHostIdentity(),
+    enabledProviders: [],
+  };
+  const bridge = new AgentBridge(config, []);
+  await bridge.start();
+  const device = createDeviceIdentity("device_relay_secure_error");
+  const pairing = bridge.startPairing();
+  const credential = bridge.confirmPairing({
+    pairingId: pairing.pairingId,
+    secret: pairing.secret,
+    shortCode: pairing.shortCode,
+    deviceId: device.deviceId,
+    devicePublicKeyPem: device.publicKeyPem,
+  });
+  const relay = new RelayServer({ host: "127.0.0.1", port: 0, heartbeatIntervalMs: 60_000 });
+  await relay.listen();
+  const relayAddress = relay.address();
+  assert.ok(relayAddress !== null && typeof relayAddress === "object");
+  const relayUrl = `ws://127.0.0.1:${relayAddress.port}/relay`;
+  const relayToken = "relay-secure-error-token".padEnd(43, "x");
+  const relayClient = new BridgeRelayClient(bridge, { url: relayUrl, token: relayToken, reconnect: false });
+  await relayClient.start();
+  await waitFor(() => bridge.host().relayConnected, "the secure relay host to attach");
+  const connection = await connect(relayUrl);
+  context.after(async () => {
+    connection.socket.close();
+    await relayClient.dispose();
+    await relay.close();
+    await bridge.dispose();
+  });
+
+  connection.socket.send(JSON.stringify({
+    type: "relay.attach",
+    role: "device",
+    hostId: config.hostId,
+    token: relayToken,
+    deviceId: device.deviceId,
+    proof: signRelayDeviceAttach({
+      hostId: config.hostId,
+      deviceId: device.deviceId,
+      token: relayToken,
+      credential,
+      devicePrivateKeyPem: device.privateKeyPem,
+    }),
+  }));
+  await connection.inbox.nextWhere((value) => isRecord(value) && value.type === "relay.attached");
+  connection.socket.send(JSON.stringify({ kind: "hello", role: "device", deviceId: device.deviceId }));
+  const hello = await connection.inbox.nextWhere((value) => isRecord(value) && value.kind === "hello");
+  assert.ok(isRecord(hello));
+  const offer = parseSecureHandshakeOffer(hello.encryption);
+  assert.ok(offer !== null);
+  const handshake = acceptSecureHandshake({
+    offer,
+    hostId: config.hostId,
+    hostPublicKeyPem: config.identity.publicKeyPem,
+    deviceId: device.deviceId,
+    devicePrivateKeyPem: device.privateKeyPem,
+    credential,
+  });
+  const phone = new SecureChannel(handshake.keys, "device");
+  connection.socket.send(JSON.stringify(handshake.accept));
+  const confirmationWire = await connection.inbox.nextWhere((value) => isRecord(value) && value.kind === "secure");
+  const confirmationFrame = parseSecureFrame(confirmationWire);
+  assert.ok(confirmationFrame !== null);
+  const confirmation = JSON.parse(phone.open(confirmationFrame)) as unknown;
+  assert.ok(isRecord(confirmation) && confirmation.kind === "secure_established");
+
+  const rejectedRequest = request(config.hostId, "host.get", "request_relay_secure_rejected", {});
+  const signed = signDeviceAction({
+    credential,
+    action: JSON.parse(JSON.stringify(rejectedRequest)) as JsonObject,
+    devicePrivateKeyPem: device.privateKeyPem,
+  });
+  const invalidSignature = `${signed.signature.startsWith("A") ? "B" : "A"}${signed.signature.slice(1)}`;
+  connection.socket.send(JSON.stringify(phone.seal(JSON.stringify({
+    kind: "signed_action",
+    signed: { ...signed, signature: invalidSignature },
+  }))));
+
+  const errorWire = await connection.inbox.nextWhere((value) => isRecord(value) && value.kind === "secure");
+  assert.equal(JSON.stringify(errorWire).includes("request_relay_secure_rejected"), false);
+  assert.equal(JSON.stringify(errorWire).includes("transport.error"), false);
+  const errorFrame = parseSecureFrame(errorWire);
+  assert.ok(errorFrame !== null);
+  const transportError = JSON.parse(phone.open(errorFrame)) as unknown;
+  assert.ok(isRecord(transportError));
+  assert.equal(transportError.type, "transport.error");
+  assert.equal(transportError.requestId, rejectedRequest.requestId);
+  assert.match(String(transportError.message), /signature/u);
 });
 
 test("unsigned local mode unlocks event replay after an authorized request", async () => {

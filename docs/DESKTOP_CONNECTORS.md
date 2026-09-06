@@ -67,12 +67,15 @@ Completions endpoints and keeps those encrypted keys in host-local state.
 Copilot CLI ACP is public preview and remains capability-gated.
 
 Tethoq does not include, bundle, market, or author a Claude Code integration
-in this release. Gemini CLI is deferred because its official terms warn about
-third-party access to the services behind the CLI. Cursor, Aider, Crush, and
-Kilo Code are also deferred for the permission, lifecycle, or current protocol
-reasons recorded in [PROVIDER_RESEARCH.md](PROVIDER_RESEARCH.md). The connector
-boundary remains provider-neutral; Tethoq supplies no provider-specific setup
-or support for independent connectors.
+in this release. Gemini CLI and Antigravity are not shipped built-ins, but
+Google now documents API-key/Vertex-authenticated headless CLI, SDK, and
+preview Antigravity Agent API routes that may support a future reviewed BYOK
+adapter. Consumer/IDE automation and Google-account OAuth reuse remain
+excluded. Cursor, Aider, Crush, and Kilo Code are also deferred for the
+permission, lifecycle, or current protocol reasons recorded in
+[PROVIDER_RESEARCH.md](PROVIDER_RESEARCH.md). The connector boundary remains
+provider-neutral; Tethoq supplies no provider-specific setup or support for
+independent connectors.
 
 Approval takes effect after restart. Revocation immediately removes a
 connector from the authorized provider set and stops its process; restarting

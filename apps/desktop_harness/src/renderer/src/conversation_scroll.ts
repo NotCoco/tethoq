@@ -4,6 +4,30 @@ export interface ScrollMetrics {
   clientHeight: number;
 }
 
+/** Semantic row identity plus one concrete member retained across group reshapes. */
+export interface ConversationScrollAnchorIdentity {
+  readonly id: string;
+  readonly memberToken?: string | undefined;
+}
+
+/** The first encoded member is enough to find a Reasoning group after a prepend rekeys it. */
+export function firstScrollMemberToken(encodedMembers: string | undefined): string | undefined {
+  return encodedMembers?.split("|").find((token) => token.length > 0);
+}
+
+/** Match either the stable row key, a row later folded into a group, or a retained group member. */
+export function scrollAnchorMatches(
+  anchor: ConversationScrollAnchorIdentity,
+  candidateAnchorId: string | undefined,
+  candidateMembers: string | undefined,
+): boolean {
+  if (candidateAnchorId === anchor.id) return true;
+  if (!candidateMembers) return false;
+  const members = candidateMembers.split("|");
+  return members.includes(encodeURIComponent(anchor.id))
+    || (anchor.memberToken !== undefined && members.includes(anchor.memberToken));
+}
+
 /** How close to the end counts as "following the conversation". */
 export const BOTTOM_FOLLOW_GAP_PX = 72;
 /** Re-follow only at the physical end; the wider gap is display tolerance, not consent. */
@@ -18,8 +42,22 @@ export function retainedHistoryCursor(existing: string | null, refreshed: string
   if (refreshed === null) return existing;
   const current = Number.parseInt(existing, 10);
   const next = Number.parseInt(refreshed, 10);
-  if (!Number.isInteger(current) || !Number.isInteger(next)) return existing;
+  if (!Number.isInteger(current) || !Number.isInteger(next)) {
+    // Provider-page cursors carry the provider's snapshot boundary. A refresh
+    // can replace that boundary (Codex uses an opaque byte-offset cursor), so
+    // retaining the old string guarantees that the next older-page request is
+    // rejected as expired. Stable message anchors remain safe to retain, but
+    // once either side is provider-owned the refreshed boundary is authoritative.
+    if (existing.startsWith("provider-page:") || refreshed.startsWith("provider-page:")) return refreshed;
+    return existing;
+  }
   return String(Math.min(current, next));
+}
+
+/** True when the bridge rejected a page because its snapshot boundary expired. */
+export function isHistoryPageExpired(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /message history page expired|history cursor expired/iu.test(message);
 }
 
 /** A reverse page above one full page cannot truthfully exhaust at this cursor. */

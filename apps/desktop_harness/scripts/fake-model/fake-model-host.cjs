@@ -156,6 +156,15 @@ function nonEmptyString(value) {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
+const FAKE_GOAL_STATUSES = new Set(['active', 'paused', 'blocked', 'usageLimited', 'budgetLimited', 'complete']);
+const FAKE_GOAL_GUIDANCE_HEADER = 'Tethoq persistent task goal (private control context; do not quote this block):';
+
+function fakeGoalGuidance(goal) {
+  if (!goal) return undefined;
+  const budget = goal.tokenBudget === null ? 'No token budget is set.' : `Token budget: ${goal.tokenBudget} tokens. This fake-provider fallback has no usage accounting or enforcement; treat the budget as advisory.`;
+  return `${FAKE_GOAL_GUIDANCE_HEADER}\n\nObjective: ${goal.objective}\nStatus: ${goal.status}. ${budget} Keep this objective in view across turns. The goal lifecycle is controlled by Tethoq and is independent of whether this turn is busy or finished.`;
+}
+
 function mapEntries(value) {
   if (value instanceof Map) return [...value.entries()];
   if (Array.isArray(value)) return value.filter((entry) => Array.isArray(entry) && entry.length === 2);
@@ -242,7 +251,11 @@ function createFakeModelHost(options = {}) {
   const baseIso = options.baseIso ?? clock.nowIso();
   const baseMs = Date.parse(baseIso);
 
-  const parentSession = { ...sessionBase('fake-main', 'fake-main-native', 'Fake model main task', 'C:\\FakeModel\\main', baseIso), childCount: 1 };
+  const parentSession = {
+    ...sessionBase('fake-main', 'fake-main-native', 'Fake model main task', 'C:\\FakeModel\\main', baseIso),
+    ...(options.imageSendFixture === true ? { providerId: 'direct', modelId: 'direct/vision-audio', reasoningEffort: 'low' } : {}),
+    childCount: 1,
+  };
   const subagentSession = {
     ...sessionBase('fake-subagent', 'fake-subagent-native', 'Hidden deterministic sub-agent', 'C:\\FakeModel\\main', new Date(baseMs + 30_000).toISOString()),
     parentSessionId: parentSession.id,
@@ -276,7 +289,31 @@ function createFakeModelHost(options = {}) {
     ['fake-audio', []],
     ['fake-side', attachmentHistory('fake-side', baseIso)],
   ]);
+  if (options.projectGroupingFixture === true) {
+    const projectFixtures = [
+      sessionBase('fake-project-alpha', 'fake-project-alpha-native', 'Payments alpha', 'C:\\FakeModel\\repo-a\\payments', new Date(baseMs + 150_000).toISOString()),
+      sessionBase('fake-project-beta', 'fake-project-beta-native', 'Payments beta', 'C:\\FakeModel\\repo-b\\payments', new Date(baseMs + 180_000).toISOString()),
+      { ...sessionBase('fake-project-root', 'fake-project-root-native', 'Root task', 'C:\\', new Date(baseMs + 210_000).toISOString()) },
+      { ...sessionBase('fake-project-unassigned', 'fake-project-unassigned-native', 'Provider-only task', '', new Date(baseMs + 240_000).toISOString()), project: 'Provider-only' },
+    ];
+    sessions.push(...projectFixtures);
+    for (const session of projectFixtures) messagesBySession.set(session.id, []);
+  }
+
+  function addProjectGroupingFixtureForTests() {
+    if (sessions.some((session) => session.id === 'fake-project-alpha')) return false;
+    const projectFixtures = [
+      sessionBase('fake-project-alpha', 'fake-project-alpha-native', 'Payments alpha', 'C:\\FakeModel\\repo-a\\payments', new Date(baseMs + 150_000).toISOString()),
+      sessionBase('fake-project-beta', 'fake-project-beta-native', 'Payments beta', 'C:\\FakeModel\\repo-b\\payments', new Date(baseMs + 180_000).toISOString()),
+      { ...sessionBase('fake-project-root', 'fake-project-root-native', 'Root task', 'C:\\', new Date(baseMs + 210_000).toISOString()) },
+      { ...sessionBase('fake-project-unassigned', 'fake-project-unassigned-native', 'Provider-only task', '', new Date(baseMs + 240_000).toISOString()), project: 'Provider-only' },
+    ];
+    sessions.push(...projectFixtures);
+    for (const session of projectFixtures) messagesBySession.set(session.id, []);
+    return true;
+  }
   let queue = [];
+  const scheduledTasks = [];
   const approvals = [];
   let latestSequence = 0;
   let runCounter = 0;
@@ -290,11 +327,16 @@ function createFakeModelHost(options = {}) {
   const pendingUploads = new Map();
   const completedUploads = new Map();
   const queueAttachmentIds = new Map();
+  const queuedNewTaskDeliveries = new Map();
   const executionRecords = [];
   const providerStatusOverrides = new Map();
   const oneShotFailures = new Map();
   const requestLedger = new Map();
   const historyReplayBySession = new Map();
+  const goalsBySession = new Map();
+  let goalRevision = 0;
+  let modelTurnCount = 0;
+  let modelTokenCount = 0;
 
   const persistedState = options.persistedState;
   if (persistedState && typeof persistedState === 'object') {
@@ -308,6 +350,7 @@ function createFakeModelHost(options = {}) {
       }
     }
     if (Array.isArray(persistedState.queue)) queue = clone(persistedState.queue);
+    if (Array.isArray(persistedState.scheduledTasks)) scheduledTasks.push(...clone(persistedState.scheduledTasks));
     if (Array.isArray(persistedState.approvals)) approvals.push(...clone(persistedState.approvals));
     if (Array.isArray(persistedState.delegations)) delegations.push(...clone(persistedState.delegations));
     if (Array.isArray(persistedState.executionRecords)) executionRecords.push(...clone(persistedState.executionRecords));
@@ -329,9 +372,74 @@ function createFakeModelHost(options = {}) {
     if (Number.isSafeInteger(persistedState.latestSequence)) latestSequence = persistedState.latestSequence;
     if (Number.isSafeInteger(persistedState.runCounter)) runCounter = persistedState.runCounter;
     if (Number.isSafeInteger(persistedState.sendCounter)) sendCounter = persistedState.sendCounter;
+    for (const [sessionId, goal] of mapEntries(persistedState.goalsBySession)) {
+      if (goal && typeof goal === 'object') goalsBySession.set(sessionId, clone(goal));
+    }
+    if (Number.isSafeInteger(persistedState.goalRevision)) goalRevision = persistedState.goalRevision;
+    if (Number.isSafeInteger(persistedState.modelTurnCount)) modelTurnCount = persistedState.modelTurnCount;
+    if (Number.isSafeInteger(persistedState.modelTokenCount)) modelTokenCount = persistedState.modelTokenCount;
   }
 
   const sessionById = (sessionId) => sessions.find((session) => session.id === sessionId);
+
+  function goalForSession(sessionId) {
+    return goalsBySession.get(sessionId) ?? null;
+  }
+
+  function goalEvent(sessionId, type, goal, revision) {
+    emit([nextEvent(sessionId, 'goal', type, type === 'session.goal_updated' ? { goal: clone(goal) } : { revision }, clock.nowIso())]);
+    // The fake never spends model tokens for a goal mutation. Keeping this
+    // explicit makes the zero-token contract observable in unit and Electron QA.
+  }
+
+  function setGoal(sessionId, update) {
+    if (!sessionById(sessionId)) return { ok: false, message: 'That fake model task does not exist.' };
+    const previous = goalForSession(sessionId);
+    const objective = update.objective === undefined ? previous?.objective : update.objective.trim();
+    if (!objective) return { ok: false, message: 'Set a goal objective before changing its state.' };
+    if (objective.length > 4_000) return { ok: false, message: 'Goal objective must contain between 1 and 4000 characters.' };
+    const status = update.status ?? previous?.status ?? 'active';
+    if (!FAKE_GOAL_STATUSES.has(status)) return { ok: false, message: 'Goal status is invalid.' };
+    const tokenBudget = update.tokenBudget === undefined ? previous?.tokenBudget ?? null : update.tokenBudget;
+    if (tokenBudget !== null && (!Number.isSafeInteger(tokenBudget) || tokenBudget <= 0)) return { ok: false, message: 'Goal token budget must be a positive whole number.' };
+    const now = clock.nowIso();
+    const replaced = previous !== null && update.objective !== undefined && objective !== previous.objective;
+    const goal = {
+      sessionId,
+      objective,
+      status,
+      source: 'tethoq',
+      tokenBudget,
+      tokensUsed: replaced ? 0 : previous?.tokensUsed ?? 0,
+      timeUsedSeconds: replaced ? 0 : previous?.timeUsedSeconds ?? 0,
+      createdAt: replaced ? now : previous?.createdAt ?? now,
+      updatedAt: now,
+      revision: ++goalRevision,
+    };
+    goalsBySession.set(sessionId, goal);
+    goalEvent(sessionId, 'session.goal_updated', goal, goal.revision);
+    return { ok: true, goal };
+  }
+
+  function clearGoal(sessionId) {
+    if (!sessionById(sessionId)) return { ok: false, message: 'That fake model task does not exist.' };
+    const hadGoal = goalsBySession.delete(sessionId);
+    if (hadGoal) goalEvent(sessionId, 'session.goal_cleared', null, ++goalRevision);
+    return { ok: true, cleared: hadGoal, revision: goalRevision };
+  }
+
+  function injectGoalGuidance(type, input) {
+    if (type !== 'session.send_message' && type !== 'session.steer_message' && type !== 'message_queue.enqueue') return input;
+    const goal = typeof input.sessionId === 'string' ? goalForSession(input.sessionId) : null;
+    const guidance = fakeGoalGuidance(goal);
+    if (!guidance || (typeof input.developerInstructions === 'string' && input.developerInstructions.includes(FAKE_GOAL_GUIDANCE_HEADER))) return input;
+    return {
+      ...input,
+      developerInstructions: typeof input.developerInstructions === 'string' && input.developerInstructions.length > 0
+        ? `${input.developerInstructions}\n\n${guidance}`
+        : guidance,
+    };
+  }
 
   const providerIdForSession = (sessionId) => sessionById(sessionId)?.providerId ?? FAKE_PROVIDER_ID;
 
@@ -445,7 +553,7 @@ function createFakeModelHost(options = {}) {
       modelId: session?.modelId ?? FAKE_MODEL_ID,
       usedTokens: 4_200,
       contextWindowTokens: 128_000,
-      usedPercent: (4_200 / thresholdTokens) * 100,
+      usedPercent: (4_200 / 128_000) * 100,
       compactionThresholdTokens: thresholdTokens,
       minimumThresholdTokens: 8_000,
       supportsManualCompaction: true,
@@ -475,6 +583,83 @@ function createFakeModelHost(options = {}) {
       occurredAt: atIso,
       payload,
     };
+  }
+
+  function scheduledTaskById(requestId) {
+    return scheduledTasks.find((task) => task.requestId === requestId);
+  }
+
+  function scheduledTaskWithStatus(task, status, options = {}) {
+    const {
+      dispatchingAt: _dispatchingAt,
+      startedAt: _startedAt,
+      failedAt: _failedAt,
+      failureMessage: _failureMessage,
+      ...base
+    } = task;
+    const at = typeof options.at === 'string' ? options.at : clock.nowIso();
+    const runAt = typeof options.runAt === 'string' ? options.runAt : base.runAt;
+    const targetSessionId = typeof options.targetSessionId === 'string' && options.targetSessionId
+      ? options.targetSessionId
+      : base.targetSessionId;
+    if (status === 'pending') return { ...base, targetSessionId, runAt, status };
+    const dispatchingAt = typeof task.dispatchingAt === 'string' ? task.dispatchingAt : at;
+    if (status === 'dispatching') return { ...base, targetSessionId, runAt, status, dispatchingAt };
+    if (status === 'started') return { ...base, targetSessionId, runAt, status, dispatchingAt, startedAt: at };
+    if (status === 'failed') {
+      return {
+        ...base,
+        targetSessionId,
+        runAt,
+        status,
+        dispatchingAt,
+        failedAt: at,
+        failureMessage: typeof options.failureMessage === 'string' && options.failureMessage.trim()
+          ? options.failureMessage.trim()
+          : 'Deterministic scheduled-task dispatch failure.',
+      };
+    }
+    throw new Error(`Unsupported fake scheduled-task status: ${status}`);
+  }
+
+  function setScheduledTaskStatusForTests(requestId, status, options = {}) {
+    const index = scheduledTasks.findIndex((task) => task.requestId === requestId);
+    if (index < 0) throw new Error('That fake scheduled task does not exist.');
+    const current = scheduledTasks[index];
+    let materializedSession = null;
+    let previousTargetSessionId;
+    if (status === 'started' && current.targetSessionId.startsWith('scheduled-task:')) {
+      previousTargetSessionId = current.targetSessionId;
+      const sessionId = `fake-scheduled-session-${++sendCounter}`;
+      materializedSession = {
+        ...sessionBase(sessionId, `${sessionId}-native`, current.title, current.workingDirectory, clock.nowIso()),
+        providerId: current.providerId,
+        modelId: current.modelId ?? FAKE_MODEL_ID,
+        reasoningEffort: current.reasoningEffort ?? 'medium',
+        preview: current.content.slice(0, 180),
+      };
+      sessions.unshift(materializedSession);
+      messagesBySession.set(sessionId, []);
+      options = { ...options, targetSessionId: sessionId };
+    }
+    const task = scheduledTaskWithStatus(current, status, options);
+    scheduledTasks[index] = task;
+    const at = clock.nowIso();
+    const events = [];
+    if (materializedSession) {
+      events.push(nextEvent(task.targetSessionId, `schedule-${requestId}`, 'session.created', { sessionId: task.targetSessionId }, at));
+    }
+    events.push(nextEvent(task.targetSessionId, `schedule-${requestId}`, 'scheduled_task.updated', {
+      change: 'updated',
+      task: clone(task),
+      ...(previousTargetSessionId ? { previousTargetSessionId } : {}),
+    }, at));
+    if (status === 'started') {
+      setSessionState(task.targetSessionId, 'working', at);
+      events.push(nextEvent(task.targetSessionId, `schedule-${requestId}`, 'session.updated', { state: 'working' }, at));
+    }
+    emit(events);
+    return clone(task);
   }
 
   function eventIdentity(event) {
@@ -592,14 +777,10 @@ function createFakeModelHost(options = {}) {
     const settledAt = new Date(Date.parse(playStartedAtIso) + active.lastOffset + 40).toISOString();
     updateExecution(active.runId, plan.endState === 'failed' ? 'failed' : 'completed', settledAt);
     setSessionState(sessionId, plan.endState, settledAt);
-    emit([nextEvent(sessionId, active.runId, 'session.updated', { state: plan.endState }, settledAt)]);
-    // A late, quiet settle makes the idle/failed state land through the app's
-    // own debounce even when the terminal event arrived hot on the stream's heels.
-    clock.schedule(() => {
-      const session = sessionById(sessionId);
-      if (!session || session.state !== plan.endState) return;
-      emit([nextEvent(sessionId, active.runId, 'session.updated', { state: plan.endState }, clock.nowIso())]);
-    }, 2_600);
+    // Emit the provider's terminal state once, directly beside the last chunk.
+    // The renderer must retain this early signal and apply it after its own
+    // quiet boundary; a second fixture event would conceal a dropped-signal bug.
+    emit([nextEvent(sessionId, active.runId, 'session.status_changed', { state: plan.endState, providerStatus: null }, settledAt)]);
   }
 
   function terminalizeDeferredPlan() {
@@ -630,6 +811,7 @@ function createFakeModelHost(options = {}) {
     // real renderer reconciliation path—not fixture mutation—does the work.
     historyReplayBySession.set(sessionId, { remaining: 3 });
     const atIso = clock.nowIso();
+    setSessionState(sessionId, 'completed', atIso);
     emit([nextEvent(sessionId, runId, 'session.updated', { state: 'completed', historyReleased: true }, atIso)]);
     clock.schedule(() => {
       if (!sessionById(sessionId)) return;
@@ -642,6 +824,16 @@ function createFakeModelHost(options = {}) {
       answerId: plan.history.find((message) => message.nativeMetadata?.phase === 'final_answer')?.providerMessageId ?? null,
       canonicalMessageCount: plan.history.length,
     };
+  }
+
+  /** A provider can retract an early terminal report by producing newer work. */
+  function emitDeferredLiveActivityForTests() {
+    const active = deferredTerminal;
+    if (!active) return { emitted: false };
+    const atIso = clock.nowIso();
+    setSessionState(active.sessionId, 'working', atIso);
+    emit([nextEvent(active.sessionId, active.runId, 'session.updated', { state: 'working', resumedAfterTerminal: true }, atIso)]);
+    return { emitted: true, sessionId: active.sessionId, runId: active.runId, occurredAt: atIso };
   }
 
   function audioPlan(sessionId, context, attachments) {
@@ -679,6 +871,7 @@ function createFakeModelHost(options = {}) {
     const session = sessionById(sessionId);
     if (!session) throw new Error('That fake model task does not exist.');
     if (playing) return { alreadyPlaying: true };
+    modelTurnCount += 1;
     const runId = `run-${++runCounter}`;
     const playStartedAtIso = clock.nowIso();
     const context = {
@@ -813,6 +1006,7 @@ function createFakeModelHost(options = {}) {
   function handleRequest(type, payload = {}, requestId) {
     const requestKey = typeof requestId === 'string' && requestId.length > 0 ? requestId : null;
     if (requestKey !== null && requestLedger.has(requestKey)) return clone(requestLedger.get(requestKey));
+    payload = injectGoalGuidance(type, payload);
     requests.push({ type, payload: JSON.parse(JSON.stringify(payload)), requestId: requestId ?? null });
     const injectedFailure = oneShotFailures.get(type);
     if (injectedFailure !== undefined) {
@@ -835,9 +1029,94 @@ function createFakeModelHost(options = {}) {
         return response(type, {
           models: modelsFor(typeof payload.providerId === 'string' ? payload.providerId : FAKE_PROVIDER_ID),
         }, requestId, true);
+      case 'session.goal.get':
+        return response(type, { goal: goalForSession(payload.sessionId) }, requestId, true);
+      case 'session.goal.set': {
+        const result = setGoal(payload.sessionId, payload);
+        return result.ok
+          ? response(type, { goal: result.goal }, requestId, true)
+          : response(type, {}, requestId, false, result.message);
+      }
+      case 'session.goal.clear': {
+        const result = clearGoal(payload.sessionId);
+        return result.ok
+          ? response(type, { cleared: result.cleared, revision: result.revision }, requestId, true)
+          : response(type, {}, requestId, false, result.message);
+      }
       case 'sessions.refresh':
       case 'sessions.list':
         return response(type, { sessions: sessions.map((session) => ({ ...session })) }, requestId, true);
+      case 'scheduled_task.list': {
+        const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : null;
+        const tasks = sessionId === null
+          ? scheduledTasks
+          : scheduledTasks.filter((task) => task.targetSessionId === sessionId);
+        return response(type, { tasks: clone(tasks) }, requestId, true);
+      }
+      case 'scheduled_task.create': {
+        const content = typeof payload.content === 'string' ? payload.content.trim() : '';
+        const providerId = typeof payload.providerId === 'string' && payload.providerId ? payload.providerId : FAKE_PROVIDER_ID;
+        const workingDirectory = typeof payload.workingDirectory === 'string' ? payload.workingDirectory.trim() : '';
+        const runAt = typeof payload.runAt === 'string' ? payload.runAt : '';
+        if (!content || !workingDirectory || !Number.isFinite(Date.parse(runAt))) {
+          return response(type, {}, requestId, false, 'The fake scheduled task needs content, a project folder, and a valid run time.');
+        }
+        const ordinal = ++sendCounter;
+        const scheduledTaskId = typeof requestId === 'string' && requestId.length > 0
+          ? requestId
+          : `fake-scheduled-task-${ordinal}`;
+        const sessionId = `scheduled-task:${scheduledTaskId}`;
+        const createdAt = clock.nowIso();
+        const title = typeof payload.title === 'string' && payload.title.trim()
+          ? payload.title.trim().slice(0, 96)
+          : content.split(/\r?\n/u)[0]?.slice(0, 96) || 'Scheduled fake task';
+        const task = {
+          kind: 'new_task',
+          requestId: scheduledTaskId,
+          targetSessionId: sessionId,
+          providerId,
+          ...(typeof payload.modelId === 'string' && payload.modelId ? { modelId: payload.modelId } : {}),
+          ...(typeof payload.reasoningEffort === 'string' && payload.reasoningEffort ? { reasoningEffort: payload.reasoningEffort } : {}),
+          workingDirectory,
+          title,
+          content,
+          runAt: new Date(Date.parse(runAt)).toISOString(),
+          createdAt,
+          status: 'pending',
+        };
+        scheduledTasks.push(task);
+        emit([nextEvent(sessionId, `schedule-${scheduledTaskId}`, 'scheduled_task.created', { change: 'created', task: clone(task) }, createdAt)]);
+        return response(type, { task }, requestId, true);
+      }
+      case 'scheduled_task.cancel': {
+        const index = scheduledTasks.findIndex((task) => task.requestId === payload.scheduledTaskId);
+        if (index < 0) return response(type, {}, requestId, false, 'That fake scheduled task does not exist.');
+        const task = scheduledTasks[index];
+        if (task.status !== 'pending' && task.status !== 'failed') {
+          return response(type, {}, requestId, false, 'Only a pending or failed fake scheduled task can be cancelled.');
+        }
+        scheduledTasks.splice(index, 1);
+        emit([nextEvent(task.targetSessionId, `schedule-${task.requestId}`, 'scheduled_task.updated', { change: 'cancelled', task: clone(task) }, clock.nowIso())]);
+        return response(type, { task }, requestId, true);
+      }
+      case 'scheduled_task.run_now': {
+        const task = scheduledTaskById(payload.scheduledTaskId);
+        if (!task) return response(type, {}, requestId, false, 'That fake scheduled task does not exist.');
+        if (task.status !== 'pending') return response(type, {}, requestId, false, 'Only a pending fake scheduled task can run now.');
+        const updated = setScheduledTaskStatusForTests(task.requestId, 'dispatching', { runAt: clock.nowIso() });
+        return response(type, { task: updated }, requestId, true);
+      }
+      case 'scheduled_task.retry': {
+        const task = scheduledTaskById(payload.scheduledTaskId);
+        if (!task) return response(type, {}, requestId, false, 'That fake scheduled task does not exist.');
+        if (task.status !== 'failed') return response(type, {}, requestId, false, 'Only a failed fake scheduled task can be retried.');
+        const updated = setScheduledTaskStatusForTests(task.requestId, 'pending', {
+          runAt: typeof payload.runAt === 'string' && Number.isFinite(Date.parse(payload.runAt))
+            ? new Date(Date.parse(payload.runAt)).toISOString()
+            : clock.nowIso(),
+        });
+        return response(type, { task: updated }, requestId, true);
+      }
       case 'session.open': {
         const sessionId = payload.sessionId;
         const limit = typeof payload.limit === 'number' ? payload.limit : 40;
@@ -1096,6 +1375,7 @@ function createFakeModelHost(options = {}) {
           modelId,
           ...(reasoningEffort ? { reasoningEffort } : {}),
           preview: content,
+          state: 'working',
         };
         sessions.unshift(session);
         messagesBySession.set(id, []);
@@ -1114,9 +1394,26 @@ function createFakeModelHost(options = {}) {
         }]);
         latestSequence += 1;
         emit([nextEvent(id, 'create', 'session.created', { sessionId: id }, clock.nowIso())]);
-        startPlay(id, content, attachments, { modelId, reasoningEffort });
-        session.preview = content;
-        return response(type, { session }, requestId, true);
+        const delivery = { id: `fake-queued-delivery-${sendCounter}`, sessionId: id, state: 'pending' };
+        queuedNewTaskDeliveries.set(delivery.id, {
+          delivery,
+          content,
+          attachments,
+          selection: { modelId, reasoningEffort },
+        });
+        return response(type, { session, delivery }, requestId, true);
+      }
+      case 'message_queue.deliver_new_task': {
+        const record = queuedNewTaskDeliveries.get(payload.deliveryId);
+        if (!record) return response(type, {}, requestId, false, 'That queued fake delivery is unavailable.');
+        if (record.delivery.state === 'sent') return response(type, { delivery: record.delivery }, requestId, true);
+        const started = startPlay(record.delivery.sessionId, record.content, record.attachments, record.selection);
+        if (started?.alreadyPlaying) {
+          record.delivery = { ...record.delivery, state: 'failed', error: 'The fake model already has an active turn.' };
+        } else {
+          record.delivery = { id: record.delivery.id, sessionId: record.delivery.sessionId, state: 'sent' };
+        }
+        return response(type, { delivery: record.delivery }, requestId, true);
       }
       case 'session.children':
         return response(type, { sessions: sessions.filter((session) => session.relationship?.kind === 'subagent' && session.relationship.sourceSessionId === payload.sessionId) }, requestId, true);
@@ -1208,6 +1505,7 @@ function createFakeModelHost(options = {}) {
             const models = modelsFor(providerId).filter((model) => model.inputModalities.includes('image'));
             return models.length ? [{ providerId, displayName, models }] : [];
           }),
+          incomplete: false,
         }, requestId, true);
       case 'session.vision.get': {
         const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : '';
@@ -1224,7 +1522,7 @@ function createFakeModelHost(options = {}) {
         return response(type, { vision: { sessionId, primaryModelSupportsImageInput: false, configured: configuredVisionBySession.get(sessionId) ?? null } }, requestId, true);
       }
       case 'session.vision.ask':
-        return response(type, { observation: 'Deterministic fake vision observation.', helperSessionId: null }, requestId, true);
+        return response(type, { observation: 'Deterministic fake vision observation.' }, requestId, true);
       case 'wallet.get':
       case 'wallet.configure':
         return response(type, { wallet: { providerId: FAKE_PROVIDER_ID, kind: 'subscription', label: 'Fake model subscription', detail: 'Test-only deterministic model usage.', currency: 'USD', apiKeyConfigured: false } }, requestId, true);
@@ -1233,6 +1531,38 @@ function createFakeModelHost(options = {}) {
         return response(type, { sources: clone(dictationSources) }, requestId, true);
       case 'delegation.list':
         return response(type, { delegations: delegations.map((item) => ({ ...item })) }, requestId, true);
+      case 'delegation.prepare': {
+        const targets = Array.isArray(payload.targets) ? payload.targets : [];
+        if (targets.length === 0 || targets.length > 4) return response(type, {}, requestId, false, 'A fake mesh needs one to four targets.');
+        const parent = sessionById(payload.parentSessionId);
+        const providerIds = new Set();
+        const validatedTargets = [];
+        for (const target of targets) {
+          const providerId = typeof target?.providerId === 'string' ? target.providerId : '';
+          const route = validRouteSelection(target, 'text');
+          if (!route || providerId === parent?.providerId || providerIds.has(providerId)) {
+            return response(type, {}, requestId, false, 'That fake mesh target is duplicated, belongs to the parent harness, or has an invalid model or reasoning effort.');
+          }
+          providerIds.add(providerId);
+          validatedTargets.push(route);
+        }
+        const task = {
+          id: typeof requestId === 'string' && requestId ? requestId : `fake-prepared-delegation-${delegations.length + 1}`,
+          parentSessionId: payload.parentSessionId,
+          prompt: typeof payload.prompt === 'string' ? payload.prompt : '',
+          state: 'awaiting_dispatch',
+          createdAt: clock.nowIso(),
+          updatedAt: clock.nowIso(),
+          children: [],
+          orchestration: 'parent',
+          targets: validatedTargets,
+          presentationSegments: Array.isArray(payload.presentationSegments) ? clone(payload.presentationSegments) : [],
+          ...(typeof payload.modelId === 'string' && payload.modelId ? { parentModelId: payload.modelId } : {}),
+          ...(typeof payload.reasoningEffort === 'string' && payload.reasoningEffort ? { parentReasoningEffort: payload.reasoningEffort } : {}),
+        };
+        delegations.push(task);
+        return response(type, { delegation: task, delivery: { accepted: true, details: ['The fake parent Mesh turn was accepted.'] } }, requestId, true);
+      }
       case 'delegation.start': {
         const targets = Array.isArray(payload.targets) ? payload.targets : [];
         if (targets.length === 0 || targets.length > 4) return response(type, {}, requestId, false, 'A fake mesh needs one to four targets.');
@@ -1468,6 +1798,7 @@ function createFakeModelHost(options = {}) {
   return {
     bootstrap,
     handleRequest,
+    addProjectGroupingFixtureForTests,
     failNextRequestForTests(type, message = `Injected fake failure for ${type}.`, options = {}) {
       oneShotFailures.set(type, {
         message,
@@ -1478,6 +1809,18 @@ function createFakeModelHost(options = {}) {
       });
     },
     setProviderStatusForTests,
+    setScheduledTaskStatusForTests,
+    emitGoalUpdateForTests(sessionId, goal) {
+      const candidate = goal && typeof goal === 'object' ? clone(goal) : goalForSession(sessionId);
+      if (!candidate) return false;
+      emit([nextEvent(sessionId, 'goal-test', 'session.goal_updated', { goal: candidate }, clock.nowIso())]);
+      return true;
+    },
+    emitGoalClearedForTests(sessionId, revision = goalRevision) {
+      emit([nextEvent(sessionId, 'goal-test', 'session.goal_cleared', { revision }, clock.nowIso())]);
+      return true;
+    },
+    emitDeferredLiveActivityForTests,
     releaseDeferredFinalHistoryForTests,
     dispose() {
       if (playing) {
@@ -1492,6 +1835,7 @@ function createFakeModelHost(options = {}) {
     stateForTests() {
       return {
         sessions: clone(sessions),
+        scheduledTasks: clone(scheduledTasks),
         messagesBySession: new Map([...messagesBySession.entries()].map(([id, messages]) => [id, clone(messages)])),
         queue: clone(queue),
         approvals: clone(approvals),
@@ -1503,6 +1847,10 @@ function createFakeModelHost(options = {}) {
         queueAttachmentIds: new Map([...queueAttachmentIds.entries()].map(([id, attachmentIds]) => [id, clone(attachmentIds)])),
         executionRecords: clone(executionRecords),
         providerStatusOverrides: new Map([...providerStatusOverrides.entries()].map(([id, status]) => [id, clone(status)])),
+        goalsBySession: new Map([...goalsBySession.entries()].map(([id, goal]) => [id, clone(goal)])),
+        goalRevision,
+        modelTurnCount,
+        modelTokenCount,
         latestSequence,
         playing: playing ? { runId: playing.runId, sessionId: playing.sessionId, scenarioId: playing.plan.id, gate: playing.gate ? playing.gate.kind : null } : null,
         deferredTerminal: deferredTerminal ? { runId: deferredTerminal.runId, sessionId: deferredTerminal.sessionId, scenarioId: deferredTerminal.plan.id } : null,
@@ -1512,6 +1860,7 @@ function createFakeModelHost(options = {}) {
     exportStateForTests() {
       return {
         sessions: clone(sessions),
+        scheduledTasks: clone(scheduledTasks),
         messagesBySession: Object.fromEntries([...messagesBySession.entries()].map(([id, messages]) => [id, clone(messages)])),
         queue: clone(queue),
         approvals: clone(approvals),
@@ -1522,6 +1871,10 @@ function createFakeModelHost(options = {}) {
         queueAttachmentIds: Object.fromEntries([...queueAttachmentIds.entries()].map(([id, attachmentIds]) => [id, clone(attachmentIds)])),
         executionRecords: clone(executionRecords),
         providerStatusOverrides: Object.fromEntries([...providerStatusOverrides.entries()].map(([id, status]) => [id, clone(status)])),
+        goalsBySession: Object.fromEntries([...goalsBySession.entries()].map(([id, goal]) => [id, clone(goal)])),
+        goalRevision,
+        modelTurnCount,
+        modelTokenCount,
         latestSequence,
         runCounter,
         sendCounter,

@@ -186,7 +186,7 @@ export function LiveSessionPanel({ session, experimental, notify, onClose }: {
     const record: UtteranceRecord = { id, startedAtWallMs, endedAtWallMs, transcript: "", status: "transcribing", usedEyes: false };
     setUtterances((current) => [...current.slice(-(MAX_UTTERANCES - 1)), record]);
     void processUtterance(record, buffer).catch((failure: unknown) => {
-      updateUtterance(record.id, { status: "error", error: failure instanceof Error ? failure.message : String(failure) });
+      updateUtterance(record.id, { status: "error", error: safeLiveSessionError(failure, "That utterance could not be sent. Try again.") });
     });
   }, [processUtterance, updateUtterance]);
 
@@ -211,7 +211,11 @@ export function LiveSessionPanel({ session, experimental, notify, onClose }: {
       if (status.primaryModelSupportsImageInput === false && status.configured === null) {
         const targetsPayload = await request("vision.targets", {});
         const available = Array.isArray(targetsPayload.targets) ? targetsPayload.targets as unknown as VisionProxyTarget[] : [];
-        if (!available.length) throw new Error("This model cannot see images and no vision model is available. Configure a visual-support model first.");
+        if (!available.length) {
+          throw new Error(targetsPayload.incomplete === true
+            ? "Visual models could not be checked right now. Try again in a moment."
+            : "This model cannot see images and no vision model is available. Configure a visual-support model first.");
+        }
         setTargets(available);
         setProviderId(available[0]?.providerId ?? "");
         setModelId(available[0]?.models.find((model) => model.isDefault)?.id ?? available[0]?.models[0]?.id ?? "");
@@ -282,7 +286,7 @@ export function LiveSessionPanel({ session, experimental, notify, onClose }: {
       setPhase("recording");
       notify("Instant session started. Speak naturally; each utterance is transcribed and sent with synchronized screen and pointer evidence.");
     } catch (failure) {
-      const message = failure instanceof Error ? failure.message : String(failure);
+      const message = safeLiveSessionError(failure, "Instant session could not start. Check the microphone and EYES settings, then try again.");
       setError(message);
       setPhase("idle");
       notify(microphoneErrorMessage(failure), "error");
@@ -299,7 +303,7 @@ export function LiveSessionPanel({ session, experimental, notify, onClose }: {
     try {
       if (!isBrowserPreview) await window.tethoqDesktop.liveSessionAction({ type: "end", reason: "user" });
     } catch (failure) {
-      notify(failure instanceof Error ? failure.message : String(failure), "error");
+      notify(safeLiveSessionError(failure, "EYES could not be configured. Refresh the available models and try again."), "error");
     }
     setPhase("idle");
   }, [notify, stopLocalAudio]);
@@ -365,5 +369,18 @@ function microphoneErrorMessage(error: unknown): string {
     if (error.name === "NotAllowedError" || error.name === "SecurityError") return "Microphone access was denied. Allow the microphone for Tethoq to use instant sessions.";
     if (error.name === "NotFoundError" || error.name === "DevicesNotFoundError") return "No microphone device was found on this computer.";
   }
-  return error instanceof Error ? error.message : String(error);
+  return safeLiveSessionError(error, "Instant session could not access the microphone. Check the microphone settings and try again.");
+}
+
+function safeLiveSessionError(error: unknown, fallback: string): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/^EYES\b/u.test(message)) return message;
+  const normalized = message.toLowerCase();
+  if (/\b(?:401|403|unauthori[sz]ed|forbidden|api[_ -]?key|credential|auth(?:entication|ori[sz]ation)?)\b/u.test(normalized)) {
+    return "EYES could not use the selected model because its API key is missing, invalid, or no longer accepted. Update the key in EYES settings and try again.";
+  }
+  if (/\b(?:429|quota|rate[_ -]?limit|usage[_ -]?limit|resource[_ -]?exhausted|insufficient (?:balance|credit)|billing)\b/u.test(normalized)) {
+    return "EYES could not use the selected model because its usage limit was reached or it is temporarily rate-limited. Check the provider account or choose another EYES model.";
+  }
+  return fallback;
 }

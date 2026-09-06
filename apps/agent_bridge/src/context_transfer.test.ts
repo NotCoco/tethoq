@@ -10,6 +10,7 @@ import {
   handoffSummary,
   maximumHandoffSummaryWords,
   minimumHandoffSummaryWords,
+  maximumBranchBootstrapBytes,
   persistableBranchMessages,
 } from "./context_transfer.js";
 
@@ -88,12 +89,22 @@ test("branch bootstrap carries every normalized message but omits private reason
   assert.deepEqual(visible[0]?.parts, [{ type: "text", text: "Run the focused check." }]);
 });
 
-test("branch bootstrap fails before session creation when the transcript is unsafe to inject as one message", () => {
+test("branch bootstrap compactly snapshots an oversized transcript instead of failing", () => {
   const oversized: RemoteMessage = {
     ...messages[0]!,
-    parts: [{ type: "text", text: "x".repeat(1_000_000) }],
+    parts: [{ type: "text", text: `Keep the existing checkout flow ${"x".repeat(1_300_000)}` }],
   };
-  assert.throws(() => branchBootstrap(session, [oversized]), /generic bootstrap limit/);
+  const result = branchBootstrap(session, [oversized, messages[1]!], "Continue independently.");
+  const size = Buffer.byteLength(result.content, "utf8");
+  assert.ok(size <= maximumBranchBootstrapBytes);
+  assert.equal(result.copiedMessageCount, 2);
+  assert.match(result.content, /TETHOQ_BRANCH_TRANSCRIPT_BOOTSTRAP_V1/);
+  assert.match(result.content, /bounded snapshot/);
+  assert.match(result.content, /Keep the existing checkout flow|retry guard|Continue independently/);
+  assert.doesNotMatch(result.content, /generic bootstrap limit/);
+  assert.doesNotMatch(result.content, /normalized transcript is \d+ bytes/);
+  assert.doesNotMatch(result.content, /private chain of thought/);
+  assert.doesNotMatch(result.content, /AQID/);
 });
 
 test("branch copies redact parameterized and URL-safe data URIs from text fields", () => {

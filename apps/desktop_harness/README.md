@@ -156,6 +156,11 @@ Bridge identity, or GUI internals.
 
 ## Run locally
 
+For a fresh clone, run `npm run setup:desktop` and then `npm start` from the
+repository root. See [Harness setup](../../docs/HARNESS_SETUP.md) for automatic
+discovery, login prerequisites, troubleshooting, and the copyable agent
+prompts in **Settings > Harness connections**.
+
 From this folder:
 
 ```powershell

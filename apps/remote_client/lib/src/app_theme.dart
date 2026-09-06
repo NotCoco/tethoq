@@ -6,6 +6,7 @@ class ProviderVisualTheme {
     required this.displayName,
     required this.version,
     required this.icon,
+    this.markColor,
     required this.accent,
     required this.background,
     required this.surface,
@@ -17,6 +18,7 @@ class ProviderVisualTheme {
   final String displayName;
   final String version;
   final IconData icon;
+  final Color? markColor;
   final Color accent;
   final Color background;
   final Color surface;
@@ -29,6 +31,7 @@ const codexVisualTheme = ProviderVisualTheme(
   displayName: 'Codex',
   version: 'v1.3',
   icon: Icons.blur_circular_rounded,
+  markColor: Color(0xfff0f1ee),
   accent: Color(0xffd7d7d4),
   background: Color(0xff10100f),
   surface: Color(0xff181817),
@@ -41,6 +44,7 @@ const openCodeVisualTheme = ProviderVisualTheme(
   displayName: 'OpenCode',
   version: 'v1.2',
   icon: Icons.grid_view_rounded,
+  markColor: Color(0xff80c7a1),
   accent: Color(0xffb9bcba),
   background: Color(0xff070808),
   surface: Color(0xff101111),
@@ -53,6 +57,7 @@ const grokVisualTheme = ProviderVisualTheme(
   displayName: 'Grok Build',
   version: 'v1.0',
   icon: Icons.bolt_rounded,
+  markColor: Color(0xffd7d8d5),
   accent: Color(0xffffffff),
   background: Color(0xff000000),
   surface: Color(0xff040404),
@@ -67,6 +72,7 @@ const piVisualTheme = ProviderVisualTheme(
   displayName: 'Pi',
   version: 'Local CLI',
   icon: Icons.architecture_rounded,
+  markColor: Color(0xff84cdb2),
   accent: Color(0xffd9e7df),
   background: Color(0xff0c100e),
   surface: Color(0xff151b18),
@@ -79,6 +85,7 @@ const ompVisualTheme = ProviderVisualTheme(
   displayName: 'Oh My Pi',
   version: 'Local CLI',
   icon: Icons.route_rounded,
+  markColor: Color(0xffd9aa70),
   accent: Color(0xffe4ded4),
   background: Color(0xff100d0b),
   surface: Color(0xff1b1714),
@@ -91,6 +98,7 @@ const qwenVisualTheme = ProviderVisualTheme(
   displayName: 'Qwen Code',
   version: 'Local CLI',
   icon: Icons.auto_awesome_mosaic_rounded,
+  markColor: Color(0xff91a9e9),
   accent: Color(0xffdde1ec),
   background: Color(0xff0b0d12),
   surface: Color(0xff151820),
@@ -103,6 +111,7 @@ const gooseVisualTheme = ProviderVisualTheme(
   displayName: 'Goose',
   version: 'Local CLI',
   icon: Icons.flight_rounded,
+  markColor: Color(0xffa7c582),
   accent: Color(0xffe1e5da),
   background: Color(0xff0d100b),
   surface: Color(0xff171b15),
@@ -115,6 +124,7 @@ const kimiVisualTheme = ProviderVisualTheme(
   displayName: 'Kimi Code',
   version: 'Local CLI',
   icon: Icons.nightlight_round,
+  markColor: Color(0xffb39be2),
   accent: Color(0xffe4e0ed),
   background: Color(0xff0e0c12),
   surface: Color(0xff18151e),
@@ -127,6 +137,7 @@ const hermesVisualTheme = ProviderVisualTheme(
   displayName: 'Hermes Agent',
   version: 'Local CLI',
   icon: Icons.swap_calls_rounded,
+  markColor: Color(0xffe0a673),
   accent: Color(0xffe6dfd5),
   background: Color(0xff100d0b),
   surface: Color(0xff1b1714),
@@ -139,6 +150,7 @@ const clineVisualTheme = ProviderVisualTheme(
   displayName: 'Cline',
   version: 'Local CLI',
   icon: Icons.polyline_rounded,
+  markColor: Color(0xff70bbcc),
   accent: Color(0xffdce7e9),
   background: Color(0xff0b1012),
   surface: Color(0xff151d20),
@@ -151,6 +163,7 @@ const copilotVisualTheme = ProviderVisualTheme(
   displayName: 'GitHub Copilot CLI',
   version: 'Local CLI',
   icon: Icons.hub_rounded,
+  markColor: Color(0xffba92d5),
   accent: Color(0xffe4e1eb),
   background: Color(0xff0e0c11),
   surface: Color(0xff1b1821),
@@ -163,6 +176,7 @@ const directApiVisualTheme = ProviderVisualTheme(
   displayName: 'Direct API',
   version: 'User API wallet',
   icon: Icons.cloud_outlined,
+  markColor: Color(0xff69aaf9),
   accent: Color(0xff5aa9ff),
   background: Color(0xff09111c),
   surface: Color(0xff111e2d),
@@ -237,14 +251,104 @@ class ProviderLogo extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final visual = providerVisualThemeFor(providerId);
-    return Icon(
-      visual.icon,
-      key: ValueKey<String>('provider-logo-$providerId'),
-      color: visual.accent,
-      size: size,
-      semanticLabel: semanticLabel ?? '${visual.displayName} provider',
+    final harnessId = _canonicalHarnessId(providerId);
+    final markColor = visual.markColor ?? visual.accent;
+    final monogram = _tethoqHarnessMonograms[harnessId] ??
+        (harnessId == 'all' ? null : _providerInitials(visual.displayName));
+    return Semantics(
+      label: semanticLabel ?? '${visual.displayName} provider',
+      image: true,
+      excludeSemantics: true,
+      child: SizedBox.square(
+        key: ValueKey<String>('provider-logo-$providerId'),
+        dimension: size,
+        child: monogram != null
+            ? _HarnessMonogram(
+                monogram: monogram,
+                color: markColor,
+                size: size,
+              )
+            : Icon(visual.icon, color: markColor, size: size),
+      ),
     );
   }
+}
+
+// Recognition comes from the truthful harness name, a restrained colour cue,
+// and this one Tethoq-owned typographic family—not copied provider geometry.
+const _tethoqHarnessMonograms = <String, String>{
+  'codex': 'CX',
+  'opencode': 'OC',
+  'grok': 'G',
+  'pi': 'π',
+  'omp': 'OMP',
+  'qwen': 'Q',
+  'goose': 'g',
+  'kimi': 'K',
+  'hermes': 'H',
+  'cline': 'CL',
+  'copilot': 'CP',
+  'direct': 'API',
+};
+
+String _canonicalHarnessId(String providerId) {
+  final normalized = providerId.trim().toLowerCase();
+  return switch (normalized) {
+    'oh-my-pi' => 'omp',
+    'qwen-code' => 'qwen',
+    'kimi-code' => 'kimi',
+    'hermes-agent' => 'hermes',
+    'github-copilot' || 'github-copilot-cli' => 'copilot',
+    _ => normalized,
+  };
+}
+
+String _providerInitials(String name) {
+  final words = name
+      .trim()
+      .split(RegExp(r'[^A-Za-z0-9]+'))
+      .where((word) => word.isNotEmpty)
+      .toList(growable: false);
+  if (words.length > 1) {
+    return '${words.first[0]}${words.last[0]}'.toUpperCase();
+  }
+  final word = words.isEmpty ? '?' : words.first;
+  return (word.length <= 3 ? word : word[0]).toUpperCase();
+}
+
+class _HarnessMonogram extends StatelessWidget {
+  const _HarnessMonogram({
+    required this.monogram,
+    required this.color,
+    required this.size,
+  });
+
+  final String monogram;
+  final Color color;
+  final double size;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+        padding: EdgeInsets.symmetric(horizontal: size * .04),
+        child: FittedBox(
+          fit: BoxFit.scaleDown,
+          child: Text(
+            monogram,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: color,
+              fontSize: size * .56,
+              fontWeight: FontWeight.w700,
+              height: 1,
+              letterSpacing: monogram.length == 3
+                  ? -.6
+                  : monogram.length == 1
+                      ? 0
+                      : -.25,
+            ),
+          ),
+        ),
+      );
 }
 
 ThemeData buildRemoteTheme(ProviderVisualTheme visual) {

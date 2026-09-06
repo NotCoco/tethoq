@@ -140,7 +140,10 @@ A provider adapter should:
 12. Implement `compactSession` only for a documented native operation or the
     Direct API adapter's explicit local transcript-summary operation. The
     bridge enables automatic thresholds only when compaction and a model
-    context-window limit are both available.
+    context-window limit are both available. Resolve only when the compacted
+    context is ready for another turn; request acceptance is insufficient.
+    Reject on failure, cancellation, or unconfirmed completion, and keep
+    provider event processing available while waiting for the native lifecycle.
 
 Do not implement an adapter from an inferred endpoint name. Research and record the official source first.
 

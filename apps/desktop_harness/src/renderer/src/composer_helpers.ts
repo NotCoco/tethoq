@@ -1,4 +1,8 @@
 import { matchReasoningEffort } from "../../../../../packages/protocol/src/reasoning";
+import AttachmentEncodingWorker from "./attachment_encoding.worker.ts?worker&inline";
+import type { SessionState } from "./types";
+
+export { encodeAttachmentBytesToBase64 } from "./attachment_base64";
 
 export interface UploadableAttachment {
   readonly name: string;
@@ -56,6 +60,11 @@ export const composerSlashCommands: readonly ComposerSlashCommand[] = [
     description: "Send this turn to other coding tools together",
   },
   {
+    id: "goal",
+    command: "/goal",
+    description: "Set or manage this task's goal",
+  },
+  {
     id: "ears",
     command: "/ears",
     description: "Configure dictation preprocessing",
@@ -65,20 +74,57 @@ export const composerSlashCommands: readonly ComposerSlashCommand[] = [
     command: "/eyes",
     description: "Choose the model that reads images",
   },
+  {
+    id: "schedule",
+    command: "/schedule",
+    description: "Run a new task at a later time",
+  },
 ];
 
 export function slashCommandSuggestions(
   value: string,
   commands: readonly ComposerSlashCommand[] = composerSlashCommands,
 ): readonly ComposerSlashCommand[] | null {
-  const match = /^\/([a-z0-9_-]*)$/iu.exec(value);
+  // A slash query belongs to the draft token at the caret/end, not only to an
+  // otherwise empty draft. Requiring whitespace (or the start) before the slash
+  // keeps URL paths and embedded text such as `tool/mesh` out of the palette.
+  const match = /(?:^|\s)\/([a-z0-9_-]*)$/iu.exec(value);
   if (!match) return null;
   const query = match[1]?.toLowerCase() ?? "";
   return commands.filter((item) => item.command.slice(1).toLowerCase().startsWith(query));
 }
 
-export function insertedSlashCommand(command: ComposerSlashCommand): string {
-  return `${command.command} `;
+function escapedRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+function slashCommandTokenMatch(value: string, command: string): RegExpExecArray | null {
+  return new RegExp(`(^|[\\s\\uE000-\\uF8FF])${escapedRegExp(command)}(?=$|\\s)`, "iu").exec(value);
+}
+
+export function hasSlashCommandToken(value: string, command: string): boolean {
+  return slashCommandTokenMatch(value, command) !== null;
+}
+
+export function removeSlashCommandToken(value: string, command: string): string {
+  const match = slashCommandTokenMatch(value, command);
+  if (!match) return value;
+  const tokenStart = match.index + (match[1]?.length ?? 0);
+  const tokenEnd = tokenStart + command.length;
+  let before = value.slice(0, tokenStart);
+  let after = value.slice(tokenEnd);
+  if (!before.trim()) after = after.replace(/^\s/u, "");
+  else if (!after.trim()) before = before.replace(/\s$/u, "");
+  else if (/\s$/u.test(before) && /^\s/u.test(after)) after = after.replace(/^\s/u, "");
+  return `${before}${after}`;
+}
+
+export function insertedSlashCommand(command: ComposerSlashCommand, value = "", caret = value.length): string {
+  const prefix = value.slice(0, caret);
+  const match = /(^|[\s\uE000-\uF8FF])\/[a-z0-9_-]*$/iu.exec(prefix);
+  if (!match) return `${command.command} `;
+  const queryStart = match.index + (match[1]?.length ?? 0);
+  return `${value.slice(0, queryStart)}${command.command} ${value.slice(caret)}`;
 }
 
 export function appendAttachmentsWithinLimits<T extends { readonly path: string; readonly byteLength: number }>(
@@ -113,7 +159,9 @@ export function resolveComposerModelId(
   models: readonly { readonly id: string; readonly name: string }[],
   sessionModel: string,
 ): string {
-  return models.find((model) => model.id === sessionModel || model.name === sessionModel)?.id ?? "default";
+  const resolved = models.find((model) => model.id === sessionModel || model.name === sessionModel)?.id;
+  if (resolved) return resolved;
+  return isAmbiguousSelectionValue(sessionModel) ? "default" : sessionModel.trim();
 }
 
 export interface ModelCatalogRouteInput {
@@ -171,23 +219,125 @@ export function isAmbiguousSelectionValue(value: string | null | undefined): boo
   return ambiguousSelectionValues.has(value?.trim().toLowerCase() ?? "");
 }
 
+type SessionPresentationItem = {
+  readonly id?: string;
+  readonly presentationId?: string;
+  readonly messageId?: string;
+  readonly providerPartId?: string;
+  readonly turnId?: string;
+  readonly kind?: string;
+  readonly state?: string;
+  readonly phase?: string;
+  readonly notice?: string;
+  readonly title?: string;
+  readonly body?: string;
+};
+
+const turnContinuationKinds = new Set(["reasoning", "tool", "command", "file", "subagent"]);
+const compactionBoundaryText = /(?:\b(?:context|conversation|session)\s+(?:was\s+|has\s+been\s+|automatically\s+)?compacted\b|\b(?:automatic\s+|context\s+|session\s+)?compaction\s+(?:complete|completed)\b)/iu;
+
+function isTurnContinuationAfterFinal(item: SessionPresentationItem): boolean {
+  if (item.state === "running") return true;
+  if (turnContinuationKinds.has(item.kind ?? "")) return true;
+  if (item.kind !== "assistant") return false;
+  if (compactionBoundaryText.test(`${item.title ?? ""} ${item.body ?? ""}`.trim())) return true;
+  return item.phase !== "final_answer";
+}
+
+/** The visible ending which existed immediately before a newer live turn event. */
+export interface SessionWorkingBoundary {
+  readonly visibleEndingIdentity: string | null;
+}
+
+function timelineItemIdentity(item: SessionPresentationItem): string | null {
+  const identity = item.providerPartId ?? item.messageId ?? item.turnId ?? item.presentationId ?? item.id;
+  return identity?.trim() ? identity : null;
+}
+
+/** Stable identity of the newest final reply, interruption, or failure on screen. */
+export function latestVisibleEndingIdentity(timeline: readonly SessionPresentationItem[]): string | null {
+  let ending: string | null = null;
+  for (const item of timeline) {
+    const endingKind = item.kind === "error"
+      ? "error"
+      : item.kind === "assistant" && item.phase === "final_answer" && item.state !== "running" ? "final" : null;
+    if (endingKind === null) continue;
+    const identity = timelineItemIdentity(item);
+    if (identity !== null) ending = `${endingKind}:${identity}`;
+  }
+  return ending;
+}
+
+export function captureSessionWorkingBoundary(timeline: readonly SessionPresentationItem[]): SessionWorkingBoundary {
+  return { visibleEndingIdentity: latestVisibleEndingIdentity(timeline) };
+}
+
+/** The newer turn has not yet painted its own final reply, interruption, or failure. */
+export function sessionBoundaryNeedsVisibleEnding(
+  timeline: readonly SessionPresentationItem[],
+  workingBoundary: SessionWorkingBoundary | undefined,
+): boolean {
+  return workingBoundary !== undefined
+    && workingBoundary.visibleEndingIdentity === latestVisibleEndingIdentity(timeline);
+}
+
+/** Reconcile a boundary against a canonical history page without inventing a second turn. */
+export function canonicalSessionWorkingBoundary(
+  session: { readonly state: string },
+  timeline: readonly SessionPresentationItem[],
+  current: SessionWorkingBoundary | undefined,
+): SessionWorkingBoundary | undefined {
+  if (current !== undefined) {
+    return sessionBoundaryNeedsVisibleEnding(timeline, current) ? current : undefined;
+  }
+  return session.state === "working" ? captureSessionWorkingBoundary(timeline) : undefined;
+}
+
+function hasFreshProviderWorkingState(
+  session: { readonly state: string },
+  timeline: readonly SessionPresentationItem[],
+  workingBoundary: SessionWorkingBoundary | undefined,
+): boolean {
+  return session.state === "working"
+    && sessionBoundaryNeedsVisibleEnding(timeline, workingBoundary);
+}
+
+/** EYES owns its lifecycle while the parent provider is waiting for its result. */
+function hasRunningEyesInspection(session: { readonly state: string }, timeline: readonly SessionPresentationItem[]): boolean {
+  if (session.state !== "working" && session.state !== "idle") return false;
+  for (let index = timeline.length - 1; index >= 0; index -= 1) {
+    const item = timeline[index]!;
+    if (item.kind === "user" || item.kind === "error" || item.state === "failed" || item.notice === "eyes_failure"
+      || item.kind === "assistant" && item.phase === "final_answer"
+      || (item.kind === "assistant" || item.title === "System") && compactionBoundaryText.test(`${item.title ?? ""} ${item.body ?? ""}`)) return false;
+    if (item.kind === "tool" && item.notice === "eyes_inspection" && item.state === "running") return true;
+  }
+  return false;
+}
+
 /** Hold follow-up instructions in the queue while a turn is still live. */
 export function sessionHoldsFollowUpQueue(
   session: { readonly state: string },
-  timeline: readonly { readonly kind?: string; readonly state?: string; readonly phase?: string }[] = [],
+  timeline: readonly SessionPresentationItem[] = [],
+  workingBoundary?: SessionWorkingBoundary,
 ): boolean {
-  // A completed final answer is terminal evidence for the current turn. Some
-  // providers leave the session or an earlier reasoning row marked working for
-  // a short time after that answer lands; neither stale note can make Stop a
-  // truthful action or hold the next instruction in a queue.
-  let latestUser = -1;
-  for (let index = timeline.length - 1; index >= 0; index -= 1) {
-    if (timeline[index]?.kind === "user") { latestUser = index; break; }
-  }
-  const finalAnswerCompleted = timeline.slice(latestUser + 1).some((item) =>
-    item.kind === "assistant" && item.phase === "final_answer" && item.state !== "running");
-  if (finalAnswerCompleted) return false;
-  if (session.state === "working" || session.state === "needs_approval" || session.state === "needs_input") return true;
+  // Approval and input are explicit provider-owned blockers, not a generic
+  // working scalar. They can be the first evidence of a new turn after a
+  // restart, before its user echo or running row reaches history, so the prior
+  // turn's final answer must never hide them.
+  if (session.state === "needs_approval" || session.state === "needs_input") return true;
+  if (hasRunningEyesInspection(session, timeline)) return true;
+  // A working event is newer than the ending that was visible when it arrived.
+  // Paint that next turn immediately instead of waiting for its first transcript
+  // row; a newly visible final/error changes the identity and closes the override.
+  if (hasFreshProviderWorkingState(session, timeline, workingBoundary)) return true;
+  // A completed final answer is terminal evidence for the current turn only
+  // when no newer row shows that work continued. Some providers leave the
+  // session or an earlier reasoning row marked working for a short time after
+  // the answer lands; neither stale note can make Stop a truthful action or
+  // hold the next instruction in a queue.
+  if (latestTurnHasCompletedFinal(timeline)) return false;
+  if (session.state === "working") return true;
   if (session.state === "idle" || session.state === "completed" || session.state === "failed" || session.state === "offline" || session.state === "disconnected") return false;
   return timeline.some((item) => item.state === "running" && item.kind !== "user");
 }
@@ -199,8 +349,22 @@ export function sessionHoldsFollowUpQueue(
  */
 export function sessionNeedsTranscriptCatchUp(
   session: { readonly state: string },
-  timeline: readonly { readonly kind?: string; readonly state?: string; readonly phase?: string }[] = [],
+  timeline: readonly SessionPresentationItem[] = [],
+  workingBoundary?: SessionWorkingBoundary,
 ): boolean {
+  // A newly restored attention request may precede every transcript row for
+  // its turn. Keep following history even when the currently painted ending is
+  // the previous turn's final answer.
+  if (session.state === "needs_approval" || session.state === "needs_input") return true;
+  if (hasRunningEyesInspection(session, timeline)) return true;
+  // A newer provider-owned turn may start before its user echo or first output
+  // reaches persisted history. The previous turn's final must not stop the
+  // selected transcript from following that new work. Keep this boundary after
+  // task-complete as well: transport completion retires Stop/queue immediately,
+  // but only the newer visible final/interruption/error completes transcript
+  // delivery. Offline/disconnected cannot heal history, so they remain terminal.
+  if (sessionBoundaryNeedsVisibleEnding(timeline, workingBoundary)
+    && session.state !== "offline" && session.state !== "disconnected") return true;
   let latestUser = -1;
   for (let index = timeline.length - 1; index >= 0; index -= 1) {
     if (timeline[index]?.kind === "user") { latestUser = index; break; }
@@ -212,24 +376,105 @@ export function sessionNeedsTranscriptCatchUp(
 
   const unfinished = latestTurn.some((item) => item.kind !== "user" && item.state === "running");
   if (unfinished) return true;
-  return session.state === "working" || session.state === "needs_approval" || session.state === "needs_input";
+  if (session.state === "working") return true;
+  // A terminal state and transcript completeness are separate facts. If the
+  // newest persisted user turn has no final/error terminal item yet, keep the
+  // selected history healing quietly until the provider supplies one.
+  return latestUser >= 0 && (session.state === "idle" || session.state === "completed");
 }
 
-/** Only an explicitly completed final answer closes a persisted turn. */
+/**
+ * Live presentation is the task-control fact, not the transcript-recovery fact.
+ * A provider may finish before its final answer reaches persisted history. That
+ * missing answer must keep healing, but an old Reasoning row must not keep a
+ * spinner/shimmer and make the completed task look stuck while it catches up.
+ */
+export function sessionPresentsLiveTurn(
+  session: { readonly state: string },
+  timeline: readonly SessionPresentationItem[] = [],
+  workingBoundary?: SessionWorkingBoundary,
+): boolean {
+  return sessionHoldsFollowUpQueue(session, timeline, workingBoundary);
+}
+
+/** A terminal task flag without a visible ending must force canonical history. */
+export function terminalSessionNeedsCanonicalHistory(
+  session: { readonly state: string },
+  timeline: readonly SessionPresentationItem[] = [],
+  workingBoundary?: SessionWorkingBoundary,
+): boolean {
+  return (session.state === "idle" || session.state === "completed")
+    && sessionNeedsTranscriptCatchUp(session, timeline, workingBoundary);
+}
+
+/** Only the latest explicitly completed final, with no newer continuation, closes a persisted turn. */
 export function latestTurnHasCompletedFinal(
-  timeline: readonly { readonly kind?: string; readonly state?: string; readonly phase?: string }[],
+  timeline: readonly SessionPresentationItem[],
 ): boolean {
   let latestUser = -1;
   for (let index = timeline.length - 1; index >= 0; index -= 1) {
     if (timeline[index]?.kind === "user") { latestUser = index; break; }
   }
-  return timeline.slice(latestUser + 1).some((item) => item.kind === "assistant"
-    && item.phase === "final_answer"
-    && item.state !== "running");
+  let completedFinal = -1;
+  let continuation = -1;
+  for (let index = latestUser + 1; index < timeline.length; index += 1) {
+    const item = timeline[index];
+    if (item?.kind === "assistant" && item.phase === "final_answer" && item.state !== "running"
+      && !compactionBoundaryText.test(`${item.title ?? ""} ${item.body ?? ""}`.trim())) completedFinal = index;
+    else if (item && isTurnContinuationAfterFinal(item)) continuation = index;
+  }
+  return completedFinal > continuation;
 }
 
-/** Keep terminal-history recovery quick but finite. */
-export const terminalTranscriptCatchUpMaxAttempts = 12;
+/**
+ * The provider's task state describes transport availability; the status the
+ * reader sees describes the latest visible turn. An idle listing may follow a
+ * successful OpenCode turn, while a task-complete event may arrive before its
+ * final answer is present in history, so neither scalar can stand in for the
+ * painted outcome.
+ */
+export function presentedSessionState(
+  session: { readonly state: SessionState },
+  timeline: readonly SessionPresentationItem[],
+  workingBoundary?: SessionWorkingBoundary,
+): SessionState {
+  // Unlike an unqualified `working` scalar, an unresolved approval/input state
+  // is concrete provider evidence. It must remain visible even when history
+  // still ends at the previous turn's final answer after startup/reconnect.
+  if (session.state === "needs_approval" || session.state === "needs_input") return session.state;
+  const boundaryNeedsVisibleEnding = sessionBoundaryNeedsVisibleEnding(timeline, workingBoundary);
+  let latestUser = -1;
+  for (let index = timeline.length - 1; index >= 0; index -= 1) {
+    if (timeline[index]?.kind === "user") { latestUser = index; break; }
+  }
+
+  let finalIndex = -1;
+  let errorIndex = -1;
+  let continuationIndex = -1;
+  for (let index = latestUser + 1; index < timeline.length; index += 1) {
+    const item = timeline[index];
+    if (item?.kind === "assistant" && item.phase === "final_answer" && item.state !== "running"
+      && !compactionBoundaryText.test(`${item.title ?? ""} ${item.body ?? ""}`.trim())) finalIndex = index;
+    if (item?.kind === "error") errorIndex = index;
+    if (item && isTurnContinuationAfterFinal(item)) continuationIndex = index;
+  }
+
+  // A provider can begin the next turn before its user echo reaches history.
+  // A newer running row is stronger evidence than the previous turn's final;
+  // an old standalone `working` scalar remains too weak to revive that final.
+  if (hasFreshProviderWorkingState(session, timeline, workingBoundary)
+    || session.state === "working" && continuationIndex > Math.max(finalIndex, errorIndex)) return "working";
+  // While a newer turn is still waiting for its visible ending, the ending at
+  // the boundary belongs to the preceding turn. A task-complete transport flag
+  // therefore retires live controls but must not label that old final as the
+  // outcome of the newer turn.
+  if (!boundaryNeedsVisibleEnding && finalIndex > errorIndex) return "completed";
+  if (!boundaryNeedsVisibleEnding && errorIndex >= 0) return session.state === "failed" ? "failed" : "idle";
+  // `completed` without a visible final is only task-complete transport
+  // evidence. Transcript catch-up keeps running, but the UI must not claim the
+  // reply is complete until the reader can actually see it.
+  return session.state === "completed" ? "idle" : session.state;
+}
 
 export type ComposerMessageRequestType = "session.send_message" | "session.steer_message" | "message_queue.enqueue";
 
@@ -239,10 +484,12 @@ export function composerMessageRequestType(input: {
   readonly blockedByAttention: boolean;
   readonly queueingEnabled: boolean;
   readonly externalWriter: boolean;
-  readonly externalWriterAttachmentsSupported?: boolean;
 }): ComposerMessageRequestType {
-  if (input.externalWriter && input.hasAttachments && input.externalWriterAttachmentsSupported === true) return "session.send_message";
-  if (input.externalWriter) return "message_queue.enqueue";
+  // External ownership matters only while another Codex client is actively
+  // writing the turn. Once the task is idle, Tethoq's App Server can resume it
+  // directly; forcing every idle follow-up through the Desktop queue made Send
+  // silently depend on that task being open in Codex Desktop.
+  if (input.externalWriter && input.blockedByAttention) return "message_queue.enqueue";
   if (input.liveGuidance) return "session.steer_message";
   if (input.blockedByAttention && input.queueingEnabled) return "message_queue.enqueue";
   return "session.send_message";
@@ -334,6 +581,37 @@ export function resolveConcreteModelSelection(
   return { modelId: model.id, ...(reasoningEffort ? { reasoningEffort } : {}) };
 }
 
+/**
+ * Resolve what the provider says an existing task is actually running.
+ *
+ * A concrete reported id remains authoritative even before its catalogue row
+ * arrives. Falling through to the user's default in that gap paints a perfectly
+ * valid but entirely different model. Provider-reported effort receives the
+ * same treatment; a later catalogue may normalize its spelling, never replace
+ * it merely because the initial list was partial.
+ */
+export function resolveReportedSessionSelection(
+  models: readonly { readonly id: string; readonly name: string; readonly isDefault?: boolean; readonly efforts: readonly string[]; readonly defaultEffort?: string }[],
+  current: { readonly modelId?: string; readonly reasoningEffort?: string },
+  preferred?: { readonly modelId: string; readonly reasoningEffort?: string },
+): ConcreteModelSelection | null {
+  const reportedModelId = current.modelId?.trim();
+  if (isAmbiguousSelectionValue(reportedModelId)) {
+    return resolveConcreteModelSelection(models, current, preferred);
+  }
+  const reportedModel = models.find((model) => model.id === reportedModelId || model.name === reportedModelId);
+  const modelId = reportedModel?.id ?? reportedModelId!;
+  const reportedEffort = isAmbiguousSelectionValue(current.reasoningEffort) ? undefined : current.reasoningEffort!.trim();
+  if (reportedEffort !== undefined) {
+    const normalizedEffort = reportedModel === undefined
+      ? undefined
+      : matchReasoningEffort(reportedEffort, reportedModel.efforts.filter((effort) => !isAmbiguousSelectionValue(effort)));
+    return { modelId, reasoningEffort: normalizedEffort ?? reportedEffort };
+  }
+  if (reportedModel === undefined) return { modelId };
+  return resolveConcreteModelSelection(models, { modelId }) ?? { modelId };
+}
+
 export async function uploadAttachments(
   items: readonly UploadableAttachment[],
   request: UploadRequest,
@@ -352,12 +630,20 @@ export async function uploadAttachments(
     const chunkBytes = typeof started.chunkBytes === "number"
       ? Math.min(192 * 1024, Math.max(32 * 1024, started.chunkBytes))
       : 192 * 1024;
-    const binary = atob(item.dataBase64);
-    for (let offset = 0; offset < binary.length; offset += chunkBytes) {
-      const end = Math.min(binary.length, offset + chunkBytes);
-      let chunk = "";
-      for (let index = offset; index < end; index += 1) chunk += binary[index] ?? "";
-      await request("attachment.upload.chunk", { uploadId, offset, dataBase64: btoa(chunk) });
+    // The attachment is already base64. Decoding the whole file and rebuilding
+    // every chunk briefly multiplied a large paste in renderer memory and froze
+    // the composer again when Send was pressed. Align byte boundaries to three
+    // and slice the existing encoding directly instead.
+    const alignedChunkBytes = Math.max(3, chunkBytes - (chunkBytes % 3));
+    for (let offset = 0; offset < item.byteLength; offset += alignedChunkBytes) {
+      const byteLength = Math.min(alignedChunkBytes, item.byteLength - offset);
+      const base64Offset = (offset / 3) * 4;
+      const base64Length = Math.ceil(byteLength / 3) * 4;
+      await request("attachment.upload.chunk", {
+        uploadId,
+        offset,
+        dataBase64: item.dataBase64.slice(base64Offset, base64Offset + base64Length),
+      });
     }
     const completed = await request("attachment.upload.complete", { uploadId });
     const attachmentId = typeof completed.attachmentId === "string" ? completed.attachmentId : "";
@@ -459,6 +745,23 @@ export function shouldApplySessionState(state: string, streamQuiet: boolean): bo
   return streamQuiet || (state !== "idle" && state !== "completed" && state !== "unknown");
 }
 
+export type TerminalStateEventAction = "apply" | "ignore";
+
+/**
+ * A terminal report that is immediately followed by newer live work is stale.
+ * Otherwise it retires task controls immediately. Transcript catch-up is a
+ * separate decision and may keep reading until the final/error is visible.
+ */
+export function terminalStateEventAction(
+  _state: "idle" | "completed",
+  _streamQuiet: boolean,
+  hasLaterLiveEvent: boolean,
+  authoritative = false,
+): TerminalStateEventAction {
+  if (!authoritative && hasLaterLiveEvent) return "ignore";
+  return "apply";
+}
+
 /**
  * Quietness is per session: a burst of live events on one task must not keep
  * the catch-up away from the task the user is actually watching. A session
@@ -524,23 +827,87 @@ export function appendTranscript(content: string, transcript: string): string {
   return `${content}${/\s$/.test(content) ? "" : " "}${clean}`;
 }
 
-export function growTextarea(textarea: HTMLTextAreaElement, maxHeight = 184): void {
+export function growTextarea(textarea: HTMLTextAreaElement | HTMLDivElement, maxHeight = 184): void {
   textarea.style.height = "auto";
   textarea.style.height = `${Math.min(textarea.scrollHeight, maxHeight)}px`;
   textarea.style.overflowY = textarea.scrollHeight > maxHeight ? "auto" : "hidden";
 }
 
-export async function blobToUploadable(blob: Blob, name = "tethoq-dictation.webm"): Promise<UploadableAttachment> {
-  const bytes = new Uint8Array(await blob.arrayBuffer());
-  let binary = "";
-  const step = 32 * 1024;
-  for (let offset = 0; offset < bytes.length; offset += step) {
-    binary += String.fromCharCode(...bytes.subarray(offset, Math.min(bytes.length, offset + step)));
+interface AttachmentEncodingResult {
+  readonly id: number;
+  readonly dataBase64?: string;
+  readonly error?: string;
+}
+
+let attachmentEncodingWorker: Worker | null = null;
+let attachmentEncodingJobId = 0;
+const attachmentEncodingJobs = new Map<number, {
+  readonly resolve: (value: string) => void;
+  readonly reject: (reason: Error) => void;
+}>();
+
+function failAttachmentEncodingWorker(error: Error): void {
+  const jobs = [...attachmentEncodingJobs.values()];
+  attachmentEncodingJobs.clear();
+  attachmentEncodingWorker?.terminate();
+  attachmentEncodingWorker = null;
+  for (const job of jobs) job.reject(error);
+}
+
+function encodingWorker(): Worker {
+  if (attachmentEncodingWorker !== null) return attachmentEncodingWorker;
+  const worker = new AttachmentEncodingWorker({ name: "tethoq-attachment-encoding" });
+  worker.addEventListener("message", (event: MessageEvent<AttachmentEncodingResult>) => {
+    const job = attachmentEncodingJobs.get(event.data.id);
+    if (job === undefined) return;
+    attachmentEncodingJobs.delete(event.data.id);
+    if (typeof event.data.dataBase64 === "string") job.resolve(event.data.dataBase64);
+    else job.reject(new Error(event.data.error || "Attachment encoding failed"));
+  });
+  worker.addEventListener("error", () => failAttachmentEncodingWorker(new Error("Attachment encoding worker failed")));
+  attachmentEncodingWorker = worker;
+  return worker;
+}
+
+/**
+ * Pay the worker-start cost after the Composer's first paint, rather than in
+ * the same interaction that accepts a pasted image. The renderer owns this
+ * worker for its lifetime; repeatedly stopping and rebuilding it made the
+ * first paste after every short idle period hitch again.
+ */
+export function prewarmAttachmentEncodingWorker(): void {
+  if (typeof Worker === "undefined") return;
+  try {
+    encodingWorker();
+  } catch {
+    // A real preparation will retry and report the concrete worker failure on
+    // the attachment. Prewarming itself should never disrupt the composer.
   }
+}
+
+function encodeBlobInWorker(blob: Blob): Promise<string> {
+  if (typeof Worker === "undefined") return Promise.reject(new Error("Attachment encoding worker is unavailable"));
+  const id = ++attachmentEncodingJobId;
+  return new Promise<string>((resolve, reject) => {
+    attachmentEncodingJobs.set(id, { resolve, reject });
+    try {
+      encodingWorker().postMessage({ id, blob });
+    } catch (error) {
+      attachmentEncodingJobs.delete(id);
+      reject(error instanceof Error ? error : new Error(String(error)));
+    }
+  });
+}
+
+export async function blobToUploadable(blob: Blob, name = "tethoq-dictation.webm"): Promise<UploadableAttachment> {
+  // Electron always supplies Worker. If the worker cannot start, fail this
+  // attachment instead of silently moving a multi-megabyte encode onto the UI
+  // thread and making the message field unusable again.
+  const dataBase64 = await encodeBlobInWorker(blob);
   return {
     name,
     mimeType: blob.type.split(";")[0] || "audio/webm",
-    byteLength: bytes.byteLength,
-    dataBase64: btoa(binary),
+    byteLength: blob.size,
+    dataBase64,
   };
 }

@@ -7,7 +7,7 @@ import vm from "node:vm";
 const source = async () => await readFile(new URL("../src/main/browser_workspace.ts", import.meta.url), "utf8");
 
 function loadPureExports(code) {
-  const transformed = ts.transpileModule(`${code}\n;globalThis.__browserPure = { normalizeNavigationInput, isAllowedWebUrl };`, {
+  const transformed = ts.transpileModule(`${code}\n;globalThis.__browserPure = { normalizeNavigationInput, isAllowedWebUrl, isAbortedNavigationError };`, {
     compilerOptions: {
       module: ts.ModuleKind.ESNext,
       target: ts.ScriptTarget.ES2022,
@@ -62,6 +62,10 @@ test("browser navigation accepts only web pages and converts search text safely"
   assert.equal(pure.isAllowedWebUrl("http://localhost:3000"), true);
   assert.equal(pure.isAllowedWebUrl("file:///etc/passwd"), false);
   assert.equal(pure.isAllowedWebUrl("data:text/html,hello"), false);
+  assert.equal(pure.isAbortedNavigationError(Object.assign(new Error("navigation cancelled"), { code: -3 })), true);
+  assert.equal(pure.isAbortedNavigationError(Object.assign(new Error("navigation cancelled"), { code: "ERR_ABORTED" })), true);
+  assert.equal(pure.isAbortedNavigationError(new Error("net::ERR_ABORTED")), true);
+  assert.equal(pure.isAbortedNavigationError(new Error("net::ERR_FAILED")), false);
 });
 
 test("permissions, popups, device access, certificates and downloads are explicit", async () => {
@@ -101,9 +105,9 @@ test("manager exposes bounded tab, view and lifecycle controls for narrow IPC", 
   const code = await source();
 
   for (const method of [
-    "initialize", "getState", "createTab", "activateTab", "closeTab", "navigate",
+    "initialize", "getState", "createTab", "activateTab", "setMuted", "closeTab", "navigate",
     "goBack", "goForward", "reload", "stop", "setBounds", "setVisible", "setHostVisible", "setVisibleForSession", "releaseSession", "focus",
-    "openOverlay", "closeOverlay", "resolvePermission", "clearProfileData", "clearDownloadHistory", "dispose",
+    "prepareOverlay", "openOverlay", "closeOverlay", "resolvePermission", "clearProfileData", "clearDownloadHistory", "dispose",
   ]) assert.match(code, new RegExp(`public (?:async )?${method}\\(`), `${method} should be public`);
 
   assert.match(code, /const MAX_TABS\s*=\s*24/);
@@ -121,13 +125,61 @@ test("manager exposes bounded tab, view and lifecycle controls for narrow IPC", 
   assert.match(code, /removeListener\("select-usb-device"/);
 });
 
+test("tab mute survives inactive-session suspension and restore", async () => {
+  const code = await source();
+  const snapshot = code.match(/#snapshotActiveSession\(\): void \{[\s\S]*?\n  \}/)?.[0] ?? "";
+  const restore = code.match(/async #restoreSession\([\s\S]*?\n  \}/)?.[0] ?? "";
+
+  assert.match(snapshot, /muted:\s*tab\.view\.webContents\.isDestroyed\(\)\s*\?\s*tab\.muted\s*:\s*tab\.view\.webContents\.isAudioMuted\(\)/);
+  assert.match(restore, /setAudioMuted\(source\.muted\)/);
+  assert.match(restore, /#syncAudioState\(tab\)/);
+});
+
+test("a first background tab is usable without stealing native focus", async () => {
+  const code = await source();
+  const addTab = code.match(/#addTab\(activate: boolean\): TabRecord \{[\s\S]*?\n  \}/)?.[0] ?? "";
+  const activate = code.match(/#activate\(tab: TabRecord, focus = true\): void \{[\s\S]*?\n  \}/)?.[0] ?? "";
+
+  assert.match(addTab, /activate \|\| this\.#activeTabId === null/);
+  assert.match(addTab, /this\.#activate\(tab, activate\)/);
+  assert.match(activate, /if \(focus && this\.#visible\) tab\.view\.webContents\.focus\(\)/);
+});
+
+test("long-lived browser actions stay bounded and tab-cap paths cannot leak rejections", async () => {
+  const code = await source();
+
+  assert.match(code, /const BROWSER_NAVIGATION_TIMEOUT_MS\s*=\s*45_000/);
+  assert.match(code, /const BROWSER_AGENT_ACTION_TIMEOUT_MS\s*=\s*15_000/);
+  assert.match(code, /const BROWSER_AGENT_INSPECT_ALL_TIMEOUT_MS\s*=\s*30_000/);
+  assert.match(code, /withBrowserDeadline\([^]*?Promise\.race\(\[operation, timeout\]\)/);
+  assert.match(code, /#inspectAgentPage\([^]*?withBrowserDeadline\([^]*?executeJavaScript/);
+  assert.match(code, /const deadline = Date\.now\(\) \+ BROWSER_AGENT_INSPECT_ALL_TIMEOUT_MS/);
+  assert.match(code, /public async captureForAgent\([^]*?withBrowserDeadline\([^]*?capturePage/);
+  assert.match(code, /if \(this\.#tabs\.size >= MAX_TABS\) \{[^]*?type: "tab-limit"[^]*?action: "deny"/);
+  assert.match(code, /#createTabDetached\([^]*?\.catch\(\(\) => undefined\)/);
+  assert.match(code, /closeTab\(tab\.id\)\.catch\(\(\) => undefined\)/);
+});
+
+test("session restoration is awaited and protects the target snapshot before LRU trimming", async () => {
+  const code = await source();
+  const prepare = code.match(/public async prepareAgentSession\([\s\S]*?\n  }/)?.[0] ?? "";
+  const visible = code.match(/public async setVisibleForSession\([\s\S]*?\n  }/)?.[0] ?? "";
+
+  assert.match(prepare, /await this\.#restorePromise/);
+  assert.match(prepare, /#touchSessionSnapshot\(boundedSessionId\)[^]*?#snapshotActiveSession\(\)/);
+  assert.match(prepare, /#restoreSessionCoordinated\(boundedSessionId\)/);
+  assert.match(visible, /await this\.#restorePromise/);
+  assert.match(visible, /#touchSessionSnapshot\(sessionId\)[^]*?#snapshotActiveSession\(\)/);
+  assert.match(visible, /#restoreSessionCoordinated\(sessionId\)/);
+});
+
 test("Chromium stays lazy until a session explicitly opens the browser", async () => {
   const code = await source();
   const initialize = code.match(/public async initialize\([\s\S]*?\n  }\n\n  public getState/)?.[0] ?? "";
   const sessionVisible = code.match(/public async setVisibleForSession\([\s\S]*?\n  }/)?.[0] ?? "";
 
   assert.doesNotMatch(initialize, /createTab\(/);
-  assert.match(sessionVisible, /if \(!visible && !this\.#initialized\) return this\.setVisible\(false\)/);
+  assert.match(sessionVisible, /if \(!visible\) return this\.setVisible\(false\)/);
   assert.match(sessionVisible, /visible && this\.#hostVisible && this\.#tabs\.size === 0[^]*?#restoreSession/);
 });
 
@@ -148,30 +200,39 @@ test("inactive browser state is lightweight, bounded and download-safe", async (
 
 test("browser overlay capture is tab-local and clamps to the native view", async () => {
   const code = await source();
-  const openOverlay = code.match(/public async openOverlay\([\s\S]*?\n  }\n\n  public closeOverlay/)?.[0] ?? "";
+  const prepareOverlay = code.match(/public async prepareOverlay\([\s\S]*?\n  }\n\n  public openOverlay/)?.[0] ?? "";
 
-  assert.match(openOverlay, /const viewBounds = tab\.view\.getBounds\(\)/);
-  assert.match(openOverlay, /const captureBounds = \{\s*x:\s*0,\s*y:\s*0,/);
-  assert.match(openOverlay, /width:\s*Math\.min\(requested\.width,\s*viewBounds\.width\)/);
-  assert.match(openOverlay, /height:\s*Math\.min\(requested\.height,\s*viewBounds\.height\)/);
-  assert.match(openOverlay, /capturePage\(captureBounds,\s*\{\s*stayHidden:\s*true\s*\}\)/);
-  assert.doesNotMatch(openOverlay, /capturePage\(normalizeBounds\(bounds\)\)/);
+  assert.match(prepareOverlay, /const viewBounds = tab\.view\.getBounds\(\)/);
+  assert.match(prepareOverlay, /const captureBounds = \{\s*x:\s*0,\s*y:\s*0,/);
+  assert.match(prepareOverlay, /width:\s*Math\.min\(requested\.width,\s*viewBounds\.width\)/);
+  assert.match(prepareOverlay, /height:\s*Math\.min\(requested\.height,\s*viewBounds\.height\)/);
+  assert.match(prepareOverlay, /capturePage\(captureBounds,\s*\{\s*stayHidden:\s*true\s*\}\)/);
+  assert.doesNotMatch(prepareOverlay, /capturePage\(normalizeBounds\(bounds\)\)/);
 });
 
 test("browser overlay transitions cancel late capture and keep native focus guarded", async () => {
   const code = await source();
-  const openOverlay = code.match(/public async openOverlay\([\s\S]*?\n  }\n\n  public closeOverlay/)?.[0] ?? "";
+  const prepareOverlay = code.match(/public async prepareOverlay\([\s\S]*?\n  }\n\n  public openOverlay/)?.[0] ?? "";
+  const openOverlay = code.match(/public openOverlay\([\s\S]*?\n  }\n\n  public closeOverlay/)?.[0] ?? "";
   const closeOverlay = code.match(/public closeOverlay\([\s\S]*?\n  }\n\n  public resolvePermission/)?.[0] ?? "";
   const focus = code.match(/public focus\([\s\S]*?\n  }/)?.[0] ?? "";
   const activate = code.match(/\n  #activate\([\s\S]*?\n  }/)?.[0] ?? "";
 
-  assert.match(openOverlay, /const generation = \+\+this\.#overlayGeneration/);
-  assert.match(openOverlay, /generation !== this\.#overlayGeneration/);
-  assert.match(openOverlay, /this\.#overlayCaptureTabId !== tab\.id/);
-  assert.match(openOverlay, /!this\.#tabs\.has\(tab\.id\)/);
+  assert.match(prepareOverlay, /const generation = \+\+this\.#overlayGeneration/);
+  assert.match(prepareOverlay, /generation !== this\.#overlayGeneration/);
+  assert.match(prepareOverlay, /this\.#overlayCaptureTabId !== tab\.id/);
+  assert.match(prepareOverlay, /!this\.#tabs\.has\(tab\.id\)/);
+  assert.match(prepareOverlay, /return \{ snapshot, token: generation \}/);
+  assert.match(prepareOverlay, /this\.#overlayCaptureBounds = \{ \.\.\.viewBounds \}/);
+  assert.doesNotMatch(prepareOverlay, /this\.#overlayOpen = true/);
+  assert.match(openOverlay, /token !== this\.#overlayGeneration/);
+  assert.match(openOverlay, /capturedBounds[\s\S]*?currentBounds[\s\S]*?boundsChanged/);
+  assert.match(openOverlay, /tab\.view\.webContents\.isDestroyed\(\) \|\| boundsChanged/);
+  assert.match(openOverlay, /this\.#overlayCaptureTabId = null[\s\S]*?this\.#overlayOpen = true[\s\S]*?this\.#syncTabVisibility\(\)/);
   assert.match(openOverlay, /throw new Error\("The browser overlay request was cancelled"\)/);
   assert.match(closeOverlay, /\+\+this\.#overlayGeneration/);
   assert.match(closeOverlay, /if \(!wasOpen && !wasCapturing\) return/);
+  assert.match(code, /if \(!this\.#visible\) \{[\s\S]*?\+\+this\.#overlayGeneration;[\s\S]*?this\.#overlayOpen = false;[\s\S]*?this\.#overlayCaptureTabId = null;/);
   assert.match(focus, /!this\.#overlayBusy\(\)[^]*?webContents\.focus\(\)/);
   assert.match(activate, /if \(!this\.#overlayBusy\(\)\)[^]*?webContents\.focus\(\)/);
 });

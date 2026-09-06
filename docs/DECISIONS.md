@@ -73,10 +73,12 @@ fingerprint approval.
 for a rich client, or, for Direct API, a documented user-key HTTPS request
 surface. Copilot CLI ACP is explicitly documented for custom frontends and
 multi-agent systems, although it remains public preview. Claude Code remains
-permission-gated; Gemini CLI's official terms warn against the third-party
-access path; and candidates without a dependable rich lifecycle remain
-deferred. Provider-specific authentication and service terms still belong to
-the provider and user.
+permission-gated. Gemini CLI and Antigravity are not shipped entries, but
+Google now documents API-key/Vertex-authenticated headless CLI, SDK, and
+preview Agent API routes suitable for future reviewed BYOK work; consumer
+automation and Google-account OAuth reuse remain prohibited. Candidates
+without a dependable rich lifecycle remain deferred. Provider-specific
+authentication and service terms still belong to the provider and user.
 
 ## D-012 — Dependency-free host WebSocket server
 

@@ -6,8 +6,8 @@ const openAiTranscriptionUrl = "https://api.openai.com/v1/audio/transcriptions";
 const xAiTranscriptionUrl = "https://api.x.ai/v1/stt";
 const openAiCredentialCheckUrl = "https://api.openai.com/v1/models";
 const xAiCredentialCheckUrl = "https://api.x.ai/v1/models";
-const openAiMaximumAudioBytes = 4 * 1024 * 1024;
 const bridgeMaximumAudioBytes = 25 * 1024 * 1024;
+const transcriptionRequestTimeoutMs = 12 * 60_000;
 const openAiAudioTypes = new Set([
   "audio/flac",
   "audio/m4a",
@@ -138,7 +138,7 @@ export function defaultTranscriptionSourceRegistry(options: {
       id: openAiTranscriptionSourceId,
       label: "OpenAI speech-to-text",
       setupEnvironmentVariable: "TETHOQ_OPENAI_API_KEY",
-      maxAudioBytes: openAiMaximumAudioBytes,
+      maxAudioBytes: bridgeMaximumAudioBytes,
       transcriber: openAi,
       credential: {
         label: "OpenAI API key",
@@ -172,7 +172,7 @@ export function singleTranscriptionSourceRegistry(
     id: openAiTranscriptionSourceId,
     label: "OpenAI speech-to-text",
     setupEnvironmentVariable: "TETHOQ_OPENAI_API_KEY",
-    maxAudioBytes: openAiMaximumAudioBytes,
+    maxAudioBytes: bridgeMaximumAudioBytes,
     transcriber,
     isReady: () => true,
   }]);
@@ -203,7 +203,7 @@ export class OpenAiDictationTranscriber implements DictationTranscriber {
     audio: MessageAttachment,
     options: DictationOptions = {},
   ): Promise<{ readonly text: string }> {
-    validateAudio(audio, openAiAudioTypes, openAiMaximumAudioBytes);
+    validateAudio(audio, openAiAudioTypes, bridgeMaximumAudioBytes);
     if (!this.isConfigured) {
       throw new Error(
         "OpenAI speech-to-text needs an API key. Open its setup from the dictation source menu.",
@@ -223,7 +223,7 @@ export class OpenAiDictationTranscriber implements DictationTranscriber {
         Authorization: `Bearer ${this.#apiKey!.trim()}`,
       },
       body,
-      signal: AbortSignal.timeout(60_000),
+      signal: AbortSignal.timeout(transcriptionRequestTimeoutMs),
     });
     return transcriptFromResponse(response, "OpenAI API key");
   }
@@ -273,7 +273,7 @@ export class XAiDictationTranscriber implements DictationTranscriber {
         Authorization: `Bearer ${this.#apiKey!.trim()}`,
       },
       body,
-      signal: AbortSignal.timeout(60_000),
+      signal: AbortSignal.timeout(transcriptionRequestTimeoutMs),
     });
     return transcriptFromResponse(response, "xAI API key");
   }

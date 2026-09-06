@@ -33,6 +33,7 @@ export interface BridgeMessageSessionOptions {
   readonly allowUnsignedRequests?: boolean;
   readonly eventPollIntervalMs?: number;
   readonly desktopLifecycle?: DesktopLifecycleController;
+  readonly onSecureEstablished?: (deviceId: string) => void;
 }
 
 type Sender = (text: string) => void;
@@ -60,12 +61,31 @@ function jsonObject(value: unknown): JsonObject {
   return JSON.parse(JSON.stringify(value)) as JsonObject;
 }
 
+class BridgeMessageError extends Error {
+  public readonly requestId: string | undefined;
+
+  public constructor(error: unknown, requestId: string | undefined) {
+    super(error instanceof Error ? error.message : String(error));
+    this.name = "BridgeMessageError";
+    this.requestId = requestId;
+  }
+}
+
+function exposedRequestId(value: unknown): string | undefined {
+  if (!isRecord(value)) return undefined;
+  if (typeof value.requestId === "string" && value.requestId.length > 0) return value.requestId;
+  if (value.kind !== "signed_action" || !isRecord(value.signed) || !isRecord(value.signed.action)) return undefined;
+  const requestId = value.signed.action.requestId;
+  return typeof requestId === "string" && requestId.length > 0 ? requestId : undefined;
+}
+
 export class BridgeMessageSession {
   readonly #router: BridgeRequestRouter;
   readonly #responses = new RequestLedger<ResponseEnvelope>();
   readonly #inflight = new Map<string, Promise<ResponseEnvelope>>();
   readonly #allowUnsignedRequests: boolean;
   readonly #eventPollIntervalMs: number;
+  readonly #onSecureEstablished: ((deviceId: string) => void) | undefined;
   #latestSequence = 0;
   #eventTimer: NodeJS.Timeout | null = null;
   #started = false;
@@ -83,6 +103,7 @@ export class BridgeMessageSession {
     this.#router = new BridgeRequestRouter(bridge, options.desktopLifecycle);
     this.#allowUnsignedRequests = options.allowUnsignedRequests ?? false;
     this.#eventPollIntervalMs = options.eventPollIntervalMs ?? 250;
+    this.#onSecureEstablished = options.onSecureEstablished;
   }
 
   /** True once a paired device has agreed a key for this connection. */
@@ -133,7 +154,7 @@ export class BridgeMessageSession {
     if (frame !== null) {
       const channel = this.#secure;
       if (channel === null) throw new Error("An encrypted frame arrived before this connection agreed a key");
-      await this.handleDecoded(parseJson(channel.open(frame)));
+      await this.handleDecodedWithContext(parseJson(channel.open(frame)));
       return;
     }
 
@@ -145,7 +166,7 @@ export class BridgeMessageSession {
     }
 
     if (this.#secure !== null) throw new Error("This connection is encrypted and no longer accepts plain messages");
-    await this.handleDecoded(outer);
+    await this.handleDecodedWithContext(outer);
   }
 
   private establishSecureChannel(accept: NonNullable<ReturnType<typeof parseSecureHandshakeAccept>>): void {
@@ -168,11 +189,31 @@ export class BridgeMessageSession {
     // Sent through the new channel: the device can only read it if it derived
     // the same key, which confirms the agreement in both directions.
     this.emit(JSON.stringify({ kind: "secure_established", deviceId, fingerprint: channel.fingerprint() }));
+    this.#onSecureEstablished?.(deviceId);
   }
 
   private emit(text: string): void {
     const channel = this.#secure;
     this.send(channel === null ? text : JSON.stringify(channel.seal(text)));
+  }
+
+  /** Reports a message failure over the same channel that received it. */
+  public sendTransportError(error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error);
+    const requestId = error instanceof BridgeMessageError ? error.requestId : undefined;
+    this.emit(JSON.stringify({
+      type: "transport.error",
+      message,
+      ...(requestId !== undefined ? { requestId } : {}),
+    }));
+  }
+
+  private async handleDecodedWithContext(raw: unknown): Promise<void> {
+    try {
+      await this.handleDecoded(raw);
+    } catch (error) {
+      throw error instanceof BridgeMessageError ? error : new BridgeMessageError(error, exposedRequestId(raw));
+    }
   }
 
   private async handleDecoded(raw: unknown): Promise<void> {
@@ -326,6 +367,9 @@ export class BridgeSocketServer {
   readonly #server: WebSocketServer;
   readonly #connections = new Set<WebSocketConnection>();
   readonly #sessions = new Map<WebSocketConnection, BridgeMessageSession>();
+  readonly #authenticatedDevices = new Map<WebSocketConnection, string>();
+  readonly #connectionsByDevice = new Map<string, Set<WebSocketConnection>>();
+  readonly #connectedDevicesChangedListeners = new Set<() => void>();
   readonly #heartbeatIntervalMs: number;
   readonly #heartbeatTimeoutMs: number;
   readonly #stopWatchingRevocations: () => void;
@@ -365,23 +409,31 @@ export class BridgeSocketServer {
     return this.#server.address();
   }
 
+  /** Paired devices that currently have at least one authenticated socket. */
+  public connectedDeviceIds(): readonly string[] {
+    return [...this.#connectionsByDevice.keys()].sort();
+  }
+
+  /** Notifies when the set returned by connectedDeviceIds changes. */
+  public onConnectedDevicesChanged(listener: () => void): () => void {
+    this.#connectedDevicesChangedListeners.add(listener);
+    return () => { this.#connectedDevicesChangedListeners.delete(listener); };
+  }
+
   public async close(): Promise<void> {
     if (this.#heartbeat !== null) clearInterval(this.#heartbeat);
     this.#heartbeat = null;
     this.#stopWatchingRevocations();
-    for (const session of this.#sessions.values()) session.close();
-    this.#sessions.clear();
+    for (const connection of [...this.#connections]) this.removeConnection(connection);
     await this.#server.close();
     this.#connections.clear();
   }
 
   /** Revoking a device ends its live connection instead of only refusing it. */
   private disconnectDevice(deviceId: string): void {
-    for (const [connection, session] of this.#sessions) {
+    for (const [connection, session] of [...this.#sessions]) {
       if (session.deviceId !== deviceId) continue;
-      session.close();
-      this.#sessions.delete(connection);
-      this.#connections.delete(connection);
+      this.removeConnection(connection);
       connection.close(1008, "Device access revoked");
     }
   }
@@ -390,19 +442,50 @@ export class BridgeSocketServer {
     const session = new BridgeMessageSession(this.bridge, (text) => connection.sendText(text), {
       allowUnsignedRequests: this.options.allowUnsignedRequests ?? false,
       ...(this.options.desktopLifecycle !== undefined ? { desktopLifecycle: this.options.desktopLifecycle } : {}),
+      onSecureEstablished: (deviceId) => this.markAuthenticated(connection, session, deviceId),
     });
     this.#connections.add(connection);
     this.#sessions.set(connection, session);
     connection.onMessage((text) => session.handle(text));
     connection.onError((error) => {
-      connection.sendJson({ type: "transport.error", message: error.message });
+      session.sendTransportError(error);
     });
     connection.onClose(() => {
-      session.close();
-      this.#sessions.delete(connection);
-      this.#connections.delete(connection);
+      this.removeConnection(connection);
     });
     session.start();
+  }
+
+  private markAuthenticated(connection: WebSocketConnection, session: BridgeMessageSession, deviceId: string): void {
+    if (connection.isClosed || this.#sessions.get(connection) !== session || this.#authenticatedDevices.has(connection)) return;
+    this.#authenticatedDevices.set(connection, deviceId);
+    let connections = this.#connectionsByDevice.get(deviceId);
+    if (connections === undefined) {
+      connections = new Set();
+      this.#connectionsByDevice.set(deviceId, connections);
+    }
+    const wasConnected = connections.size > 0;
+    connections.add(connection);
+    if (!wasConnected) this.notifyConnectedDevicesChanged();
+  }
+
+  private removeConnection(connection: WebSocketConnection): void {
+    this.#sessions.get(connection)?.close();
+    this.#sessions.delete(connection);
+    this.#connections.delete(connection);
+    const deviceId = this.#authenticatedDevices.get(connection);
+    if (deviceId === undefined) return;
+    this.#authenticatedDevices.delete(connection);
+    const connections = this.#connectionsByDevice.get(deviceId);
+    connections?.delete(connection);
+    if (connections !== undefined && connections.size === 0) {
+      this.#connectionsByDevice.delete(deviceId);
+      this.notifyConnectedDevicesChanged();
+    }
+  }
+
+  private notifyConnectedDevicesChanged(): void {
+    for (const listener of this.#connectedDevicesChangedListeners) listener();
   }
 
   private heartbeat(): void {
@@ -558,7 +641,7 @@ export class BridgeRelayClient {
       session.start();
     }
     void session.handle(forward.payload).catch((error: unknown) => {
-      this.sendToDevice(forward.deviceId, JSON.stringify({ type: "transport.error", message: error instanceof Error ? error.message : String(error) }));
+      session.sendTransportError(error);
     });
   }
 
