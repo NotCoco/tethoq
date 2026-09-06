@@ -1,6 +1,6 @@
 # Tethoq web
 
-The public website and account dashboard for Tethoq. It is a standard Next.js App Router project and can run on Vercel or any compatible Node host. It contains no Sites, Vinext, Wrangler, Cloudflare Worker, or platform-specific build layer.
+The public download website for Tethoq. It is a standard Next.js App Router project and can run on Vercel or any compatible Node host. It contains no Sites, Vinext, Wrangler, Cloudflare Worker, or platform-specific build layer.
 
 ## Local development
 
@@ -10,7 +10,7 @@ npm install
 npm run dev
 ```
 
-The marketing site and installer page build without credentials. Authentication controls clearly report that setup is unavailable until the two public Supabase variables are configured.
+The marketing site and installer page build without account credentials. The launch site offers free Desktop and Bridge downloads. Account and dashboard routes redirect to the download page; subscriptions and a Tethoq-hosted mobile relay are not offered. The Supabase code below is retained for future account-service development and is not enabled by this launch.
 
 The checked-in auth pages are not by themselves evidence that a deployment's
 login is active. Each installation needs its public variables, database

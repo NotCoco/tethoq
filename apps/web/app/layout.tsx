@@ -1,7 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
-const siteDescription = "Securely keep up with supported coding harnesses and Direct API models from your phone.";
+const siteDescription = "A free, open-source Windows workspace for your coding agents. Download Tethoq Desktop with Bridge included, or install Bridge on its own.";
 
 export const metadata: Metadata = {
   metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL || "http://localhost:3000"),

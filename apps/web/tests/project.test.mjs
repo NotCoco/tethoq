@@ -34,7 +34,7 @@ test("public pages distinguish desktop and bridge releases without placeholder l
   assert.match(download, /Tethoq Bridge/u);
   assert.match(download, /Provider-neutral SDK for user-installed community connectors/u);
   assert.match(download, /Community connectors require local review and explicit approval/u);
-  assert.match(download, /No placeholder download/u);
+  assert.match(download, /button-disabled/u);
   assert.match(auth, /Account services are not configured/u);
   assert.match(env, /NEXT_PUBLIC_DESKTOP_WINDOWS_DOWNLOAD_URL=/u);
   assert.match(env, /NEXT_PUBLIC_BRIDGE_WINDOWS_DOWNLOAD_URL=/u);
