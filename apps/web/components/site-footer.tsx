@@ -13,7 +13,7 @@ export function SiteFooter() {
           <Link href="/#how-it-works">How it works</Link>
           <Link href="/#security">Security</Link>
           <Link href="/download">Desktop &amp; Bridge</Link>
-          <Link href="/auth/sign-in">Sign in</Link>
+          <a href="https://github.com/NotCoco/tethoq">GitHub</a>
         </nav>
         <p className="footer-note">Tethoq is provisional software. Provider names and marks belong to their respective owners. Community connectors are independent and unsupported.</p>
       </div>

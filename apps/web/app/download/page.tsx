@@ -21,7 +21,7 @@ interface DownloadActionProps {
 
 function DownloadAction({ href, label }: DownloadActionProps) {
   if (!href) {
-    return <span className="button button-disabled"><Download /> Release link not configured</span>;
+    return <span className="button button-disabled"><Download /> Download unavailable</span>;
   }
   return <a className="button button-primary" href={href}><Download /> {label}</a>;
 }
@@ -38,9 +38,9 @@ export default function DownloadPage() {
       <main className="download-page">
         <section className="download-hero section-shell">
           <div>
-            <p className="eyebrow">Tethoq for Windows</p>
+            <p className="eyebrow">Free Windows preview</p>
             <h1>Choose the way<br /><em>you want to work.</em></h1>
-            <p>Install the complete desktop coding harness, or add the standalone bridge beside the agent tools you already use. The desktop app already includes the bridge.</p>
+            <p>Install the complete desktop coding harness, or add the standalone bridge beside the agent tools you already use. The desktop app already includes the bridge. No Tethoq account or subscription is required.</p>
             <div className="download-jump-links" aria-label="Download choices">
               <a href="#desktop">Desktop app</a>
               <a href="#bridge">Bridge only</a>
@@ -70,7 +70,7 @@ export default function DownloadPage() {
               <DownloadAction href={desktopDownload} label="Download Desktop" />
               {desktopChecksum && <a className="checksum-link" href={desktopChecksum}>Verify checksum</a>}
             </div>
-            {!desktopDownload && <p className="installer-notice"><strong>No placeholder download.</strong> Add the published Desktop HTTPS release URL to enable this button.</p>}
+            {!desktopDownload && <p className="installer-notice">Check <a href="https://github.com/NotCoco/tethoq/releases">GitHub releases</a> for Desktop availability.</p>}
             <dl><div><dt>Platform</dt><dd>Windows 10/11 · x64</dd></div><div><dt>Package</dt><dd>Desktop installer</dd></div><div><dt>Bridge</dt><dd>Included</dd></div></dl>
           </article>
 
@@ -89,7 +89,7 @@ export default function DownloadPage() {
               <DownloadAction href={bridgeDownload} label="Download Bridge" />
               {bridgeChecksum && <a className="checksum-link" href={bridgeChecksum}>Verify checksum</a>}
             </div>
-            {!bridgeDownload && <p className="installer-notice"><strong>No placeholder download.</strong> Add the published Bridge HTTPS release URL to enable this button.</p>}
+            {!bridgeDownload && <p className="installer-notice">Check <a href="https://github.com/NotCoco/tethoq/releases">GitHub releases</a> for Bridge availability.</p>}
             <dl><div><dt>Platform</dt><dd>Windows 10/11 · x64</dd></div><div><dt>Package</dt><dd>Bridge installer</dd></div><div><dt>Desktop UI</dt><dd>Not included</dd></div></dl>
           </article>
         </section>
@@ -97,7 +97,7 @@ export default function DownloadPage() {
         <section className="install-steps section-shell">
           <article><span>1</span><h3>Download the right package</h3><p>Use Desktop for the complete harness. Use Bridge only if you already have the coding environment you want.</p></article>
           <article><span>2</span><h3>Verify and install</h3><p>Check the published SHA-256, then install Desktop or the lightweight Bridge companion.</p></article>
-          <article><span>3</span><h3>Connect deliberately</h3><p>Pair an approved device with the short-lived Bridge flow. Tethoq never imports an existing browser login or uploads a recorded workflow by itself.</p></article>
+          <article><span>3</span><h3>Open your workspace</h3><p>Use your existing coding tools and provider accounts. Phone access is optional and requires the Android client and Bridge pairing; the hosted relay service is not part of this preview.</p></article>
         </section>
 
         <section className="requirements section-shell">

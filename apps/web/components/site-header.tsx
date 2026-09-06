@@ -13,7 +13,7 @@ export function SiteHeader() {
           <Link href="/download">Desktop &amp; Bridge</Link>
         </nav>
         <div className="nav-actions">
-          <Link className="text-link" href="/auth/sign-in">Sign in</Link>
+          <a className="text-link" href="https://github.com/NotCoco/tethoq">GitHub</a>
           <Link className="button button-small button-primary" href="/download">Download</Link>
         </div>
       </div>
