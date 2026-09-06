@@ -278,8 +278,10 @@ test("a real right-click builds the right menu and never fights an app-owned one
         const seen = [];
         // Building the template rather than popping it: a real popup would block
         // this process on an OS menu loop that nothing is there to dismiss.
-        window.webContents.on("context-menu", (_event, params) => seen.push(
-          contextMenuTemplate(params, actions).map((item) => ({ id: item.role ?? item.label ?? item.type, enabled: item.enabled }))));
+        window.webContents.on("context-menu", (_event, params) => seen.push({
+          canPaste: params.editFlags.canPaste,
+          items: contextMenuTemplate(params, actions).map((item) => ({ id: item.role ?? item.label ?? item.type, enabled: item.enabled })),
+        }));
         await window.loadFile(process.argv[2]);
         await new Promise((resolve) => setTimeout(resolve, 400));
         const rects = JSON.parse(await window.webContents.executeJavaScript("window.__rects()"));
@@ -291,12 +293,14 @@ test("a real right-click builds the right menu and never fights an app-owned one
           await new Promise((resolve) => setTimeout(resolve, 260));
           return seen.length;
         };
-        const result = {};
+        const result = { canPaste: {} };
         const record = async (name, rect, prepare) => {
           if (prepare) { await window.webContents.executeJavaScript(prepare); await new Promise((r) => setTimeout(r, 60)); }
           const before = seen.length;
           await at(rect);
-          result[name] = seen.length === before ? null : seen[seen.length - 1];
+          const menu = seen.length === before ? null : seen[seen.length - 1];
+          result[name] = menu?.items ?? null;
+          result.canPaste[name] = menu?.canPaste;
         };
         await record("guarded", rects.guarded, "window.__select(document.getElementById('answer')); true");
         await record("answer", rects.answer, "window.__select(document.getElementById('answer')); true");
@@ -325,12 +329,15 @@ test("a real right-click builds the right menu and never fights an app-owned one
     const draft = Object.fromEntries(result.draft.map((item) => [item.id, item.enabled]));
     assert.equal(draft.cut, true, "cut was not offered for selected text in a field");
     assert.equal(draft.copy, true, "copy was not offered for selected text in a field");
-    assert.equal(draft.paste, true, "paste was not offered in an editable field");
+    // A clean CI desktop may have an empty clipboard. Follow Chromium's flag
+    // without reading or replacing the user's clipboard to prepare this test.
+    assert.equal(draft.paste, result.canPaste.draft, "paste ignored the native clipboard availability");
 
     const secret = Object.fromEntries(result.secret.map((item) => [item.id, item.enabled]));
     assert.equal(secret.copy, false, "a masked field offered a live copy");
     assert.equal(secret.cut, false, "a masked field offered a live cut");
-    assert.equal(secret.paste, true, "a masked field should still accept a paste");
+    assert.ok(Object.hasOwn(secret, "paste"), "a masked field did not offer paste");
+    assert.equal(secret.paste, result.canPaste.secret, "masked-field paste ignored the native clipboard availability");
 
     assert.deepEqual(ids(result.link), ["Copy link"]);
     // Chromium always asks about bare space; the template answers with nothing,

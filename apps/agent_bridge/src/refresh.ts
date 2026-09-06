@@ -251,10 +251,10 @@ export class RefreshCoordinator {
     );
     let task!: Promise<void>;
     task = new Promise<void>((resolve) => {
-      const immediate = setImmediate(() => {
+      // Keep the scheduled turn alive so lifecycle callers can await the tail.
+      setImmediate(() => {
         void this.runCatalogueTail(adapter, token, sessions, firstCursor, authoritative).then(resolve, resolve);
       });
-      immediate.unref();
     }).finally(() => {
       this.#backgroundTasks.delete(task);
     });

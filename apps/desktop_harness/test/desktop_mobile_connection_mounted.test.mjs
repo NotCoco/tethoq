@@ -65,7 +65,6 @@ test("mounted phone dialog distinguishes a saved phone from live presence", { ti
           import "./src/renderer/src/styles.css";
 
           globalThis.IS_REACT_ACT_ENVIRONMENT = false;
-          window.requestAnimationFrame = (callback) => window.setTimeout(() => callback(performance.now()), 0);
 
           const savedPhone = {
             id: "opaque-phone-handle",
@@ -186,7 +185,8 @@ test("mounted phone dialog distinguishes a saved phone from live presence", { ti
           y: -10000,
           width: 760,
           height: 620,
-          webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false },
+          // Offscreen rendering supplies real frames even on a headless CI desktop.
+          webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false, offscreen: true },
         });
         try {
           await window.loadFile(process.argv[2]);

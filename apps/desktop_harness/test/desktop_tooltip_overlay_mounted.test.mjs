@@ -53,7 +53,10 @@ test("mounted tooltip overlay owns edge pixels, clamps to eight pixels, and avoi
           import "./src/renderer/src/navigation.css";
 
           const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
-          const settle = async (milliseconds = 25) => { await wait(milliseconds); };
+          const settle = async (milliseconds = 25) => {
+            await wait(milliseconds);
+            await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+          };
           const check = (condition, message) => { if (!condition) throw new Error(message); };
           const outside = document.createElement("button");
           outside.textContent = "Outside";
@@ -64,6 +67,14 @@ test("mounted tooltip overlay owns edge pixels, clamps to eight pixels, and avoi
           createRoot(host).render(<AppTooltipLayer />);
 
           const tooltip = () => document.querySelector(".app-tooltip-overlay");
+          const paintedTooltip = async (name) => {
+            await settle();
+            const tip = tooltip();
+            check(tip instanceof HTMLElement, name + ": tooltip missing");
+            await Promise.all(tip.getAnimations().map((animation) => animation.finished));
+            await settle();
+            return tip;
+          };
           const hover = async (trigger) => {
             // Hidden Electron windows cannot receive OS hover. Apply the real
             // hover CSS state, then exercise the tooltip's pointer handler.
@@ -90,9 +101,7 @@ test("mounted tooltip overlay owns edge pixels, clamps to eight pixels, and avoi
             trigger.style.cssText = "position:fixed;width:32px;height:32px;margin:0;padding:0;" + css;
             document.body.append(trigger);
             await hover(trigger);
-            await settle();
-            const tip = tooltip();
-            check(tip instanceof HTMLElement, name + ": tooltip missing");
+            const tip = await paintedTooltip(name);
             const rect = tip.getBoundingClientRect();
             const triggerRect = trigger.getBoundingClientRect();
             const owner = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
@@ -130,9 +139,7 @@ test("mounted tooltip overlay owns edge pixels, clamps to eight pixels, and avoi
               document.body.append(collisionTrigger);
               collisionTrigger.focus();
               collisionTrigger.dispatchEvent(new FocusEvent('focusin', { bubbles: true, relatedTarget: outside }));
-              await settle();
-              let liveTip = tooltip();
-              check(liveTip instanceof HTMLElement, "collision tooltip missing");
+              let liveTip = await paintedTooltip("collision");
               const collisionPlacement = liveTip.dataset.placement;
               const blockerRect = blocker.getBoundingClientRect();
               const collisionRect = liveTip.getBoundingClientRect();
@@ -164,7 +171,9 @@ test("mounted tooltip overlay owns edge pixels, clamps to eight pixels, and avoi
       app.commandLine.appendSwitch("force-device-scale-factor", "1");
       app.setPath("userData", path.join(__dirname, "profile"));
       app.whenReady().then(async () => {
-        const window = new BrowserWindow({ x: -10000, y: -10000, width: 800, height: 560, show: false, webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false } });
+        // Offscreen rendering keeps animation, layout and hit testing advancing
+        // even when CI has no interactive desktop displaying the hidden window.
+        const window = new BrowserWindow({ x: -10000, y: -10000, width: 800, height: 560, show: false, webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false, offscreen: true } });
         try {
           await window.loadFile(${JSON.stringify(htmlPath)});
           window.webContents.debugger.attach("1.3");
