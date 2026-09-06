@@ -16,6 +16,8 @@ import {
   type LiveSessionState,
   type LiveSessionAction,
   type LiveSessionEvent,
+  type MobileConnectionAction,
+  type MobileConnectionState,
 } from "../shared/desktop_api.js";
 import type { JsonObject } from "../../../../packages/protocol/src/index.js";
 
@@ -37,6 +39,7 @@ const api: DesktopHarnessApi = Object.freeze({
   localOpenHandlers: (): ReturnType<DesktopHarnessApi["localOpenHandlers"]> => ipcRenderer.invoke(IPC_CHANNELS.localOpenHandlers),
   openLocalTarget: (target: Parameters<DesktopHarnessApi["openLocalTarget"]>[0]): ReturnType<DesktopHarnessApi["openLocalTarget"]> => ipcRenderer.invoke(IPC_CHANNELS.openLocalTarget, target),
   openDictationSetupPage: (sourceId: Parameters<DesktopHarnessApi["openDictationSetupPage"]>[0]): ReturnType<DesktopHarnessApi["openDictationSetupPage"]> => ipcRenderer.invoke(IPC_CHANNELS.openDictationSetupPage, { sourceId }),
+  openHarnessSetupPage: (providerId: Parameters<DesktopHarnessApi["openHarnessSetupPage"]>[0]): Promise<void> => ipcRenderer.invoke(IPC_CHANNELS.openHarnessSetupPage, { providerId }),
   showWindow: (): ReturnType<DesktopHarnessApi["showWindow"]> => ipcRenderer.invoke(IPC_CHANNELS.showWindow),
   hideWindow: (): ReturnType<DesktopHarnessApi["hideWindow"]> => ipcRenderer.invoke(IPC_CHANNELS.hideWindow),
   notifyReady: (): void => { ipcRenderer.send(IPC_CHANNELS.rendererReady); },
@@ -51,6 +54,8 @@ const api: DesktopHarnessApi = Object.freeze({
   preferencesAction: (action: PreferencesAction): ReturnType<DesktopHarnessApi["preferencesAction"]> => ipcRenderer.invoke(IPC_CHANNELS.preferencesAction, action),
   liveSessionState: (): ReturnType<DesktopHarnessApi["liveSessionState"]> => ipcRenderer.invoke(IPC_CHANNELS.liveSessionGetState),
   liveSessionAction: (action: LiveSessionAction): ReturnType<DesktopHarnessApi["liveSessionAction"]> => ipcRenderer.invoke(IPC_CHANNELS.liveSessionAction, action),
+  mobileConnectionState: (): ReturnType<DesktopHarnessApi["mobileConnectionState"]> => ipcRenderer.invoke(IPC_CHANNELS.mobileConnectionGetState),
+  mobileConnectionAction: (action: MobileConnectionAction): ReturnType<DesktopHarnessApi["mobileConnectionAction"]> => ipcRenderer.invoke(IPC_CHANNELS.mobileConnectionAction, action),
   ...(process.env.TETHOQ_PACKAGED_SMOKE === "1" ? {
     quitForSmoke: (): Promise<boolean> => ipcRenderer.invoke(IPC_CHANNELS.smokeQuit),
   } : {}),
@@ -63,6 +68,7 @@ const api: DesktopHarnessApi = Object.freeze({
   onPreferencesState: (listener: (state: DesktopPreferencesState) => void): (() => void) => subscribe<DesktopPreferencesState>(IPC_CHANNELS.preferencesState, listener),
   onLiveSessionState: (listener: (state: LiveSessionState) => void): (() => void) => subscribe<LiveSessionState>(IPC_CHANNELS.liveSessionState, listener),
   onLiveSessionEvent: (listener: (event: LiveSessionEvent) => void): (() => void) => subscribe<LiveSessionEvent>(IPC_CHANNELS.liveSessionEvent, listener),
+  onMobileConnectionState: (listener: (state: MobileConnectionState) => void): (() => void) => subscribe<MobileConnectionState>(IPC_CHANNELS.mobileConnectionState, listener),
 });
 
 contextBridge.exposeInMainWorld("tethoqDesktop", api);

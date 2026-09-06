@@ -42,7 +42,10 @@ function annotationArray(value: unknown): readonly ParsedResponseAnnotation[] {
     const item = candidate as Record<string, unknown>;
     const text = typeof item.text === "string" ? item.text.trim().slice(0, maximumAnnotationCharacters) : "";
     const annotation = typeof item.annotation === "string" ? item.annotation.trim().slice(0, maximumAnnotationCharacters) : "";
-    if (!text || !annotation) continue;
+    // Codex can persist a selection-only annotation when the user highlights
+    // response text without adding a comment. The selection is still valid UI
+    // data; rejecting it would expose the entire transport envelope as prose.
+    if (!text) continue;
     const audioAttachmentIndex = typeof item.audioAttachmentIndex === "number" && Number.isInteger(item.audioAttachmentIndex) && item.audioAttachmentIndex >= 0
       ? item.audioAttachmentIndex
       : undefined;

@@ -87,6 +87,18 @@ the Desktop implementation. See
 
 ## Windows desktop app
 
+From a fresh clone on Windows with Node.js 22.13 or newer:
+
+```powershell
+npm run setup:desktop
+npm start
+```
+
+Install and sign in to your preferred coding harness separately. Tethoq
+attempts the connections automatically. **Settings > Harness connections**
+provides installation guides, retries and copyable setup prompts for every
+built-in and for **Other harness**. See [Harness setup](docs/HARNESS_SETUP.md).
+
 Tethoq Desktop is the complete Windows coding harness. It ships compatibility
 for Codex, OpenCode, Grok Build, Pi, OMP, Qwen Code, goose, Kimi Code, Hermes
 Agent, Cline, and GitHub Copilot CLI. It also includes the aggregate Direct API
@@ -437,9 +449,9 @@ Plain `ws://` is suitable only for local development. Deploy behind authenticate
 
 ## Flutter client bootstrap
 
-Flutter 3.44.9 / Dart 3.12.2 is installed locally and the Windows launcher is already generated
-(existing `lib/` and `test/` preserved). `flutter analyze` is clean and the current
-`flutter test` suite passes, including shared Node/Dart signing vectors. Status commands:
+Install Flutter stable and add its `bin` directory to `PATH`. The Windows and
+Android launchers are included in the repository; no particular SDK install
+directory is required. From a fresh clone, fetch packages and verify the client:
 
 ```bash
 cd apps/remote_client

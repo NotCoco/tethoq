@@ -216,6 +216,9 @@ export interface ModifierState {
 
 export interface HookKeyboardEvent extends ModifierState {
   readonly keycode: number;
+  /** Stable libuiohook identity such as A, Enter, or ShiftRight; never typed text. */
+  readonly key?: string;
+  readonly repeat?: boolean;
 }
 
 export interface HookMouseEvent extends ModifierState, Point {

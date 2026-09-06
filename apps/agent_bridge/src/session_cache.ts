@@ -15,6 +15,7 @@ const bridgeNativeMetadataKeys = [
   "tethoqClientPreview",
   "tethoqInitialProviderTitle",
   "tethoqObservedExternalLaunch",
+  "tethoqObservedExternalLauncherSessionId",
 ] as const;
 
 export interface SessionCacheOptions {
@@ -39,9 +40,12 @@ export interface RequestedSelection {
 export class SessionCache {
   readonly #sessions = new Map<string, RemoteSession>();
   readonly #knownSelections = new Map<string, SessionSelection>();
+  readonly #reportedSelectionGenerations = new Map<string, number>();
   readonly #preserveWorking: (globalSessionId: string) => boolean;
   readonly #onSelectionsChange: ((selections: Readonly<Record<string, SessionSelection>>) => void) | undefined;
   readonly #now: () => Date;
+  #selectionBatchDepth = 0;
+  #selectionNotificationPending = false;
 
   public constructor(options: SessionCacheOptions = {}) {
     this.#preserveWorking = options.preserveWorking ?? (() => false);
@@ -82,12 +86,26 @@ export class SessionCache {
   public delete(globalSessionId: string): void {
     this.#sessions.delete(globalSessionId);
     this.#knownSelections.delete(globalSessionId);
+    this.#reportedSelectionGenerations.delete(globalSessionId);
   }
 
   public upsert(session: RemoteSession): void {
     // A listing that states the level is the harness reporting it, so learn from it.
     this.learnFromSession(session);
     this.#sessions.set(session.id, withInferredSubagentRelationship(this.withKnownSelection(session)));
+  }
+
+  /**
+   * Applies a directly fetched provider session only if the cache still contains
+   * the exact row that was current when the read began. Provider events replace
+   * cached row objects, so this compare-before-apply rule prevents a late idle
+   * response from overwriting a newer working event. An uncontested direct read
+   * is authoritative and therefore bypasses the catalogue-only working guard.
+   */
+  public reconcileAuthoritative(session: RemoteSession, expectedCurrent: RemoteSession | undefined): boolean {
+    if (this.#sessions.get(session.id) !== expectedCurrent) return false;
+    this.reconcileSession(session, false);
+    return true;
   }
 
   /**
@@ -98,6 +116,11 @@ export class SessionCache {
    */
   public rememberRequestedSelection(globalSessionId: string, selection: RequestedSelection): void {
     this.recordSelection(globalSessionId, selection, "requested");
+  }
+
+  /** Changes only when the provider itself reports a model or reasoning level. */
+  public reportedSelectionGeneration(globalSessionId: string): number {
+    return this.#reportedSelectionGenerations.get(globalSessionId) ?? 0;
   }
 
   /** Everything learned so far, for persisting across restarts. */
@@ -121,6 +144,12 @@ export class SessionCache {
     const modelId = selection.modelId?.trim();
     const reasoningEffort = selection.reasoningEffort?.trim();
     if (!modelId && !reasoningEffort) return;
+    if (source === "reported") {
+      this.#reportedSelectionGenerations.set(
+        globalSessionId,
+        (this.#reportedSelectionGenerations.get(globalSessionId) ?? 0) + 1,
+      );
+    }
     const previous = this.#knownSelections.get(globalSessionId);
     // A model change invalidates an effort chosen for the previous model.
     const keepsEffort = !reasoningEffort && (!modelId || modelId === previous?.modelId);
@@ -133,7 +162,7 @@ export class SessionCache {
     };
     const changed = next.modelId !== previous?.modelId || next.reasoningEffort !== previous?.reasoningEffort;
     this.#knownSelections.set(globalSessionId, next);
-    if (changed) this.#onSelectionsChange?.(this.knownSelections());
+    if (changed) this.notifySelectionsChange();
     const session = this.#sessions.get(globalSessionId);
     if (session === undefined) return;
     // This is the newest thing known about the session, so it is applied directly.
@@ -160,40 +189,62 @@ export class SessionCache {
   }
 
   public reconcileProvider(providerId: string, sessions: readonly RemoteSession[]): number {
-    const priorIds = new Set([...this.#sessions.values()]
-      .filter((session) => session.providerId === providerId && session.parentSessionId === undefined)
-      .map((session) => session.id));
-    let newlyDiscovered = 0;
-    for (const session of sessions) {
-      if (this.reconcileSession(session)) newlyDiscovered += 1;
-      priorIds.delete(session.id);
-    }
-    for (const removedId of priorIds) {
-      // A positively-linked child is durable evidence that this task is its
-      // mother. Some provider listings briefly omit an externally-owned parent;
-      // deleting it here makes the mother row blink out while its children stay
-      // cached. Keep only exact relationship sources, never title-like guesses.
-      const ownsLinkedSession = [...this.#sessions.values()].some((candidate) =>
-        candidate.relationship?.sourceSessionId === removedId);
-      if (ownsLinkedSession) continue;
-      this.#sessions.delete(removedId);
-      this.#knownSelections.delete(removedId);
-    }
-    return newlyDiscovered;
+    return this.batchSelectionNotifications(() => {
+      const priorIds = new Set([...this.#sessions.values()]
+        .filter((session) => session.providerId === providerId && session.parentSessionId === undefined)
+        .map((session) => session.id));
+      let newlyDiscovered = 0;
+      for (const session of sessions) {
+        if (this.reconcileSession(session)) newlyDiscovered += 1;
+        priorIds.delete(session.id);
+      }
+      for (const removedId of priorIds) {
+        // A positively-linked child is durable evidence that this task is its
+        // mother. Some provider listings briefly omit an externally-owned parent;
+        // deleting it here makes the mother row blink out while its children stay
+        // cached. Keep only exact relationship sources, never title-like guesses.
+        const ownsLinkedSession = [...this.#sessions.values()].some((candidate) =>
+          candidate.relationship?.sourceSessionId === removedId);
+        if (ownsLinkedSession) continue;
+        this.#sessions.delete(removedId);
+        this.#knownSelections.delete(removedId);
+        this.#reportedSelectionGenerations.delete(removedId);
+      }
+      return newlyDiscovered;
+    });
+  }
+
+  /**
+   * Applies one provider catalogue page without treating that page as the
+   * provider's complete inventory. Startup uses this to make the newest tasks
+   * available immediately while older pages are still loading; only
+   * reconcileProvider() is allowed to delete sessions after the final page.
+   */
+  public mergeProviderPage(providerId: string, sessions: readonly RemoteSession[]): number {
+    return this.batchSelectionNotifications(() => {
+      let newlyDiscovered = 0;
+      for (const session of sessions) {
+        if (session.providerId !== providerId) continue;
+        if (this.reconcileSession(session)) newlyDiscovered += 1;
+      }
+      return newlyDiscovered;
+    });
   }
 
   public reconcileChildren(parentSessionId: string, sessions: readonly RemoteSession[]): number {
-    const priorIds = new Set([...this.#sessions.values()]
-      .filter((session) => session.parentSessionId === parentSessionId)
-      .map((session) => session.id));
-    let newlyDiscovered = 0;
-    for (const session of sessions) {
-      if (session.parentSessionId !== parentSessionId) continue;
-      if (this.reconcileSession(session)) newlyDiscovered += 1;
-      priorIds.delete(session.id);
-    }
-    for (const removedId of priorIds) this.#sessions.delete(removedId);
-    return newlyDiscovered;
+    return this.batchSelectionNotifications(() => {
+      const priorIds = new Set([...this.#sessions.values()]
+        .filter((session) => session.parentSessionId === parentSessionId)
+        .map((session) => session.id));
+      let newlyDiscovered = 0;
+      for (const session of sessions) {
+        if (session.parentSessionId !== parentSessionId) continue;
+        if (this.reconcileSession(session)) newlyDiscovered += 1;
+        priorIds.delete(session.id);
+      }
+      for (const removedId of priorIds) this.#sessions.delete(removedId);
+      return newlyDiscovered;
+    });
   }
 
   public markProviderStale(providerId: string): void {
@@ -203,13 +254,18 @@ export class SessionCache {
     }
   }
 
-  public updateState(globalSessionId: string, state: RemoteSession["state"], needsApproval?: boolean): void {
+  public updateState(
+    globalSessionId: string,
+    state: RemoteSession["state"],
+    needsApproval?: boolean,
+    lastActivityAt = new Date().toISOString(),
+  ): void {
     const session = this.#sessions.get(globalSessionId);
     if (session === undefined) return;
     this.#sessions.set(globalSessionId, {
       ...session,
       state,
-      lastActivityAt: new Date().toISOString(),
+      lastActivityAt,
       ...(needsApproval !== undefined ? { needsApproval } : {}),
     });
   }
@@ -235,7 +291,7 @@ export class SessionCache {
 
   public updateMetadata(
     globalSessionId: string,
-    metadata: Partial<Pick<RemoteSession, "modelId" | "reasoningEffort" | "variantId" | "parentSessionId" | "relationship" | "sessionKind" | "contextHandoffSummary" | "agentNickname" | "agentRole">>,
+    metadata: Partial<Pick<RemoteSession, "title" | "modelId" | "reasoningEffort" | "variantId" | "parentSessionId" | "relationship" | "sessionKind" | "contextHandoffSummary" | "agentNickname" | "agentRole">>,
   ): void {
     const session = this.#sessions.get(globalSessionId);
     if (session === undefined) return;
@@ -249,14 +305,16 @@ export class SessionCache {
   }
 
   public replace(sessions: readonly RemoteSession[]): void {
-    this.#sessions.clear();
-    for (const session of sessions) this.upsert(session);
+    this.batchSelectionNotifications(() => {
+      this.#sessions.clear();
+      for (const session of sessions) this.upsert(session);
+    });
   }
 
-  private reconcileSession(session: RemoteSession): boolean {
+  private reconcileSession(session: RemoteSession, preserveWorking = true): boolean {
     this.learnFromSession(session);
     const existing = this.#sessions.get(session.id);
-    const state = this.#preserveWorking(session.id) && existing?.state === "working"
+    const state = preserveWorking && this.#preserveWorking(session.id) && existing?.state === "working"
       ? "working"
       : session.state === "unknown" && existing !== undefined && existing.state !== "unknown" && existing.state !== "working"
         ? existing.state
@@ -287,6 +345,28 @@ export class SessionCache {
       ...(session.agentRole === undefined && existing?.agentRole !== undefined ? { agentRole: existing.agentRole } : {}),
     })));
     return existing === undefined;
+  }
+
+  private notifySelectionsChange(): void {
+    if (this.#onSelectionsChange === undefined) return;
+    if (this.#selectionBatchDepth > 0) {
+      this.#selectionNotificationPending = true;
+      return;
+    }
+    this.#onSelectionsChange(this.knownSelections());
+  }
+
+  private batchSelectionNotifications<T>(action: () => T): T {
+    this.#selectionBatchDepth += 1;
+    try {
+      return action();
+    } finally {
+      this.#selectionBatchDepth -= 1;
+      if (this.#selectionBatchDepth === 0 && this.#selectionNotificationPending) {
+        this.#selectionNotificationPending = false;
+        this.#onSelectionsChange?.(this.knownSelections());
+      }
+    }
   }
 }
 

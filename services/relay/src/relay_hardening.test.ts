@@ -219,10 +219,30 @@ test("the real host can reattach with a fresh signature", async (context) => {
   const first = await connect(url);
   first.send(hostAttach(identity, "host_reattach"));
   await settle();
+  const device = await connect(url);
+  const pairing = new PairingManager("host_reattach", identity);
+  const deviceIdentity = createDeviceIdentity("reattach_device");
+  const challenge = pairing.startPairing();
+  const credential = pairing.confirmPairing({
+    pairingId: challenge.pairingId,
+    secret: challenge.secret,
+    shortCode: challenge.shortCode,
+    deviceId: deviceIdentity.deviceId,
+    devicePublicKeyPem: deviceIdentity.publicKeyPem,
+  });
+  device.send(deviceAttach("host_reattach", deviceIdentity.deviceId, { identity: deviceIdentity, credential }));
+  await settle();
+  device.messages.length = 0;
   const second = await connect(url);
   second.send(hostAttach(identity, "host_reattach"));
   await settle();
   assert.equal(second.closed(), false, "the owner must be able to replace its own tunnel");
+  assert.equal(device.closed(), false, "devices must stay connected across host replacement");
+  assert.equal(
+    device.messages.some((message) => (message as { type?: unknown }).type === "relay.host_offline"),
+    false,
+    "replacing a live host must not announce a false outage",
+  );
   assert.equal(relay.roomCount(), 1);
 });
 

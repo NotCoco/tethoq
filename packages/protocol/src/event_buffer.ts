@@ -133,6 +133,10 @@ export class RequestLedger<T> {
     }
   }
 
+  public delete(requestId: string): boolean {
+    return this.#entries.delete(requestId);
+  }
+
   private prune(now: number): void {
     for (const [key, entry] of this.#entries) if (entry.expiresAt <= now) this.#entries.delete(key);
   }

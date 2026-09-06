@@ -3,12 +3,13 @@ import type { DesktopPreferencesState, PreferencesAction } from "@shared/desktop
 import { ProviderLogo } from "./components";
 import { reasoningLabel } from "./Composer";
 import { isAmbiguousSelectionValue, modelCatalogRoute, modelMatchesCatalogQuery, resolveConcreteModelSelection } from "./composer_helpers";
-import { CheckIcon, ChevronDownIcon, RefreshIcon, SearchIcon } from "./icons";
+import { CheckIcon, ChevronDownIcon, FileIcon, RefreshIcon, SearchIcon, SettingsIcon, XIcon } from "./icons";
 import type { DesktopSnapshot, ModelOption, Provider } from "./types";
 
 function selectableModels(providerId: string, models: readonly ModelOption[]): ModelOption[] {
   if (providerId !== "direct") return [...models];
-  return models.filter((model) => model.walletKind !== "user_api" || model.apiKeyConfigured === true);
+  return models.filter((model) => model.walletKind !== "user_api"
+    || (model.apiKeyConfigured === true && model.apiKeyVerified === true));
 }
 
 function modelGroups(providerId: string, providerName: string, models: readonly ModelOption[]): Array<{ label: string | null; models: ModelOption[] }> {
@@ -40,7 +41,9 @@ function routeLabel(providerId: string, model: ModelOption): string | undefined 
 function providerConnectionDetail(provider: Provider, models: readonly ModelOption[]): string | undefined {
   if (provider.id === "direct") {
     const endpoints = [...new Set(models
-      .filter((model) => model.walletKind === "user_api" && model.apiKeyConfigured === true)
+      .filter((model) => model.walletKind === "user_api"
+        && model.apiKeyConfigured === true
+        && model.apiKeyVerified === true)
       .map((model) => model.endpointName)
       .filter((name): name is string => Boolean(name)))];
     if (endpoints.length === 0) return "API key required";
@@ -49,6 +52,12 @@ function providerConnectionDetail(provider: Provider, models: readonly ModelOpti
   }
   if (!provider.version) return undefined;
   return provider.version.replace(/^v(?=\d)/iu, "");
+}
+
+function directApiNeedsKey(providerId: string, models: readonly ModelOption[]): boolean {
+  return providerId === "direct" && !models.some((model) => model.walletKind === "user_api"
+    && model.apiKeyConfigured === true
+    && model.apiKeyVerified === true);
 }
 
 function compactModelWindow(tokens: number): string {
@@ -106,14 +115,25 @@ function AgentModelPicker({ providerId, providerName, models, selectedModel, onC
   const [query, setQuery] = useState("");
   const [tip, setTip] = useState<{ model: ModelOption; rect: DOMRect } | null>(null);
   const root = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
   const search = useRef<HTMLInputElement>(null);
+  const close = (restoreFocus: boolean) => {
+    setOpen(false);
+    setTip(null);
+    if (restoreFocus) requestAnimationFrame(() => trigger.current?.focus());
+  };
   useEffect(() => {
     if (!open) return;
-    const close = (event: PointerEvent) => { if (!root.current?.contains(event.target as Node)) setOpen(false); };
-    const escape = (event: KeyboardEvent) => { if (event.key === "Escape") setOpen(false); };
-    document.addEventListener("pointerdown", close);
+    const closeOutside = (event: PointerEvent) => { if (!root.current?.contains(event.target as Node)) close(false); };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      close(true);
+    };
+    document.addEventListener("pointerdown", closeOutside);
     window.addEventListener("keydown", escape);
-    return () => { document.removeEventListener("pointerdown", close); window.removeEventListener("keydown", escape); };
+    return () => { document.removeEventListener("pointerdown", closeOutside); window.removeEventListener("keydown", escape); };
   }, [open]);
   useEffect(() => {
     if (open) search.current?.focus();
@@ -127,15 +147,14 @@ function AgentModelPicker({ providerId, providerName, models, selectedModel, onC
   const groups = modelGroups(providerId, providerName, matches);
   const choose = (model: ModelOption) => {
     const next = resolveConcreteModelSelection(models, { modelId: model.id });
-    setOpen(false);
-    setTip(null);
+    close(true);
     if (next) void onChange(providerId, next.modelId, next.reasoningEffort);
   };
   const showTip = (option: HTMLElement, model: ModelOption) => {
     setTip(modelHasFacts(model) ? { model, rect: option.getBoundingClientRect() } : null);
   };
   return <div className="agent-model-picker" ref={root}>
-    <button type="button" className="agent-model-trigger" aria-haspopup="listbox" aria-expanded={open} aria-label={`Default model for ${providerName}`} onClick={() => { setOpen((current) => !current); setTip(null); }}>
+    <button ref={trigger} type="button" className="agent-model-trigger" aria-haspopup="listbox" aria-expanded={open} aria-label={`Default model for ${providerName}`} onClick={() => { setOpen((current) => !current); setTip(null); }}>
       <span>{selectedModel.name}</span><ChevronDownIcon />
     </button>
     {open ? <div className="agent-model-dropdown">
@@ -168,12 +187,14 @@ function AgentModelPicker({ providerId, providerName, models, selectedModel, onC
   </div>;
 }
 
-export function AgentDefaultsSettings({ snapshot, preferences, onChange, onGlobalAgentsAction, onReconnect }: {
+export function AgentDefaultsSettings({ snapshot, preferences, onChange, onGlobalAgentsAction, onReconnect, onDirectApiSetup, onHarnessSetup }: {
   snapshot: DesktopSnapshot;
   preferences: DesktopPreferencesState;
   onChange: (providerId: string, modelId: string, reasoningEffort?: string) => Promise<void>;
   onGlobalAgentsAction: (action: PreferencesAction) => Promise<void>;
   onReconnect: (id: string) => Promise<void>;
+  onDirectApiSetup: () => void;
+  onHarnessSetup?: (id: string) => void;
 }) {
   const [busy, setBusy] = useState<string | null>(null);
   return <><section className="settings-block agent-defaults" id="agent-defaults">
@@ -183,6 +204,11 @@ export function AgentDefaultsSettings({ snapshot, preferences, onChange, onGloba
         const allModels = snapshot.models[provider.id] ?? [];
         const models = selectableModels(provider.id, allModels);
         const detail = providerConnectionDetail(provider, allModels);
+        const apiKeyRequired = directApiNeedsKey(provider.id, allModels);
+        const connectionState = apiKeyRequired ? "action-required" : provider.state;
+        const connectionTooltip = apiKeyRequired
+          ? "API key required · Direct API is not ready"
+          : `${provider.state === "online" ? "Connected" : provider.state === "error" ? "Connection error" : "Offline"} · ${provider.authenticated ? "Signed in" : "Sign-in unavailable"}`;
         const configured = preferences.agentDefaults[provider.id];
         const selection = resolveConcreteModelSelection(models, {}, configured);
         const selectedModel = models.find((model) => model.id === selection?.modelId);
@@ -194,39 +220,49 @@ export function AgentDefaultsSettings({ snapshot, preferences, onChange, onGloba
           : efforts[0];
         return <article key={provider.id}>
           <div className="agent-default-identity">
-            <ProviderLogo providerId={provider.id} provider={provider} size={30}/>
+            <ProviderLogo providerId={provider.id} provider={provider} size={34}/>
             <span><strong>{provider.name}</strong>{detail ? <small>{detail}</small> : null}</span>
+            <i className={`connection-dot ${connectionState}`} data-tooltip={connectionTooltip} />
           </div>
-          {selection && selectedModel ? <div className="agent-default-controls">
-            <div className="agent-default-model-row">
-              <span className="agent-default-label">Model</span>
-              <span className="agent-default-field">
-                <AgentModelPicker providerId={provider.id} providerName={provider.name} models={models} selectedModel={selectedModel} onChange={onChange} />
-                {routeLabel(provider.id, selectedModel) ? <small>{routeLabel(provider.id, selectedModel)}</small> : null}
-              </span>
-            </div>
-            {efforts.length && selectedEffort ? <div className="agent-default-model-row">
-              <span className="agent-default-label">Reasoning</span>
-              <span className="agent-default-field">
-                {/* The native select arrow sits wherever the platform draws it, which
-                    never lines up with the model trigger's chevron. Suppress it and
-                    reuse the same glyph in the same place instead. */}
-                <span className="agent-default-select">
-                  <select
-                    className="agent-default-reasoning"
-                    aria-label={`Default reasoning for ${provider.name}`}
-                    value={selectedEffort}
-                    onChange={(event) => void onChange(provider.id, selectedModel.id, event.target.value)}
-                  >
-                    {efforts.map((effort) => <option key={effort} value={effort}>{reasoningLabel(effort, { providerId: provider.id, modelId: selectedModel.id, displayName: selectedModel.name })}</option>)}
-                  </select>
-                  <ChevronDownIcon aria-hidden="true" />
+          <div className="agent-default-controls">
+            {selection && selectedModel ? <>
+              <div className="agent-default-model-row">
+                <span className="agent-default-label">Model</span>
+                <span className="agent-default-field">
+                  <AgentModelPicker providerId={provider.id} providerName={provider.name} models={models} selectedModel={selectedModel} onChange={onChange} />
+                  {routeLabel(provider.id, selectedModel) ? <small>{routeLabel(provider.id, selectedModel)}</small> : null}
                 </span>
-              </span>
-            </div> : null}
-          </div> : <p className="agent-default-unavailable">{provider.id === "direct" && allModels.length ? "Add an API key to choose a direct model" : "Model catalogue unavailable"}</p>}
-          <i className={`connection-dot ${provider.state}`} data-tooltip={`${provider.state === "online" ? "Connected" : provider.state === "error" ? "Connection error" : "Offline"} · ${provider.authenticated ? "Signed in" : "Sign-in unavailable"}`} />
-          {provider.state !== "online" ? <button className="settings-icon-action" data-tooltip={`Retry ${provider.name}`} aria-label={`Retry ${provider.name}`} disabled={busy === provider.id} onClick={async () => { setBusy(provider.id); await onReconnect(provider.id); setBusy(null); }}><RefreshIcon className="refresh-icon" /></button> : null}
+              </div>
+              {efforts.length && selectedEffort ? <div className="agent-default-model-row">
+                <span className="agent-default-label">Reasoning</span>
+                <span className="agent-default-field">
+                  {/* The native select arrow sits wherever the platform draws it, which
+                      never lines up with the model trigger's chevron. Suppress it and
+                      reuse the same glyph in the same place instead. */}
+                  <span className="agent-default-select">
+                    <select
+                      className="agent-default-reasoning"
+                      aria-label={`Default reasoning for ${provider.name}`}
+                      value={selectedEffort}
+                      onChange={(event) => void onChange(provider.id, selectedModel.id, event.target.value)}
+                    >
+                      {efforts.map((effort) => <option key={effort} value={effort}>{reasoningLabel(effort, { providerId: provider.id, modelId: selectedModel.id, displayName: selectedModel.name })}</option>)}
+                    </select>
+                    <ChevronDownIcon aria-hidden="true" />
+                  </span>
+                </span>
+              </div> : null}
+            </> : <div className="agent-default-model-row agent-default-setup-row">
+              <span className="agent-default-label">Model</span>
+              <span className="agent-default-field"><span className="agent-default-required">{apiKeyRequired ? "API key required" : "Catalogue unavailable"}</span></span>
+            </div>}
+          </div>
+          <div className="agent-default-row-actions">
+            {!apiKeyRequired && provider.state !== "online" && onHarnessSetup ? <button type="button" className="agent-default-setup-action" onClick={() => onHarnessSetup(provider.id)}><SettingsIcon /><span>Set up</span></button> : null}
+            {apiKeyRequired ? <button type="button" className="agent-default-setup-action" onClick={onDirectApiSetup}><SettingsIcon /><span>Set up</span></button>
+              : provider.state !== "online" ? <button className="settings-icon-action" data-tooltip={`Retry ${provider.name}`} aria-label={`Retry ${provider.name}`} disabled={busy === provider.id} onClick={async () => { setBusy(provider.id); await onReconnect(provider.id); setBusy(null); }}><RefreshIcon className="refresh-icon" /></button>
+                : null}
+          </div>
         </article>;
       })}
     </div>
@@ -236,8 +272,8 @@ export function AgentDefaultsSettings({ snapshot, preferences, onChange, onGloba
       <div><strong>{preferences.globalAgentsPath ? "AGENTS.md selected" : "No global instructions"}</strong>
         <small>{preferences.globalAgentsPath ?? "Each task uses its own project instructions."}</small></div>
       <div className="global-agents-actions">
-        {preferences.globalAgentsPath ? <button type="button" onClick={() => void onGlobalAgentsAction({ type: "clear-global-agents" })}>Clear</button> : null}
-        <button type="button" onClick={() => void onGlobalAgentsAction({ type: "choose-global-agents" })}>{preferences.globalAgentsPath ? "Change" : "Choose AGENTS.md"}</button>
+        {preferences.globalAgentsPath ? <button type="button" onClick={() => void onGlobalAgentsAction({ type: "clear-global-agents" })}><XIcon /><span>Clear</span></button> : null}
+        <button type="button" onClick={() => void onGlobalAgentsAction({ type: "choose-global-agents" })}><FileIcon /><span>{preferences.globalAgentsPath ? "Change AGENTS.md" : "Choose AGENTS.md"}</span></button>
       </div>
     </div>
   </section></>;

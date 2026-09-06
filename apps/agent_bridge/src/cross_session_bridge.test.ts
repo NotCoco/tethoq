@@ -126,9 +126,9 @@ test("cross-task history exposes validated origin and hides the routing envelope
   const sent = await bridge.sendCrossSessionMessage(source, target, "origin-once", "Check the build output.");
   assert.equal(sent.state, "delivered");
   const opened = await bridge.openSession(target);
-  const message = opened.messages.find((candidate) => candidate.origin?.envelopeId === sent.envelope.id);
+  const message = opened.messages.find((candidate) => candidate.origin?.kind === "cross_session" && candidate.origin.envelopeId === sent.envelope.id);
   assert.equal(message?.origin?.kind, "cross_session");
-  assert.equal(message?.origin?.sourceSessionId, source);
+  assert.equal(message?.origin?.kind === "cross_session" ? message.origin.sourceSessionId : undefined, source);
   assert.deepEqual(message?.parts, [{ type: "text", text: "Check the build output." }]);
   assert.doesNotMatch(JSON.stringify(message), /TETHOQ_REMOTE_MESSAGE_V1/);
 });

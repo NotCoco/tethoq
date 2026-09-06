@@ -14,7 +14,10 @@ const resources = path.join(unpackedRoot, 'resources');
 const sdkRoot = path.join(resources, 'connector-sdk');
 const asarUnpackedRoot = path.join(resources, 'app.asar.unpacked');
 const { verifyEmbeddedBridge } = require('./verify-embedded-bridge.cjs');
-const fixturePort = Number(process.env.TETHOQ_SMOKE_OPENCODE_PORT ?? 4096);
+// Port 4096 commonly belongs to the user's real `opencode serve` process.
+// Let Windows choose an unused loopback port unless QA explicitly pins one so
+// packaged smoke can never contend with or depend on that user-owned server.
+let fixturePort = Number(process.env.TETHOQ_SMOKE_OPENCODE_PORT ?? 0);
 const debugPort = Number(process.env.TETHOQ_SMOKE_DEBUG_PORT ?? 9327);
 let runRoot;
 let userData;
@@ -200,7 +203,7 @@ async function startOpenCodeFixture() {
         'Cache-Control': 'no-store',
         'Set-Cookie': 'tethoq-browser-smoke=present; Path=/; HttpOnly; SameSite=Lax',
       });
-      response.end(`<!doctype html><html><head><title>Tethoq browser smoke ${pageName}</title></head><body><main data-smoke-page="${pageName}">Browser smoke ${pageName}</main></body></html>`);
+      response.end(`<!doctype html><html><head><title>Tethoq browser smoke ${pageName}</title><style>html,body{min-height:100%;margin:0;background:#173c31;color:#eef8f3}main{padding:24px;font:16px system-ui}</style></head><body><main data-smoke-page="${pageName}">Browser smoke ${pageName}</main></body></html>`);
       return;
     }
     if (url.pathname === '/global/health') return json(response, { healthy: true, version: 'smoke-fixture' });
@@ -280,7 +283,15 @@ async function startOpenCodeFixture() {
   });
   await new Promise((resolve, reject) => {
     server.once('error', reject);
-    server.listen(fixturePort, '127.0.0.1', resolve);
+    server.listen(fixturePort, '127.0.0.1', () => {
+      const address = server.address();
+      if (address === null || typeof address === 'string') {
+        reject(new Error('The packaged smoke fixture did not bind a TCP port.'));
+        return;
+      }
+      fixturePort = address.port;
+      resolve();
+    });
   });
   return { server, clients, sessions, messages, statuses, abortCalls, reasoningRuns, messageReads };
 }
@@ -337,6 +348,7 @@ async function connectCdp(port) {
   });
   await send('Runtime.enable');
   return {
+    send,
     evaluate: async (expression, awaitPromise = true) => {
       let result;
       try {
@@ -791,6 +803,32 @@ async function exerciseBrowserDownloadPopover() {
   const before = await cdp.evaluate(`(() => { const rect = document.querySelector('.browser-viewport')?.getBoundingClientRect(); return rect ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height } : null; })()`);
   assert.ok(before && before.width > 0 && before.height > 0, 'The packaged browser viewport is not laid out.');
   await cdp.evaluate(`(() => {
+    const transition = { samples: [], popoverWithoutFreezeFrame: false, rendererWithoutDecodedFrame: false };
+    const sample = () => {
+      const trigger = document.querySelector('.browser-downloads');
+      const value = {
+        phase: document.querySelector('.browser-page')?.getAttribute('data-browser-overlay-phase') ?? null,
+        busy: trigger?.getAttribute('aria-busy') ?? null,
+        expanded: trigger?.getAttribute('aria-expanded') ?? null,
+        popover: Boolean(document.querySelector('.browser-download-popover')),
+        freezeFrame: Boolean(document.querySelector('.browser-freeze-frame')),
+        frameDecoded: (() => {
+          const frame = document.querySelector('.browser-freeze-frame');
+          return frame instanceof HTMLImageElement && frame.complete && frame.naturalWidth > 0 && frame.naturalHeight > 0;
+        })(),
+      };
+      if (value.popover && !value.freezeFrame) transition.popoverWithoutFreezeFrame = true;
+      if (value.phase === 'renderer' && !value.frameDecoded) transition.rendererWithoutDecodedFrame = true;
+      const serialized = JSON.stringify(value);
+      if (transition.samples.at(-1)?.serialized !== serialized) transition.samples.push({ serialized, value });
+    };
+    const observer = new MutationObserver(sample);
+    observer.observe(document.querySelector('.browser-page'), { attributes: true, childList: true, subtree: true });
+    transition.stop = () => observer.disconnect();
+    sample();
+    window.__tethoqDownloadTransition = transition;
+  })()`);
+  await cdp.evaluate(`(() => {
     const trigger = document.querySelector('.browser-downloads');
     if (!trigger) return false;
     trigger.focus();
@@ -835,6 +873,33 @@ async function exerciseBrowserDownloadPopover() {
   assert.equal(open.freezeFrame.complete, true, 'The packaged Chromium freeze frame did not load.');
   assert.equal(open.freezeFrame.naturalWidth, Math.round(before.width), 'The packaged Chromium freeze frame width is cropped.');
   assert.equal(open.freezeFrame.naturalHeight, Math.round(before.height), 'The packaged Chromium freeze frame height is cropped.');
+  const freezeFramePixels = await cdp.evaluate(`(async () => {
+    const image = document.querySelector('.browser-freeze-frame');
+    if (!(image instanceof HTMLImageElement)) return null;
+    await image.decode();
+    const canvas = document.createElement('canvas');
+    canvas.width = image.naturalWidth;
+    canvas.height = image.naturalHeight;
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    context.drawImage(image, 0, 0);
+    const pixels = context.getImageData(Math.floor(canvas.width * .1), Math.floor(canvas.height * .55), Math.max(1, Math.floor(canvas.width * .3)), Math.max(1, Math.floor(canvas.height * .25))).data;
+    let white = 0;
+    for (let index = 0; index < pixels.length; index += 4) {
+      if (pixels[index] >= 245 && pixels[index + 1] >= 245 && pixels[index + 2] >= 245 && pixels[index + 3] >= 240) white++;
+    }
+    return { whiteRatio: white / (pixels.length / 4) };
+  })()`);
+  assert.ok(freezeFramePixels && freezeFramePixels.whiteRatio < .01, `The packaged browser surrogate was blank or white: ${JSON.stringify(freezeFramePixels)}`);
+  const openTransition = await cdp.evaluate(`(() => {
+    const value = window.__tethoqDownloadTransition;
+    return value ? { popoverWithoutFreezeFrame: value.popoverWithoutFreezeFrame, rendererWithoutDecodedFrame: value.rendererWithoutDecodedFrame, samples: value.samples.map((sample) => sample.value) } : null;
+  })()`);
+  assert.ok(openTransition, 'The packaged download transition tracker did not run.');
+  assert.equal(openTransition.popoverWithoutFreezeFrame, false, `The packaged download panel exposed the viewport before its freeze frame painted: ${JSON.stringify(openTransition.samples)}`);
+  assert.equal(openTransition.rendererWithoutDecodedFrame, false, `The renderer took browser ownership before its replacement frame decoded: ${JSON.stringify(openTransition.samples)}`);
+  assert.ok(openTransition.samples.some((sample) => sample.phase === 'preparing' && sample.busy === 'true' && !sample.popover), 'The packaged download button did not own its prepare phase.');
+  assert.ok(openTransition.samples.some((sample) => sample.phase === 'prepared' && sample.popover && sample.freezeFrame), 'The packaged download panel and freeze frame were not painted before native handoff.');
+  assert.ok(openTransition.samples.some((sample) => sample.phase === 'renderer' && sample.expanded === 'true' && sample.popover && sample.freezeFrame), 'The renderer took browser ownership before the download panel and freeze frame were ready.');
 
   await cdp.evaluate(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
   await waitFor(() => cdp.evaluate('!document.querySelector(".browser-download-popover")'), 'download popover Escape close');
@@ -842,7 +907,35 @@ async function exerciseBrowserDownloadPopover() {
     const value = await cdp.evaluate(`(() => { const trigger = document.querySelector('.browser-downloads'); return { freezeFrame: Boolean(document.querySelector('.browser-freeze-frame')), expanded: trigger?.getAttribute('aria-expanded'), focused: document.activeElement === trigger }; })()`);
     return !value.freezeFrame && value.expanded === 'false' && value.focused ? value : null;
   }, 'download popover native restoration');
-  return { ...open.popover, freezeFrame: open.freezeFrame, viewportShifted: false, escapeClosed: true, nativeRestored: !closed.freezeFrame, focusRestored: closed.focused };
+  const transition = await cdp.evaluate(`(() => {
+    const value = window.__tethoqDownloadTransition;
+    value?.stop?.();
+    return value ? { popoverWithoutFreezeFrame: value.popoverWithoutFreezeFrame, rendererWithoutDecodedFrame: value.rendererWithoutDecodedFrame, samples: value.samples.map((sample) => sample.value) } : null;
+  })()`);
+  assert.ok(transition, 'The packaged download transition tracker disappeared before close.');
+  const rendererIndex = transition.samples.findIndex((sample) => sample.phase === 'renderer');
+  const firstFrameRemoval = transition.samples.slice(rendererIndex + 1).find((sample) => !sample.freezeFrame);
+  assert.ok(firstFrameRemoval, 'The packaged download freeze frame was not retired after close.');
+  assert.equal(firstFrameRemoval.phase, 'native', `The packaged download freeze frame disappeared before Chromium ownership returned: ${JSON.stringify(transition.samples)}`);
+
+  // Cancel one capture while it is preparing, then reopen. A stale capture or
+  // generation token must never strand Chromium hidden or reject the next use.
+  await cdp.evaluate(`document.querySelector('.browser-downloads')?.click()`);
+  await waitFor(() => cdp.evaluate(`document.querySelector('.browser-page')?.getAttribute('data-browser-overlay-phase') === 'preparing'`), 'download overlay rapid-cycle prepare');
+  await cdp.evaluate(`document.querySelector('.browser-downloads')?.click()`);
+  await waitFor(() => cdp.evaluate(`(() => {
+    const page = document.querySelector('.browser-page');
+    const trigger = document.querySelector('.browser-downloads');
+    return page?.getAttribute('data-browser-overlay-phase') === 'native' && trigger?.getAttribute('aria-busy') === 'false' && !document.querySelector('.browser-freeze-frame') && !document.querySelector('.browser-download-popover');
+  })()`), 'download overlay rapid-cycle cancellation');
+  await cdp.evaluate(`document.querySelector('.browser-downloads')?.click()`);
+  await waitFor(() => cdp.evaluate(`(() => {
+    const frame = document.querySelector('.browser-freeze-frame');
+    return document.querySelector('.browser-page')?.getAttribute('data-browser-overlay-phase') === 'renderer' && Boolean(document.querySelector('.browser-download-popover')) && frame instanceof HTMLImageElement && frame.complete && frame.naturalWidth > 0;
+  })()`), 'download overlay rapid-cycle reopen');
+  await cdp.evaluate(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
+  await waitFor(() => cdp.evaluate(`document.querySelector('.browser-page')?.getAttribute('data-browser-overlay-phase') === 'native' && !document.querySelector('.browser-freeze-frame')`), 'download overlay rapid-cycle final close');
+  return { ...open.popover, freezeFrame: open.freezeFrame, freezeFrameWhiteRatio: freezeFramePixels.whiteRatio, transitionSamples: transition.samples, viewportShifted: false, flashFree: true, escapeClosed: true, nativeRestored: !closed.freezeFrame, focusRestored: closed.focused, rapidCycle: true };
 }
 
 async function exerciseRecorder() {
@@ -966,6 +1059,11 @@ async function launchPackagedApp() {
     throw new Error(`${error instanceof Error ? error.message : String(error)}${appOutput.length ? `\n${appOutput.slice(-20).join('')}` : ''}`);
   }
   await waitFor(() => cdp.evaluate('Boolean(window.tethoqDesktop && document.querySelector(".desktop-app"))'), 'real preload and renderer shell', 45_000);
+  const shellHistory = await cdp.send('Page.getNavigationHistory');
+  assert.equal(shellHistory.entries.length, 1, 'The packaged shell retained its temporary startup page in Back/Forward history.');
+  const rendererUrl = await cdp.evaluate('location.href');
+  await cdp.evaluate('history.back()');
+  assert.equal(await cdp.evaluate('location.href'), rendererUrl, 'A Back command navigated the packaged shell away from the live renderer.');
   const smokeWindowState = await cdp.evaluate(`({ focused: document.hasFocus(), visibility: document.visibilityState })`);
   assert.equal(smokeWindowState.focused, false, 'The hidden packaged smoke window took foreground focus.');
 }
@@ -1034,7 +1132,12 @@ async function main() {
   await cdp.evaluate('document.querySelector(".sidebar-task-filter")?.click()');
   await waitFor(() => cdp.evaluate('!document.querySelector(".task-filter-popover")'), 'pending connector task filters close');
   await cdp.evaluate('document.querySelector(".new-task-button")?.click()');
-  await waitFor(() => cdp.evaluate(`document.querySelector('.workspace-title h1')?.textContent === 'New task' && document.querySelector('textarea[aria-label="Message"]')?.placeholder.startsWith('Describe the task')`), 'pending connector local draft');
+  try {
+    await waitFor(() => cdp.evaluate(`document.querySelector('.workspace-title h1')?.textContent === 'New task' && document.querySelector('textarea[aria-label="Message"]')?.placeholder.startsWith('Describe the task')`), 'pending connector local draft');
+  } catch (error) {
+    const draftState = await cdp.evaluate(`({ title: document.querySelector('.workspace-title h1')?.textContent ?? null, placeholder: document.querySelector('textarea[aria-label="Message"]')?.placeholder ?? null, selected: document.querySelector('[data-session-id] > .session-row.selected')?.parentElement?.getAttribute('data-session-id') ?? null, toast: document.querySelector('.toast')?.textContent ?? null, body: document.body.innerText.slice(0, 800), error: document.querySelector('.renderer-error-boundary')?.textContent ?? null })`);
+    throw new Error(`${error instanceof Error ? error.message : String(error)}; state=${JSON.stringify(draftState)}`);
+  }
   await cdp.evaluate('document.querySelector(".model-picker-trigger")?.click()');
   await waitFor(() => cdp.evaluate('Boolean(document.querySelector(".model-picker-dropup"))'), 'pending connector model catalog');
   const pendingModelCatalog = await cdp.evaluate(`Boolean(document.querySelector('.model-picker-dropup [data-provider-group="community.echo"]'))`);

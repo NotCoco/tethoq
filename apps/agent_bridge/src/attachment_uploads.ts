@@ -4,6 +4,7 @@ import type { MessageAttachment } from "../../../packages/provider_contract/src/
 export const maxAttachmentBytes = 25 * 1024 * 1024;
 export const maxAttachmentChunkBytes = 192 * 1024;
 export const maxPendingAttachmentUploads = 32;
+export const maxMessageAttachments = 12;
 export const maxMessageAttachmentBytes = 50 * 1024 * 1024;
 
 interface Upload {
@@ -93,7 +94,9 @@ export class AttachmentUploadManager {
   }
 
   public consume(attachmentIds: readonly string[]): AttachmentConsumption {
-    if (attachmentIds.length > 4) throw new Error("A message can contain at most four attachments");
+    if (attachmentIds.length > maxMessageAttachments) {
+      throw new Error(`You can attach up to ${maxMessageAttachments} files to one message`);
+    }
     if (new Set(attachmentIds).size !== attachmentIds.length) throw new Error("Attachment IDs must be unique");
     const uploads = attachmentIds.map((id) => {
       const upload = this.require(id);

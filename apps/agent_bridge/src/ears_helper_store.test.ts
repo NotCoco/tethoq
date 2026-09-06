@@ -6,7 +6,7 @@ import test from "node:test";
 import { earsModelKey, makeGlobalSessionId } from "../../../packages/protocol/src/index.js";
 import { EarsHelperStore, defaultEarsHelperStatePath } from "./ears_helper_store.js";
 
-test("EARS helper mappings persist only provider-matched bounded session identities", async (t) => {
+test("EARS helper mappings retain every provider-matched privacy identity", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "tethoq-ears-helper-store-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const configPath = join(root, "bridge.json");
@@ -29,4 +29,12 @@ test("EARS helper mappings persist only provider-matched bounded session identit
   }), "utf8");
   assert.deepEqual(await new EarsHelperStore(path).read(), { version: 1, helpers: { [validKey]: validId } });
   assert.match(await readFile(path, "utf8"), /wrong-provider/);
+
+  const many = Object.fromEntries(Array.from({ length: 1_050 }, (_, index) => [
+    earsModelKey("direct", `model-${index}`),
+    makeGlobalSessionId("host", "direct", `helper-${index}`),
+  ]));
+  await store.scheduleWrite(many);
+  const retained = await new EarsHelperStore(path).read();
+  assert.equal(Object.keys(retained.helpers).length, 1_050, "retired helpers lost their durable privacy marker");
 });

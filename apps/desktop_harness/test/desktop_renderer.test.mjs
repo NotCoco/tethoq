@@ -10,10 +10,24 @@ const testDirectory = dirname(fileURLToPath(import.meta.url));
 const appRoot = join(testDirectory, "..");
 const outputDirectory = join(tmpdir(), `tethoq-desktop-renderer-${process.pid}-${Date.now()}`);
 const bridgeBundle = join(outputDirectory, "bridge.mjs");
+const timelineMergeBundle = join(outputDirectory, "timeline-merge.mjs");
+const timelineBundle = join(outputDirectory, "timeline.mjs");
 const searchBundle = join(outputDirectory, "search-helpers.mjs");
+const inlineWorkerStubPlugin = {
+  name: "inline-worker-stub",
+  setup(buildContext) {
+    buildContext.onResolve({ filter: /\?worker&inline$/ }, (args) => ({ path: args.path, namespace: "inline-worker-stub" }));
+    buildContext.onLoad({ filter: /.*/, namespace: "inline-worker-stub" }, () => ({
+      contents: "export default class InlineWorkerStub { constructor() { throw new Error('Workers are not started by unit tests'); } }",
+      loader: "js",
+    }));
+  },
+};
 await mkdir(outputDirectory, { recursive: true });
 
 const calls = [];
+let releaseDeferredHistoryImage;
+const deferredHistoryImage = new Promise((resolve) => { releaseDeferredHistoryImage = resolve; });
 globalThis.window = {
   tethoqDesktop: {
     selectFiles: async (providerId) => providerId === "opencode" ? [{ kind: "file", name: "notes.ts", path: "C:\\notes.ts", mimeType: "text/plain", byteLength: 4, dataBase64: "dGVzdA==" }] : [],
@@ -51,6 +65,24 @@ globalThis.window = {
     request: async (type, payload = {}) => {
       calls.push({ type, payload });
       if (type === "sessions.list") return { ok: true, payload: { sessions: [{
+        id: "external-session",
+        providerId: "acme-agent",
+        title: "External task",
+        state: "idle",
+        workingDirectory: "C:\\work",
+        lastActivityAt: "2026-08-13T00:00:00.000Z",
+        contextHandoffSummary: "Top-level handoff summary",
+        externalWriter: true,
+        nativeMetadata: { tethoqHandoffSummary: "Legacy summary must not win" },
+      }, {
+        id: "legacy-handoff-session",
+        providerId: "acme-agent",
+        title: "Legacy handoff",
+        state: "idle",
+        workingDirectory: "C:\\work",
+        lastActivityAt: "2026-08-13T00:00:00.000Z",
+        nativeMetadata: { tethoqHandoffSummary: "Legacy metadata summary" },
+      }, {
         id: "host/opencode/root-chat",
         providerId: "opencode",
         title: "OpenCode project chat",
@@ -71,7 +103,7 @@ globalThis.window = {
         relationship: { kind: "subagent", sourceSessionId: "host/opencode/root-chat", strategy: "native" },
         nativeMetadata: {},
       }] } };
-      if (type === "sessions.refresh") return { ok: true, payload: { sessions: [{
+      if (type === "sessions.bootstrap" || type === "sessions.refresh") return { ok: true, payload: { sessions: [{
         id: "external-session",
         providerId: "acme-agent",
         title: "External task",
@@ -112,6 +144,23 @@ globalThis.window = {
         { id: "first-model", providerId: "acme-agent", displayName: "First model", isDefault: false, nativeMetadata: { sourceProviderId: "synthetic", sourceProviderName: "Synthetic", contextWindow: 128_000, pricing: { input: 3 / 1_000_000, output: 15 / 1_000_000 } } },
         { id: "default-model", providerId: "acme-agent", displayName: "Default model", isDefault: true, nativeMetadata: {} },
       ] } };
+      if (type === "session.open" && payload.sessionId === "deferred-history-image") return { ok: true, payload: { messages: [{
+        id: "deferred-image-message",
+        sessionId: payload.sessionId,
+        providerMessageId: "deferred-image-native",
+        role: "user",
+        createdAt: "2026-08-25T10:00:00.000Z",
+        status: "completed",
+        nativeMetadata: {},
+        parts: [
+          { type: "text", text: "Text must render before the preview arrives." },
+          { type: "image", retrievalId: "deferred-image", mimeType: "image/png", name: "slow.png" },
+        ],
+      }] } };
+      if (type === "session.image.get" && payload.retrievalId === "deferred-image") {
+        await deferredHistoryImage;
+        return { ok: true, payload: { retrievalId: "deferred-image", offset: 0, totalBytes: 3, dataBase64: "AQID", nextOffset: null, mimeType: "image/png" } };
+      }
       if (type === "session.open" && payload.sessionId === "role-mapping") return { ok: true, payload: { messages: [{
         id: "assistant-message",
         sessionId: payload.sessionId,
@@ -229,6 +278,7 @@ globalThis.window = {
         stale: false,
         nativeMetadata: {},
       }] } };
+      if (type === "scheduled_task.list") return { ok: true, payload: { tasks: [] } };
       throw new Error(`Unexpected request: ${type}`);
     },
   },
@@ -244,6 +294,23 @@ await build({
   alias: { "@shared": join(appRoot, "src", "shared") },
 });
 await build({
+  entryPoints: [join(appRoot, "src", "renderer", "src", "timeline_merge.ts")],
+  outfile: timelineMergeBundle,
+  bundle: true,
+  format: "esm",
+  platform: "node",
+  target: "node22",
+});
+await build({
+  entryPoints: [join(appRoot, "src", "renderer", "src", "ChatTimeline.tsx")],
+  outfile: timelineBundle,
+  bundle: true,
+  format: "esm",
+  platform: "node",
+  target: "node22",
+  plugins: [inlineWorkerStubPlugin],
+});
+await build({
   entryPoints: [join(appRoot, "src", "renderer", "src", "search_helpers.ts")],
   outfile: searchBundle,
   bundle: true,
@@ -253,6 +320,8 @@ await build({
 });
 const searchHelpers = await import(`file:///${searchBundle.replaceAll("\\", "/")}`);
 const bridge = await import(`file:///${bridgeBundle.replaceAll("\\", "/")}`);
+const timelineMerge = await import(`file:///${timelineMergeBundle.replaceAll("\\", "/")}`);
+const timelineHelpers = await import(`file:///${timelineBundle.replaceAll("\\", "/")}`);
 process.on("exit", () => { void rm(outputDirectory, { recursive: true, force: true }); });
 
 const source = async (path) => await readFile(join(appRoot, path), "utf8");
@@ -268,9 +337,9 @@ test("desktop search stays bounded to normalized in-memory UI metadata", async (
   const palette = app.match(/function CommandPalette[\s\S]*?(?=\n\}\n\nexport default)/u)?.[0] ?? "";
   assert.match(app, /const settingsSearchCatalogue = \[/u);
   assert.match(app, /agent provider connection model default reasoning/u);
-  // The palette indexes one pre-filtered list; internal, side-chat, and archived
-  // records are excluded before it ever sees them.
-  assert.match(app, /const activeSessions = useMemo\(\(\) => topLevelSessions\.filter\(\(session\) => !session\.archived && session\.sessionKind !== "side_chat" && session\.sessionKind !== "internal"\)/u);
+  // The palette indexes one pre-filtered list; provisional drafts, internal,
+  // side-chat, and archived records are excluded before it ever sees them.
+  assert.match(app, /const activeSessions = useMemo\(\(\) => topLevelSessions\.filter\(\(session\) => !session\.provisional && !session\.archived && !isSideChatSession\(session\) && session\.sessionKind !== "internal"\)/u);
   assert.match(app, /<CommandPalette snapshot=\{snapshot\} sessions=\{activeSessions\}/u);
   assert.doesNotMatch(palette, /snapshot\.sessions/u);
   assert.match(palette, /maxLength=\{maximumUiSearchCharacters\}/u);
@@ -289,6 +358,7 @@ test("renderer transient dialogs have names, focus return, and correct modal sem
   assert.match(components, /focusableSelector/);
   assert.match(components, /event\.key !== "Tab"/);
   assert.match(components, /target && target\.isConnected\) target\.focus\(\)/);
+  assert.match(components, /document\.addEventListener\("mousedown", closeOutside, true\)/);
   assert.match(components, /aria-modal="true"/);
   assert.match(app, /<Modal title="" label="Command palette"/);
   assert.match(app, /task-details-popover" role="dialog" aria-modal="false"/);
@@ -296,14 +366,18 @@ test("renderer transient dialogs have names, focus return, and correct modal sem
   assert.match(app, /requestAnimationFrame\(\(\) => trigger\.current\?\.focus\(\)\)/);
   assert.match(app, /closeOutside = \(event: MouseEvent\) => \{ if \(!root\.current\?\.contains\(event\.target as Node\)\) closeFromOutside\(\); \}/);
   assert.match(composer, /model-library" role="dialog" aria-modal="true"/);
+  // The model browser mounts at the document root. Left inside .composer-wrap, whose
+  // own stacking context sits below the workspace header, its backdrop blur stopped
+  // short and the top of the app stayed sharp behind the modal.
+  assert.match(composer, /createPortal\(<div className="model-library-backdrop"/);
   assert.match(composer, /modelLibrary\.current\?\.querySelector/);
   assert.match(composer, /const closePicker = \(restoreFocus = true\)/);
   assert.match(composer, /!root\.current\?\.contains\(event\.target as Node\)\) closePicker\(false\)/);
   assert.match(composer, /side-chat-panel .*role="dialog" aria-modal="false"/);
-  assert.match(composer, /const restoreFocus = \(\) =>/);
+  assert.match(composer, /const restoreFocus = useCallback\(\(\) =>/);
   assert.match(navigation, /session-subagents-popover" style=\{popoverStyle\} role="dialog" aria-modal="false"/);
   assert.match(navigation, /const popoverId = `session-subagents-\$\{session\.id\}`/);
-  assert.match(navigation, /!root\.current\?\.contains\(event\.target as Node\)\) closeFromOutside\(\)/);
+  assert.match(navigation, /!root\.current\?\.contains\(target\) && !popover\.current\?\.contains\(target\)\) closeFromOutside\(\)/);
 });
 
 test("settings expose one agents catalogue with truthful model routes and compact cards", async () => {
@@ -315,7 +389,7 @@ test("settings expose one agents catalogue with truthful model routes and compac
   ]);
 
   assert.match(defaults, /Your coding tools and their default models\./u);
-  assert.match(defaults, /model\.walletKind !== "user_api" \|\| model\.apiKeyConfigured === true/u);
+  assert.match(defaults, /model\.walletKind !== "user_api"[\s\S]*model\.apiKeyConfigured === true && model\.apiKeyVerified === true/u);
   assert.match(defaults, /API key saved/u);
   assert.match(defaults, /through \$\{model\.source/u);
   assert.match(defaults, /endpointName \?\? "Other models"/u);
@@ -328,9 +402,13 @@ test("settings expose one agents catalogue with truthful model routes and compac
   assert.doesNotMatch(defaults, /Managed by agent/u);
   assert.match(defaults, /API key required/u);
   assert.match(defaults, /API providers · keys saved/u);
-  // The Agents catalogue lives in one place now: connection dot and reconnect
-  // ride the model row instead of a duplicate provider list.
-  assert.match(defaults, /className=\{`connection-dot \$\{provider\.state\}`\}/u);
+  // Transport state and usability are separate: a reachable Direct bridge with
+  // no verified key must not borrow the healthy green connected treatment.
+  assert.match(defaults, /const apiKeyRequired = directApiNeedsKey\(provider\.id, allModels\)/u);
+  assert.match(defaults, /const connectionState = apiKeyRequired \? "action-required" : provider\.state/u);
+  assert.match(defaults, /API key required · Direct API is not ready/u);
+  assert.match(defaults, /className=\{`connection-dot \$\{connectionState\}`\}/u);
+  assert.match(styles, /\.connection-dot\.action-required \{[^}]*background: #bc9352/u);
   assert.match(defaults, /className="settings-icon-action"/u);
   assert.match(defaults, /contextWindowTokens/u);
   assert.match(defaults, /inputPricePerMillion/u);
@@ -342,13 +420,23 @@ test("settings expose one agents catalogue with truthful model routes and compac
   assert.doesNotMatch(app, /<small>v\{provider\.version\}<\/small>/u);
   assert.match(app, /const closeSettings = useCallback/u);
   assert.match(app, /className="settings-close-button"[^>]*aria-label="Close settings"[^>]*onClick=\{onClose\}/u);
+  assert.match(app, /<AgentDefaultsSettings[\s\S]*?<WorkflowSettings/u, "Agents must be the first settings section");
   assert.match(navigation, /className="sidebar-settings"[^>]*aria-label=\{view === "settings" \? "Close settings" : "Open settings"\}/u);
   assert.doesNotMatch(navigation, /sidebar-settings \$\{view === "settings" \? "active"/u);
   assert.match(styles, /\.settings-close-button \{[^}]*position: sticky;[^}]*width: 32px;[^}]*height: 32px;/u);
   assert.match(styles, /\.settings-page::-webkit-scrollbar \{ width: 10px; \}/u);
   assert.match(styles, /\.settings-page::-webkit-scrollbar-thumb:hover \{ background: #8a8a83; \}/u);
   assert.match(styles, /\.agent-default-list \{[^}]*overflow: visible;/u);
-  assert.match(styles, /\.agent-default-list > article \{[^}]*grid-template-columns: minmax\(180px,\.8fr\) minmax\(280px,1\.2fr\) 16px 32px/u);
+  assert.match(styles, /\.agent-default-list > article \{[^}]*grid-template-columns: minmax\(180px,1fr\) minmax\(280px,360px\) 76px/u);
+  assert.doesNotMatch(styles, /\.settings-simplified \.connector-card\.pending \{[^}]*border-color:\s*transparent/u);
+  assert.match(styles, /\.agent-default-controls \{[^}]*max-width: 360px;[^}]*justify-self: end/u);
+  assert.match(defaults, /<ProviderLogo providerId=\{provider\.id\} provider=\{provider\} size=\{34\}/u);
+  assert.match(styles, /\.agent-default-identity \{[^}]*grid-template-columns: 34px minmax\(0,1fr\) 8px/u);
+  assert.match(defaults, /className="agent-default-model-row agent-default-setup-row"[\s\S]*?>Model<[\s\S]*?API key required/u);
+  assert.match(defaults, /className="agent-default-setup-action" onClick=\{onDirectApiSetup\}[\s\S]*?<SettingsIcon \/><span>Set up<\/span>/u);
+  assert.match(app, /onDirectApiSetup=\{\(\) => setDirectApiSetupRevision\(\(current\) => current \+ 1\)\}/u);
+  assert.match(app, /handledDirectApiSetupRevision[\s\S]*?setOpen\(true\);[\s\S]*?void showDirectWallet\(\)/u, "Set up must open the real single-owned wallet surface");
+  assert.doesNotMatch(defaults, /wallet\.configure|wallet-trigger/u, "settings must not duplicate or fake-click the wallet implementation");
   assert.match(styles, /\.agent-model-tip \{[^}]*position: fixed/u);
   assert.match(styles, /\.agent-model-tip \{[^}]*opacity: 0;[^}]*transition: opacity \.11s ease \.45s/u);
   // Values line up because the label column is a fixed width, not an auto column
@@ -361,6 +449,14 @@ test("settings expose one agents catalogue with truthful model routes and compac
   assert.match(styles, /\.agent-default-reasoning \{[^}]*appearance: none;/u);
   assert.match(styles, /\.agent-default-select > svg \{[^}]*right: 8px;[^}]*width: 13px;/u);
   assert.match(styles, /\.agent-model-trigger \{[^}]*padding: 0 8px;/u);
+  assert.match(styles, /\.settings-simplified \{[^}]*grid-template-columns: 40px minmax\(0,720px\) 40px/u);
+  assert.match(styles, /\.settings-simplified > \.settings-close-button \{[^}]*grid-column: 1;[^}]*grid-row: 1;[^}]*justify-self: end;[^}]*margin: 22px 8px 0 0/u);
+  assert.match(defaults, /<FileIcon \/><span>\{preferences\.globalAgentsPath \? "Change AGENTS\.md" : "Choose AGENTS\.md"\}<\/span>/u);
+  assert.match(defaults, /<XIcon \/><span>Clear<\/span>/u);
+  assert.match(app, /className="connector-disclosure"><span>Details<\/span><ChevronDownIcon className="details-chevron" \/><\/span>/u);
+  assert.match(styles, /\.settings-simplified \.connector-list \{[^}]*gap: 0;[^}]*overflow: hidden;[^}]*border: 1px solid var\(--line\);[^}]*border-radius: 8px/u);
+  assert.match(styles, /\.settings-simplified \.connector-card \{ border: 0; border-radius: 0; background: transparent; \}/u);
+  assert.match(styles, /\.settings-simplified \.connector-card \+ \.connector-card \{ border-top: 1px solid var\(--line\); \}/u);
   // A long catalogue is filterable; the list scrolls beneath a fixed field.
   assert.match(defaults, /const searchable = models\.length > 8;/u);
   assert.match(defaults, /className="agent-model-search"/u);
@@ -378,16 +474,17 @@ test("settings expose one agents catalogue with truthful model routes and compac
   assert.doesNotMatch(defaults, /<div className="agent-model-dropdown" role="listbox"/u);
 });
 
-test("initial renderer snapshot preserves dynamic providers and keyed input answers", async () => {
+test("initial renderer snapshot paints providers before attention requests settle", async () => {
   calls.length = 0;
   const result = await bridge.loadInitialSnapshot();
 
-  assert.deepEqual(calls.slice(0, 3).map((call) => call.type).sort(), [
-    "approval.list",
-    "sessions.refresh",
-    "user_input.list",
+  assert.deepEqual(calls.slice(0, 2).map((call) => call.type).sort(), [
+    "scheduled_task.list",
+    "sessions.list",
   ]);
-  assert.deepEqual(result.snapshot.inputRequests, [{
+  assert.deepEqual(result.snapshot.inputRequests, []);
+  const attention = await result.attentionHydration;
+  assert.deepEqual(attention.inputRequests, [{
     id: "input-1",
     sessionId: "session-1",
     title: "Choose target",
@@ -402,16 +499,8 @@ test("initial renderer snapshot preserves dynamic providers and keyed input answ
   assert.equal(result.snapshot.sessions[0].contextSummary, "Top-level handoff summary");
   assert.equal(result.snapshot.sessions[0].externalWriter, true);
   assert.equal(result.snapshot.sessions[1].contextSummary, "Legacy metadata summary");
-  assert.equal(result.snapshot.models["acme-agent"][0].isDefault, undefined);
-  assert.equal(result.snapshot.models["acme-agent"][1].isDefault, true);
-  // Native context window and per-token pricing become renderer-facing facts;
-  // absent provider data stays absent instead of defaulting to zero.
-  assert.equal(result.snapshot.models["acme-agent"][0].contextWindowTokens, 128_000);
-  assert.equal(result.snapshot.models["acme-agent"][0].inputPricePerMillion, 3);
-  assert.equal(result.snapshot.models["acme-agent"][0].outputPricePerMillion, 15);
-  assert.equal(result.snapshot.models["acme-agent"][1].contextWindowTokens, undefined);
-  assert.equal(result.snapshot.models["acme-agent"][1].inputPricePerMillion, undefined);
-  assert.equal(result.snapshot.models["acme-agent"][1].outputPricePerMillion, undefined);
+  // First paint deliberately does not wait for any provider's model catalogue.
+  assert.deepEqual(result.snapshot.models, {});
 });
 
 test("context usage parsing and threshold updates preserve provider values", async () => {
@@ -474,7 +563,7 @@ test("desktop context control applies a model-bounded threshold from the enlarge
   // its first turn that is nothing, which is what showed as a stuck empty bar.
   assert.match(app, /const \[sessionContext, setSessionContext\] = useState<SessionContextState \| null>\(null\)/);
   assert.match(app, /<ContextUsageControl key=\{session\.id\} session=\{session\} context=\{sessionContext\?\.sessionId === session\.id \? sessionContext : null\}/);
-  assert.match(app, /\}, \[session\?\.draft, session\?\.id, session\?\.state, updateContextCompaction\]\)/);
+  assert.match(app, /\}, \[session\?\.draft, session\?\.id, session\?\.schedule\?\.status, session\?\.state, updateContextCompaction\]\)/);
   assert.doesNotMatch(app, /\[refresh, session\.state, session\.updatedAt\]/);
   assert.doesNotMatch(app, /window\.setInterval\(\(\) => \{ void refresh\(\); \}/);
   // One reading is a snapshot, and a snapshot taken while a provider was still
@@ -497,13 +586,14 @@ test("desktop context control applies a model-bounded threshold from the enlarge
   assert.match(app, /event\.key === "Escape"\) dismiss\(\)/);
   assert.match(app, /onClick=\{\(\) => open \? dismiss\(\) : setOpen\(true\)\}/);
 
-  // The visible percentage answers the user's actual question: how close this
-  // task is to its automatic-compaction point. The model's larger raw capacity
-  // remains separately visible in Usage.
+  // The compact header previews distance to the draft/applied compaction point,
+  // while the slider's white underlay independently measures full context use.
   assert.match(app, /const meterLimit = thresholdAvailable \? safeThreshold : appliedLimit/);
   assert.match(app, /used \/ meterLimit \* 100/);
-  assert.match(app, /Automatic compaction limit used/);
-  assert.match(app, /% of \$\{thresholdAvailable \? "automatic compaction limit" : "context"\} used/);
+  assert.match(app, /const reportedContextPercent = used !== null && windowTokens !== null/);
+  assert.match(app, /used \/ windowTokens \* 100/);
+  assert.match(app, /className="context-expanded-track"[^>]*aria-label="Context window used"/);
+  assert.match(app, /<i style=\{\{ width: `\$\{shownContextPercent\}%` \}\} \/>/);
 
   // An agent can report what a task used without reporting the model's limit. A
   // share of an unknown limit cannot be drawn, and an empty gauge reads exactly
@@ -540,6 +630,17 @@ test("task header exposes concise child-task details instead of a duplicate inte
   assert.match(styles, /\.task-details-popover \{[^}]*background-color: #181817[^}]*opacity: 1/);
 });
 
+test("failed compaction reports a retryable system notice without claiming success", () => {
+  const item = bridge.eventToTimeline({
+    sequence: 1, eventId: "compact-failed", type: "context.compaction_failed",
+    hostId: "desktop_test", providerId: "codex", sessionId: "session-1",
+    occurredAt: "2026-09-06T00:00:00.000Z", payload: { kind: "automatic" },
+  });
+  assert.equal(item.title, "System");
+  assert.equal(item.body, "Compaction could not be completed. You can try again.");
+  assert.equal(item.state, "completed");
+});
+
 test("streaming events reuse provider message identity through completion", () => {
   const base = {
     sequence: 1,
@@ -571,6 +672,131 @@ test("Codex item completion reuses the streamed item id and exposes completed te
   assert.equal(delta.id, completed.id);
   assert.equal(delta.body, "Hello ");
   assert.equal(completed.body, "Hello world");
+});
+
+test("completed user events expose only safe loading placeholders for image attachments", () => {
+  const base = {
+    sequence: 1,
+    hostId: "desktop_test",
+    providerId: "codex",
+    sessionId: "session-1",
+    occurredAt: "2026-09-02T08:00:00.000Z",
+  };
+  const completed = bridge.eventToTimeline({
+    ...base,
+    eventId: "codex:user-with-image",
+    type: "message.completed",
+    payload: {
+      messageId: "user-with-image",
+      role: "user",
+      text: "This message has an image.",
+      imageAttachments: [{
+        name: " C:\\private\\screenshot.png ",
+        mimeType: "image/png",
+        uri: "file:///C:/private/screenshot.png",
+        path: "C:\\private\\screenshot.png",
+        src: "data:image/png;base64,AQID",
+        dataBase64: "AQID",
+      }, {
+        name: "preview",
+        mimeType: "text/html",
+        base64: "unsafe",
+      }, {
+        name: "   ",
+        mimeType: "image/jpeg",
+      }],
+    },
+  });
+
+  assert.equal(completed.kind, "user");
+  assert.equal(completed.body, "This message has an image.");
+  assert.deepEqual(completed.images, [
+    { name: "screenshot.png", mimeType: "image/png", loading: true },
+    { name: "preview", loading: true },
+    { name: "Attached image", mimeType: "image/jpeg", loading: true },
+  ]);
+  assert.equal(timelineHelpers.hasVisibleTimelineContent(completed), true);
+  assert.doesNotMatch(JSON.stringify(completed.images), /file:|C:\\\\private|data:image|AQID|unsafe/u);
+
+  const delta = bridge.eventToTimeline({
+    ...base,
+    eventId: "codex:user-delta",
+    type: "message.delta",
+    payload: { messageId: "user-delta", role: "user", text: "Streaming", imageAttachments: [{ name: "ignored.png", mimeType: "image/png" }] },
+  });
+  const assistant = bridge.eventToTimeline({
+    ...base,
+    eventId: "codex:assistant-with-descriptor",
+    type: "message.completed",
+    payload: { messageId: "assistant-with-descriptor", role: "assistant", text: "Done", imageAttachments: [{ name: "ignored.png", mimeType: "image/png" }] },
+  });
+  const ordinary = bridge.eventToTimeline({
+    ...base,
+    eventId: "codex:ordinary-user",
+    type: "message.completed",
+    payload: { messageId: "ordinary-user", role: "user", text: "No attachment" },
+  });
+  assert.equal(delta.images, undefined);
+  assert.equal(assistant.images, undefined);
+  assert.equal(ordinary.images, undefined);
+});
+
+test("live and canonical Codex attachment records coalesce two images without fallback duplicates", () => {
+  const body = "Compare both attached screenshots.";
+  const live = bridge.eventToTimeline({
+    sequence: 1,
+    eventId: "codex:response-item:user-message",
+    hostId: "desktop_test",
+    providerId: "codex",
+    sessionId: "session-two-images",
+    occurredAt: "2026-09-02T08:15:00.000Z",
+    type: "message.completed",
+    payload: {
+      messageId: "response-item-user-message",
+      turnId: "turn-two-images",
+      role: "user",
+      text: body,
+      imageAttachments: [
+        { name: "first.png", mimeType: "image/png" },
+        { mimeType: "image/png" },
+      ],
+    },
+  });
+  const canonical = bridge.mapMessages([{
+    id: "canonical-user-message",
+    sessionId: "session-two-images",
+    providerMessageId: "canonical-user-message",
+    role: "user",
+    createdAt: "2026-09-02T08:15:05.000Z",
+    completedAt: "2026-09-02T08:15:05.000Z",
+    status: "completed",
+    nativeMetadata: { turnId: "turn-two-images", canonicalUserMessage: true },
+    parts: [
+      { type: "text", text: body },
+      { type: "image", retrievalId: "first-image", mimeType: "image/png", name: "first.png", uri: "data:image/png;base64,AQID" },
+      { type: "image", retrievalId: "second-image", mimeType: "image/png", uri: "data:image/png;base64,BAUG" },
+    ],
+  }]);
+
+  assert.ok(live);
+  assert.deepEqual(live.images?.map((image) => image.name), ["first.png", "Attached image"]);
+  assert.equal(canonical.length, 1);
+  assert.deepEqual(canonical[0].images?.map((image) => image.name), ["first.png", "Attached image"]);
+
+  const reconciled = timelineMerge.reconcileTimelinePage(canonical, [live]);
+  assert.equal(reconciled.length, 1, "one Codex turn remains one user row");
+  assert.equal(reconciled[0].kind, "user");
+  assert.equal(reconciled[0].body, body);
+  assert.equal(reconciled[0].images?.length, 2, "the transcript renders exactly two image widgets");
+  assert.deepEqual(reconciled[0].images?.map((image) => image.name), ["first.png", "Attached image"]);
+  assert.deepEqual(reconciled[0].images?.map((image) => image.dataUrl), [
+    "data:image/png;base64,AQID",
+    "data:image/png;base64,BAUG",
+  ]);
+
+  const reopened = timelineMerge.reconcileTimelinePage(canonical, reconciled);
+  assert.equal(reopened.length, 1, "a repeated canonical refresh cannot duplicate the user row");
+  assert.equal(reopened[0].images?.length, 2, "fallback naming cannot duplicate the unnamed image widget");
 });
 
 test("Codex command activity carries its call identity into timeline reconciliation", () => {
@@ -609,6 +835,28 @@ test("stored pending commands display their known input before output arrives", 
   assert.equal(page.items[0].state, "running");
   assert.equal(page.items[0].body, "npm test -- --runInBand");
   assert.doesNotMatch(page.items[0].body, /Command is running/iu);
+});
+
+test("history text and placeholders return before deferred image bytes", async () => {
+  const page = await Promise.race([
+    bridge.loadSessionTimelinePage("deferred-history-image"),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("History page waited for its image")), 500)),
+  ]);
+
+  assert.equal(page.items[0]?.body, "Text must render before the preview arrives.");
+  assert.equal(page.items[0]?.images?.[0]?.name, "slow.png");
+  assert.equal(page.items[0]?.images?.[0]?.dataUrl, undefined);
+  assert.equal(page.items[0]?.images?.[0]?.loading, true);
+  assert.ok(page.imageHydration instanceof Promise);
+
+  releaseDeferredHistoryImage();
+  const hydrated = await page.imageHydration;
+  assert.equal(hydrated[0]?.images?.[0]?.dataUrl, "data:image/png;base64,AQID");
+
+  const imageRequests = calls.filter((call) => call.type === "session.image.get" && call.payload.retrievalId === "deferred-image").length;
+  const reopened = await bridge.loadSessionTimelinePage("deferred-history-image");
+  await reopened.imageHydration;
+  assert.equal(calls.filter((call) => call.type === "session.image.get" && call.payload.retrievalId === "deferred-image").length, imageRequests, "the hydrated preview is reused from the bounded renderer cache");
 });
 
 test("an opened session returns its first-prompt preview to the renderer", async () => {
@@ -694,6 +942,72 @@ test("OpenCode edit, write, and run activity reaches the timeline with concrete 
   assert.match(run.body, /Command: npm test[\s\S]*12 tests passed/u);
 });
 
+test("OpenCode tool snapshots keep one provider-part row as call details arrive", () => {
+  const base = {
+    hostId: "desktop_test",
+    providerId: "opencode",
+    sessionId: "session-1",
+    occurredAt: "2026-08-26T00:00:00.000Z",
+  };
+  const pending = bridge.eventToTimeline({
+    ...base,
+    sequence: 1,
+    eventId: "oc:tool-pending",
+    type: "tool.started",
+    payload: { id: "tool_part_1", partId: "tool_part_1", messageID: "assistant_1", name: "Run", output: "Running…", status: "pending" },
+  });
+  const running = bridge.eventToTimeline({
+    ...base,
+    sequence: 2,
+    eventId: "oc:tool-running",
+    type: "tool.started",
+    payload: { id: "tool_part_1", partId: "tool_part_1", messageID: "assistant_1", callId: "call_1", name: "Run npm test", output: "Command: npm test\n\nResult:\nRunning…", status: "running" },
+  });
+  const completed = bridge.eventToTimeline({
+    ...base,
+    sequence: 3,
+    eventId: "oc:tool-complete",
+    type: "tool.completed",
+    payload: { id: "tool_part_1", partId: "tool_part_1", messageID: "assistant_1", callId: "call_1", name: "Run npm test", output: "Command: npm test\n\nResult:\n12 tests passed", status: "completed" },
+  });
+
+  assert.equal(pending.id, running.id);
+  assert.equal(running.id, completed.id);
+  assert.equal(completed.id, "session-1:tool:tool_part_1");
+  assert.equal(completed.providerPartId, "tool_part_1");
+  assert.equal(completed.messageId, "assistant_1");
+  assert.equal(running.detail, "tool_part_1");
+  assert.deepEqual([pending.streamDelta, running.streamDelta, completed.streamDelta], [false, false, false]);
+  assert.deepEqual([pending.state, running.state, completed.state], ["running", "running", "completed"]);
+
+  const failedRunning = bridge.eventToTimeline({
+    ...base,
+    sequence: 4,
+    eventId: "oc:tool-failed-running",
+    type: "tool.started",
+    payload: { id: "tool_part_2", partId: "tool_part_2", messageID: "assistant_1", name: "Run missing command", output: "Running…", status: "running" },
+  });
+  const failed = bridge.eventToTimeline({
+    ...base,
+    sequence: 5,
+    eventId: "oc:tool-failed",
+    type: "tool.completed",
+    payload: { id: "tool_part_2", partId: "tool_part_2", messageID: "assistant_1", callId: "call_2", name: "Run missing command", output: "Missing command", status: "failed" },
+  });
+  assert.equal(failedRunning.id, failed.id, "a failed tool abandoned its live row");
+  assert.equal(failed.state, "failed");
+
+  const generic = bridge.eventToTimeline({
+    ...base,
+    providerId: "codex",
+    sequence: 6,
+    eventId: "codex:tool-output",
+    type: "tool.output",
+    payload: { toolCallId: "call_2", output: "one chunk" },
+  });
+  assert.equal(generic.streamDelta, undefined, "non-OpenCode tool chunks retain append semantics");
+});
+
 test("unknown provider session status is idle rather than offline", async () => {
   const rendererBridge = await source(join("src", "renderer", "src", "bridge.ts"));
   assert.match(rendererBridge, /if \(value === "unknown"\) return "idle"/);
@@ -764,10 +1078,100 @@ test("session history preserves renderer-safe inline image data", async () => {
   assert.equal(image.images[0].dataUrl, "data:image/png;base64,AQID");
 });
 
+test("image-only history keeps media metadata without inventing visible prose", () => {
+  const timeline = bridge.mapMessages([{
+    id: "image-only-history",
+    sessionId: "host/opencode/image-only",
+    providerMessageId: "native-image-only",
+    role: "user",
+    createdAt: "2026-08-28T08:00:00.000Z",
+    completedAt: "2026-08-28T08:00:00.000Z",
+    status: "completed",
+    nativeMetadata: {},
+    parts: [
+      { type: "image", uri: "data:image/png;base64,AQID", mimeType: "image/png", name: "one.png" },
+      { type: "image", uri: "data:image/png;base64,BAUG", mimeType: "image/png", name: "two.png" },
+    ],
+  }]);
+  assert.equal(timeline.length, 1);
+  assert.equal(timeline[0].kind, "user");
+  assert.equal(timeline[0].body, "");
+  assert.deepEqual(timeline[0].images.map((image) => image.name), ["one.png", "two.png"]);
+});
+
 test("session history preserves provider content-part identity", async () => {
   const timeline = await bridge.loadSessionTimeline("part-identity");
   assert.deepEqual(timeline.map((item) => item.providerPartId), ["prt_reasoning", "prt_text"]);
   assert.deepEqual(timeline.map((item) => item.messageId), ["provider-message", "provider-message"]);
+});
+
+test("a recovered OpenCode reasoning leak renders inside Reasoning with only the answer top-level", () => {
+  const mapped = bridge.mapMessages([{
+    id: "opencode-leaked-reasoning",
+    sessionId: "host/opencode/session",
+    providerMessageId: "assistant_leaked",
+    role: "assistant",
+    createdAt: "2026-08-31T00:00:00.000Z",
+    completedAt: "2026-08-31T00:00:01.000Z",
+    status: "completed",
+    nativeMetadata: {},
+    parts: [{
+      type: "reasoning",
+      text: "The user is asking for a concise result. Keep it short.",
+      redacted: false,
+      providerPartId: "leaked_text:reasoning-presentation",
+    }, {
+      type: "text",
+      text: "I fixed the stale completion state.",
+      providerPartId: "leaked_text",
+    }],
+  }]);
+  const groups = timelineHelpers.groupTimeline(mapped, false);
+
+  assert.deepEqual(mapped.map((item) => item.kind), ["reasoning", "assistant"]);
+  assert.deepEqual(groups.map((group) => group.kind), ["reasoning", "item"]);
+  assert.equal(groups[0].items[0].body, "The user is asking for a concise result. Keep it short.");
+  assert.equal(groups[1].item.body, "I fixed the stale completion state.");
+});
+
+test("OpenCode tool history preserves the same provider-part identity as live snapshots", () => {
+  const timeline = bridge.mapMessages([{
+    id: "assistant-history",
+    sessionId: "host/opencode/session",
+    providerMessageId: "assistant_1",
+    role: "assistant",
+    createdAt: "2026-08-26T00:00:00.000Z",
+    completedAt: "2026-08-26T00:00:01.000Z",
+    status: "completed",
+    nativeMetadata: {},
+    parts: [{ type: "tool", providerPartId: "tool_part_1", name: "Run npm test", output: "12 tests passed", status: "completed" }],
+  }]);
+
+  assert.equal(timeline.length, 1);
+  assert.equal(timeline[0].providerPartId, "tool_part_1");
+  assert.equal(timeline[0].messageId, "assistant_1");
+});
+
+test("pasted files render as user attachment widgets without transport metadata", () => {
+  const timeline = bridge.mapMessages([{
+    id: "user-paste",
+    sessionId: "host/codex/thread",
+    providerMessageId: "provider-user-paste",
+    role: "user",
+    createdAt: "2026-08-24T16:10:25.000Z",
+    completedAt: "2026-08-24T16:10:25.000Z",
+    status: "completed",
+    nativeMetadata: {},
+    parts: [
+      { type: "file", name: "Pasted text", mimeType: "text/plain" },
+      { type: "text", text: "Build this experience from the attached brief." },
+    ],
+  }]);
+  assert.equal(timeline.length, 1);
+  assert.equal(timeline[0]?.kind, "user");
+  assert.equal(timeline[0]?.body, "Build this experience from the attached brief.");
+  assert.deepEqual(timeline[0]?.files, [{ name: "Pasted text", mimeType: "text/plain" }]);
+  assert.doesNotMatch(JSON.stringify(timeline), /Files pasted|attachments\\|C:\\\\Users/u);
 });
 
 test("history role mapping nests tool text and suppresses unrecognized system trace", async () => {
@@ -789,10 +1193,13 @@ test("large history images hydrate through bounded Bridge chunks", async () => {
   assert.match(rendererBridge, /request\("session\.image\.get", \{ sessionId, retrievalId, offset \}\)/);
   assert.match(rendererBridge, /maximumHistoryImageBytes\s*=\s*25 \* 1024 \* 1024/);
   assert.match(rendererBridge, /index < 64/);
-  assert.match(rendererBridge, /hydrateHistoryImages\(sessionId, remoteMessages\(payload\.messages\)\)/);
+  assert.match(rendererBridge, /items: timelineWithDelegations\(mapMessages\(messages\), delegationPayload\)/);
+  assert.match(rendererBridge, /imageHydration/);
+  assert.match(rendererBridge, /maximumConcurrentHistoryImageLoads\s*=\s*4/);
+  assert.match(rendererBridge, /maximumHistoryImageCacheBytes\s*=\s*64 \* 1024 \* 1024/);
 });
 
-test("timeline image mapping admits HTTPS and exact loopback HTTP URLs only", () => {
+test("timeline image mapping admits safe remote and validated local raster references only", () => {
   assert.equal(bridge.renderableImageUri("https://images.example/safe.png"), "https://images.example/safe.png");
   assert.equal(bridge.renderableImageUri("http://localhost:8080/output.png"), "http://localhost:8080/output.png");
   assert.equal(bridge.renderableImageUri("http://127.0.0.1:8080/output.png"), "http://127.0.0.1:8080/output.png");
@@ -800,6 +1207,11 @@ test("timeline image mapping admits HTTPS and exact loopback HTTP URLs only", ()
   assert.equal(bridge.renderableImageUri("http://images.example/unsafe.png"), undefined);
   assert.equal(bridge.renderableImageUri("http://localhost.example/unsafe.png"), undefined);
   assert.equal(bridge.renderableImageUri("http://127.0.0.1.example/unsafe.png"), undefined);
+  assert.equal(bridge.renderableImageUri("C:\\Users\\test\\Pictures\\result.png"), "tethoq-media://local/C%3A%5CUsers%5Ctest%5CPictures%5Cresult.png");
+  assert.equal(bridge.renderableImageUri("file:///C:/Users/test/Pictures/result%20two.webp"), "tethoq-media://local/C%3A%2FUsers%2Ftest%2FPictures%2Fresult%20two.webp");
+  assert.equal(bridge.renderableImageUri("file:///C:/Users/test/Pictures/result.svg"), undefined);
+  assert.equal(bridge.renderableImageUri("file://server/share/result.png"), undefined);
+  assert.equal(bridge.renderableImageUri("relative.png"), undefined);
 });
 
 test("renderer source keeps initial and forced history loading wired", async () => {
@@ -809,7 +1221,7 @@ test("renderer source keeps initial and forced history loading wired", async () 
   // Working sessions still catch up through the page load once the live stream
   // goes quiet; the adapter only session/loads when no chunks are arriving.
   // Quietness is measured on the selected session itself, not the whole feed.
-  assert.match(app, /timelinePage = selected && quietCatchUpDue\(selectedLastDelta\(selected\), Date\.now\(\), 3_000\)/);
+  assert.match(app, /timelinePage = selected && !selectedIsScheduled && !incrementallyObserved\s*&& quietCatchUpDue\(selectedLastDelta\(selected\), Date\.now\(\), 3_000\)/);
   assert.doesNotMatch(app, /workingSessionIds\.current\.has\(sessionId\)\) return/);
   assert.match(app, /const hasPagedWindow = timelineWindows\[sessionId\] !== undefined/);
   assert.match(app, /alreadyLoaded !== undefined && hasPagedWindow && !force/);
@@ -817,7 +1229,7 @@ test("renderer source keeps initial and forced history loading wired", async () 
   assert.match(app, /Revealed history belongs to the task just like its scroll mode/);
   assert.match(app, /reconcileTimelinePage\(page\.items, current\.timelines\[sessionId\] \?\? \[\]\)/);
   assert.match(app, /applyOpenedSessionPreview\(current\.sessions, page\.session\)/);
-  assert.match(app, /const visibleTimeline = timelineWindow \? timeline\?\.slice\(timelineWindow\.revealStart\) : undefined/);
+  assert.match(app, /const resolvedRevealStart = timelineWindow && presentationTimeline[\s\S]*anchoredTimelineRevealStart\(presentationTimeline, timelineWindow\.revealStart, timelineWindow\.revealAnchorKey\)[\s\S]*const visibleTimeline = useMemo\([\s\S]*presentationTimeline\?\.slice\(resolvedRevealStart\)[\s\S]*\[hasTimelineWindow, presentationTimeline, resolvedRevealStart\]/);
   assert.doesNotMatch(app, /loadSessionTimeline\(/);
 });
 
@@ -830,12 +1242,15 @@ test("task history opens on the recent assistant tail and pages upward without j
   assert.match(rendererBridge, /nextCursor: typeof payload\.nextCursor === "string" \? payload\.nextCursor : null/);
   assert.match(app, /initialTimelineRevealStart\(items: readonly TimelineItem\[\], assistantCount = 3\)/);
   assert.match(app, /const messageId = item\.messageId \?\? item\.id/);
-  assert.match(app, /loadSessionTimelinePage\(selected\)\.then\(\(page\)/);
-  assert.match(app, /\[selected\]: \{ nextCursor: page\.nextCursor, revealStart: initialTimelineRevealStart\(page\.items\), loadingOlder: false \}/);
+  assert.match(app, /loadTimelinePage\(selected\)\.then\(\(page\)/);
+  assert.match(app, /\[selected\]: initialTimelineWindow\(page\.items, page\.nextCursor\)/);
   assert.match(app, /if \(shouldRequestOlder\(element\)\) void loadOlder\(\)/);
   assert.match(app, /applyScrollTop\(element, anchoredScrollTop\(element, historyAnchor\.current\)\)/);
   // A page landing wholly above the fold leaves no scroll event to ask for the next.
   assert.match(app, /element\.scrollTop <= 1\) void loadOlder\(\)/);
+  assert.match(app, /maximumInvisibleHistoryPages/);
+  assert.match(app, /renderedTimelineAnchorIds\(candidate, active\)\.some\(\(id\) => !anchorsBefore\.has\(id\)\)/);
+  assert.match(app, /requestedCursors\.has\(cursor\)/);
 });
 
 test("renderer source reconciles live provider, session, and attention events", async () => {
@@ -844,9 +1259,9 @@ test("renderer source reconciles live provider, session, and attention events", 
   assert.match(app, /refreshProvidersNeeded = batch\.replayGap \|\| batch\.events\.some\(\(event\) => event\.type === "provider\.connected" \|\| event\.type === "provider\.disconnected"\)/);
   assert.match(app, /refreshSessionsNeeded = batch\.replayGap \|\| remotelyUpdatedSessionIds\.length > 0[\s\S]*?event\.type === "session\.created"/);
   assert.match(app, /session\.updated[\s\S]*?event\.payload\.reasoningEffort[\s\S]*?replaceSession/);
-  assert.match(app, /import \{ mergeRefreshedSessions, sameSessionContext \} from "\.\/session_refresh"/);
+  assert.match(app, /import \{ mergeAuthoritativeOpenedSession, mergeRefreshedSessions, sameSessionContext, scheduledTaskEventSchedule, scheduledTaskFailureCanRetractPresentation, scheduledTaskPresentationState, scheduledTaskScheduleAfterProviderEvidence, withoutRetiredScheduledSessions \} from "\.\/session_refresh"/);
   assert.match(app, /liveSessionRevisionBySession/);
-  assert.match(app, /attentionChanged = batch\.events\.some\(\(event\) => event\.type === "approval\.requested" \|\| event\.type === "approval\.resolved" \|\| event\.type === "user_input\.requested"\)/);
+  assert.match(app, /attentionChanged = batch\.events\.some\(\(event\) => event\.type === "approval\.requested" \|\| event\.type === "approval\.resolved" \|\| event\.type === "user_input\.requested" \|\| event\.type === "user_input\.resolved"\)/);
   assert.match(app, /let refreshSessionsNeeded\s*=\s*batch\.replayGap/);
   assert.match(app, /void refreshAll\(false\)/);
   assert.match(app, /if \(refreshInFlight\.current\) \{[\s\S]*?refreshQueued\.current = true;[\s\S]*?return;/);
@@ -898,11 +1313,11 @@ test("composer resets per task and gates attachment support from provider metada
 
   assert.match(app, /<Composer\s+key=\{session\.id\}/);
   assert.match(app, /composerAttachments[\s\S]*?Record<string, readonly ComposerAttachment\[\]>/);
-  assert.match(app, /initialAttachments=\{composerAttachments\[selectedSession\?\.id \?\? ""\] \?\? \[\]\}/);
+  assert.match(app, /initialAttachments=\{composerAttachments\.current\[selectedSession\?\.id \?\? ""\] \?\? \[\]\}/);
   assert.match(app, /onAttachmentsChange=\{\(attachments\) =>/);
   assert.match(composer, /provider\?\.supportsAttachments === true/);
   assert.match(composer, /useState<readonly ComposerAttachment\[\]>\(\(\) => initialAttachments\)/);
-  assert.match(composer, /attachmentsChangeRef\.current\?\.\(attachments\)/);
+  assert.match(composer, /attachmentsRef\.current = next;[\s\S]*?setAttachments\(next\);[\s\S]*?attachmentsChangeRef\.current\?\.\(next\)/);
   assert.match(composer, /disabled=\{!canAttach\}/);
   assert.match(rendererBridge, /builtInImageEntryProviders[^;]+"direct"/);
 });
@@ -982,7 +1397,7 @@ test("browser preview and release QA exercise dynamic connector models through l
 test("attention-blocked sessions queue follow-up messages", async () => {
   const composer = await source(join("src", "renderer", "src", "Composer.tsx"));
 
-  assert.match(composer, /const holdsFollowUpQueue = sessionHoldsFollowUpQueue\(session, timeline\)/);
+  assert.match(composer, /const holdsFollowUpQueue = !stopPresentationActive && sessionHoldsFollowUpQueue\(session, timeline, workingBoundary\)/);
   assert.match(composer, /const blockedByAttention = holdsFollowUpQueue \|\| turnInFlight\.current/);
   assert.match(composer, /const requestType = composerMessageRequestType\(\{[\s\S]*?externalWriter: session\.externalWriter === true,[\s\S]*?\}\)/);
 });
@@ -1001,9 +1416,10 @@ test("workflow recorder progress refreshes live counts and pauses its lone timer
 });
 
 test("browser chrome exposes live download management and Ctrl L address focus", async () => {
-  const [app, main] = await Promise.all([
+  const [app, main, styles] = await Promise.all([
     source(join("src", "renderer", "src", "App.tsx")),
     source(join("src", "main", "index.ts")),
+    source(join("src", "renderer", "src", "styles.css")),
   ]);
 
   assert.match(app, /notice\.action === "focus-address"[\s\S]*?setBrowserAddressFocusToken/);
@@ -1023,10 +1439,26 @@ test("browser chrome exposes live download management and Ctrl L address focus",
   assert.match(app, /disabled=\{!isBrowserPreview && current\?\.visible !== true\}/);
   assert.match(app, /document\.addEventListener\("pointerdown", closeOnOutsideClick\)/);
   assert.match(app, /event\.key !== "Escape"/);
+  assert.match(app, /type: "prepare-overlay"/);
   assert.match(app, /type: "open-overlay"/);
   assert.match(app, /type: "close-overlay"/);
   assert.match(app, /browser-freeze-frame/);
+  assert.match(app, /type: "set-muted"/);
+  assert.match(app, /label="New browser tab"/);
+  assert.doesNotMatch(app, /Tethoq profile|browser-profile-pill/u, "browser tab chrome must not carry an inactive profile label");
+  assert.doesNotMatch(styles, /\.browser-profile-pill/u, "the removed browser profile pill must not retain dead responsive CSS");
+  const browserWorkspace = app.match(/function BrowserWorkspace\([\s\S]*?\n}/)?.[0] ?? "";
+  const openDownloads = browserWorkspace.match(/const openDownloads = useCallback\([\s\S]*?\n  }, \[closeDownloads, notify\]\);/)?.[0] ?? "";
+  const closeDownloads = browserWorkspace.match(/const closeDownloads = useCallback\([\s\S]*?\n  }, \[\]\);/)?.[0] ?? "";
+  assert.match(openDownloads, /prepare-overlay[\s\S]*?image\.decode\(\)[\s\S]*?flushSync\([\s\S]*?setBrowserFreezeFrame\(snapshot\)[\s\S]*?setDownloadsOpen\(true\)[\s\S]*?requestAnimationFrame[\s\S]*?open-overlay/);
+  assert.match(closeDownloads, /close-overlay[\s\S]*?\.then\([\s\S]*?setBrowserOverlayPhase\("native"\)[\s\S]*?requestAnimationFrame[\s\S]*?setBrowserFreezeFrame\(null\)/);
   const visualQa = await source(join("scripts", "visual-qa.cjs"));
+  assert.match(app, /tethoq\.browser-privacy-notice-dismissed\.v1/);
+  assert.match(app, /aria-label="Dismiss browser profile notice"/);
+  assert.match(app, /setPrivacyNoticeVisible\(false\)[\s\S]*?localStorage\.setItem\(browserPrivacyNoticeDismissedKey, "true"\)/);
+  assert.match(visualQa, /--browser-only/);
+  assert.match(visualQa, /browser profile notice returned after a real remount/i);
+  assert.match(visualQa, /browser profile notice returned after renderer reload/i);
   assert.match(visualQa, /browser-downloads-1440x900/);
   assert.match(visualQa, /browser-downloads-minimum-980x680/);
   assert.match(visualQa, /browser-download-panel \.browser-download-progress/);
@@ -1067,21 +1499,27 @@ test("desktop navigation keeps browser and workflow complexity session-scoped", 
   assert.doesNotMatch(packagedSmoke, /primary-nav button[^\n]*Browser/);
 });
 
-test("startup loading state uses readable type and plain local-connection copy", async () => {
-  const [app, components, styles] = await Promise.all([
+test("startup paints a progressive usable shell without spinner prose", async () => {
+  const [app, navigation, styles, html, main] = await Promise.all([
     source(join("src", "renderer", "src", "App.tsx")),
-    source(join("src", "renderer", "src", "components.tsx")),
+    source(join("src", "renderer", "src", "NavigationPanels.tsx")),
     source(join("src", "renderer", "src", "styles.css")),
+    source(join("src", "renderer", "index.html")),
+    source(join("src", "main", "index.ts")),
   ]);
 
-  assert.match(components, /Connecting to your coding tools on this computer…/);
-  assert.doesNotMatch(components, /local Tethoq runtime/);
-  assert.match(styles, /\.loading-state strong[^{]*\{[^}]*font-size:\s*15px;[^}]*line-height:\s*1\.3/);
-  assert.match(styles, /\.loading-state small[^{]*\{[^}]*color:\s*#969b96;[^}]*font-size:\s*12\.5px;[^}]*line-height:\s*1\.45/);
-  assert.match(app, /const page = await loadSessionTimelinePage\(first\.id\);[\s\S]*setSnapshot\(initialSnapshot\)/);
-  assert.match(styles, /\.app-loading \{ position:\s*fixed; inset:\s*0;[\s\S]*place-items:\s*center/);
+  assert.match(app, /useState<DesktopSnapshot \| null>\(\(\) => progressiveStartupSnapshot\(\)\)/);
+  assert.match(app, /<Composer key=\{session\.id\}/);
+  assert.match(navigation, /session-list-skeleton/);
+  assert.match(styles, /\.transcript-skeleton-row\.user/);
+  assert.match(styles, /@keyframes progressive-skeleton-shimmer/);
+  assert.match(html, /pre-react-message user/);
+  assert.match(html, /pre-react-composer/);
+  assert.doesNotMatch(html, /Connecting to your coding tools|startup-spin/);
+  assert.match(main, /class="messages"/);
+  assert.match(main, /class="composer"/);
+  assert.doesNotMatch(main, /startup-spinner|Connecting to your coding tools/);
   assert.match(styles, /\.titlebar \{[^}]*background:\s*var\(--bg\)/);
-  assert.match(styles, /\.app-loading \{[^}]*background:\s*var\(--bg\)/);
   assert.match(styles, /@keyframes app-shell-enter[\s\S]*\.desktop-app[^{]*\{[^}]*animation:\s*app-shell-enter \.14s ease-out both/);
 });
 
@@ -1099,7 +1537,7 @@ test("merged sidebar task search and composable agent filters stay compact", asy
   assert.match(navigation, /const openTaskSearch = \(\) => \{[\s\S]*?setSearchOpen\(true\);[\s\S]*?requestAnimationFrame\(\(\) => searchInput\.current\?\.focus\(\)\)/);
   assert.match(navigation, /onClick=\{openTaskSearch\}/);
   assert.match(navigation, /searchInput\.current\?\.focus\(\)/);
-  assert.match(navigation, /<header className="sidebar-task-header">[\s\S]*?<h2>Tasks<\/h2>[\s\S]*?<div className="sidebar-task-tools"[\s\S]*?<button type="button" onClick=\{onNewTask\}/);
+  assert.match(navigation, /<header className=\{`sidebar-task-header \$\{searchExpanded \? "search-expanded" : ""\}`\}>[\s\S]*?<h2>Tasks<\/h2>[\s\S]*?<div className="sidebar-task-tools"[\s\S]*?<button type="button" onClick=\{taskListMode === "project" \? onNewProject : onNewTask\}/);
   assert.match(navigation, /<\/div>\s*<button ref=\{filterButton\} type="button" className=\{filtersOpen \|\| activeFilterCount \? "sidebar-task-filter active" : "sidebar-task-filter"\}/);
   assert.doesNotMatch(navigation, /className="sidebar-task-search"[^]*className=\{filtersOpen \|\| activeFilterCount \? "filter-toggle/);
   assert.match(navigation, /className="task-filter-popover"/);
@@ -1136,28 +1574,55 @@ test("merged sidebar task search and composable agent filters stay compact", asy
   assert.match(styles, /\.provider-filter-option\.unavailable \{ opacity: \.3/);
   assert.match(styles, /\.session-row-top strong \{ font-size: 12\.5px/);
   assert.match(navigation, /className="session-row-trailing"/);
-  // Pin and time occupy the same reserved trailing slot, so neither shifts the row.
-  assert.match(navigation, /<span className="session-row-trailing">\{session\.pinned \? <PinIcon className="session-row-pin" \/> : null\}<time>\{relativeTime\(session\.updatedAt\)\}<\/time><\/span>\s*\{session\.state === "working" \? <i className="session-row-working-spinner"/);
+  // Schedule/pin and time occupy the same reserved trailing slot, so none shifts the row.
+  assert.match(navigation, /const scheduledIndicator = session\.schedule[\s\S]*?session\.schedule\.status === "failed" \? <AlertIcon \/> : <ClockIcon \/>/);
+  assert.match(navigation, /<span className="session-row-trailing">\{session\.state === "working" \? null : scheduledIndicator \?\? \(session\.pinned \? <PinIcon className="session-row-pin" \/> : null\)\}<time>\{relativeTime\(session\.updatedAt\)\}<\/time><\/span>\s*\{session\.state === "working" \? <span className="session-row-working-indicator"[^>]*><i className="spinner session-row-working-spinner"/);
   assert.doesNotMatch(navigation, /session-row-state-/);
   assert.match(navigation, /aria-current=\{selected \? "page" : undefined\}/);
-  assert.match(styles, /\.session-row \{ min-height: 66px; grid-template-columns: 36px minmax\(0, 1fr\) 32px;[\s\S]*?align-content: center;[\s\S]*?row-gap: 3px/);
+  assert.match(styles, /\.session-row \{ height: 74px; min-height: 74px; grid-template-columns: 36px minmax\(0, 1fr\) 32px;[\s\S]*?align-content: center;[\s\S]*?row-gap: 3px/);
   assert.doesNotMatch(styles, /\.session-row:hover,[\s\S]*?grid-template-columns/);
   assert.match(styles, /\.session-row-top \{ display: contents; \}/);
-  assert.match(styles, /\.session-row-top \.provider-logo \{[^}]*grid-row: 1 \/ span 2;[^}]*align-self: center;[^}]*transform: translate\(-5px, -10px\)/);
+  assert.match(styles, /\.session-row-top \.provider-logo \{[^}]*grid-row: 1 \/ span 2;[^}]*align-self: center;[^}]*transform: translate\(-5px, -17px\)/, "rich recency rows align the provider ink with the title ink");
   assert.match(navigation, /<ProviderLogo providerId=\{session\.providerId\} provider=\{provider\} size=\{36\}\/>/);
+  assert.match(navigation, /<span className="session-subagents-summary"><SubagentsIcon className="session-subagents-icon"\/><span className="session-subagents-count" data-count-capped=\{compactCountCapped \|\| undefined\}>\{visibleChildCount\}<\/span><\/span>/u, "rich and compact parent rows use one generic sub-agent summary");
+  assert.match(styles, /\.session-subagents:not\(\.compact\) \.session-subagents-trigger \{[^}]*width: 38px;[^}]*height: 25px;[^}]*grid-template-columns: minmax\(0, 1fr\);[^}]*grid-template-rows: 13px 7px;[^}]*padding: 4px 1px 1px/u, "the rich trigger adds three background pixels above its unchanged stacked content lanes");
+  assert.match(styles, /\.session-subagents:not\(\.compact\) \.session-subagents-summary \{[^}]*display: inline-flex;[^}]*grid-column: 1;[^}]*grid-row: 1;[^}]*align-items: flex-end;[^}]*justify-self: center;[^}]*gap: 2px/u, "the icon and smaller variable-width count centre as a bottom-aligned group");
+  assert.match(styles, /\.session-subagents:not\(\.compact\) \.session-subagents-icon \{[^}]*width: 13px;[^}]*height: 13px/u);
+  assert.match(styles, /\.session-subagents:not\(\.compact\) \.session-subagents-count \{[^}]*font-size: 11\.5px;[^}]*line-height: 1;[^}]*translate: 0 -1px/u, "the rich count is one type step smaller with its painted-bottom correction");
+  assert.match(styles, /\.session-subagents:not\(\.compact\) \.session-subagents-chevron \{[^}]*width: 8px;[^}]*height: 8px;[^}]*grid-column: 1;[^}]*grid-row: 2;[^}]*align-self: center;[^}]*justify-self: center;[^}]*opacity: \.38;[^}]*stroke-width: 2\.4;[^}]*translate: -1px 0/u, "the stronger disclosure sits subtly underneath the summary");
+  assert.match(styles, /\.session-subagents:not\(\.compact\) \.session-subagents-trigger:hover > \.session-subagents-chevron,\s*\.session-subagents:not\(\.compact\) \.session-subagents-trigger:focus-visible > \.session-subagents-chevron,\s*\.session-subagents:not\(\.compact\)\.open \.session-subagents-chevron \{ opacity: 1; \}/u, "hover, keyboard focus, and open states fully reveal the rich disclosure");
+  assert.match(styles, /\.session-row\.compact \{[^}]*height: 31px;[^}]*min-height: 31px;[^}]*grid-template-columns: subgrid;[^}]*padding: 3px 7px 3px 1px/u, "project tasks remain one line within the shared harness, count, and title grid");
+  assert.match(styles, /\.session-project-items \.session-row-shell \{[^}]*width: calc\(100% \+ 24px\);[^}]*grid-template-columns: 32px minmax\(0, 1fr\);[^}]*margin-left: -24px/u, "every project shell owns the full selected-paint lane and harness column");
+  assert.match(styles, /\.session-row-shell:has\(\.session-subagents\.compact\) \{[^}]*grid-template-columns: 32px max-content minmax\(0, 1fr\)/u, "compact counts size to their content beside the harness and title");
+  assert.match(styles, /\.session-subagents\.compact \.session-subagents-trigger \{[^}]*width: max-content;[^}]*min-width: 28px;[^}]*height: 22px;[^}]*grid-template-rows: 1fr/u, "the project trigger gives its chevron-free summary the full height");
+  assert.match(styles, /\.session-subagents\.compact \.session-subagents-summary \{[^}]*display: inline-flex;[^}]*justify-self: center;[^}]*gap: 2px;[^}]*translate: 0 1px/u, "project counts centre dynamically with the generic icon on the title baseline");
+  assert.match(styles, /\.session-subagents\.compact \.session-subagents-icon \{[^}]*width: 13px;[^}]*height: 13px;[^}]*translate: 0 1px/u, "the compact generic mark receives a local optical correction");
+  assert.match(styles, /\.session-subagents\.compact \.session-subagents-count \{[^}]*width: auto;[^}]*font-size: 12px;[^}]*font-weight: 650/u);
+  assert.match(styles, /\.session-subagents\.compact \.session-subagents-count\[data-count-capped="true"\] \{[^}]*font-size: 11px/u);
+  assert.match(navigation, /\{!compact \? <ChevronDownIcon className="session-subagents-chevron" \/> : null\}/u, "compact project triggers omit the redundant chevron without changing rich recency controls");
+  assert.doesNotMatch(styles, /\.session-subagents\.compact[^\n{]*\.session-subagents-chevron/u);
+  assert.match(styles, /\.session-project-items \.session-row-shell:has\(> \.session-row\.compact\.selected\) \{[^}]*background: #292927/u, "project selection always paints one uninterrupted full-width shell");
+  assert.match(styles, /\.session-project-items \.session-row-shell > \.session-row\.compact\.selected \{ background: transparent; \}/u);
+  assert.match(styles, /\.session-project-show-more \{[^}]*margin-left: 11px;[^}]*padding: 3px 7px/u, "Show more aligns with the invariant project-title lane");
+  assert.match(styles, /\.session-project-working-indicator \{[^}]*justify-self: end;[^}]*translate: 0 2px/u, "the compact working spinner receives its measured one-pixel optical correction without leaving the fixed trailing lane");
   assert.match(styles, /\.session-row-trailing \{[\s\S]*?grid-template-columns: minmax\(0, 1fr\);[\s\S]*?gap: 0/);
-  assert.match(styles, /\.session-row-working-spinner \{[^}]*width: 12px;[^}]*height: 12px;[^}]*grid-column: 1;[^}]*grid-row: 2;[^}]*align-self: end;[^}]*justify-self: center;[^}]*translate: -5px 0;[^}]*border-right-color:\s*transparent;[^}]*animation:\s*spin/);
-  assert.match(styles, /\.session-row-top time \{[\s\S]*?font-size: 12\.5px;[\s\S]*?opacity: 0;[\s\S]*?transform: translateY\(2px\)/);
+  assert.match(styles, /\.session-row-working-indicator \{[^}]*position: absolute;[^}]*right: 5px;[^}]*bottom: 5px;[^}]*width: 12px;[^}]*height: 12px;[^}]*color: #7fd39b;[^}]*translate: 0 0/, "the recency-row spinner stays in the fixed lower-right corner");
+  assert.match(styles, /\.session-row-working-spinner \{[^}]*width: 12px;[^}]*height: 12px/);
+  assert.match(styles, /\.session-row-top time \{[\s\S]*?font-size: 12\.5px;[\s\S]*?opacity: 0;[\s\S]*?transform: none/);
   assert.match(styles, /\.session-row:hover \.session-row-top time,[\s\S]*?\.session-row:focus-visible \.session-row-top time,[\s\S]*?\.session-row\.selected \.session-row-top time \{ opacity: 1; \}/);
   assert.match(navigation, /<OverflowReveal axis="horizontal" className="session-row-title">/);
-  assert.match(navigation, /<OverflowReveal axis="vertical" className="session-row-preview">/);
+  assert.match(navigation, /<OverflowReveal axis="vertical" className=\{`session-row-preview \$\{session\.previewKind === "realtime_voice" \? "session-row-preview-realtime" : ""\}`\} prefix=\{session\.previewKind === "realtime_voice" \? <MicrophoneIcon \/> : undefined\}>\{session\.preview\}<\/OverflowReveal>/u, "voice previews use clean text with the existing microphone identity instead of transport tags");
+  assert.match(navigation, /\{prefix \? <i className="overflow-reveal-prefix">\{prefix\}<\/i> : null\}<span ref=\{content\}>/u, "the semantic preview icon stays outside moving overflow text");
   assert.match(navigation, /const pixelsPerSecond = axis === "vertical" \? 18 : 28/);
   assert.match(navigation, /const duration = distance \/ pixelsPerSecond/);
   assert.match(navigation, /"--overflow-duration": `\$\{duration\.toFixed\(2\)\}s`/);
   assert.match(styles, /\.overflow-reveal-horizontal\[data-overflow="true"\][\s\S]*mask-image:[^;]*transparent 100%/);
   assert.match(styles, /\.session-row-title \{[^}]*margin-left: -6px/);
   assert.match(styles, /\.session-row-preview \{[^}]*margin-left: -6px/);
+  assert.match(styles, /\.session-row-preview-realtime \{[^}]*position: relative;[^}]*padding-left: 18px/u);
+  assert.match(styles, /\.session-row-preview-realtime > \.overflow-reveal-prefix \{[^}]*position: absolute;[^}]*top: 1px;[^}]*left: 0;[^}]*width: 13px;[^}]*height: 13px/u, "the voice identity remains in a fixed compact preview lane");
   assert.match(styles, /\.overflow-reveal-vertical\[data-overflow="true"\][^}]*calc\(100% - 3px\)[^}]*rgba\(0,0,0,\.72\) 100%/);
+  assert.match(styles, /\.session-row:hover \.overflow-reveal-vertical\[data-overflow="true"\],[\s\S]*?\.overflow-reveal-vertical\[data-overflow="true"\]:focus-within \{[^}]*linear-gradient\(transparent 0,#000 3px,#000 calc\(100% - 3px\),rgba\(0,0,0,\.72\) 100%\)/, "moving task-preview text fades through a three-pixel top edge instead of meeting a hard clip");
   assert.match(styles, /\.overflow-reveal-horizontal\[data-overflow="true"\]:hover > span[\s\S]*translateX/);
   assert.match(styles, /\.session-row:hover \.overflow-reveal-vertical\[data-overflow="true"\] > span[\s\S]*translateY/);
   assert.match(styles, /transition: transform var\(--overflow-duration\) linear \.55s/);
@@ -1184,7 +1649,7 @@ test("sidebar owns the task list in one resizable navigation column", async () =
 
   assert.match(navigation, /export interface SidebarProps/);
   assert.match(navigation, /className="sidebar-tasks"/);
-  assert.match(navigation, /className="sidebar-task-header"/);
+  assert.match(navigation, /className=\{`sidebar-task-header \$\{searchExpanded \? "search-expanded" : ""\}`\}/);
   assert.match(navigation, /onClick=\{onNewTask\}/);
   assert.match(navigation, /onCommandSearch: \(\) => void/);
   assert.match(navigation, /className="sidebar-command-search"/);
@@ -1198,19 +1663,21 @@ test("sidebar owns the task list in one resizable navigation column", async () =
   assert.match(styles, /:root \{ --navigation-panel: 248px; \}/);
   assert.match(styles, /\.app-body,[\s\S]*?grid-template-columns: var\(--navigation-panel\) minmax\(400px, 1fr\)/);
   assert.match(styles, /\.new-task-row \.new-task-button \{[\s\S]*?font-size: 13px/);
-  assert.match(styles, /\.new-task-row \.new-task-button \{[\s\S]*?display: grid;[\s\S]*?grid-template-columns: 17px minmax\(0, 1fr\) 17px/);
+  assert.match(styles, /\.new-task-row \.new-task-button \{[\s\S]*?display: grid;[\s\S]*?grid-template-columns: minmax\(0, 1fr\) auto minmax\(0, 1fr\)/, "New task keeps symmetric flexible tracks around its independently centred label");
+  assert.match(styles, /\.new-task-row \.new-task-button svg \{[^}]*grid-column: 1;[^}]*justify-self: end;[^}]*margin-right: 8px;/, "the plus sits eight pixels beside the centred label");
   assert.match(styles, /\.new-task-row \.new-task-button span \{ grid-column: 2; justify-self: center; \}/);
   assert.match(styles, /\.new-task-row \{[\s\S]*?grid-template-columns: minmax\(0, 1fr\) 38px/);
   assert.match(styles, /\.new-task-row \.new-task-button \{[\s\S]*?min-height: 38px/);
   assert.match(styles, /\.sidebar-command-search \{[\s\S]*?width: 38px;[\s\S]*?height: 38px/);
   assert.match(styles, /\.primary-nav \{[\s\S]*?grid-template-columns: minmax\(0, 1fr\) 38px/);
   assert.match(styles, /\.primary-nav button \{[\s\S]*?width: 100%;[\s\S]*?min-height: 38px/);
-  assert.match(styles, /\.primary-nav button \{[^}]*display: grid;[^}]*grid-template-columns: 18px minmax\(0, 1fr\) 18px/);
+  assert.match(styles, /\.primary-nav button \{[^}]*display: grid;[^}]*grid-template-columns: minmax\(0, 1fr\) auto minmax\(0, 1fr\)/, "Dashboard uses the same symmetric tracks as New task");
+  assert.match(styles, /\.primary-nav button svg \{[^}]*grid-column: 1;[^}]*width: 17px;[^}]*justify-self: end;[^}]*margin-right: 8px;/, "Dashboard uses the New task icon slot");
   assert.match(styles, /\.primary-nav button span \{ grid-column: 2; justify-self: center; \}/);
   assert.match(styles, /\.sidebar \{[\s\S]*?padding-left: 5px/);
   assert.match(styles, /--navigation-panel: 232px/);
   assert.match(styles, /--navigation-panel: 270px/);
-  assert.match(styles, /\.primary-nav button \{[\s\S]*?font-size: 12\.5px/);
+  assert.match(styles, /\.primary-nav button \{[\s\S]*?font-size: 13px/);
   assert.match(app, /navigationPanelStorageKey = "tethoq\.navigation-panel-width"/);
   assert.match(app, /clampNavigationPanelWidth\(startWidth \+ moveEvent\.clientX - startX, window\.innerWidth\)/);
   assert.match(app, /role="separator"[\s\S]*?aria-label="Resize task list"[\s\S]*?aria-orientation="vertical"/);
@@ -1233,18 +1700,23 @@ test("new task opens a local draft and materializes it once from the composer", 
   assert.match(app, /draft: true/);
   // Refreshes omit derived sessions, so locally tracked drafts, side chats, and
   // delegated children must survive the merge instead of blanking their workspace.
-  assert.match(app, /const localOnly = current\.sessions\.filter\(\(session\) => \(session\.draft \|\| session\.sessionKind === "side_chat" \|\| session\.parentSessionId !== undefined \|\| !incomingProviders\.has\(session\.providerId\) \|\| changedSinceRefresh\(session\.id\)\) && !refreshedIds\.has\(session\.id\)\)/);
-  assert.match(app, /sessions: applyOpenedSessionPreview\(\[\.\.\.localOnly, \.\.\.mergeRefreshedSessions\(current\.sessions, sessions, quiet, changedSinceRefresh\)\], timelinePage\?\.session\)/);
+  assert.match(app, /const localOnly = current\.sessions\.filter\(\(session\) => \(session\.draft \|\| isSideChatSession\(session\) \|\| session\.parentSessionId !== undefined \|\| !incomingProviders\.has\(session\.providerId\) \|\| changedSinceRefresh\(session\.id\)\) && !refreshedIds\.has\(session\.id\)\)/);
+  assert.match(app, /sessions: applyOpenedSessionPreview\(\[\.\.\.localOnly, \.\.\.mergeRefreshedSessions\(current\.sessions, visibleSessions, quiet, changedSinceRefresh\)\], timelinePage\?\.session\)/);
   assert.doesNotMatch(app, /function NewSessionModal|<NewSessionModal/);
   assert.match(app, /const createDraftSend = useCallback/);
   assert.match(app, /const separatedFirstTurn = input\.attachmentIds\.length > 0 \|\| input\.workflowIds\.length > 0/);
-  assert.match(app, /\.\.\.\(separatedFirstTurn \? \{\} : \{ firstInstruction: input\.content \}\)/);
+  assert.match(app, /beginDraftMaterialization\(materializeInput, separatedFirstTurn \? undefined : \{/);
+  assert.match(app, /\.\.\.\(firstTurn \? \{ firstInstruction: firstTurn\.content \} : \{\}\)/);
   assert.match(app, /await request\("session\.send_message"/);
   assert.match(app, /input\.workflowIds\.length \? \{ workflowIds: \[\.\.\.input\.workflowIds\] \} : \{\}/);
-  assert.match(app, /input\.workflows\.length \? \{ workflows: input\.workflows \} : \{\}/);
+  assert.match(composer, /optimisticItem: acceptedRow/);
+  assert.match(app, /mergeAcceptedComposerRow\(combinedTimeline, presentation\.acceptedItem/);
+  assert.match(app, /composerDraftSnapshot\(composerDraftStore, input\.draftSessionId\)/);
   assert.match(app, /Choose a project folder before starting this task/);
   assert.match(app, /onDraftSelectionChange=\{onDraftSelectionChange\}/);
   assert.match(app, /onCreateDraftSend=\{onCreateDraftSend\}/);
+  assert.match(app, /onMaterializeDraft=\{onMaterializeDraft\}/);
+  assert.match(app, /pendingAction=\{pendingComposerAction\}/);
   assert.match(composer, /if \(draftSession\)[\s\S]*?await onCreateDraftSend/);
 });
 
@@ -1274,7 +1746,7 @@ test("desktop wallet UI exposes direct-key safety, local budgets, and custom end
   assert.match(app, /request\("wallet\.get"/);
   assert.match(app, /request\("wallet\.configure"/);
   assert.match(app, /status\?\.availableEndpoints/);
-  assert.match(app, /loadProviderModels\(\[directProvider\]\)/);
+  assert.match(app, /onRefreshProviderModels\(directProvider\.id\)/);
   assert.match(app, /type="password" autoComplete="new-password"/);
   assert.match(app, /status\.kind === "user_api" \? <div><dt>API key<\/dt><dd>\{status\.apiKeyConfigured \? "Saved" : "Not added"\}<\/dd><\/div> : null/);
   assert.match(app, /status\?\.kind === "user_api" \? <footer><LockIcon \/>API keys stay in the local Bridge and are never shown again\.<\/footer> : null/);
@@ -1288,6 +1760,7 @@ test("desktop wallet UI exposes direct-key safety, local budgets, and custom end
   assert.match(bridge, /sourceProviderId/);
   assert.match(styles, /\.wallet-user_api\s*\{\s*--wallet-tone:\s*#69aaf9/);
   assert.match(styles, /\.wallet-harness\s*\{\s*--wallet-tone:\s*#e9a15a/);
+  assert.match(styles, /\.titlebar:has\(\.wallet-dropdown:hover\),\s*\.titlebar:has\(\.wallet-dropdown:focus-within\),\s*\.titlebar:has\(\.wallet-dropdown\.open\)\s*\{\s*z-index:\s*410/);
   assert.doesNotMatch(app, /aria-label="Refresh wallet"/);
   assert.match(app, /<RefreshIcon className="refresh-icon" \/>/);
   assert.match(styles, /svg\.refresh-icon \{[^}]*width: 20px !important/);
@@ -1296,9 +1769,11 @@ test("desktop wallet UI exposes direct-key safety, local budgets, and custom end
 });
 
 test("task context menu can branch an online persisted task without replacing Explorer access", async () => {
-  const [app, navigation] = await Promise.all([
+  const [app, navigation, rendererBridge, composerStyles] = await Promise.all([
     source(join("src", "renderer", "src", "App.tsx")),
     source(join("src", "renderer", "src", "NavigationPanels.tsx")),
+    source(join("src", "renderer", "src", "bridge.ts")),
+    source(join("src", "renderer", "src", "composer.css")),
   ]);
   assert.match(navigation, /Branch in New Task/);
   assert.match(navigation, /disabled=\{!canBranchMenuSession\}/);
@@ -1308,7 +1783,12 @@ test("task context menu can branch an online persisted task without replacing Ex
   assert.match(navigation, /menuProvider\.capabilities\.includes\("Session History"\)/);
   assert.match(navigation, /Open in File Explorer/);
   assert.match(app, /request\("session\.branch", \{ sessionId \}\)/);
-  assert.match(app, /insertDerivedSession\(source, result\.session as Record<string, unknown>\)/);
+  assert.match(app, /insertDerivedSession\(source, result\.session as Record<string, unknown>, undefined, undefined, navigationIntent\)/);
+  assert.match(rendererBridge, /relationshipSourceSessionId: value\.relationship\.sourceSessionId/);
+  assert.match(app, /Branched from \$\{incomingBranch\.title\}/);
+  assert.match(app, /Branched to \$\{candidate\.title\}/);
+  assert.match(app, /className="task-relationship-notices"/);
+  assert.match(composerStyles, /\.task-relationship-notices button:hover/);
 });
 
 test("provider model catalogues load for every provider and never block the boot", async () => {
@@ -1327,14 +1807,42 @@ test("provider model catalogues load for every provider and never block the boot
   assert.equal(models["acme-agent"]?.[0]?.sourceProviderId, "synthetic");
   assert.equal(models["acme-agent"]?.[0]?.sourceProviderName, "Synthetic");
   assert.equal(models["late-provider"]?.length, 2, "a provider detected late must still get its catalogue");
+  assert.equal(models["acme-agent"]?.[0]?.isDefault, undefined);
+  assert.equal(models["acme-agent"]?.[1]?.isDefault, true);
+  // Native context window and per-token pricing become renderer-facing facts;
+  // absent provider data stays absent instead of defaulting to zero.
+  assert.equal(models["acme-agent"]?.[0]?.contextWindowTokens, 128_000);
+  assert.equal(models["acme-agent"]?.[0]?.inputPricePerMillion, 3);
+  assert.equal(models["acme-agent"]?.[0]?.outputPricePerMillion, 15);
+  assert.equal(models["acme-agent"]?.[1]?.contextWindowTokens, undefined);
+  assert.equal(models["acme-agent"]?.[1]?.inputPricePerMillion, undefined);
+  assert.equal(models["acme-agent"]?.[1]?.outputPricePerMillion, undefined);
   // The periodic catch-up heals a provider whose models never arrived: the
   // selected task's provider with an empty catalogue gets a bounded reload.
   assert.match(app, /healMissingModels = useCallback/u);
-  assert.match(app, /loadProviderModels\(\[provider\]\)/u);
+  assert.match(app, /hydrateProviderModels\(\[provider\]\)/u);
   assert.match(app, /healMissingModels\(\);/u);
   assert.match(app, /modelHealAttempts\.current\.get\(provider\.id\)/u);
   // No single models.list call may hang the initial snapshot forever.
-  assert.match(rendererBridge, /withTimeout\(request\("models\.list"/u);
+  assert.match(rendererBridge, /withTimeout\(catalogueRequest\("models\.list"/u);
+});
+
+test("renderer preserves the semantic realtime voice preview marker", () => {
+  const mapped = bridge.mapSession({
+    id: "host/codex/voice",
+    hostId: "host",
+    providerId: "codex",
+    providerSessionId: "voice",
+    title: "New Realtime Voice Chat",
+    state: "idle",
+    preview: "What folder are you in?",
+    lastActivityAt: "2026-08-30T16:05:40.170Z",
+    needsApproval: false,
+    stale: false,
+    nativeMetadata: { tethoqRealtimeVoice: true },
+  });
+  assert.equal(mapped?.preview, "What folder are you in?");
+  assert.equal(mapped?.previewKind, "realtime_voice");
 });
 
 test("OpenCode parented user chats stay in the task list while explicit subagents stay hidden", async () => {
@@ -1345,7 +1853,7 @@ test("OpenCode parented user chats stay in the task list while explicit subagent
   assert.equal(mapped?.parentSessionId, "host/opencode/workspace");
   assert.equal(mapped?.providerId, "opencode");
   assert.equal(mapped?.childCount, 1, "the visible parent must carry the hidden child count");
-  assert.deepEqual(mapped?.childProviderIds, ["opencode"], "the parent control must use the child's provider identity");
+  assert.deepEqual(mapped?.childProviderIds, ["opencode"], "session aggregation retains truthful child-provider metadata without repeating it in the generic trigger");
   assert.deepEqual(mapped?.providerStatus, { kind: "retry", message: "Provider is temporarily busy", retryAt: "2026-08-20T12:00:00.000Z" });
 });
 
@@ -1354,7 +1862,8 @@ test("task rows expose the sub-agent disclosure only when children exist and han
   assert.equal(refreshed.every((session) => session.childCount === undefined), true, "ordinary tasks must not reserve empty child chrome");
 
   const navigation = await source(join("src", "renderer", "src", "NavigationPanels.tsx"));
-  assert.match(navigation, /const displayedChildCount = childrenLoaded \? children\.length : session\.childCount/);
+  const subagentControl = navigation.match(/function SessionSubagentControl[\s\S]*?\n\}\n\nfunction SessionRow/u)?.[0] ?? "";
+  assert.match(navigation, /const displayedChildCount = childrenLoaded \? children\.length : \(session\.childCount \?\? 0\)/);
   assert.match(navigation, /if \(!displayedChildCount\) return null;/);
   assert.match(navigation, /displayedChildCount === 1 \? "" : "s"/);
   assert.match(navigation, /children\.map\(\(child\) =>/);
@@ -1362,10 +1871,70 @@ test("task rows expose the sub-agent disclosure only when children exist and han
   assert.match(navigation, /child\.state === "working" \? <span className="spinner"/);
   assert.match(navigation, /aria-label=\{`Sub-agents for \$\{session\.title\}`\}/);
   assert.match(navigation, /onClick=\{\(\) => \{ close\(\); onOpenChild\(child\); \}\}/);
+  assert.match(navigation, /<SessionSubagentControl compact=\{compact\} session=\{session\}/);
+  assert.match(navigation, /<span className="session-subagents-summary"><SubagentsIcon className="session-subagents-icon"\/><span className="session-subagents-count" data-count-capped=\{compactCountCapped \|\| undefined\}>\{visibleChildCount\}<\/span><\/span>/u, "every parent trigger uses the generic two-person mark and dynamically sized count");
+  assert.doesNotMatch(subagentControl, /const providerId = session\.childProviderIds|providers\.find\(\(candidate\) => candidate\.id === providerId\)/u, "parent trigger geometry no longer depends on the first child's provider");
+  assert.match(navigation, /data-tooltip=\{open \? undefined : countLabel\}/, "the exact sub-agent count must use the shared app tooltip layer");
+  assert.doesNotMatch(subagentControl, /tooltipActive|positionTooltip|session-subagents-tooltip|createPortal\(<span/, "the sub-agent control must not keep a second tooltip implementation");
 
   const app = await source(join("src", "renderer", "src", "App.tsx"));
-  assert.match(app, /topLevelSessions = useMemo\(\(\) => organizedSessions\.filter\(\(session\) => session\.relationshipKind !== "subagent"\)/);
-  assert.match(app, /return topLevelSessions\.filter\(\(session\) =>/);
+  assert.match(app, /<AppTooltipLayer \/>/, "the app-level tooltip portal must own sub-agent tooltip placement");
+  assert.match(app, /topLevelSessions = useMemo\(\(\) => presentedOrganizedSessions\.filter\(\(session\) => session\.relationshipKind !== "subagent"\)/);
+  assert.match(app, /sessionsForTaskListMode\(topLevelSessions, preferences\.taskListMode\)/);
+  assert.match(app, /return taskListSessions\.filter\(\(session\) =>/);
+});
+
+test("sub-agent popover portals above the task-list resize divider", async () => {
+  const [navigation, styles, navigationStyles] = await Promise.all([
+    source(join("src", "renderer", "src", "NavigationPanels.tsx")),
+    source(join("src", "renderer", "src", "styles.css")),
+    source(join("src", "renderer", "src", "navigation.css")),
+  ]);
+  const childRows = navigation.match(/children\.map\(\(child\) => \{[\s\S]*?\}\)\}\{!loading/u)?.[0] ?? "";
+
+  assert.match(navigation, /const popover = useRef<HTMLElement>\(null\)/);
+  assert.match(navigation, /!root\.current\?\.contains\(target\) && !popover\.current\?\.contains\(target\)/, "portaled child rows must remain inside the control's outside-click boundary");
+  assert.match(navigation, /createPortal\(<section ref=\{popover\} id=\{popoverId\} className="session-subagents-popover"[\s\S]*?<\/section>, document\.body\)/, "the fixed panel must escape the task-row stacking context");
+  assert.match(navigation, /const popoverWidth = 300;/u);
+  assert.match(navigation, /const popoverMaximumHeight = 318;/u);
+  assert.match(childRows, /<ProviderLogo providerId=\{child\.providerId\}[\s\S]*?size=\{28\}\/>/u, "each child row retains its actual harness identity");
+  assert.doesNotMatch(childRows, /SubagentsIcon|session-subagents-icon/u, "the generic parent summary icon must not repeat in child rows");
+  assert.match(childRows, /reasoningDisplayLabel\(child\.effort, \{ providerId: child\.providerId, modelId: child\.model, displayName: child\.model \}\)/u, "child reasoning labels come from the truthful provider-aware display helper");
+  assert.match(childRows, /className="session-subagent-model">\{child\.model\}<\/span>\{reasoning \? <><span className="session-subagent-separator" aria-hidden="true">·<\/span><span className="session-subagent-reasoning">\{reasoning\}<\/span>/u, "model and reasoning share one line with a centred dot separator");
+  assert.match(childRows, /className="session-subagent-state"[\s\S]*?sidebarChildStateLabel\(child\.state\)/u, "child identity, model, reasoning, and state remain independently readable");
+  assert.match(styles, /\.session-subagents-popover \{[^}]*width:\s*300px;[^}]*max-height:\s*min\(318px, calc\(100vh - 16px\)\);[^}]*overflow-y:\s*auto/su);
+  assert.match(styles, /\.session-subagents-popover > button \{[^}]*min-height:\s*50px;[^}]*grid-template-columns:\s*28px minmax\(0,1fr\) minmax\(72px,max-content\) 13px/su);
+  assert.match(styles, /\.session-subagents-popover small \{[^}]*font-size:\s*12\.5px/u);
+  assert.match(styles, /\.session-subagent-metadata \{[^}]*display:\s*flex;[^}]*align-items:\s*center;[^}]*gap:\s*4px/su);
+  assert.match(styles, /\.session-subagent-separator, \.session-subagent-reasoning \{[^}]*flex:\s*0 0 auto/su);
+  assert.doesNotMatch(styles, /\.session-subagents-tooltip/u, "the retired private tooltip must not retain CSS");
+
+  const popoverZIndex = Number(styles.match(/\.session-subagents-popover \{[^}]*z-index: (\d+)/)?.[1]);
+  const resizeHandleZIndex = Number(navigationStyles.match(/\.navigation-resize-handle \{[^}]*z-index: (\d+)/)?.[1]);
+  assert.ok(Number.isFinite(popoverZIndex) && Number.isFinite(resizeHandleZIndex));
+  assert.ok(popoverZIndex > resizeHandleZIndex, "the viewport-level panel must paint above the active resize divider");
+  assert.match(navigationStyles, /\.navigation-resize-handle:hover::after,[\s\S]*?\.sidebar-resizing \.navigation-resize-handle::after \{ background: #686863; \}/, "the divider must keep its visible hover, focus, and drag states outside overlays");
+});
+
+test("dashboard keeps useful hierarchy without decorative boxes, fake arrows, or undersized task labels", async () => {
+  const app = await source(join("src", "renderer", "src", "App.tsx"));
+  const styles = await source(join("src", "renderer", "src", "styles.css"));
+
+  assert.match(app, /<header className="page-heading"><h1>Dashboard<\/h1><Button variant="primary" onClick=\{onNew\}>/u);
+  assert.match(app, /<div className="section-title"><h2>Recent tasks<\/h2><button onClick=\{\(\) => onProvider\("all"\)\}>View all/u);
+  assert.doesNotMatch(app, /Local coding workspace|Everything running across your coding tools|Across every coding tool/u);
+  assert.doesNotMatch(styles, /\.page-heading > div > p:last-child/u, "removed dashboard subtitle must not retain dead spacing");
+  assert.match(app, /<div className="active-task-footer"><span><FolderIcon \/>\{active\.project\}<\/span><span>\{relativeTime\(active\.updatedAt\)\}<\/span><\/div>/u, "the whole active-task button stays clickable without a fake edge chevron");
+  assert.match(app, /<ProviderLogo providerId=\{session\.providerId\} provider=\{provider\} size=\{30\}\/><strong>\{session\.title\}<\/strong>/u, "recent task identity is large enough to scan");
+
+  const attentionCountRule = styles.match(/\.attention-heading > b \{[^}]*\}/u)?.[0] ?? "";
+  assert.match(attentionCountRule, /font-size:\s*15px/u, "the attention count must remain readable");
+  assert.doesNotMatch(attentionCountRule, /border|border-radius|background/u, "the attention count must not be boxed or circled");
+  assert.match(styles, /\.attention-card \.empty-icon \{[^}]*width:\s*auto;[^}]*height:\s*auto;[^}]*border:\s*0;[^}]*background:\s*transparent/su, "the clear-state shield must not sit in a decorative box");
+  assert.match(styles, /\.attention-card \.empty-icon svg \{[^}]*width:\s*30px;[^}]*height:\s*30px/su, "the unboxed clear-state shield must remain legible");
+  assert.match(styles, /\.active-task-footer \{[^}]*color:\s*#a7aca7;[^}]*font-size:\s*13px/su, "project and updated time must remain readable");
+  assert.match(styles, /\.active-task-footer svg \{[^}]*width:\s*18px;[^}]*height:\s*18px/su, "the active project folder must match its larger label");
+  assert.match(styles, /\.recent-table strong \{[^}]*font-size:\s*13\.5px;[^}]*font-weight:\s*600/su, "recent task names must not regress to tiny text");
 });
 
 test("renderer accepts only the display-safe retry status contract", () => {
@@ -1403,9 +1972,9 @@ test("delegated children map safely and stay visible across refreshes even when 
 
   const app = await source(join("src", "renderer", "src", "App.tsx"));
   // Both refresh merges preserve derived sessions instead of dropping them.
-  const localOnlyMatches = app.match(/const localOnly = current\.sessions\.filter\(\(session\) => \(session\.draft \|\| session\.sessionKind === "side_chat" \|\| session\.parentSessionId !== undefined \|\| !incomingProviders\.has\(session\.providerId\) \|\| changedSinceRefresh\(session\.id\)\) && !refreshedIds\.has\(session\.id\)\)/gu) ?? [];
+  const localOnlyMatches = app.match(/const localOnly = current\.sessions\.filter\(\(session\) => \(session\.draft \|\| isSideChatSession\(session\) \|\| session\.parentSessionId !== undefined \|\| !incomingProviders\.has\(session\.providerId\) \|\| changedSinceRefresh\(session\.id\)\) && !refreshedIds\.has\(session\.id\)\)/gu) ?? [];
   assert.equal(localOnlyMatches.length, 2);
-  assert.match(app, /sessions: applyOpenedSessionPreview\(\[\.\.\.localOnly, \.\.\.mergeRefreshedSessions\(current\.sessions, sessions, quiet, changedSinceRefresh\)\], timelinePage\?\.session\)/);
+  assert.match(app, /sessions: applyOpenedSessionPreview\(\[\.\.\.localOnly, \.\.\.mergeRefreshedSessions\(current\.sessions, visibleSessions, quiet, changedSinceRefresh\)\], timelinePage\?\.session\)/);
   // Opening a child inserts it into the tracked sessions before its timeline loads.
   assert.match(app, /onOpenChild=\{\(child\) => \{[\s\S]*?sessions: \[child, \.\.\.current\.sessions\.filter/);
   // The child row tolerates a provider that is absent from the provider list.
@@ -1413,30 +1982,35 @@ test("delegated children map safely and stay visible across refreshes even when 
   assert.match(app, /<ProviderLogo providerId=\{child\.providerId\} provider=\{childProvider\}/);
 });
 
-test("foreign sub-agent permission UI exposes a master switch and a per-task checkbox only while enabled", async () => {
+test("experimental features own the sub-agent gate while task details retain the per-task checkbox", async () => {
   const [app, api] = await Promise.all([
     source(join("src", "renderer", "src", "App.tsx")),
     source(join("src", "shared", "desktop_api.ts")),
   ]);
 
-  // Both preference actions exist in the shared API and dispatch through the IPC.
+  // The legacy master action remains in the shared API for compatibility, but
+  // the renderer exposes only the experimental-features master control.
   assert.match(api, /"set-allow-foreign-subagents"/);
   assert.match(api, /"set-session-foreign-subagents"/);
-  assert.match(app, /type: "set-allow-foreign-subagents", enabled/);
+  assert.doesNotMatch(app, /type: "set-allow-foreign-subagents", enabled/);
+  assert.match(app, /type: "set-experimental-features", enabled/);
   assert.match(app, /type: "set-session-foreign-subagents", sessionId: selectedSession\.id, allowed/);
-  assert.match(app, /foreignSubagentsEnabled=\{preferences\.allowForeignSubagents === true\}/);
+  assert.match(app, /foreignSubagentsEnabled=\{preferences\.experimentalFeatures\}/);
   assert.match(app, /sessionForeignSubagents=\{preferences\.foreignSubagentOverrides\?\.\[selectedSession\?\.id \?\? ""\] \?\? true\}/);
 
   // The per-task control renders only while the master gate is on, so a
   // disabled gate leaves no section, no heading, and no reserved gap.
-  assert.match(app, /\{foreignSubagentsEnabled \? <section className="task-details-section" aria-labelledby=\{`task-foreign-subagents-\$\{session\.id\}`\}>[\s\S]*?<\/section> : null\}/);
+  assert.match(app, /\{foreignSubagentsEnabled \? <section className="task-details-section" aria-labelledby=\{foreignSubagentsHeadingId\}>[\s\S]*?<\/section> : null\}/);
   assert.match(app, /This task may spawn sub-agents on a different coding tool\./);
 
-  // Settings row mirrors the experimental toggle's switch markup and copy.
-  assert.match(app, /<h2>Sub-agents<\/h2>/);
-  assert.match(app, /Allow sub-agents from other coding tools/);
-  assert.match(app, /aria-checked=\{preferences\.allowForeignSubagents === true\}/);
-  assert.match(app, /className=\{`settings-toggle \$\{preferences\.allowForeignSubagents === true \? "on" : ""\}`\}/);
+  // Settings presents one concept and names current examples in its description.
+  assert.equal(app.match(/<section className="settings-block experimental-features-block"/gu)?.length, 1);
+  assert.equal(app.match(/<h2>Experimental features<\/h2>/gu)?.length, 1);
+  assert.doesNotMatch(app, /<h2>Sub-agents<\/h2>/);
+  assert.match(app, /including instant sessions and sub-agents from other coding tools\./);
+  assert.match(app, /keywords: "experimental feature instant session sub-agent subagent other coding tools"/);
+  assert.match(app, /aria-checked=\{preferences\.experimentalFeatures\}/);
+  assert.match(app, /className=\{`settings-toggle \$\{preferences\.experimentalFeatures \? "on" : ""\}`\}/);
   assert.match(app, /role="switch"/);
 });
 
@@ -1473,6 +2047,20 @@ test("an echoed Grok user chunk renders live instead of waiting for a history re
   assert.equal(completedEcho.kind, "user");
   assert.equal(completedEcho.body, "Keep my role");
 
+  const annotationEnvelope = `\n# Response annotations:\nTransport instructions.\n<response-annotations>\n[{"text":"Final answer versus task complete","annotation":"What is the difference?"}]\n</response-annotations>\n\n## My request:\n`;
+  const completedAnnotation = bridge.eventToTimeline({
+    ...base,
+    providerId: "codex",
+    eventId: "codex:annotation-completed",
+    type: "message.completed",
+    payload: { messageId: "user_2", role: "user", text: annotationEnvelope },
+  });
+  assert.equal(completedAnnotation.kind, "user");
+  assert.equal(completedAnnotation.body, "");
+  assert.deepEqual(completedAnnotation.annotations.map(({ text, annotation }) => ({ text, annotation })), [
+    { text: "Final answer versus task complete", annotation: "What is the difference?" },
+  ]);
+
   // An assistant message.started is only a turn marker and must not draw a row.
   assert.equal(bridge.eventToTimeline({
     ...base,
@@ -1480,6 +2068,24 @@ test("an echoed Grok user chunk renders live instead of waiting for a history re
     type: "message.started",
     payload: { messageId: "assistant_0", role: "assistant" },
   }), null);
+});
+
+test("an explicit interruption becomes the visible unsuccessful terminal row", () => {
+  const interrupted = bridge.eventToTimeline({
+    sequence: 1,
+    hostId: "desktop_test",
+    providerId: "codex",
+    sessionId: "session-1",
+    eventId: "codex:interrupted",
+    occurredAt: "2026-08-25T00:00:00.000Z",
+    type: "agent.interrupted",
+    payload: { turnId: "turn-1" },
+  });
+
+  assert.equal(interrupted.kind, "error");
+  assert.equal(interrupted.title, "Task interrupted");
+  assert.equal(interrupted.body, "Task interrupted");
+  assert.equal(interrupted.state, "failed");
 });
 
 test("streamed message deltas carry their event identity so a replay cannot duplicate text", () => {

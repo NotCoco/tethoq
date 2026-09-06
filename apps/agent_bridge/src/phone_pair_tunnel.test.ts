@@ -130,6 +130,21 @@ test("quick tunnel readiness rejects promptly when cloudflared exits", async () 
   await assert.rejects(operation, /cloudflared exited while verifying.*code 1/u);
 });
 
+test("quick tunnel readiness follows desktop cancellation", async () => {
+  const controller = new AbortController();
+  const fetchDns: TunnelFetch = async (_url, init) => await new Promise((_resolve, reject) => {
+    init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+  });
+  const operation = waitForQuickTunnelReadiness("https://cancel-example.trycloudflare.com", child(), {
+    fetch: fetchDns,
+    socketFactory: () => new FakeProbeSocket(),
+    timeoutMs: 5_000,
+    signal: controller.signal,
+  });
+  controller.abort(new Error("desktop shutdown cancelled pairing"));
+  await assert.rejects(operation, /desktop shutdown cancelled pairing/u);
+});
+
 test("quick tunnel readiness timeout reports the last failed public check", async () => {
   const fetchDns: TunnelFetch = async () => dnsResponse(false);
   await assert.rejects(

@@ -7,8 +7,6 @@ export interface EarsHelperState {
   readonly helpers: Readonly<Record<string, string>>;
 }
 
-const maximumHelpers = 100;
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -18,7 +16,7 @@ function validate(value: unknown): EarsHelperState {
     throw new Error("EARS-helper file is invalid");
   }
   const helpers: Record<string, string> = {};
-  for (const [key, helperId] of Object.entries(value.helpers).slice(0, maximumHelpers)) {
+  for (const [key, helperId] of Object.entries(value.helpers)) {
     if (typeof helperId !== "string" || key.length > 640 || helperId.length > 2_048) continue;
     try {
       const model = parseEarsModelKey(key);
@@ -37,7 +35,9 @@ export function defaultEarsHelperStatePath(configPath: string): string {
 
 export class EarsHelperStore {
   readonly #store: JsonFileStore<EarsHelperState>;
-  #tail: Promise<void> = Promise.resolve();
+  #pending: EarsHelperState | undefined;
+  #drain: Promise<void> | undefined;
+  #writeFailure: { readonly error: unknown } | undefined;
 
   public constructor(path: string) {
     this.#store = new JsonFileStore(path, validate);
@@ -47,12 +47,42 @@ export class EarsHelperStore {
     return await this.#store.read({ version: 1, helpers: {} });
   }
 
-  public scheduleWrite(helpers: Readonly<Record<string, string>>): void {
-    const bounded = Object.fromEntries(Object.entries(helpers).slice(-maximumHelpers));
-    this.#tail = this.#tail.then(() => this.#store.write({ version: 1, helpers: bounded }));
+  public scheduleWrite(helpers: Readonly<Record<string, string>>): Promise<void> {
+    this.#pending = validate({ version: 1, helpers });
+    this.#writeFailure = undefined;
+    this.ensureDrain();
+    return this.flush();
   }
 
   public async flush(): Promise<void> {
-    await this.#tail;
+    while (this.#pending !== undefined || this.#drain !== undefined) {
+      if (this.#writeFailure !== undefined) throw this.#writeFailure.error;
+      this.ensureDrain();
+      if (this.#drain !== undefined) await this.#drain;
+    }
+    if (this.#writeFailure !== undefined) throw this.#writeFailure.error;
+  }
+
+  private ensureDrain(): void {
+    if (this.#drain !== undefined || this.#pending === undefined || this.#writeFailure !== undefined) return;
+    this.#drain = this.drainWrites()
+      .catch((error: unknown) => { this.#writeFailure = { error }; })
+      .finally(() => {
+        this.#drain = undefined;
+        if (this.#pending !== undefined && this.#writeFailure === undefined) this.ensureDrain();
+      });
+  }
+
+  private async drainWrites(): Promise<void> {
+    while (this.#pending !== undefined) {
+      const state = this.#pending;
+      this.#pending = undefined;
+      try {
+        await this.#store.write(state);
+      } catch (error) {
+        if (this.#pending === undefined) this.#pending = state;
+        throw error;
+      }
+    }
   }
 }

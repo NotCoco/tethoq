@@ -14,6 +14,7 @@ export class JsonLineProcessTransport implements JsonRpcTransport {
   readonly #child: ChildProcessWithoutNullStreams;
   readonly #spawnResult: Promise<Error | null>;
   readonly #listeners = new Set<(message: unknown) => void>();
+  readonly #closeListeners = new Set<(error: Error) => void>();
   readonly #errors: string[] = [];
   #processError: Error | null = null;
   #closed = false;
@@ -41,10 +42,31 @@ export class JsonLineProcessTransport implements JsonRpcTransport {
       this.#child.on("error", (error) => {
         this.#processError ??= error;
         settle(this.#processError);
+        this.notifyUnexpectedClose(this.#processError);
       });
     });
+    this.#child.once("exit", (code, signal) => {
+      if (this.#closed) return;
+      const error = this.#processError ?? new Error(
+        `Process transport exited before closing${code === null ? "" : ` with code ${code}`}${signal === null ? "" : ` after ${signal}`}`,
+      );
+      this.#processError = error;
+      this.notifyUnexpectedClose(error);
+    });
     const decoder = new StringDecoder("utf8");
-    let outputBuffer = "";
+    let lineParts: string[] = [];
+    let lineChars = 0;
+    const appendLinePart = (part: string): void => {
+      if (part.length === 0) return;
+      lineParts.push(part);
+      lineChars += part.length;
+    };
+    const takeLine = (): string => {
+      const line = lineParts.length === 0 ? "" : lineParts.length === 1 ? lineParts[0]! : lineParts.join("");
+      lineParts = [];
+      lineChars = 0;
+      return line;
+    };
     const parseLine = (rawLine: string): void => {
       const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
       if (line.length === 0) return;
@@ -55,17 +77,25 @@ export class JsonLineProcessTransport implements JsonRpcTransport {
         this.#errors.push(`Invalid JSON line: ${error instanceof Error ? error.message : String(error)}`);
       }
     };
-    this.#child.stdout.on("data", (chunk: Buffer) => {
-      outputBuffer += decoder.write(chunk);
-      let newline: number;
-      while ((newline = outputBuffer.indexOf("\n")) >= 0) {
-        parseLine(outputBuffer.slice(0, newline));
-        outputBuffer = outputBuffer.slice(newline + 1);
+    const consumeText = (text: string): void => {
+      let offset = 0;
+      while (offset < text.length) {
+        const newline = text.indexOf("\n", offset);
+        if (newline < 0) {
+          appendLinePart(offset === 0 ? text : text.slice(offset));
+          return;
+        }
+        appendLinePart(text.slice(offset, newline));
+        parseLine(takeLine());
+        offset = newline + 1;
       }
+    };
+    this.#child.stdout.on("data", (chunk: Buffer) => {
+      consumeText(decoder.write(chunk));
     });
     this.#child.stdout.once("end", () => {
-      outputBuffer += decoder.end();
-      if (outputBuffer.length > 0) parseLine(outputBuffer);
+      consumeText(decoder.end());
+      if (lineChars > 0) parseLine(takeLine());
     });
     let errorBuffer = "";
     this.#child.stderr.setEncoding("utf8");
@@ -85,6 +115,11 @@ export class JsonLineProcessTransport implements JsonRpcTransport {
   public onMessage(listener: (message: unknown) => void): () => void {
     this.#listeners.add(listener);
     return () => this.#listeners.delete(listener);
+  }
+
+  public onClose(listener: (error: Error) => void): () => void {
+    this.#closeListeners.add(listener);
+    return () => this.#closeListeners.delete(listener);
   }
 
   public async send(message: unknown): Promise<void> {
@@ -123,6 +158,13 @@ export class JsonLineProcessTransport implements JsonRpcTransport {
         });
       }
     });
+  }
+
+  private notifyUnexpectedClose(error: Error): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    for (const listener of this.#closeListeners) listener(error);
+    this.#closeListeners.clear();
   }
 }
 

@@ -73,6 +73,7 @@ export interface PiRpcProviderAdapterOptions {
   readonly command?: string;
   readonly commandArgs?: readonly string[];
   readonly requestTimeoutMs?: number;
+  readonly compactionTimeoutMs?: number;
   readonly extensionPath?: string;
   readonly environment?: NodeJS.ProcessEnv;
   readonly now?: () => Date;
@@ -88,6 +89,7 @@ interface PendingCommand {
 class PiRpcClient {
   readonly #pending = new Map<string, PendingCommand>();
   readonly #unsubscribe: () => void;
+  readonly #unsubscribeClose: () => void;
   #counter = 0;
   #closed = false;
 
@@ -107,16 +109,17 @@ class PiRpcClient {
         }
       });
     });
+    this.#unsubscribeClose = transport.onClose?.((error) => this.handleClosed(error)) ?? (() => undefined);
   }
 
-  public async request<T>(type: string, fields: Record<string, unknown> = {}): Promise<T> {
+  public async request<T>(type: string, fields: Record<string, unknown> = {}, timeoutMs = this.timeoutMs): Promise<T> {
     if (this.#closed) throw new Error("Pi RPC process is closed");
     const id = `${this.idPrefix}_${++this.#counter}_${randomUUID()}`;
     const result = new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.#pending.delete(id);
         reject(new Error(`Pi RPC command timed out: ${type}`));
-      }, this.timeoutMs);
+      }, timeoutMs);
       this.#pending.set(id, { timer, resolve, reject });
     });
     try {
@@ -136,14 +139,20 @@ class PiRpcClient {
 
   public async close(): Promise<void> {
     if (this.#closed) return;
+    this.handleClosed(new Error("Pi RPC process closed"));
+    await this.transport.close();
+  }
+
+  private handleClosed(error: Error): void {
+    if (this.#closed) return;
     this.#closed = true;
     this.#unsubscribe();
+    this.#unsubscribeClose();
     for (const pending of this.#pending.values()) {
       clearTimeout(pending.timer);
-      pending.reject(new Error("Pi RPC process closed"));
+      pending.reject(error);
     }
     this.#pending.clear();
-    await this.transport.close();
   }
 
   private async handle(value: unknown): Promise<void> {
@@ -162,6 +171,7 @@ class PiRpcClient {
 }
 
 interface PiRuntime {
+  readonly clientToolsDisabled: boolean;
   providerSessionId: string;
   readonly client: PiRpcClient;
   readonly cwd: string;
@@ -209,16 +219,19 @@ const capabilities: ProviderCapabilities = {
 export class PiRpcProviderAdapter implements AgentProviderAdapter {
   public readonly providerId: string;
   public readonly displayName: string;
-  public readonly sessionCreationFeatures = {
+  public get sessionCreationFeatures() { return {
     hiddenDeveloperInstructions: false,
     ephemeralSessions: true,
     selectableClientTools: true,
-  } as const;
+    visionToolIsolation: this.#preset.providerId === "pi",
+  } as const; }
   readonly #hostId: string;
   readonly #preset: PiHarnessPreset;
   readonly #command: string;
   readonly #commandArgs: readonly string[];
   readonly #timeoutMs: number;
+  readonly #compactionTimeoutMs: number;
+  readonly #compactions = new Map<string, Promise<void>>();
   readonly #now: () => Date;
   readonly #transportFactory: ((cwd: string, args: readonly string[]) => JsonRpcTransport) | undefined;
   readonly #extensionPath: string | undefined;
@@ -237,6 +250,7 @@ export class PiRpcProviderAdapter implements AgentProviderAdapter {
     this.#command = options.command ?? options.preset.command;
     this.#commandArgs = options.commandArgs ?? options.preset.commandArgs;
     this.#timeoutMs = options.requestTimeoutMs ?? 120_000;
+    this.#compactionTimeoutMs = options.compactionTimeoutMs ?? 10 * 60_000;
     this.#now = options.now ?? (() => new Date());
     this.#transportFactory = options.transportFactory;
     this.#extensionPath = options.extensionPath;
@@ -410,7 +424,14 @@ export class PiRpcProviderAdapter implements AgentProviderAdapter {
   }
 
   public async compactSession(providerSessionId: string): Promise<void> {
-    await this.runtime(providerSessionId).client.request("compact");
+    const existing = this.#compactions.get(providerSessionId);
+    if (existing !== undefined) return await existing;
+    // Pi and OMP return this RPC result after session.compact has finished.
+    // It is a long model operation, not an ordinary control request.
+    const pending = this.runtime(providerSessionId).client.request("compact", {}, this.#compactionTimeoutMs)
+      .then(() => undefined).finally(() => { this.#compactions.delete(providerSessionId); });
+    this.#compactions.set(providerSessionId, pending);
+    await pending;
   }
 
   public async subscribe(providerSessionId: string | null, sink: ProviderEventSink): Promise<Subscription> {
@@ -440,13 +461,29 @@ export class PiRpcProviderAdapter implements AgentProviderAdapter {
     await Promise.allSettled(runtimes.map((runtime) => runtime.client.close()));
   }
 
-  private async startRuntime(options: Pick<CreateSessionOptions, "workingDirectory" | "title" | "modelId" | "ephemeral" | "clientTools">, retain: boolean): Promise<PiRuntime> {
+  public async releaseSession(providerSessionId: string): Promise<void> {
+    const runtime = this.#runtimes.get(providerSessionId);
+    if (runtime === undefined || !runtime.clientToolsDisabled) return;
+    await runtime.client.close();
+    this.#runtimes.delete(providerSessionId);
+  }
+
+  private async startRuntime(options: Pick<CreateSessionOptions, "workingDirectory" | "title" | "modelId" | "ephemeral" | "clientTools" | "metadata">, retain: boolean): Promise<PiRuntime> {
+    const visionHelper = options.metadata?.internalPurpose === "vision_proxy";
+    const clientToolsDisabled = visionHelper || options.clientTools === "none";
+    if (visionHelper && !this.sessionCreationFeatures.visionToolIsolation) {
+      throw new ProviderAdapterError(this.providerId, "VISION_ISOLATION_UNAVAILABLE", `${this.displayName} cannot isolate its EYES toolchain`, false);
+    }
+    if (visionHelper && this.#commandArgs.some((arg) => /^(?:-e|--extension|--skill|--prompt-template|--tools)(?:=|$)/u.test(arg))) {
+      throw new ProviderAdapterError(this.providerId, "VISION_ISOLATION_UNAVAILABLE", "Explicit Pi tool or extension arguments cannot be inherited by EYES", false);
+    }
     const args = [
       ...this.#commandArgs,
       ...(options.title !== undefined ? ["--name", options.title] : []),
       ...(options.modelId !== undefined ? ["--model", options.modelId] : []),
       ...(options.ephemeral === true ? ["--no-session"] : []),
-      ...(this.#preset.providerId === "pi" && this.#extensionPath !== undefined && options.clientTools !== "none" ? ["--extension", this.#extensionPath] : []),
+      ...(this.#preset.providerId === "pi" && this.#extensionPath !== undefined && !clientToolsDisabled ? ["--extension", this.#extensionPath] : []),
+      ...(visionHelper ? ["--no-tools", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes"] : []),
     ];
     let runtime!: PiRuntime;
     const transport = this.#transportFactory?.(options.workingDirectory, args) ?? new JsonLineProcessTransport({
@@ -463,6 +500,7 @@ export class PiRpcProviderAdapter implements AgentProviderAdapter {
       this.providerId,
     );
     runtime = {
+      clientToolsDisabled,
       providerSessionId: `starting_${randomUUID()}`,
       client,
       cwd: options.workingDirectory,
@@ -504,7 +542,7 @@ export class PiRpcProviderAdapter implements AgentProviderAdapter {
   }
 
   private async configureHostTools(runtime: PiRuntime): Promise<void> {
-    if (!this.#preset.supportsHostTools || this.#clientTooling === undefined) return;
+    if (runtime.clientToolsDisabled || !this.#preset.supportsHostTools || this.#clientTooling === undefined) return;
     await runtime.client.request("set_host_tools", {
       tools: this.#clientTooling.definitions.map((tool) => ({
         name: tool.name,
@@ -596,13 +634,16 @@ export class PiRpcProviderAdapter implements AgentProviderAdapter {
 
   private async handleHostTool(runtime: PiRuntime, frame: Record<string, unknown>): Promise<void> {
     if (typeof frame.id !== "string" || typeof frame.toolName !== "string") return;
-    if (this.#clientTooling === undefined) {
+    if (runtime.clientToolsDisabled || this.#clientTooling === undefined) {
       await runtime.client.send({ type: "host_tool_result", id: frame.id, isError: true, result: { content: [{ type: "text", text: "Tethoq client tools are unavailable" }] } });
       return;
     }
     try {
       const input = isRecord(frame.arguments) ? jsonObject(frame.arguments) : {};
-      const result = await this.#clientTooling.execute(this.providerId, runtime.providerSessionId, frame.toolName, input);
+      const result = await this.#clientTooling.execute(this.providerId, runtime.providerSessionId, frame.toolName, input, {
+        callId: frame.id,
+        lifecycleOwner: "bridge",
+      });
       await runtime.client.send({ type: "host_tool_result", id: frame.id, result: { content: [{ type: "text", text: JSON.stringify(result) }] } });
     } catch (error) {
       await runtime.client.send({ type: "host_tool_result", id: frame.id, isError: true, result: { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }] } });

@@ -1,13 +1,15 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { ExponentialBackoff, type JsonObject, type ProviderCapabilities, type RemoteMessage, type RemoteModel, type RemoteSession, type SessionContextState } from "../../protocol/src/index.js";
 import {
   ProviderAdapterError,
   ProviderEventHub,
+  isProviderContinuationContent,
   providerPromptContent,
   type AgentProviderAdapter,
   type AuthStatus,
   type CreateSessionOptions,
   type ListSessionsOptions,
+  type MessageAttachment,
   type PaginatedSessions,
   type ProviderApprovalResponse,
   type ProviderDetection,
@@ -19,16 +21,27 @@ import {
 } from "../../provider_contract/src/index.js";
 import { OpenCodeHttpClient, type OpenCodeHttpClientOptions } from "./http_client.js";
 import { SqliteOpenCodeActivityReader, type OpenCodeActivityReader, type SqliteOpenCodeActivityReaderOptions } from "./activity.js";
-import { asJsonObject, isContinuingOpenCodeToolPart, isRecord, normalizeOpenCodeMessages, normalizeOpenCodeProviderStatus, normalizeOpenCodeSession, normalizeOpenCodeToolEventPayload, normalizeStatus } from "./normalize.js";
+import {
+  isOpenCodeSessionIndexCursor,
+  SqliteOpenCodeSessionIndexReader,
+  type OpenCodeSessionIndexReader,
+} from "./catalogue.js";
+import { asJsonObject, isContinuingOpenCodeToolPart, isOpenCodeEyesTool, isRecord, normalizeOpenCodeMessages, normalizeOpenCodeProviderStatus, normalizeOpenCodeSession, normalizeOpenCodeToolEventPayload, normalizeStatus } from "./normalize.js";
+import { extractedPdfTextAttachment, isPdfAttachment } from "./pdf_fallback.js";
 
 export interface OpenCodeAdapterOptions extends OpenCodeHttpClientOptions {
   readonly hostId: string;
   readonly directory?: string;
   readonly now?: () => Date;
   readonly activityReader?: OpenCodeActivityReader;
+  readonly catalogueReader?: OpenCodeSessionIndexReader;
   /** Explicit opt-in to OpenCode's undocumented local SQLite state. */
   readonly localActivity?: false | SqliteOpenCodeActivityReaderOptions;
   readonly activityPollIntervalMs?: number;
+  /** How often the small session catalogue is sampled for external activity. */
+  readonly activityDiscoveryIntervalMs?: number;
+  /** How often the owning OpenCode server's provider-wide status map is sampled. */
+  readonly nativeStatusPollIntervalMs?: number;
   /**
    * A second server whose live events keep streaming while the desktop hands
    * over to the user's own server; used until the previous server's turns drain.
@@ -41,12 +54,20 @@ export interface OpenCodeAdapterOptions extends OpenCodeHttpClientOptions {
    * database stops reporting it, for servers that never emit session.idle.
    */
   readonly activeTurnSettleMs?: number;
+  readonly compactionTimeoutMs?: number;
+}
+
+function openCodeMessageId(requestId: string): string {
+  // OpenCode persists the caller-supplied message ID. Deriving it from the
+  // bridge request identity lets a safe retry target the same native message
+  // instead of appending a duplicate user turn after a lost HTTP response.
+  return `msg_${createHash("sha256").update(requestId).digest("hex").slice(0, 32)}`;
 }
 
 const capabilities: ProviderCapabilities = {
   authentication: false,
   listSessions: true,
-  paginatedSessions: false,
+  paginatedSessions: true,
   sessionHistory: true,
   createSession: true,
   resumeSession: true,
@@ -67,7 +88,7 @@ const capabilities: ProviderCapabilities = {
   notes: [
     "Uses OpenCode's documented HTTP/OpenAPI and SSE server surfaces.",
     "Remote-initiated authentication is intentionally disabled; authenticate providers on the host with official OpenCode flows.",
-    "The server returns a complete session array rather than a cursor, so this adapter applies local cursor pagination.",
+    "Uses a lightweight local session index for complete cursor pagination when local OpenCode state is enabled.",
   ],
 };
 
@@ -81,6 +102,8 @@ interface GuardAbortGeneration {
   readonly parentId: string;
   /** The exact same-parent assistant that caused the guarded abort attempt. */
   readonly continuationAssistantId: string;
+  /** Whether this guard repairs a completed turn or exposes a provider failure. */
+  readonly terminalKind: "completed" | "failed";
   /** A rejected HTTP response is ambiguous because the server may already have acted. */
   outcome: "attempting" | "uncertain" | "confirmed";
   /** The next Tethoq prompt, retained until its provider echo forms a FIFO boundary. */
@@ -89,9 +112,24 @@ interface GuardAbortGeneration {
   completion: Promise<void> | undefined;
 }
 
-interface PendingOwnedIdle {
-  /** The exact Tethoq-dispatched user message this otherwise-unlabelled idle may end. */
+interface EmptyUnknownSequence {
   readonly parentId: string;
+  readonly assistantIds: string[];
+}
+
+interface SettledOwnedSession {
+  readonly parentId: string;
+  readonly assistantId: string;
+}
+
+interface PendingOwnedIdle {
+  /** The exact user message this completion may end, including observed turns. */
+  readonly parentId: string;
+  /** Observing an external turn must never grant the runaway guard ownership. */
+  readonly ownedPromptId: string | undefined;
+  /** A completed no-tool assistant can prove its own terminal boundary without
+   * waiting for OpenCode's later, session-wide idle publication. */
+  assistantId: string | undefined;
   /** Preserve the native idle as evidence when the delayed confirmation succeeds. */
   nativeEvent: JsonObject | undefined;
   attempts: number;
@@ -126,25 +164,76 @@ interface SessionListSnapshot {
   readonly expiresAt: number;
 }
 
+interface NativeStatusSnapshot {
+  readonly statuses: Record<string, unknown>;
+  readonly nativeEventRevisionAtStart: number;
+  readonly connectionGenerationAtStart: number;
+}
+
 const sessionListSnapshotTtlMs = 5_000;
 const maxSessionListSnapshots = 8;
+/**
+ * `/session` has a limit but no cursor for older rows. Keep enough recent rows
+ * for several local pages without turning a small sidebar request into a full
+ * catalogue load. A task with a known session id remains directly addressable.
+ */
+const minimumSessionListSnapshotEntries = 100;
+const sessionListSnapshotPrefetchPages = 5;
+const maxSessionListSnapshotEntries = 500;
 /** Enough parts for several concurrent turns without growing without bound. */
 const maxTrackedParts = 512;
+/** Provider-wide discovery is change-driven; this only throttles repeated WAL wakes. */
+const defaultActivityDiscoveryIntervalMs = 1_000;
+/** Missed filesystem events recover here without turning the DB into a hot poll. */
+const defaultActivitySafetyPollIntervalMs = 30_000;
+/** Recovers missed status SSE without turning one HTTP request into a per-task poll. */
+const defaultNativeStatusPollIntervalMs = 1_500;
+/** A dead server cannot hold the activity reconciler behind the general 30s HTTP timeout. */
+const nativeStatusRequestTimeoutMs = 1_500;
+/** Allow a full model compaction, while bounding both transport and completion. */
+const compactionRequestTimeoutMs = 10 * 60_000;
+/** Provider events are immediate; this bounded history read only recovers a missed event. */
+const compactionCompletionPollIntervalMs = 2_000;
+/**
+ * Once a task is known to be active, exact indexed checks are tiny and keep a
+ * coalesced/missed WAL notification from leaving its spinner stale for half a
+ * safety-poll interval. Provider-wide discovery remains change-driven.
+ */
+// Filesystem notifications are the fast path. This exact-ID read is only the
+// missed-notification safety net, and packaged Electron performs it in a short
+// isolated Node helper, so keep it slower than the watcher debounce rather than
+// spawning a helper more than once per second throughout an active turn.
+const knownActiveSafetyPollIntervalMs = 2_000;
+/** Lets SQLite finish its first WAL commit before a leading-edge discovery read. */
+const activityChangeSettleMs = 100;
+/** Hydrate separate externally active tasks together without flooding the local server. */
+const maximumConcurrentActivityReconciliations = 8;
 /** Persisted messages can trail SSE slightly; retry briefly rather than losing the only idle. */
 const ownedIdleConfirmationDelaysMs = [25, 75, 200, 500, 1_000] as const;
 /** A second matching read prevents a queued tool part from losing a race to idle. */
 const ownedIdleQuietConfirmationMs = 75;
+/** Two fully persisted empty generations are provider failure, not useful work. */
+const emptyUnknownResponseLimit = 2;
 /** A rejected abort can still have acted; give its native cleanup a brief causal window. */
 const manualInterruptCleanupGraceMs = 250;
 const disabledActivityReader: OpenCodeActivityReader = {
-  async readWorkingSessionIds(): Promise<ReadonlySet<string>> { return new Set(); },
+  async readWorkingSessionIds(_sessionIds: ReadonlySet<string>): Promise<ReadonlySet<string>> { return new Set(); },
+  close(): void {},
+};
+const disabledCatalogueReader: OpenCodeSessionIndexReader = {
+  async readPage() { return undefined; },
   close(): void {},
 };
 
 export class OpenCodeAdapter implements AgentProviderAdapter {
   public readonly providerId = "opencode";
   public readonly displayName = "OpenCode";
+  readonly #visionSessions = new Set<string>();
+  public readonly sessionCreationFeatures = {
+    hiddenDeveloperInstructions: false, ephemeralSessions: false, selectableClientTools: false, visionToolIsolation: true,
+  } as const;
   readonly #client: OpenCodeHttpClient;
+  readonly #compactionTimeoutMs: number;
   readonly #hostId: string;
   readonly #directory: string | undefined;
   readonly #now: () => Date;
@@ -152,16 +241,25 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   readonly #permissions = new Map<string, PendingPermission>();
   readonly #abort = new AbortController();
   readonly #activityReader: OpenCodeActivityReader;
+  readonly #sessionIndexReader: OpenCodeSessionIndexReader;
   readonly #activityPollIntervalMs: number;
+  readonly #activityDiscoveryIntervalMs: number;
+  readonly #nativeStatusPollIntervalMs: number;
   readonly #activeTurnSettleMs: number;
   readonly #sessionListSnapshots = new Map<string, SessionListSnapshot>();
+  /** Model limits come from the catalogue, while usage remains a fresh history read. */
+  readonly #contextWindowTokensByModel = new Map<string, number | null>();
   readonly #partTexts = new Map<string, string>();
   readonly #partTypes = new Map<string, string>();
   readonly #messageRoles = new Map<string, string>();
+  readonly #reportedSelections = new Map<string, { readonly key: string; readonly messageCreatedAt?: number }>();
   readonly #activePromptMessageIds = new Map<string, string>();
+  readonly #compactionLifecycleWaiters = new Map<string, Set<() => void>>();
+  readonly #compactions = new Map<string, Promise<void>>();
   readonly #continuingToolMessageIds = new Set<string>();
   readonly #terminalPromptCandidates = new Map<string, string>();
   readonly #runawayPromptParents = new Set<string>();
+  readonly #emptyUnknownSequences = new Map<string, EmptyUnknownSequence>();
   readonly #suppressedMessageIds = new Set<string>();
   /** Sessions whose current runner was deliberately aborted after a confirmed
    * impossible same-prompt continuation. Native abort/status/idle events for
@@ -170,16 +268,47 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   /** Quarantines the trailing idle/error finalizers for one interrupted or failed turn. */
   readonly #terminalCleanupGenerations = new Map<string, TerminalCleanupGeneration>();
   readonly #pendingOwnedIdles = new Map<string, PendingOwnedIdle>();
+  /**
+   * A confirmed no-tool terminal for a Tethoq-owned prompt. OpenCode's runner
+   * often stays busy for title generation, snapshot, and plugin wrap-up after
+   * the answer is already persisted; those events must not revive the turn.
+   */
+  readonly #settledOwnedSessions = new Map<string, SettledOwnedSession>();
   /** Serializes session-wide aborts with prompt dispatches. */
   readonly #sessionLifecycleTails = new Map<string, Promise<void>>();
   /** Invalidates an activity snapshot taken across a guard-generation transition. */
   #guardActivityEpoch = 0;
   #activityLoop: Promise<void> | null = null;
+  #nativeStatusLoop: Promise<void> | null = null;
+  #nextActivityDiscoveryAt = 0;
+  #nextActivitySafetyDiscoveryAt = 0;
+  #activityRefreshRequested = false;
+  #activityDiscoveryPending = false;
+  #activityDelayWake: (() => void) | undefined;
+  #activityChangeDebounce: NodeJS.Timeout | undefined;
+  #stopActivityChangeWatch: (() => void) | undefined;
+  #initialActivitySnapshot: Promise<boolean> | undefined;
+  /** Lets an event subscriber exact-read a newly discovered task without waiting
+   * on the very startup reconciliation whose event it is currently handling. */
+  #applyingPersistedWorking: ReadonlySet<string> | undefined;
+  #persistedActivityAvailable = false;
   #persistedWorking = new Set<string>();
   readonly #activePrompts = new Set<string>();
   #activeSettleDeadlines = new Map<string, number>();
   #nativeStates = new Map<string, RemoteSession["state"]>();
+  #nativeStatuses = new Map<string, unknown>();
+  #nativeStatusRead: Promise<NativeStatusSnapshot> | undefined;
+  #nativeStatusReconcileTail: Promise<void> = Promise.resolve();
+  #nativeEventRevision = 0;
+  readonly #nativeEventRevisionBySession = new Map<string, number>();
+  #primaryEventStreamDisconnected = false;
+  #primaryConnectionGeneration = 0;
+  readonly #disconnectedActiveSessionIds = new Set<string>();
+  readonly #disconnectedNativeSessionIds = new Set<string>();
+  readonly #disconnectedPersistedSessionIds = new Set<string>();
+  readonly #primaryReconnectRefreshes = new Set<Promise<void>>();
   #eventLoop: Promise<void> | null = null;
+  readonly #eventNamespace = randomUUID();
   #eventCounter = 0;
   #sessionListSnapshotGeneration = 0;
   #everDetected = false;
@@ -198,6 +327,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
 
   public constructor(options: OpenCodeAdapterOptions) {
     this.#client = new OpenCodeHttpClient(options);
+    this.#compactionTimeoutMs = options.compactionTimeoutMs ?? compactionRequestTimeoutMs;
     this.#hostId = options.hostId;
     this.#directory = options.directory;
     this.#now = options.now ?? (() => new Date());
@@ -206,7 +336,16 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
         ? disabledActivityReader
         : new SqliteOpenCodeActivityReader({ ...options.localActivity, now: options.localActivity.now ?? this.#now })
     );
-    this.#activityPollIntervalMs = options.activityPollIntervalMs ?? 5_000;
+    this.#sessionIndexReader = options.catalogueReader ?? (
+      options.localActivity === undefined || options.localActivity === false
+        ? disabledCatalogueReader
+        : new SqliteOpenCodeSessionIndexReader({
+            ...(options.localActivity.databasePath !== undefined ? { databasePath: options.localActivity.databasePath } : {}),
+          })
+    );
+    this.#activityPollIntervalMs = options.activityPollIntervalMs ?? defaultActivitySafetyPollIntervalMs;
+    this.#activityDiscoveryIntervalMs = options.activityDiscoveryIntervalMs ?? defaultActivityDiscoveryIntervalMs;
+    this.#nativeStatusPollIntervalMs = options.nativeStatusPollIntervalMs ?? defaultNativeStatusPollIntervalMs;
     this.#activeTurnSettleMs = options.activeTurnSettleMs ?? 45_000;
     this.#secondaryActiveSeed = options.secondaryActiveSessionIds ?? [];
     this.#secondaryClientOptions = {
@@ -314,23 +453,71 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
         });
       }
     }
+    this.#contextWindowTokensByModel.clear();
+    for (const model of result) this.#contextWindowTokensByModel.set(model.id, openCodeContextWindow(model.nativeMetadata) ?? null);
     return result;
   }
 
   public async listSessions(options: ListSessionsOptions = {}): Promise<PaginatedSessions> {
+    await this.awaitInitialActivitySnapshot();
+    const limit = Math.max(1, Math.min(options.limit ?? 100, 500));
+    if (options.cursor === undefined || isOpenCodeSessionIndexCursor(options.cursor)) {
+      const indexed = await this.listSessionsFromLocalIndex(options, limit);
+      if (indexed !== undefined) return indexed;
+      if (options.cursor !== undefined) {
+        throw new ProviderAdapterError(this.providerId, "BAD_CURSOR", "OpenCode local session index is unavailable for this cursor", true);
+      }
+    }
     const offset = options.cursor === undefined ? 0 : Number.parseInt(options.cursor, 10);
     if (!Number.isInteger(offset) || offset < 0) throw new ProviderAdapterError(this.providerId, "BAD_CURSOR", "OpenCode local pagination cursor is invalid", false);
-    const limit = Math.max(1, Math.min(options.limit ?? 100, 500));
+    const snapshotLimit = Math.min(maxSessionListSnapshotEntries, Math.max(
+      minimumSessionListSnapshotEntries,
+      limit * sessionListSnapshotPrefetchPages,
+      offset + limit,
+    ));
     const snapshotKey = this.sessionListSnapshotKey(options);
     const snapshot = options.cursor === undefined
-      ? await this.loadSessionListSnapshot(options, snapshotKey)
-      : this.cachedSessionListSnapshot(snapshotKey) ?? await this.loadSessionListSnapshot(options, snapshotKey);
+      ? await this.loadSessionListSnapshot(options, snapshotKey, snapshotLimit)
+      : this.cachedSessionListSnapshot(snapshotKey) ?? await this.loadSessionListSnapshot(options, snapshotKey, snapshotLimit);
     const page = snapshot.sessions.slice(offset, offset + limit);
     const next = offset + page.length;
     if (next >= snapshot.sessions.length && this.#sessionListSnapshots.get(snapshotKey) === snapshot) {
       this.#sessionListSnapshots.delete(snapshotKey);
     }
-    return { sessions: page, nextCursor: next < snapshot.sessions.length ? String(next) : null };
+    // `/session` has no older cursor. This fallback is deliberately
+    // non-authoritative so a bounded response can enrich the catalogue without
+    // deleting older tasks already known to Tethoq.
+    return { sessions: page, nextCursor: next < snapshot.sessions.length ? String(next) : null, authoritative: false };
+  }
+
+  private async listSessionsFromLocalIndex(
+    options: ListSessionsOptions,
+    limit: number,
+  ): Promise<PaginatedSessions | undefined> {
+    let indexed;
+    try {
+      indexed = await this.#sessionIndexReader.readPage({ ...options, limit });
+    } catch (error) {
+      if (options.cursor !== undefined) {
+        throw new ProviderAdapterError(
+          this.providerId,
+          "BAD_CURSOR",
+          error instanceof Error ? error.message : "OpenCode SQLite session cursor is invalid",
+          false,
+        );
+      }
+      return undefined;
+    }
+    if (indexed === undefined) return undefined;
+    const statusSnapshot = await this.sessionStatuses().catch((): undefined => undefined);
+    if (statusSnapshot !== undefined) await this.reconcileNativeStatusSnapshot(statusSnapshot);
+    const sessions = indexed.entries.map((entry) => {
+      const id = entry.id;
+      const session = normalizeOpenCodeSession(this.#hostId, entry, this.resolvedStatus(id, this.#nativeStatuses.get(id) ?? this.#nativeStates.get(id), this.#persistedWorking));
+      const state = this.activityDerivedState(id, session.state);
+      return state === session.state ? session : { ...session, state };
+    });
+    return { sessions, nextCursor: indexed.nextCursor, authoritative: true };
   }
 
   /**
@@ -348,15 +535,15 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
    * reach unless its worktree is a real path: `directory=/` matches nothing,
    * and no endpoint lists sessions by project id.
    */
-  private async listSessionsAcrossProjects(): Promise<readonly unknown[]> {
+  private async listSessionsAcrossProjects(limit: number): Promise<readonly unknown[]> {
     const [primary, ...rest] = await this.sessionListDirectories();
     // The primary listing still throws. A server that is down has to surface as
     // a failed refresh, because an empty list reads as "this provider has no
     // sessions" and would drop every cached session for it.
-    const pages = [await this.fetchSessionList(primary)];
+    const pages = [await this.fetchSessionList(primary, limit)];
     // Supplementary projects are best-effort: one unreadable workspace must not
     // blank out the others.
-    pages.push(...await Promise.all(rest.map(async (directory) => await this.fetchSessionList(directory).catch((): readonly unknown[] => []))));
+    pages.push(...await Promise.all(rest.map(async (directory) => await this.fetchSessionList(directory, limit).catch((): readonly unknown[] => []))));
     const merged: unknown[] = [];
     const seen = new Set<string>();
     for (const page of pages) {
@@ -389,25 +576,44 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     }
   }
 
-  private async fetchSessionList(directory: string | undefined): Promise<readonly unknown[]> {
+  private async fetchSessionList(directory: string | undefined, limit: number): Promise<readonly unknown[]> {
     const value = await this.#client.request<unknown>("GET", "/session", {
-      query: { directory, limit: Number.MAX_SAFE_INTEGER },
+      query: { directory, limit },
     });
-    return Array.isArray(value) ? value : [];
+    // Old servers and test doubles can ignore `limit`; never retain their full
+    // response as continuation state.
+    return Array.isArray(value) ? value.slice(0, limit) : [];
+  }
+
+  private async fetchChildSessionList(parentProviderSessionId: string, directory: string | undefined, limit: number): Promise<readonly unknown[]> {
+    const value = await this.#client.request<unknown>(
+      "GET",
+      `/session/${encodeURIComponent(parentProviderSessionId)}/children`,
+      { query: this.query(directory) },
+    );
+    return Array.isArray(value) ? value.slice(0, limit) : [];
   }
 
   private async loadSessionListSnapshot(
     options: ListSessionsOptions,
     snapshotKey: string,
+    snapshotLimit: number,
     retryOnInvalidation = options.cursor === undefined,
   ): Promise<SessionListSnapshot> {
     const generation = this.#sessionListSnapshotGeneration;
-    const [all, statuses, persistedWorking] = await Promise.all([
-      options.workingDirectory === undefined
-        ? this.listSessionsAcrossProjects()
-        : this.fetchSessionList(options.workingDirectory),
-      this.sessionStatuses().catch((): Record<string, unknown> => ({})),
-      this.readPersistedWorking(),
+    const directory = options.workingDirectory ?? this.#directory;
+    const listing = options.parentProviderSessionId === undefined
+      ? options.workingDirectory === undefined
+        ? this.listSessionsAcrossProjects(snapshotLimit)
+        : this.fetchSessionList(options.workingDirectory, snapshotLimit)
+      : this.fetchChildSessionList(options.parentProviderSessionId, directory, snapshotLimit).catch(async () => (
+          options.workingDirectory === undefined
+            ? await this.listSessionsAcrossProjects(snapshotLimit)
+            : await this.fetchSessionList(options.workingDirectory, snapshotLimit)
+        ));
+    const [all, statusSnapshot] = await Promise.all([
+      listing,
+      this.sessionStatuses().catch((): undefined => undefined),
     ]);
     // A live event can clear or replace provider status while these independent
     // reads are in flight. A cursorless refresh is the authority for the page it
@@ -415,25 +621,32 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     // the event already invalidated. Cursor continuations keep their established
     // single-snapshot behavior, and a second invalidation never creates a loop.
     if (retryOnInvalidation && generation !== this.#sessionListSnapshotGeneration) {
-      return await this.loadSessionListSnapshot(options, snapshotKey, false);
+      return await this.loadSessionListSnapshot(options, snapshotKey, snapshotLimit, false);
     }
-    this.captureNativeStates(statuses);
+    if (statusSnapshot !== undefined) await this.reconcileNativeStatusSnapshot(statusSnapshot);
     const filtered = all.filter((entry) => isRecord(entry)
       && (options.workingDirectory === undefined || entry.directory === options.workingDirectory)
       && (options.parentProviderSessionId === undefined || entry.parentID === options.parentProviderSessionId));
-    const sessions = Object.freeze(filtered.map((entry) => {
+    const sessions = filtered.map((entry) => {
       const id = isRecord(entry) && typeof entry.id === "string" ? entry.id : "";
-      const session = normalizeOpenCodeSession(this.#hostId, entry, this.resolvedStatus(id, statuses[id], persistedWorking));
+      const session = normalizeOpenCodeSession(this.#hostId, entry, this.resolvedStatus(id, this.#nativeStatuses.get(id) ?? this.#nativeStates.get(id), this.#persistedWorking));
       // OpenCode listings carry no session state, so an unknown answer is the
       // normal case rather than a gap. Report the adapter's own truth instead:
       // working only while a turn is genuinely in flight, idle otherwise. This
       // is what lets a finished turn settle instead of shimmering forever.
-      const state: RemoteSession["state"] = session.state === "unknown"
-        ? this.hasActiveTurn(id) ? "working" : "idle"
-        : session.state;
+      const state = this.activityDerivedState(id, session.state);
       return Object.freeze({ ...session, state });
-    }));
-    const snapshot: SessionListSnapshot = { sessions, expiresAt: this.#now().getTime() + sessionListSnapshotTtlMs };
+    });
+    const sortKey = options.sortKey ?? "updated_at";
+    const direction = options.sortDirection === "asc" ? 1 : -1;
+    sessions.sort((left, right) => {
+      const leftValue = Date.parse(sortKey === "created_at" ? left.createdAt ?? left.lastActivityAt : left.lastActivityAt);
+      const rightValue = Date.parse(sortKey === "created_at" ? right.createdAt ?? right.lastActivityAt : right.lastActivityAt);
+      const byTime = (leftValue - rightValue) * direction;
+      return byTime !== 0 ? byTime : left.providerSessionId.localeCompare(right.providerSessionId);
+    });
+    const retained = Object.freeze(sessions.slice(0, snapshotLimit));
+    const snapshot: SessionListSnapshot = { sessions: retained, expiresAt: this.#now().getTime() + sessionListSnapshotTtlMs };
     if (generation === this.#sessionListSnapshotGeneration) {
       this.#sessionListSnapshots.delete(snapshotKey);
       this.#sessionListSnapshots.set(snapshotKey, snapshot);
@@ -459,25 +672,55 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   }
 
   private sessionListSnapshotKey(options: ListSessionsOptions): string {
-    return JSON.stringify([options.workingDirectory ?? null, options.parentProviderSessionId ?? null]);
+    return JSON.stringify([
+      options.workingDirectory ?? null,
+      options.parentProviderSessionId ?? null,
+      options.sortKey ?? "updated_at",
+      options.sortDirection ?? "desc",
+    ]);
   }
 
   public async getSession(providerSessionId: string): Promise<RemoteSession> {
-    const [session, statuses, persistedWorking] = await Promise.all([
+    if (this.#applyingPersistedWorking === undefined) await this.awaitInitialActivitySnapshot();
+    const persistedWorking = this.#applyingPersistedWorking ?? this.#persistedWorking;
+    const [session, statusSnapshot] = await Promise.all([
       this.#client.request<unknown>("GET", `/session/${encodeURIComponent(providerSessionId)}`, { query: this.query() }),
-      this.sessionStatuses().catch((): Record<string, unknown> => ({})),
-      this.readPersistedWorking(),
+      this.sessionStatuses().catch((): undefined => undefined),
     ]);
-    this.captureNativeStates(statuses);
-    const normalized = normalizeOpenCodeSession(this.#hostId, session, this.resolvedStatus(providerSessionId, statuses[providerSessionId], persistedWorking));
-    const state: RemoteSession["state"] = normalized.state === "unknown"
-      ? this.hasActiveTurn(providerSessionId) ? "working" : "idle"
-      : normalized.state;
+    if (statusSnapshot !== undefined) await this.reconcileNativeStatusSnapshot(statusSnapshot);
+    const normalized = normalizeOpenCodeSession(this.#hostId, session, this.resolvedStatus(
+      providerSessionId,
+      this.#nativeStatuses.get(providerSessionId) ?? this.#nativeStates.get(providerSessionId),
+      persistedWorking,
+    ));
+    const state = this.activityDerivedState(providerSessionId, normalized.state);
     return state === normalized.state ? normalized : { ...normalized, state };
   }
 
   public async getMessages(providerSessionId: string): Promise<readonly RemoteMessage[]> {
     const value = await this.rawMessages(providerSessionId);
+    if (Array.isArray(value)) {
+      let latestSelectionInfo: Record<string, unknown> | undefined;
+      let latestSelection: OpenCodeMessageSelection | undefined;
+      for (const entry of value) {
+        const info = isRecord(entry) && isRecord(entry.info) ? entry.info : isRecord(entry) ? entry : undefined;
+        if (info === undefined) continue;
+        const selection = openCodeMessageSelection(info);
+        if (selection === undefined) continue;
+        const isNewer = latestSelection === undefined
+          || (selection.messageCreatedAt !== undefined && latestSelection.messageCreatedAt === undefined)
+          || (selection.messageCreatedAt !== undefined && latestSelection.messageCreatedAt !== undefined
+            && selection.messageCreatedAt >= latestSelection.messageCreatedAt)
+          || (selection.messageCreatedAt === undefined && latestSelection.messageCreatedAt === undefined);
+        if (isNewer) {
+          latestSelectionInfo = info;
+          latestSelection = selection;
+        }
+      }
+      if (latestSelectionInfo !== undefined) {
+        await this.publishReportedSelection(providerSessionId, latestSelectionInfo, { source: "history" });
+      }
+    }
     return normalizeOpenCodeMessages(this.#hostId, providerSessionId, value);
   }
 
@@ -501,9 +744,9 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     const providerId = latest === undefined ? undefined : firstText(latest.providerID, isRecord(latest.model) ? latest.model.providerID : undefined);
     const nativeModelId = latest === undefined ? undefined : firstText(latest.modelID, isRecord(latest.model) ? latest.model.modelID ?? latest.model.id : undefined);
     const modelId = providerId !== undefined && nativeModelId !== undefined ? `${providerId}/${nativeModelId}` : nativeModelId;
-    const models = await this.listModels().catch((): readonly RemoteModel[] => []);
-    const model = modelId === undefined ? undefined : models.find((candidate) => candidate.id === modelId);
-    const contextWindowTokens = model === undefined ? undefined : openCodeContextWindow(model.nativeMetadata);
+    if (modelId !== undefined && !this.#contextWindowTokensByModel.has(modelId)) await this.listModels().catch((): readonly RemoteModel[] => []);
+    const cachedContextWindowTokens = modelId === undefined ? undefined : this.#contextWindowTokensByModel.get(modelId);
+    const contextWindowTokens = typeof cachedContextWindowTokens === "number" ? cachedContextWindowTokens : undefined;
     const usedTokens = openCodeOccupancy(current);
     // No turn in the whole session stated a usage: the occupancy is unknown, which
     // is not the same claim as empty. Saying nothing is the honest answer; saying
@@ -531,7 +774,20 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   }
 
   public async compactSession(providerSessionId: string): Promise<void> {
-    const value = await this.rawMessages(providerSessionId);
+    const existing = this.#compactions.get(providerSessionId);
+    if (existing !== undefined) return await existing;
+    const pending = Promise.resolve().then(() => this.performCompaction(providerSessionId)).finally(() => {
+      this.#compactions.delete(providerSessionId);
+    });
+    this.#compactions.set(providerSessionId, pending);
+    return await pending;
+  }
+
+  private async performCompaction(providerSessionId: string): Promise<void> {
+    const timeoutMs = this.#compactionTimeoutMs;
+    const deadline = Date.now() + timeoutMs;
+    const signal = AbortSignal.any([this.#abort.signal, AbortSignal.timeout(timeoutMs)]);
+    const value = await this.rawMessages(providerSessionId, 500, signal);
     const entries = Array.isArray(value) ? value : [];
     const latest = entries
       .map((entry) => isRecord(entry) && isRecord(entry.info) ? entry.info : isRecord(entry) ? entry : null)
@@ -542,23 +798,73 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     const providerID = latest === undefined ? undefined : firstText(latest.providerID, isRecord(latest.model) ? latest.model.providerID : undefined);
     const modelID = latest === undefined ? undefined : firstText(latest.modelID, isRecord(latest.model) ? latest.model.modelID ?? latest.model.id : undefined);
     if (providerID === undefined || modelID === undefined) throw new Error("OpenCode has not selected a model for this session yet");
-    await this.#client.request("POST", `/session/${encodeURIComponent(providerSessionId)}/summarize`, {
+    const previousMarkers = openCodeCompactionMarkerIds(entries);
+    const requestAbort = new AbortController();
+    let requestOutcome: { readonly kind: "completed" } | { readonly kind: "failed"; readonly error: unknown } | undefined;
+    const request = this.#client.request("POST", `/session/${encodeURIComponent(providerSessionId)}/summarize`, {
       query: this.query(),
       body: { providerID, modelID },
+      signal: AbortSignal.any([requestAbort.signal, signal]),
+      timeoutMs,
+    }).then(() => {
+      requestOutcome = { kind: "completed" };
+      this.signalCompactionLifecycle(providerSessionId);
+    }, (error: unknown) => {
+      requestOutcome = { kind: "failed", error };
+      this.signalCompactionLifecycle(providerSessionId);
     });
+    try {
+      while (!signal.aborted) {
+        const recent = await this.rawMessages(providerSessionId, 20, signal);
+        if (Array.isArray(recent)) {
+          const newMarkers = openCodeCompactionMarkerIds(recent, previousMarkers);
+          const outcome = openCodeCompactionOutcome(recent, newMarkers);
+          if (outcome === "completed") return;
+          if (outcome === "failed") throw new ProviderAdapterError(
+            "opencode", "COMPACTION_FAILED", "OpenCode compaction failed or was interrupted", true,
+          );
+        }
+        // HTTP success only accepts the request. Require a new, parent-linked
+        // completed summary, including when the marker appears after the ack.
+        if (requestOutcome?.kind === "failed") throw requestOutcome.error;
+        await this.waitForCompactionLifecycle(providerSessionId, Math.max(0, Math.min(compactionCompletionPollIntervalMs, deadline - Date.now())));
+      }
+      throw new ProviderAdapterError("opencode", "COMPACTION_INCOMPLETE", "OpenCode compaction completion was not confirmed before timeout or disconnection", true);
+    } finally {
+      requestAbort.abort(new Error("OpenCode compaction lifecycle finished"));
+      await request;
+    }
   }
 
   public async createSession(options: CreateSessionOptions): Promise<RemoteSession> {
-    const directory = options.workingDirectory;
+    let directory = options.workingDirectory;
+    if (options.metadata?.internalPurpose === "vision_proxy") {
+      // MCP/plugin processes belong to the server workspace, not to each chat.
+      // Reuse it instead of starting another stack in the parent's directory.
+      if (this.#directory !== undefined) directory = this.#directory;
+      else {
+        const paths = await this.#client.request<unknown>("GET", "/path");
+        if (!isRecord(paths) || typeof paths.directory !== "string" || !paths.directory) {
+          throw new ProviderAdapterError(this.providerId, "VISION_ISOLATION_UNAVAILABLE", "OpenCode could not resolve its existing EYES workspace", false);
+        }
+        directory = paths.directory;
+      }
+    }
     const value = await this.#client.request<unknown>("POST", "/session", {
       query: this.query(directory),
-      body: { ...(options.title !== undefined ? { title: options.title } : {}) },
+      body: {
+        ...(options.title !== undefined ? { title: options.title } : {}),
+        ...(options.metadata?.internalPurpose === "vision_proxy"
+          ? { permission: [{ permission: "*", pattern: "*", action: "deny" }] } : {}),
+      },
     });
     const session = normalizeOpenCodeSession(this.#hostId, value);
+    if (options.metadata?.internalPurpose === "vision_proxy") this.#visionSessions.add(session.providerSessionId);
     if (options.firstInstruction !== undefined) {
       await this.sendMessage(session.providerSessionId, {
         requestId: `create_${randomUUID()}`,
         content: options.firstInstruction,
+        ...(options.metadata !== undefined ? { metadata: options.metadata } : {}),
         ...(options.modelId !== undefined ? { modelId: options.modelId } : {}),
         ...(options.reasoningEffort !== undefined ? { reasoningEffort: options.reasoningEffort } : {}),
       });
@@ -567,11 +873,31 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   }
 
   public async branchSession(providerSessionId: string): Promise<RemoteSession> {
-    const value = await this.#client.request<unknown>("POST", `/session/${encodeURIComponent(providerSessionId)}/fork`, {
-      query: this.query(),
-      body: {},
+    return await this.withSessionLifecycleLock(providerSessionId, async () => {
+      const history = await this.rawMessages(providerSessionId);
+      if (!Array.isArray(history)) {
+        throw new ProviderAdapterError(
+          "opencode",
+          "BRANCH_HISTORY_UNAVAILABLE",
+          "OpenCode history is unavailable, so Tethoq cannot choose a safe branch point",
+          true,
+        );
+      }
+      const branchBody = completedOpenCodeBranchBody(history);
+      if (history.length > 0 && branchBody === undefined) {
+        throw new ProviderAdapterError(
+          "opencode",
+          "NO_COMPLETED_BRANCH_BOUNDARY",
+          "OpenCode does not expose a completed response boundary that is safe to branch from yet",
+          true,
+        );
+      }
+      const value = await this.#client.request<unknown>("POST", `/session/${encodeURIComponent(providerSessionId)}/fork`, {
+        query: this.query(),
+        body: branchBody ?? {},
+      });
+      return normalizeOpenCodeSession(this.#hostId, value);
     });
-    return normalizeOpenCodeSession(this.#hostId, value);
   }
 
   public async resumeSession(providerSessionId: string): Promise<void> {
@@ -580,8 +906,34 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
 
   public async sendMessage(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
     return await this.withSessionLifecycleLock(providerSessionId, async () => {
+      if (request.metadata?.internalPurpose === "vision_proxy") this.#visionSessions.add(providerSessionId);
       const model = request.modelId === undefined ? undefined : parseModel(request.modelId);
-      const messageID = `msg_${randomUUID()}`;
+      const messageID = openCodeMessageId(request.requestId);
+      if (typeof request.metadata?.tethoqScheduledTaskId === "string") {
+        let existing: unknown;
+        try {
+          existing = await this.#client.request<unknown>(
+            "GET",
+            `/session/${encodeURIComponent(providerSessionId)}/message/${encodeURIComponent(messageID)}`,
+            { query: this.query() },
+          );
+        } catch (error) {
+          if (!(error instanceof ProviderAdapterError) || error.code !== "HTTP_404") throw error;
+        }
+        if (existing !== undefined) {
+          const info = isRecord(existing) && isRecord(existing.info) ? existing.info : undefined;
+          if (info?.id !== messageID || info.role !== "user") {
+            throw new ProviderAdapterError(
+              "opencode",
+              "INVALID_SCHEDULED_MESSAGE_LOOKUP",
+              "OpenCode returned an invalid scheduled-message lookup",
+              true,
+            );
+          }
+          return { accepted: true, providerTurnId: messageID, details: ["OpenCode already accepted this scheduled prompt."] };
+        }
+      }
+      const attachments = await this.preparePromptAttachments(request.modelId, request.attachments);
       const previousPromptId = this.#activePromptMessageIds.get(providerSessionId);
       const wasActive = this.#activePrompts.has(providerSessionId);
       const guard = this.#guardAbortGenerations.get(providerSessionId);
@@ -597,7 +949,9 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       // The SSE feed can publish an idle while prompt_async is still returning.
       // Mark ownership first so that unlabelled lifecycle noise cannot complete or
       // pump the queue for a turn whose model has not produced anything yet.
+      this.#settledOwnedSessions.delete(providerSessionId);
       this.cancelPendingOwnedCompletion(providerSessionId);
+      this.#emptyUnknownSequences.delete(providerSessionId);
       this.#activePrompts.add(providerSessionId);
       this.#activePromptMessageIds.set(providerSessionId, messageID);
       try {
@@ -606,23 +960,45 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
           body: {
             messageID,
             parts: [
-              { type: "text", text: providerPromptContent(request) },
-              ...(request.attachments ?? []).map((attachment) => ({
+              { type: "text", text: providerPromptContent({
+                content: request.content,
+                ...(request.workflows !== undefined ? { workflows: request.workflows } : {}),
+              }), ...(isProviderContinuationContent(request.content) ? { synthetic: true } : {}) },
+              ...attachments.map((attachment) => ({
                 type: "file",
                 mime: attachment.mimeType,
                 filename: attachment.name,
                 url: `data:${attachment.mimeType};base64,${attachment.dataBase64}`,
               })),
             ],
+            ...(request.developerInstructions !== undefined ? { system: request.developerInstructions } : {}),
+            tools: openCodeTurnToolOverrides(request, this.#visionSessions.has(providerSessionId)),
             ...(model !== undefined ? { model } : {}),
             // OpenCode exposes reasoning choices as model variants. The desktop
             // deliberately passes one of those advertised keys, so preserve it
             // verbatim instead of silently running the model's undefined default.
-            ...(request.reasoningEffort !== undefined ? { variant: request.reasoningEffort } : {}),
+            ...(request.reasoningEffort !== undefined && request.reasoningEffort !== "default"
+              ? { variant: request.reasoningEffort }
+              : {}),
           },
         });
       } catch (error) {
-        const providerObservedPrompt = this.#messageRoles.get(messageID) === "user";
+        let providerObservedPrompt = this.#messageRoles.get(messageID) === "user";
+        if (!providerObservedPrompt) {
+          try {
+            const persisted = await this.#client.request<unknown>(
+              "GET",
+              `/session/${encodeURIComponent(providerSessionId)}/message/${encodeURIComponent(messageID)}`,
+              { query: this.query() },
+            );
+            const info = isRecord(persisted) && isRecord(persisted.info) ? persisted.info : undefined;
+            providerObservedPrompt = info?.id === messageID && info.role === "user";
+            if (providerObservedPrompt && isRecord(persisted)) this.rememberMessageRole(persisted);
+          } catch {
+            // This read only resolves an ambiguous write. Preserve the original
+            // prompt failure when native history cannot prove acceptance.
+          }
+        }
         if (!providerObservedPrompt && this.#activePromptMessageIds.get(providerSessionId) === messageID) {
           if (previousPromptId === undefined) this.#activePromptMessageIds.delete(providerSessionId);
           else this.#activePromptMessageIds.set(providerSessionId, previousPromptId);
@@ -639,7 +1015,8 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
           this.#guardActivityEpoch += 1;
         }
         // prompt_async can lose its HTTP response after the provider has already
-        // persisted and echoed the exact user message. Retrying would duplicate it.
+        // persisted the exact user message, even before SSE echoes it. Retrying
+        // or rolling back the optimistic row would misrepresent that accepted turn.
         if (providerObservedPrompt) {
           return { accepted: true, providerTurnId: messageID, details: ["OpenCode accepted the asynchronous prompt before its response disconnected."] };
         }
@@ -661,13 +1038,15 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   }
 
   public hasActiveTurn(providerSessionId: string): boolean {
-    return this.#activePrompts.has(providerSessionId)
-      || this.#persistedWorking.has(providerSessionId)
-      || this.#nativeStates.get(providerSessionId) === "working";
+    if (this.#primaryEventStreamDisconnected || this.#disconnectedActiveSessionIds.has(providerSessionId)) return false;
+    if (this.isSettledOwnedSession(providerSessionId)) return false;
+    if (this.#activePrompts.has(providerSessionId) || this.#persistedWorking.has(providerSessionId)) return true;
+    return this.#nativeStates.get(providerSessionId) === "working";
   }
 
   public activeSessionIds(): readonly string[] {
-    return [...this.#activePrompts];
+    if (this.#primaryEventStreamDisconnected) return [];
+    return [...this.knownActiveSessionIds()].filter((sessionId) => !this.#disconnectedActiveSessionIds.has(sessionId));
   }
 
   public isSecondaryBusy(): boolean {
@@ -753,26 +1132,46 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   public async dispose(): Promise<void> {
     if (this.#disposed) return;
     this.#disposed = true;
+    if (this.#activityChangeDebounce !== undefined) clearTimeout(this.#activityChangeDebounce);
+    this.#activityChangeDebounce = undefined;
+    this.#stopActivityChangeWatch?.();
+    this.#stopActivityChangeWatch = undefined;
     this.#abort.abort();
     this.#secondaryAbort.abort();
     await Promise.all([
       this.#eventLoop?.catch(() => undefined),
       this.#secondaryLoop?.catch(() => undefined),
       this.#activityLoop?.catch(() => undefined),
+      this.#nativeStatusLoop?.catch(() => undefined),
+      this.#nativeStatusReconcileTail.catch(() => undefined),
+      this.#initialActivitySnapshot?.catch(() => undefined),
+      ...[...this.#primaryReconnectRefreshes].map(async (refresh) => await refresh.catch(() => undefined)),
     ]);
     this.#activityReader.close();
+    this.#sessionIndexReader.close();
     this.#activeSettleDeadlines.clear();
     this.#sessionListSnapshots.clear();
     this.#partTexts.clear();
     this.#partTypes.clear();
     this.#messageRoles.clear();
+    this.#reportedSelections.clear();
+    this.#nativeStates.clear();
+    this.#nativeStatuses.clear();
+    this.#nativeEventRevisionBySession.clear();
+    this.#disconnectedActiveSessionIds.clear();
+    this.#disconnectedNativeSessionIds.clear();
+    this.#disconnectedPersistedSessionIds.clear();
+    this.#primaryReconnectRefreshes.clear();
     this.#activePromptMessageIds.clear();
     this.#continuingToolMessageIds.clear();
     this.#terminalPromptCandidates.clear();
     this.#runawayPromptParents.clear();
+    this.#emptyUnknownSequences.clear();
     this.#suppressedMessageIds.clear();
     for (const generation of this.#terminalCleanupGenerations.values()) generation.resolveCleanupObserved();
     this.#terminalCleanupGenerations.clear();
+    for (const waiters of this.#compactionLifecycleWaiters.values()) for (const wake of waiters) wake();
+    this.#compactionLifecycleWaiters.clear();
     this.#guardAbortGenerations.clear();
     for (const sessionId of this.#pendingOwnedIdles.keys()) this.clearPendingOwnedIdle(sessionId);
     this.#sessionLifecycleTails.clear();
@@ -783,15 +1182,83 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     return { directory };
   }
 
-  private async rawMessages(providerSessionId: string): Promise<unknown> {
+  private async preparePromptAttachments(
+    modelId: string | undefined,
+    attachments: readonly MessageAttachment[] | undefined,
+  ): Promise<readonly MessageAttachment[]> {
+    if (attachments === undefined || !attachments.some(isPdfAttachment)) return attachments ?? [];
+    const selectedModel = modelId === undefined
+      ? undefined
+      : await this.listModels()
+          .then((models) => models.find((candidate) => candidate.id === modelId))
+          .catch((): undefined => undefined);
+    if (selectedModel !== undefined && openCodeSupportsNativePdf(selectedModel.nativeMetadata)) return attachments;
+
+    const prepared: MessageAttachment[] = [];
+    for (const attachment of attachments) {
+      prepared.push(isPdfAttachment(attachment) ? await extractedPdfTextAttachment(attachment) : attachment);
+    }
+    return prepared;
+  }
+
+  private async rawMessages(providerSessionId: string, limit = 500, signal?: AbortSignal): Promise<unknown> {
     return await this.#client.request<unknown>("GET", `/session/${encodeURIComponent(providerSessionId)}/message`, {
-      query: { ...this.query(), limit: 500 },
+      query: { ...this.query(), limit },
+      ...(signal !== undefined ? { signal } : {}),
     });
   }
 
-  private async sessionStatuses(): Promise<Record<string, unknown>> {
-    const value = await this.#client.request<unknown>("GET", "/session/status", { query: this.query() });
-    return isRecord(value) ? value : {};
+  private signalCompactionLifecycle(providerSessionId: string): void {
+    const waiters = this.#compactionLifecycleWaiters.get(providerSessionId);
+    if (waiters === undefined) return;
+    this.#compactionLifecycleWaiters.delete(providerSessionId);
+    for (const wake of waiters) wake();
+  }
+
+  private async waitForCompactionLifecycle(providerSessionId: string, timeoutMs: number): Promise<void> {
+    if (this.#abort.signal.aborted) return;
+    await new Promise<void>((resolve) => {
+      const waiters = this.#compactionLifecycleWaiters.get(providerSessionId) ?? new Set<() => void>();
+      this.#compactionLifecycleWaiters.set(providerSessionId, waiters);
+      let timer: NodeJS.Timeout | undefined;
+      const finish = (): void => {
+        if (timer !== undefined) clearTimeout(timer);
+        this.#abort.signal.removeEventListener("abort", finish);
+        waiters.delete(finish);
+        if (waiters.size === 0 && this.#compactionLifecycleWaiters.get(providerSessionId) === waiters) {
+          this.#compactionLifecycleWaiters.delete(providerSessionId);
+        }
+        resolve();
+      };
+      waiters.add(finish);
+      this.#abort.signal.addEventListener("abort", finish, { once: true });
+      timer = setTimeout(finish, timeoutMs);
+    });
+  }
+
+  private sessionStatuses(): Promise<NativeStatusSnapshot> {
+    const inFlight = this.#nativeStatusRead;
+    if (inFlight !== undefined) return inFlight;
+    const reading = this.readNativeStatusSnapshot().finally(() => {
+      if (this.#nativeStatusRead === reading) this.#nativeStatusRead = undefined;
+    });
+    this.#nativeStatusRead = reading;
+    return reading;
+  }
+
+  /** Reconnect recovery must never reuse a request begun on the dead stream's
+   * generation, so this primitive intentionally does not consult the poll cache. */
+  private readNativeStatusSnapshot(): Promise<NativeStatusSnapshot> {
+    const nativeEventRevisionAtStart = this.#nativeEventRevision;
+    const connectionGenerationAtStart = this.#primaryConnectionGeneration;
+    return this.#client.request<unknown>("GET", "/session/status", {
+      query: this.query(),
+      signal: AbortSignal.any([this.#abort.signal, AbortSignal.timeout(nativeStatusRequestTimeoutMs)]),
+    }).then((value): NativeStatusSnapshot => ({
+      statuses: isRecord(value) ? value : {},
+      nativeEventRevisionAtStart,
+      connectionGenerationAtStart,
+    }));
   }
 
   private ensureEventLoop(): void {
@@ -803,8 +1270,14 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       });
     }
     if (this.#activityLoop === null) {
+      this.ensureActivityChangeWatch();
       this.#activityLoop = this.runActivityLoop().finally(() => {
         this.#activityLoop = null;
+      });
+    }
+    if (this.#nativeStatusLoop === null) {
+      this.#nativeStatusLoop = this.runNativeStatusLoop().finally(() => {
+        this.#nativeStatusLoop = null;
       });
     }
   }
@@ -819,13 +1292,142 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     }
   }
 
-  private async runActivityLoop(): Promise<void> {
+  /**
+   * `/session/status` is one provider-wide map, so one bounded poll recovers
+   * every task whose SSE status was missed without creating per-session work.
+   * Failed reads preserve the last confirmed map; a successful later snapshot
+   * is the only poll allowed to retire it.
+   */
+  private async runNativeStatusLoop(): Promise<void> {
     while (!this.#abort.signal.aborted) {
+      await this.nativeStatusDelay();
+      if (this.#abort.signal.aborted) return;
+      const snapshot = await this.sessionStatuses().catch((): undefined => undefined);
+      if (snapshot !== undefined && !this.#abort.signal.aborted) {
+        await this.reconcileNativeStatusSnapshot(snapshot);
+      }
+      if (!this.#abort.signal.aborted) await this.recoverTerminalResponses();
+      if (!this.#primaryEventStreamDisconnected && this.#disconnectedActiveSessionIds.size > 0
+        && this.#primaryReconnectRefreshes.size === 0) {
+        this.startPrimaryReconnectRefresh(this.#primaryConnectionGeneration);
+      }
+    }
+  }
+
+  private reconcileNativeStatusSnapshot(snapshot: NativeStatusSnapshot): Promise<void> {
+    const reconciliation = this.#nativeStatusReconcileTail.then(async () => {
+      await this.applyNativeStatusSnapshot(snapshot);
+    });
+    this.#nativeStatusReconcileTail = reconciliation.catch(() => undefined);
+    return reconciliation;
+  }
+
+  /** Recover missed finish events for active chats, even when none is open. */
+  private async recoverTerminalResponses(): Promise<void> {
+    if (this.#primaryEventStreamDisconnected) return;
+    const sessions = [...this.knownActiveSessionIds()].filter((id) =>
+      !this.#pendingOwnedIdles.has(id) && !this.#secondaryActive.has(id)
+      && !this.#disconnectedActiveSessionIds.has(id)
+      && !this.#guardAbortGenerations.has(id) && !this.#terminalCleanupGenerations.has(id));
+    for (let offset = 0; offset < sessions.length; offset += maximumConcurrentActivityReconciliations) {
+      await Promise.all(sessions.slice(offset, offset + maximumConcurrentActivityReconciliations).map(async (sessionId) => {
+        const revision = this.#nativeEventRevisionBySession.get(sessionId);
+        const connection = this.#primaryConnectionGeneration;
+        const value = await this.#client.request<unknown>("GET", `/session/${encodeURIComponent(sessionId)}/message`, {
+          query: { ...this.query(), limit: 2 },
+          timeoutMs: nativeStatusRequestTimeoutMs,
+        }).catch((): unknown => undefined);
+        if (this.#disposed || this.#primaryEventStreamDisconnected || connection !== this.#primaryConnectionGeneration
+          || revision !== this.#nativeEventRevisionBySession.get(sessionId) || !Array.isArray(value)) return;
+        const tail = value.at(-1);
+        const info = isRecord(tail) && isRecord(tail.info) ? tail.info : tail;
+        if (isRecord(info)) this.armTerminalCompletion(sessionId, info);
+      }));
+    }
+  }
+
+  private async applyNativeStatusSnapshot(snapshot: NativeStatusSnapshot): Promise<void> {
+    if (snapshot.connectionGenerationAtStart !== this.#primaryConnectionGeneration) return;
+    if (this.#primaryEventStreamDisconnected) {
+      // Reads may still succeed while only SSE is down. Retain newly observed
+      // work as recovery input, but never let an empty outage-time snapshot
+      // erase the sessions that must stay visibly disconnected.
+      for (const [sessionId, status] of Object.entries(snapshot.statuses)) {
+        if (normalizeStatus(status) !== "working") continue;
+        this.#nativeStates.set(sessionId, "working");
+        this.#nativeStatuses.set(sessionId, status);
+        this.#disconnectedActiveSessionIds.add(sessionId);
+        this.#disconnectedNativeSessionIds.add(sessionId);
+      }
+      return;
+    }
+    const previousWorking = this.nativeWorkingSessionIds();
+    this.captureNativeStates(snapshot);
+    const nextWorking = this.nativeWorkingSessionIds();
+    const sessionIds = new Set([...previousWorking, ...nextWorking]);
+    for (const sessionId of sessionIds) {
+      if (this.#disconnectedActiveSessionIds.has(sessionId)) continue;
+      if ((this.#nativeEventRevisionBySession.get(sessionId) ?? 0) > snapshot.nativeEventRevisionAtStart) continue;
+      const wasWorking = previousWorking.has(sessionId)
+        || this.#persistedWorking.has(sessionId)
+        || this.#activePrompts.has(sessionId);
+      const isWorking = nextWorking.has(sessionId)
+        || this.#persistedWorking.has(sessionId)
+        || this.#activePrompts.has(sessionId);
+      if (wasWorking === isWorking) continue;
+      const nativeStatus = snapshot.statuses[sessionId];
+      const providerStatus = normalizeOpenCodeProviderStatus(nativeStatus);
+      await this.emit({
+        providerSessionId: sessionId,
+        type: "session.status_changed",
+        payload: {
+          state: isWorking ? "working" : "idle",
+          providerStatus: providerStatus === undefined ? null : asJsonObject(providerStatus),
+        },
+      });
+      if (!isWorking || (this.#nativeEventRevisionBySession.get(sessionId) ?? 0) > snapshot.nativeEventRevisionAtStart) continue;
+      // A status event cannot materialize a task the Bridge has never loaded.
+      // This companion metadata event invalidates the bounded catalogue.
+      await this.emit({ providerSessionId: sessionId, type: "session.updated", payload: { state: "working", activityDiscovered: true } });
+    }
+  }
+
+  private async nativeStatusDelay(): Promise<void> {
+    if (this.#abort.signal.aborted) return;
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(finish, this.#nativeStatusPollIntervalMs);
+      const signal = this.#abort.signal;
+      function finish(): void {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", finish);
+        resolve();
+      }
+      signal.addEventListener("abort", finish, { once: true });
+    });
+  }
+
+  private async runActivityLoop(): Promise<void> {
+    const initialAvailable = await this.ensureInitialActivitySnapshot();
+    if (!this.#abort.signal.aborted && initialAvailable) await this.activityDelay();
+    while (!this.#abort.signal.aborted) {
+      this.#activityRefreshRequested = false;
       const guardEpoch = this.#guardActivityEpoch;
-      const snapshot = await this.tryReadPersistedWorking();
+      const connectionGeneration = this.#primaryConnectionGeneration;
+      const activityReadAt = this.#now().getTime();
+      const safetyDiscovery = activityReadAt >= this.#nextActivitySafetyDiscoveryAt;
+      const changeDiscovery = this.#activityDiscoveryPending && activityReadAt >= this.#nextActivityDiscoveryAt;
+      const discovery = safetyDiscovery ? "complete" : changeDiscovery ? "recent" : undefined;
+      const pendingDiscoveryAttempted = discovery !== undefined && this.#activityDiscoveryPending;
+      if (discovery !== undefined) {
+        this.#activityDiscoveryPending = false;
+        // Record every provider-wide attempt, including an unavailable read, so
+        // repeated WAL wakes cannot hot-loop the packaged SQLite helper.
+        this.#nextActivityDiscoveryAt = activityReadAt + this.#activityDiscoveryIntervalMs;
+      }
+      const snapshot = await this.tryReadPersistedWorking(this.activityCandidates(), discovery);
       // A session-wide abort may complete while the database read is in flight.
       // Discard that old snapshot so it cannot resurrect the released generation.
-      if (guardEpoch !== this.#guardActivityEpoch) {
+      if (guardEpoch !== this.#guardActivityEpoch || connectionGeneration !== this.#primaryConnectionGeneration) {
         await this.activityDelay();
         continue;
       }
@@ -833,48 +1435,156 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
         // An unavailable activity source is not evidence that every turn ended.
         // The generic deadline may still *ask* exact history for confirmation;
         // it cannot emit idle on its own.
+        if (pendingDiscoveryAttempted) this.#activityDiscoveryPending = true;
         await this.settleUnconfirmedActiveTurns(new Set());
-        await this.activityDelay();
+        const retryWait = this.#activityDiscoveryPending
+          ? Math.max(0, this.#nextActivityDiscoveryAt - this.#now().getTime())
+          : undefined;
+        await this.activityDelay(retryWait);
         continue;
+      }
+      if (discovery !== undefined) {
+        this.#nextActivitySafetyDiscoveryAt = activityReadAt + this.#activityPollIntervalMs;
       }
       const next = new Set([...snapshot].filter((sessionId) =>
         this.#guardAbortGenerations.get(sessionId)?.outcome !== "confirmed"
         && !this.#terminalCleanupGenerations.has(sessionId)));
-      const ids = new Set([...this.#persistedWorking, ...next]);
-      for (const sessionId of ids) {
-        const wasWorking = this.#persistedWorking.has(sessionId);
-        const isWorking = next.has(sessionId);
-        if (wasWorking === isWorking) continue;
-        const activePromptId = this.#activePromptMessageIds.get(sessionId);
-        if (activePromptId !== undefined) {
-          if (isWorking) {
-            this.cancelPendingOwnedCompletion(sessionId);
-            await this.emit({ providerSessionId: sessionId, type: "session.status_changed", payload: { state: "working", providerStatus: null } });
-          } else {
-            // Database disappearance is only a hint. A completed tool step and a
-            // genuinely terminal response look identical to the activity query.
-            this.rememberPendingOwnedIdle(sessionId, activePromptId);
-          }
-          continue;
-        }
-        if (this.#nativeStates.get(sessionId) !== undefined && this.#nativeStates.get(sessionId) !== "unknown") continue;
-        if (!isWorking) {
-          // The database is the authoritative completion signal: a turn it once
-          // reported as working and now reports as done is over, so the
-          // dispatch mark must not re-flag the session on the next listing.
-          this.cancelPendingOwnedCompletion(sessionId);
-          this.#activePrompts.delete(sessionId);
-          this.#activePromptMessageIds.delete(sessionId);
-        }
-        await this.emit({ providerSessionId: sessionId, type: "session.status_changed", payload: { state: isWorking ? "working" : "idle", providerStatus: null } });
-      }
-      if (guardEpoch !== this.#guardActivityEpoch) {
+      if (!await this.reconcilePersistedActivity(next, guardEpoch, connectionGeneration)) {
         await this.activityDelay();
         continue;
       }
-      this.#persistedWorking = new Set(next);
+      const discoveryWait = this.#activityDiscoveryPending
+        ? Math.max(0, this.#nextActivityDiscoveryAt - this.#now().getTime())
+        : undefined;
+      await this.activityDelay(discoveryWait);
+    }
+  }
+
+  private async reconcilePersistedActivity(
+    next: ReadonlySet<string>,
+    guardEpoch: number,
+    connectionGeneration: number,
+  ): Promise<boolean> {
+    this.#applyingPersistedWorking = next;
+    try {
+      const previous = this.#persistedWorking;
+      if (connectionGeneration !== this.#primaryConnectionGeneration) return false;
+      if (this.#primaryEventStreamDisconnected) {
+        if (guardEpoch !== this.#guardActivityEpoch) return false;
+        this.#persistedWorking = new Set(next);
+        this.#persistedActivityAvailable = true;
+        for (const sessionId of next) {
+          this.#disconnectedActiveSessionIds.add(sessionId);
+          this.#disconnectedPersistedSessionIds.add(sessionId);
+        }
+        return true;
+      }
+      const ids = new Set([...previous, ...next]);
+      const reconciliations: Array<() => Promise<void>> = [];
+      for (const sessionId of ids) {
+        const wasWorking = previous.has(sessionId);
+        const isWorking = next.has(sessionId);
+        if (wasWorking === isWorking) continue;
+        reconciliations.push(async () => {
+          if (connectionGeneration !== this.#primaryConnectionGeneration || this.#primaryEventStreamDisconnected) return;
+          const activePromptId = this.#activePromptMessageIds.get(sessionId);
+          if (activePromptId !== undefined) {
+            if (isWorking) {
+              if (this.hasTerminalOwnedIdleArmed(sessionId)) return;
+              this.cancelPendingOwnedCompletion(sessionId);
+              await this.emit({ providerSessionId: sessionId, type: "session.status_changed", payload: { state: "working", providerStatus: null } });
+            } else {
+              // Database disappearance is only a hint. A completed tool step and a
+              // genuinely terminal response look identical to the activity query.
+              this.rememberPendingOwnedIdle(sessionId, activePromptId);
+            }
+            return;
+          }
+          if (this.isSettledOwnedSession(sessionId) && isWorking) return;
+          if (this.#nativeStates.get(sessionId) !== undefined && this.#nativeStates.get(sessionId) !== "unknown") return;
+          if (!isWorking) {
+            // The database is the authoritative completion signal: a turn it once
+            // reported as working and now reports as done is over, so the
+            // dispatch mark must not re-flag the session on the next listing.
+            this.cancelPendingOwnedCompletion(sessionId);
+            this.#activePrompts.delete(sessionId);
+            this.#activePromptMessageIds.delete(sessionId);
+          }
+          await this.emit({ providerSessionId: sessionId, type: "session.status_changed", payload: { state: isWorking ? "working" : "idle", providerStatus: null } });
+          if (isWorking) {
+            // A status event cannot materialize a task the Bridge has never loaded.
+            // This metadata event also invalidates its bounded provider catalogue.
+            await this.emit({ providerSessionId: sessionId, type: "session.updated", payload: { state: "working", activityDiscovered: true } });
+          }
+        });
+      }
+      for (let offset = 0; offset < reconciliations.length; offset += maximumConcurrentActivityReconciliations) {
+        await Promise.all(reconciliations
+          .slice(offset, offset + maximumConcurrentActivityReconciliations)
+          .map(async (reconcile) => await reconcile()));
+      }
+      if (guardEpoch !== this.#guardActivityEpoch || connectionGeneration !== this.#primaryConnectionGeneration) return false;
+      this.#persistedWorking = new Set([...next].filter((id) => !this.isSettledOwnedSession(id)));
+      this.#persistedActivityAvailable = true;
       await this.settleUnconfirmedActiveTurns(next);
-      await this.activityDelay();
+      return true;
+    } finally {
+      if (this.#applyingPersistedWorking === next) this.#applyingPersistedWorking = undefined;
+    }
+  }
+
+  private activityCandidates(): ReadonlySet<string> {
+    return this.knownActiveSessionIds();
+  }
+
+  /** Internal activity truth is retained through a feed outage so reconnect can
+   * reconcile it, while public activity methods suppress it until that happens. */
+  private knownActiveSessionIds(): Set<string> {
+    return new Set([
+      ...this.#activePrompts,
+      ...this.#persistedWorking,
+      ...(this.#applyingPersistedWorking ?? []),
+      ...[...this.#nativeStates].flatMap(([sessionId, state]) => state === "working" ? [sessionId] : []),
+      ...this.#disconnectedActiveSessionIds,
+    ].filter((id) => !this.isSettledOwnedSession(id)));
+  }
+
+  private async ensureInitialActivitySnapshot(): Promise<boolean> {
+    if (this.#initialActivitySnapshot === undefined) {
+      this.#initialActivitySnapshot = (async () => {
+        if (this.#disposed) return false;
+        const guardEpoch = this.#guardActivityEpoch;
+        const connectionGeneration = this.#primaryConnectionGeneration;
+        const activityReadAt = this.#now().getTime();
+        const snapshot = await this.tryReadPersistedWorking(this.activityCandidates(), "complete");
+        if (this.#disposed || snapshot === undefined || guardEpoch !== this.#guardActivityEpoch
+          || connectionGeneration !== this.#primaryConnectionGeneration) return false;
+        const next = new Set([...snapshot].filter((sessionId) =>
+          this.#guardAbortGenerations.get(sessionId)?.outcome !== "confirmed"
+          && !this.#terminalCleanupGenerations.has(sessionId)));
+        this.#nextActivityDiscoveryAt = activityReadAt + this.#activityDiscoveryIntervalMs;
+        this.#nextActivitySafetyDiscoveryAt = activityReadAt + this.#activityPollIntervalMs;
+        return await this.reconcilePersistedActivity(next, guardEpoch, connectionGeneration);
+      })();
+    }
+    const attempt = this.#initialActivitySnapshot;
+    const available = await attempt;
+    // A missing/locked DB is transient. A later catalogue read or the activity
+    // loop may retry, while successful startup discovery remains single-shot.
+    if (!available && this.#initialActivitySnapshot === attempt) this.#initialActivitySnapshot = undefined;
+    return available;
+  }
+
+  private async awaitInitialActivitySnapshot(): Promise<boolean> {
+    const initial = this.ensureInitialActivitySnapshot();
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        initial,
+        new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), 1_500); }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
     }
   }
 
@@ -889,7 +1599,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     const now = this.#now().getTime();
     for (const sessionId of [...this.#activePrompts]) {
       if (confirmedWorking.has(sessionId)) {
-        this.cancelPendingOwnedCompletion(sessionId);
+        if (!this.hasTerminalOwnedIdleArmed(sessionId)) this.cancelPendingOwnedCompletion(sessionId);
         continue;
       }
       if (this.#nativeStates.get(sessionId) === "working") continue;
@@ -913,19 +1623,165 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     }
   }
 
+  private async markPrimaryDisconnected(cause: unknown): Promise<void> {
+    if (this.#primaryEventStreamDisconnected) return;
+    for (const sessionId of this.#pendingOwnedIdles.keys()) this.clearPendingOwnedIdle(sessionId);
+    const nativeWorking = this.nativeWorkingSessionIds();
+    const persistedWorking = new Set([
+      ...this.#persistedWorking,
+      ...(this.#applyingPersistedWorking ?? []),
+    ]);
+    const activeSessionIds = this.knownActiveSessionIds();
+    this.#primaryEventStreamDisconnected = true;
+    this.#primaryConnectionGeneration += 1;
+    for (const sessionId of activeSessionIds) {
+      this.#disconnectedActiveSessionIds.add(sessionId);
+      if (nativeWorking.has(sessionId)) this.#disconnectedNativeSessionIds.add(sessionId);
+      if (persistedWorking.has(sessionId)) this.#disconnectedPersistedSessionIds.add(sessionId);
+    }
+    // The Bridge stops listening as soon as the provider-level event arrives.
+    // Publish every affected task first so none is mistaken for completed or
+    // interrupted merely because its live transport disappeared.
+    for (const sessionId of activeSessionIds) {
+      await this.emit({
+        providerSessionId: sessionId,
+        type: "session.status_changed",
+        payload: { state: "disconnected", providerStatus: null },
+      });
+    }
+    await this.emit({
+      type: "provider.disconnected",
+      payload: { message: cause instanceof Error ? cause.message : String(cause) },
+    });
+  }
+
+  private beginPrimaryReconnect(): void {
+    if (!this.#primaryEventStreamDisconnected) return;
+    this.#primaryEventStreamDisconnected = false;
+    this.#primaryConnectionGeneration += 1;
+    this.startPrimaryReconnectRefresh(this.#primaryConnectionGeneration);
+  }
+
+  private startPrimaryReconnectRefresh(connectionGeneration: number): void {
+    if (this.#disposed || this.#primaryEventStreamDisconnected
+      || connectionGeneration !== this.#primaryConnectionGeneration
+      || this.#disconnectedActiveSessionIds.size === 0) return;
+    const refresh = this.refreshDisconnectedSessions(connectionGeneration).catch(() => undefined);
+    this.#primaryReconnectRefreshes.add(refresh);
+    void refresh.finally(() => {
+      this.#primaryReconnectRefreshes.delete(refresh);
+    }).catch(() => undefined);
+  }
+
+  private async refreshDisconnectedSessions(connectionGeneration: number): Promise<void> {
+    const sessionIds = new Set(this.#disconnectedActiveSessionIds);
+    if (sessionIds.size === 0) return;
+    const nativeEventRevisionAtStart = this.#nativeEventRevision;
+    // Both reads start before the first reconnect event is handled. A later SSE
+    // state change therefore has a strictly newer per-session revision and wins.
+    const nativeRead = this.readNativeStatusSnapshot().catch((): undefined => undefined);
+    const persistedRead = this.tryReadPersistedWorking(sessionIds);
+    const [nativeSnapshot, persistedWorking] = await Promise.all([nativeRead, persistedRead]);
+    if (this.#disposed || this.#primaryEventStreamDisconnected
+      || connectionGeneration !== this.#primaryConnectionGeneration) return;
+    const usableNativeSnapshot = nativeSnapshot?.connectionGenerationAtStart === connectionGeneration
+      ? nativeSnapshot
+      : undefined;
+    if (usableNativeSnapshot !== undefined) this.captureNativeStates(usableNativeSnapshot);
+    if (persistedWorking !== undefined) {
+      this.#persistedActivityAvailable = true;
+      for (const sessionId of sessionIds) {
+        if (persistedWorking.has(sessionId)) this.#persistedWorking.add(sessionId);
+        else this.#persistedWorking.delete(sessionId);
+      }
+    }
+
+    for (const sessionId of sessionIds) {
+      if (!this.#disconnectedActiveSessionIds.has(sessionId)) continue;
+      if ((this.#nativeEventRevisionBySession.get(sessionId) ?? 0) > nativeEventRevisionAtStart) continue;
+      const nativeWasRelevant = this.#disconnectedNativeSessionIds.has(sessionId);
+      const persistedWasRelevant = this.#disconnectedPersistedSessionIds.has(sessionId);
+      const ownedPromptId = this.#activePromptMessageIds.get(sessionId);
+      const hasNativeStatus = usableNativeSnapshot !== undefined
+        && Object.prototype.hasOwnProperty.call(usableNativeSnapshot.statuses, sessionId);
+      const nativeStatus = hasNativeStatus ? usableNativeSnapshot!.statuses[sessionId] : undefined;
+      const nativeState = hasNativeStatus
+        ? normalizeStatus(nativeStatus)
+        : usableNativeSnapshot !== undefined && (nativeWasRelevant || ownedPromptId !== undefined)
+          ? "idle"
+          : undefined;
+      const persistedIsWorking = persistedWorking?.has(sessionId) === true;
+
+      let restoredState: RemoteSession["state"] | undefined;
+      if (nativeState === "failed") restoredState = "failed";
+      else if (nativeState === "working" || persistedIsWorking) restoredState = "working";
+      else if (ownedPromptId !== undefined) {
+        // Provider inactivity is not the final-answer signal. Keep this task
+        // disconnected while exact history confirms and publishes its terminal
+        // assistant response; never invent completion from the reconnect read.
+        if (nativeState === "idle" || persistedWorking !== undefined) {
+          this.rememberPendingOwnedIdle(sessionId, ownedPromptId);
+        }
+        continue;
+      } else {
+        const nativeUnresolved = nativeWasRelevant && nativeState !== "idle";
+        const persistedUnresolved = persistedWasRelevant && persistedWorking === undefined;
+        if (nativeUnresolved || persistedUnresolved) continue;
+        const hasIdleAuthority = (nativeWasRelevant && nativeState === "idle")
+          || (persistedWasRelevant && persistedWorking !== undefined);
+        if (hasIdleAuthority) restoredState = "idle";
+      }
+      if (restoredState === undefined) continue;
+
+      if (restoredState === "working") {
+        this.cancelPendingOwnedCompletion(sessionId);
+      } else {
+        this.cancelPendingOwnedCompletion(sessionId);
+        this.#activePrompts.delete(sessionId);
+        this.#activePromptMessageIds.delete(sessionId);
+        this.#persistedWorking.delete(sessionId);
+        if (restoredState === "failed") {
+          this.#nativeStates.set(sessionId, "failed");
+          if (hasNativeStatus) this.#nativeStatuses.set(sessionId, nativeStatus);
+        }
+      }
+      this.clearDisconnectedSession(sessionId);
+      const providerStatus = normalizeOpenCodeProviderStatus(nativeStatus);
+      await this.emit({
+        providerSessionId: sessionId,
+        type: "session.status_changed",
+        payload: {
+          state: restoredState,
+          providerStatus: providerStatus === undefined ? null : asJsonObject(providerStatus),
+        },
+      });
+      if (restoredState === "working") {
+        await this.emit({
+          providerSessionId: sessionId,
+          type: "session.updated",
+          payload: { state: "working", activityDiscovered: true },
+        });
+      }
+    }
+  }
+
   private async runEventLoop(): Promise<void> {
     const backoff = new ExponentialBackoff({ initialMs: 250, maximumMs: 10_000 });
     while (!this.#abort.signal.aborted) {
+      let disconnectCause: unknown = new Error("OpenCode event stream ended.");
       try {
         for await (const event of this.#client.sse("/global/event", { signal: this.#abort.signal })) {
           if (this.#abort.signal.aborted) return;
+          this.beginPrimaryReconnect();
           backoff.reset();
           await this.handleEvent(event, "primary");
         }
       } catch (error) {
         if (this.#abort.signal.aborted) return;
-        await this.emit({ type: "provider.disconnected", payload: { message: error instanceof Error ? error.message : String(error) } });
+        disconnectCause = error;
       }
+      if (this.#abort.signal.aborted) return;
+      await this.markPrimaryDisconnected(disconnectCause);
       await new Promise<void>((resolve) => setTimeout(resolve, backoff.next()));
     }
   }
@@ -959,9 +1815,18 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     const global = isRecord(value) && isRecord(value.payload) ? value : { payload: value };
     const payload = isRecord(global.payload) ? global.payload : {};
     const type = typeof payload.type === "string" ? payload.type : "unknown";
-    const properties = isRecord(payload.properties) ? payload.properties : {};
+    const properties = isRecord(payload.properties) ? payload.properties : isRecord(payload.data) ? payload.data : {};
     const sessionId = findSessionId(properties);
     const base = { ...(sessionId !== undefined ? { providerSessionId: sessionId } : {}), nativeEvent: asJsonObject(global) };
+    if (source === "primary" && sessionId !== undefined && primaryEventCarriesActivityState(type)) {
+      this.#nativeEventRevision += 1;
+      this.#nativeEventRevisionBySession.set(sessionId, this.#nativeEventRevision);
+    }
+
+    if (source === "primary" && sessionId !== undefined
+      && (type === "session.compacted" || type === "session.next.compaction.ended")) {
+      this.signalCompactionLifecycle(sessionId);
+    }
 
     if (type === "server.connected") return await this.emit({ ...base, type: "provider.connected", payload: {} });
     if (type === "session.created") return await this.emit({ ...base, type: "session.created", payload: asJsonObject(properties) });
@@ -969,6 +1834,12 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     if (type === "session.status") {
       const status = normalizeStatus(properties.status);
       const providerStatus = normalizeOpenCodeProviderStatus(properties.status);
+      if (source === "secondary" && sessionId !== undefined
+        && this.#activePromptMessageIds.has(sessionId)
+        && (status === "idle" || status === "unknown" || status === "failed")) {
+        this.#secondaryActive.delete(sessionId);
+        return;
+      }
       // Status has only a session id. Until a concrete message acknowledges the
       // next generation, every queued status can still belong to our own abort.
       if (source === "primary" && sessionId !== undefined) {
@@ -979,6 +1850,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
           if (status === "idle" || status === "unknown") this.observeTerminalCleanup(terminalCleanup);
           return;
         }
+        this.#nativeStatuses.set(sessionId, properties.status);
         const activePromptId = this.#activePromptMessageIds.get(sessionId);
         if (activePromptId !== undefined && (status === "idle" || status === "unknown")) {
           // This event carries only a session id, so it cannot prove which prompt
@@ -988,11 +1860,17 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
           this.rememberPendingOwnedIdle(sessionId, activePromptId, base.nativeEvent);
           return;
         }
-        if (activePromptId !== undefined && status === "working") this.cancelPendingOwnedCompletion(sessionId);
+        if (this.shouldIgnoreWrapUpWorking(sessionId) && status === "working") return;
+        // OpenCode re-publishes busy while the runner wraps up (title, snapshot,
+        // plugins) after a no-tool stop. That is not a new generation.
+        if (activePromptId !== undefined && status === "working" && !this.hasTerminalOwnedIdleArmed(sessionId)) {
+          this.cancelPendingOwnedCompletion(sessionId);
+        }
         if (status === "failed") {
           this.rememberTerminalCleanupGeneration(sessionId, "failed", activePromptId);
           if (activePromptId !== undefined) this.releaseOwnedPrompt(sessionId, activePromptId);
         }
+        if (status !== "unknown") this.clearDisconnectedSession(sessionId);
       }
       if (sessionId !== undefined) this.#nativeStates.set(sessionId, status);
       return await this.emit({
@@ -1002,6 +1880,15 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       });
     }
     if (type === "session.idle") {
+      if (source === "secondary" && sessionId !== undefined) {
+        this.#secondaryActive.delete(sessionId);
+        // The retired server can finish the old generation after the replacement
+        // server has accepted a new prompt for the same session. Its unlabelled
+        // idle owns only the retired feed; it must not clear or complete the
+        // replacement server's newer prompt.
+        if (this.#activePromptMessageIds.has(sessionId)) return;
+      }
+      if (source === "primary" && sessionId !== undefined) this.#nativeStatuses.delete(sessionId);
       if (source === "primary" && sessionId !== undefined) {
         const guard = this.#guardAbortGenerations.get(sessionId);
         const activePromptId = this.#activePromptMessageIds.get(sessionId);
@@ -1020,9 +1907,19 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
           this.rememberPendingOwnedIdle(sessionId, activePromptId, base.nativeEvent);
           return;
         }
+        const pending = this.#pendingOwnedIdles.get(sessionId);
+        if (pending !== undefined) {
+          this.rememberPendingOwnedIdle(sessionId, pending.parentId, base.nativeEvent);
+          return;
+        }
+        if (this.isSettledOwnedSession(sessionId)) {
+          this.#nativeStates.set(sessionId, "idle");
+          return;
+        }
       }
       if (sessionId !== undefined) {
         const promptMessageId = this.#activePromptMessageIds.get(sessionId);
+        if (source === "primary") this.clearDisconnectedSession(sessionId);
         this.#nativeStates.set(sessionId, "idle");
         this.#activePrompts.delete(sessionId);
         this.#activePromptMessageIds.delete(sessionId);
@@ -1033,6 +1930,9 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     }
     if (type === "message.updated") {
       const info = isRecord(properties.info) ? properties.info : properties;
+      if (source === "primary" && sessionId !== undefined && isCompletedOpenCodeCompactionAssistant(info)) {
+        this.signalCompactionLifecycle(sessionId);
+      }
       const messageId = typeof info.id === "string" ? info.id : undefined;
       const parentId = typeof info.parentID === "string" ? info.parentID : undefined;
       const role = typeof info.role === "string" ? info.role : undefined;
@@ -1058,10 +1958,19 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
         }
         this.retireGuardAtNewGenerationBoundary(sessionId, info, activePromptId);
       }
+      if (source === "primary" && sessionId !== undefined && this.isSettledTerminalRepeat(sessionId, info)) return;
+      if (source === "primary" && sessionId !== undefined) this.#settledOwnedSessions.delete(sessionId);
+      if (source === "primary" && sessionId !== undefined && activePromptId === undefined) {
+        const pending = this.#pendingOwnedIdles.get(sessionId);
+        if (pending !== undefined && !(role === "assistant" && parentId === pending.parentId
+          && messageId === pending.assistantId && isOpenCodeTurnExitFinish(info.finish))) {
+          this.cancelPendingOwnedCompletion(sessionId);
+        }
+      }
       if (source === "primary" && sessionId !== undefined && activePromptId !== undefined && messageId !== undefined) {
         const repeatedTerminal = role === "assistant" && parentId === activePromptId
           && this.#terminalPromptCandidates.get(activePromptId) === messageId
-          && info.finish === "stop" && isRecord(info.time) && typeof info.time.completed === "number";
+          && isOpenCodeTurnExitFinish(info.finish);
         const belongsToActivePrompt = (role === "user" && messageId === activePromptId)
           || (role === "assistant" && parentId === activePromptId);
         // Output after an idle proves that idle was stale. A duplicate update for
@@ -1071,6 +1980,10 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       if (source === "primary" && role === "assistant" && parentId !== undefined && this.#runawayPromptParents.has(parentId)) {
         if (messageId !== undefined) this.rememberSuppressedMessage(messageId);
         return;
+      }
+      if (source === "primary" && sessionId !== undefined && role === "assistant" && parentId !== undefined
+        && messageId !== undefined && this.#activePromptMessageIds.get(sessionId) === parentId) {
+        if (await this.maybeStopEmptyUnknownLoop(sessionId, parentId, messageId, info)) return;
       }
       const terminalAssistantId = parentId === undefined ? undefined : this.#terminalPromptCandidates.get(parentId);
       if (source === "primary" && sessionId !== undefined && role === "assistant" && messageId !== undefined
@@ -1104,15 +2017,16 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
         // check; only contradictory history proves this was a real continuation.
         if (confirmation.kind === "continuing") this.#terminalPromptCandidates.delete(parentId);
       }
-      if (source === "secondary" && sessionId !== undefined) this.#secondaryActive.add(sessionId);
-      await this.emit({ ...base, type: "message.started", payload: asJsonObject(properties) });
-      if (source === "primary" && sessionId !== undefined && role === "assistant" && parentId !== undefined
-        && this.#activePromptMessageIds.get(sessionId) === parentId
-        && messageId !== undefined && info.finish === "stop" && isRecord(info.time) && typeof info.time.completed === "number"
-        && !this.#continuingToolMessageIds.has(messageId)) {
-        this.rememberTerminalCandidate(parentId, messageId);
-        this.restartPendingOwnedIdleRecheck(sessionId, parentId);
+      if (source === "primary" && sessionId !== undefined && !this.isOwnedTerminalAssistantPart(sessionId, messageId)) {
+        this.#nativeStates.set(sessionId, "working");
+        this.clearDisconnectedSession(sessionId);
       }
+      if (source === "secondary" && sessionId !== undefined) this.#secondaryActive.add(sessionId);
+      if (sessionId !== undefined) {
+        await this.publishReportedSelection(sessionId, info, { source: "live", nativeEvent: base.nativeEvent });
+      }
+      await this.emit({ ...base, type: "message.started", payload: asJsonObject(properties) });
+      if (source === "primary" && sessionId !== undefined) this.armTerminalCompletion(sessionId, info, base.nativeEvent);
       return;
     }
     if (type === "message.part.updated") {
@@ -1134,7 +2048,15 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
         if (source === "primary" && sessionId !== undefined) {
           this.retireAmbiguousGuardAfterContinuationOutput(sessionId, messageId);
         }
-        if (source === "primary" && sessionId !== undefined) this.cancelPendingOwnedCompletion(sessionId);
+        if (source === "primary" && sessionId !== undefined) {
+          this.#emptyUnknownSequences.delete(sessionId);
+          if (!this.isOwnedTerminalAssistantPart(sessionId, messageId)) {
+            this.#settledOwnedSessions.delete(sessionId);
+            this.cancelPendingOwnedCompletion(sessionId);
+            this.#nativeStates.set(sessionId, "working");
+            this.clearDisconnectedSession(sessionId);
+          }
+        }
         return await this.emit({
           ...base,
           type: "message.delta",
@@ -1151,14 +2073,28 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       }
       if (partType === "tool") {
         if (source === "primary" && sessionId !== undefined) {
+          this.#emptyUnknownSequences.delete(sessionId);
           this.retireAmbiguousGuardAfterContinuationOutput(sessionId, messageId);
         }
         if (messageId !== undefined && isContinuingOpenCodeToolPart(part)) {
-          if (source === "primary" && sessionId !== undefined) this.cancelPendingOwnedCompletion(sessionId);
+          if (source === "primary" && sessionId !== undefined) {
+            this.#settledOwnedSessions.delete(sessionId);
+            this.cancelPendingOwnedCompletion(sessionId);
+          }
           this.rememberContinuingToolMessage(messageId);
           this.forgetTerminalCandidateForMessage(messageId);
         }
-        return await this.emit({ ...base, type: toolEventType(part), payload: normalizeOpenCodeToolEventPayload(part) });
+        if (source === "primary" && sessionId !== undefined && !this.isOwnedTerminalAssistantPart(sessionId, messageId)) {
+          this.#nativeStates.set(sessionId, "working");
+          this.clearDisconnectedSession(sessionId);
+        }
+        // EYES failures may contain provider response bodies, keys, or paths in
+        // the native part. The normalized payload is useful and sanitized; the
+        // raw native event must never cross the provider boundary.
+        const toolBase = isOpenCodeEyesTool(part.tool)
+          ? { ...(sessionId !== undefined ? { providerSessionId: sessionId } : {}) }
+          : base;
+        return await this.emit({ ...toolBase, type: toolEventType(part), payload: normalizeOpenCodeToolEventPayload(part) });
       }
       if (partType === "patch") {
         const files = Array.isArray(part.files)
@@ -1166,9 +2102,15 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
           : [];
         if (files.length === 0) return;
         if (source === "primary" && sessionId !== undefined) {
+          this.#emptyUnknownSequences.delete(sessionId);
           this.retireAmbiguousGuardAfterContinuationOutput(sessionId, messageId);
         }
-        if (source === "primary" && sessionId !== undefined) this.cancelPendingOwnedCompletion(sessionId);
+        if (source === "primary" && sessionId !== undefined && !this.isOwnedTerminalAssistantPart(sessionId, messageId)) {
+          this.#settledOwnedSessions.delete(sessionId);
+          this.cancelPendingOwnedCompletion(sessionId);
+          this.#nativeStates.set(sessionId, "working");
+          this.clearDisconnectedSession(sessionId);
+        }
         return await this.emit({ ...base, type: "file.changed", payload: { ...asJsonObject(part), files } });
       }
     }
@@ -1195,12 +2137,19 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       if (partType !== "text" && partType !== "reasoning") return;
       if (messageId !== undefined && (this.#messageRoles.get(messageId) ?? "assistant") !== "assistant") return;
       if (source === "primary" && sessionId !== undefined) {
+        this.#emptyUnknownSequences.delete(sessionId);
         this.retireAmbiguousGuardAfterContinuationOutput(sessionId, messageId);
       }
       // Keep the snapshot in step so the closing message.part.updated, which repeats the
       // whole part, diffs to nothing instead of sending the body a second time.
       this.rememberPartText(partId, (this.#partTexts.get(partId) ?? "") + delta);
-      if (source === "primary" && sessionId !== undefined) this.cancelPendingOwnedCompletion(sessionId);
+      if (source === "primary" && sessionId !== undefined
+        && !this.isOwnedTerminalAssistantPart(sessionId, messageId)) {
+        this.#settledOwnedSessions.delete(sessionId);
+        this.cancelPendingOwnedCompletion(sessionId);
+        this.#nativeStates.set(sessionId, "working");
+        this.clearDisconnectedSession(sessionId);
+      }
       return await this.emit({
         ...base,
         type: "message.delta",
@@ -1217,7 +2166,13 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       const nativeId = typeof permission.id === "string" ? permission.id : undefined;
       const permissionSessionId = typeof permission.sessionID === "string" ? permission.sessionID : sessionId;
       if (nativeId === undefined || permissionSessionId === undefined) return;
-      if (source === "primary") this.cancelPendingOwnedCompletion(permissionSessionId);
+      if (source === "primary") {
+        this.#emptyUnknownSequences.delete(permissionSessionId);
+        this.#settledOwnedSessions.delete(permissionSessionId);
+        this.cancelPendingOwnedCompletion(permissionSessionId);
+        this.#nativeStates.set(permissionSessionId, "working");
+        this.clearDisconnectedSession(permissionSessionId);
+      }
       const providerRequestId = `opencode_permission_${nativeId}`;
       this.#permissions.set(providerRequestId, { sessionId: permissionSessionId, nativePermissionId: nativeId });
       return await this.emit({
@@ -1241,7 +2196,13 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     }
     if (type === "permission.replied") return await this.emit({ ...base, type: "approval.resolved", payload: asJsonObject(properties) });
     if (type === "command.executed") {
-      if (source === "primary" && sessionId !== undefined) this.cancelPendingOwnedCompletion(sessionId);
+      if (source === "primary" && sessionId !== undefined) {
+        this.#emptyUnknownSequences.delete(sessionId);
+        this.#settledOwnedSessions.delete(sessionId);
+        this.cancelPendingOwnedCompletion(sessionId);
+        this.#nativeStates.set(sessionId, "working");
+        this.clearDisconnectedSession(sessionId);
+      }
       return await this.emit({ ...base, type: "command.completed", payload: asJsonObject(properties) });
     }
     // These are workspace/diff state notifications, not session-attributed
@@ -1274,6 +2235,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
         this.rememberTerminalCleanupGeneration(sessionId, "failed", activePromptId);
         this.releaseOwnedPrompt(sessionId, activePromptId);
         this.#nativeStates.set(sessionId, "failed");
+        this.clearDisconnectedSession(sessionId);
       }
       return await this.emit({ ...base, type: "agent.error", payload: { ...asJsonObject(properties), providerStatus: null } });
     }
@@ -1331,11 +2293,83 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
    * history confirms that the prior response had no continuing tool call.
    */
   private async stopRunawayContinuation(sessionId: string, parentId: string, continuationAssistantId: string): Promise<RunawayStopResult> {
+    return await this.stopGuardedRunaway(sessionId, parentId, continuationAssistantId, "completed");
+  }
+
+  private async maybeStopEmptyUnknownLoop(
+    sessionId: string,
+    parentId: string,
+    assistantId: string,
+    info: Record<string, unknown>,
+  ): Promise<boolean> {
+    if (!isCompletedUnknownOpenCodeAssistant(info)) {
+      if (isCompletedOpenCodeAssistant(info)) this.#emptyUnknownSequences.delete(sessionId);
+      return false;
+    }
+    if (!hasExplicitZeroOpenCodeUsage(info)) {
+      this.#emptyUnknownSequences.delete(sessionId);
+      return false;
+    }
+    const previous = this.#emptyUnknownSequences.get(sessionId);
+    const assistantIds = previous?.parentId === parentId ? [...previous.assistantIds] : [];
+    if (assistantIds.at(-1) === assistantId) return false;
+    assistantIds.push(assistantId);
+    while (assistantIds.length > emptyUnknownResponseLimit) assistantIds.shift();
+    this.#emptyUnknownSequences.set(sessionId, { parentId, assistantIds });
+    if (assistantIds.length < emptyUnknownResponseLimit || this.#guardAbortGenerations.has(sessionId)) return false;
+    if (!await this.confirmQuietEmptyUnknownLoop(sessionId, parentId, assistantIds)) return false;
+    const stopped = await this.stopGuardedRunaway(sessionId, parentId, assistantId, "failed");
+    if (stopped.kind === "completed") {
+      await stopped.completion;
+      return true;
+    }
+    this.#emptyUnknownSequences.delete(sessionId);
+    return false;
+  }
+
+  private async confirmQuietEmptyUnknownLoop(
+    sessionId: string,
+    parentId: string,
+    assistantIds: readonly string[],
+  ): Promise<boolean> {
+    if (!await this.confirmEmptyUnknownLoop(sessionId, parentId, assistantIds)) return false;
+    await new Promise<void>((resolve) => setTimeout(resolve, ownedIdleQuietConfirmationMs));
+    if (this.#disposed || this.#activePromptMessageIds.get(sessionId) !== parentId) return false;
+    return await this.confirmEmptyUnknownLoop(sessionId, parentId, assistantIds);
+  }
+
+  private async confirmEmptyUnknownLoop(
+    sessionId: string,
+    parentId: string,
+    assistantIds: readonly string[],
+  ): Promise<boolean> {
+    const value = await this.rawMessages(sessionId).catch((): unknown => undefined);
+    if (!Array.isArray(value)) return false;
+    const matching = value.filter((candidate) => {
+      if (!isRecord(candidate)) return false;
+      const info = isRecord(candidate.info) ? candidate.info : candidate;
+      return info.role === "assistant" && info.parentID === parentId;
+    });
+    const tail = matching.slice(-assistantIds.length);
+    if (tail.length !== assistantIds.length) return false;
+    return tail.every((candidate, index) => {
+      const entry = candidate as Record<string, unknown>;
+      const info = isRecord(entry.info) ? entry.info : entry;
+      return info.id === assistantIds[index] && isPersistedEmptyUnknownAssistant(entry);
+    });
+  }
+
+  private async stopGuardedRunaway(
+    sessionId: string,
+    parentId: string,
+    continuationAssistantId: string,
+    terminalKind: GuardAbortGeneration["terminalKind"],
+  ): Promise<RunawayStopResult> {
     return await this.withSessionLifecycleLock(sessionId, async () => {
       if (this.#activePromptMessageIds.get(sessionId) !== parentId) return { kind: "stale" };
       // Install narrow abort-error protection before the request. A timeout can
       // happen after the server acted, so rejection must not remove this marker.
-      const guard = this.rememberGuardAbortGeneration(sessionId, parentId, continuationAssistantId);
+      const guard = this.rememberGuardAbortGeneration(sessionId, parentId, continuationAssistantId, terminalKind);
       const aborted = await this.#client.request("POST", `/session/${encodeURIComponent(sessionId)}/abort`, { query: this.query() })
         .then(() => true, () => false);
       if (this.#guardAbortGenerations.get(sessionId) !== guard) return { kind: "stale" };
@@ -1373,18 +2407,29 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     if (guard.completion !== undefined) return guard.completion;
     this.rememberRunawayPrompt(guard.parentId);
     this.rememberSuppressedMessage(guard.continuationAssistantId);
+    this.rememberSettledOwnedSession(sessionId, guard.parentId, this.#terminalPromptCandidates.get(guard.parentId) ?? guard.continuationAssistantId);
     if (this.#disposed || !this.releaseOwnedPrompt(sessionId, guard.parentId)) {
       guard.completion = Promise.resolve();
       return guard.completion;
     }
-    this.#nativeStates.set(sessionId, "idle");
+    this.#nativeStates.set(sessionId, guard.terminalKind === "failed" ? "failed" : "idle");
     // AgentBridge intentionally strips raw provider metadata. This exact marker
     // is the only completion allowed to bypass renderer quieting.
-    guard.completion = this.emit({
-      providerSessionId: sessionId,
-      type: "agent.completed",
-      payload: { completionReason: "runaway_guard", providerStatus: null },
-    });
+    guard.completion = guard.terminalKind === "failed"
+      ? this.emit({
+          providerSessionId: sessionId,
+          type: "agent.error",
+          payload: {
+            code: "EMPTY_RESPONSE_LOOP",
+            message: "OpenCode returned repeated empty responses, so Tethoq stopped the turn. Retry or choose another model.",
+            providerStatus: null,
+          },
+        })
+      : this.emit({
+          providerSessionId: sessionId,
+          type: "agent.completed",
+          payload: { completionReason: "runaway_guard", providerStatus: null },
+        });
     return guard.completion;
   }
 
@@ -1416,17 +2461,34 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     parentId: string,
     assistantId?: string,
     continuationAssistantId?: string,
+    requireSelectedTail = false,
+    requireLatestPrompt = false,
   ): Promise<TerminalConfirmation> {
-    const value = await this.rawMessages(sessionId).catch((): unknown => undefined);
+    const value = await this.rawMessages(sessionId, requireSelectedTail ? 2 : 500).catch((): unknown => undefined);
     if (!Array.isArray(value)) return { kind: "unavailable" };
     let selected: Record<string, unknown> | undefined;
     let continuationPersisted = continuationAssistantId === undefined;
     let selectedCreated = Number.NEGATIVE_INFINITY;
     let selectedIndex = -1;
+    let latestAssistantId: string | undefined;
+    let latestAssistantCreated = Number.NEGATIVE_INFINITY;
+    let latestAssistantCompleted = Number.NEGATIVE_INFINITY;
+    let latestAssistantIndex = -1;
     for (const [index, candidate] of value.entries()) {
       if (!isRecord(candidate)) continue;
       const info = isRecord(candidate.info) ? candidate.info : candidate;
       if (info.role !== "assistant" || info.parentID !== parentId) continue;
+      const time = isRecord(info.time) ? info.time : {};
+      const created = typeof time.created === "number" ? time.created : Number.NEGATIVE_INFINITY;
+      const completed = typeof time.completed === "number" ? time.completed : Number.NEGATIVE_INFINITY;
+      if (created > latestAssistantCreated
+        || (created === latestAssistantCreated && completed > latestAssistantCompleted)
+        || (created === latestAssistantCreated && completed === latestAssistantCompleted && index > latestAssistantIndex)) {
+        latestAssistantId = typeof info.id === "string" ? info.id : undefined;
+        latestAssistantCreated = created;
+        latestAssistantCompleted = completed;
+        latestAssistantIndex = index;
+      }
       if (info.id === continuationAssistantId) continuationPersisted = true;
       if (assistantId !== undefined) {
         if (info.id === assistantId) {
@@ -1436,8 +2498,6 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
         // record in chronological history.
         continue;
       }
-      const time = isRecord(info.time) ? info.time : {};
-      const created = typeof time.created === "number" ? time.created : Number.NEGATIVE_INFINITY;
       if (created > selectedCreated || (created === selectedCreated && index > selectedIndex)) {
         selected = candidate;
         selectedCreated = created;
@@ -1451,25 +2511,51 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     if (!continuationPersisted) return { kind: "unavailable" };
     if (selected === undefined) return { kind: "unavailable" };
     const info = isRecord(selected.info) ? selected.info : selected;
-    const time = isRecord(info.time) ? info.time : {};
+    if (requireLatestPrompt) {
+      // External follow-ups can exist in history before their SSE reaches us.
+      // Never settle an older parent just because its own assistant is terminal.
+      const latest = value.map((entry) => isRecord(entry) && isRecord(entry.info) ? entry.info : entry)
+        .filter((entry): entry is Record<string, unknown> => isRecord(entry) && (entry.role === "user" || entry.role === "assistant"))
+        .at(-1);
+      if (latest?.id !== info.id) return { kind: "continuing" };
+    }
+    // A later same-parent assistant already persisted but has not necessarily
+    // reached this SSE consumer yet. Do not complete the earlier candidate and
+    // race the existing runaway/tool-continuation guard.
+    if (requireSelectedTail && info.id !== latestAssistantId) return { kind: "unavailable" };
     const parts = Array.isArray(selected.parts) ? selected.parts : [];
     if (parts.some(isContinuingOpenCodeToolPart)) return { kind: "continuing" };
-    if (info.finish !== "stop" || typeof time.completed !== "number" || info.error !== undefined) {
-      return { kind: "continuing" };
-    }
+    if (info.error !== undefined || info.summary === true) return { kind: "continuing" };
+    // OpenCode writes `finish` at step-finish and `time.completed` only later in
+    // cleanup (snapshot/title/plugins). Missing finish is a lagging persist, not
+    // proof the model will continue.
+    if (typeof info.finish !== "string" || info.finish.length === 0) return { kind: "unavailable" };
+    if (!isOpenCodeTurnExitFinish(info.finish)) return { kind: "continuing" };
     return { kind: "terminal", assistantId: typeof info.id === "string" ? info.id : assistantId ?? "" };
   }
 
-  private rememberPendingOwnedIdle(sessionId: string, parentId: string, nativeEvent?: JsonObject): void {
+  private rememberPendingOwnedIdle(
+    sessionId: string,
+    parentId: string,
+    nativeEvent?: JsonObject,
+    assistantId?: string,
+  ): void {
     const existing = this.#pendingOwnedIdles.get(sessionId);
     if (existing?.parentId === parentId) {
+      const discoveredAssistant = assistantId !== undefined && existing.assistantId !== assistantId;
       if (nativeEvent !== undefined) existing.nativeEvent = nativeEvent;
-      this.restartPendingOwnedIdleRecheck(sessionId, parentId);
+      if (assistantId !== undefined) existing.assistantId = assistantId;
+      // Duplicate wrap-up updates and a later session.idle must not reset the
+      // quiet confirmation; OpenCode republishes the same completed assistant
+      // while the runner is still busy.
+      if (discoveredAssistant) this.restartPendingOwnedIdleRecheck(sessionId, parentId);
       return;
     }
     this.clearPendingOwnedIdle(sessionId);
     const pending: PendingOwnedIdle = {
       parentId,
+      ownedPromptId: this.#activePromptMessageIds.get(sessionId),
+      assistantId,
       nativeEvent,
       attempts: 0,
       timer: undefined,
@@ -1500,13 +2586,9 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
 
   private schedulePendingOwnedIdleRecheck(sessionId: string, pending: PendingOwnedIdle, delayOverride?: number): void {
     if (this.#disposed || pending.timer !== undefined) return;
-    const delay = delayOverride ?? ownedIdleConfirmationDelaysMs[pending.attempts];
-    if (delay === undefined) {
-      // History remains the authority. The long deadline only starts another
-      // bounded confirmation pass; it never completes a prompt by itself.
-      this.#activeSettleDeadlines.set(sessionId, this.#now().getTime() + this.#activeTurnSettleMs);
-      return;
-    }
+    // Persistence can lag beyond the initial burst. Keep checking the tiny tail
+    // on the existing recovery cadence; elapsed time never proves completion.
+    const delay = delayOverride ?? ownedIdleConfirmationDelaysMs[pending.attempts] ?? knownActiveSafetyPollIntervalMs;
     pending.timer = setTimeout(() => {
       pending.timer = undefined;
       void this.recheckPendingOwnedIdle(sessionId, pending);
@@ -1515,16 +2597,23 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
 
   private async recheckPendingOwnedIdle(sessionId: string, pending: PendingOwnedIdle): Promise<void> {
     if (this.#disposed || this.#pendingOwnedIdles.get(sessionId) !== pending
-      || this.#activePromptMessageIds.get(sessionId) !== pending.parentId) {
+      || this.#activePromptMessageIds.get(sessionId) !== pending.ownedPromptId) {
       if (this.#pendingOwnedIdles.get(sessionId) === pending) this.clearPendingOwnedIdle(sessionId);
       return;
     }
     const revision = pending.revision;
     pending.checksInFlight += 1;
-    const confirmation = await this.confirmPromptTerminal(sessionId, pending.parentId);
+    const confirmation = await this.confirmPromptTerminal(
+      sessionId,
+      pending.parentId,
+      pending.assistantId,
+      undefined,
+      pending.assistantId !== undefined,
+      pending.ownedPromptId === undefined,
+    );
     pending.checksInFlight -= 1;
     if (this.#disposed || this.#pendingOwnedIdles.get(sessionId) !== pending
-      || this.#activePromptMessageIds.get(sessionId) !== pending.parentId
+      || this.#activePromptMessageIds.get(sessionId) !== pending.ownedPromptId
       || pending.revision !== revision) return;
     if (confirmation.kind === "continuing") {
       this.#terminalPromptCandidates.delete(pending.parentId);
@@ -1539,7 +2628,8 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
         return;
       }
       const nativeEvent = pending.nativeEvent;
-      this.releaseOwnedPrompt(sessionId, pending.parentId);
+      this.rememberSettledOwnedSession(sessionId, pending.parentId, confirmation.assistantId);
+      this.releaseOwnedPrompt(sessionId, pending.ownedPromptId);
       this.#nativeStates.set(sessionId, "idle");
       await this.emit({
         providerSessionId: sessionId,
@@ -1565,6 +2655,12 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     this.#activeSettleDeadlines.delete(sessionId);
   }
 
+  private clearDisconnectedSession(sessionId: string): void {
+    this.#disconnectedActiveSessionIds.delete(sessionId);
+    this.#disconnectedNativeSessionIds.delete(sessionId);
+    this.#disconnectedPersistedSessionIds.delete(sessionId);
+  }
+
   private releaseOwnedPrompt(sessionId: string, expectedParentId?: string): boolean {
     const parentId = this.#activePromptMessageIds.get(sessionId);
     if (expectedParentId !== undefined && parentId !== expectedParentId) return false;
@@ -1572,6 +2668,8 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     this.#activePrompts.delete(sessionId);
     this.#activePromptMessageIds.delete(sessionId);
     this.#persistedWorking.delete(sessionId);
+    this.#emptyUnknownSequences.delete(sessionId);
+    this.clearDisconnectedSession(sessionId);
     if (parentId !== undefined) this.#terminalPromptCandidates.delete(parentId);
     return true;
   }
@@ -1602,6 +2700,64 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     }
   }
 
+  private isTerminalCandidatePartForActivePrompt(sessionId: string, messageId: string | undefined): boolean {
+    if (messageId === undefined) return false;
+    const activePromptId = this.#activePromptMessageIds.get(sessionId);
+    return activePromptId !== undefined && this.#terminalPromptCandidates.get(activePromptId) === messageId;
+  }
+
+  private isOwnedTerminalAssistantPart(sessionId: string, messageId: string | undefined): boolean {
+    if (messageId === undefined) return false;
+    if (this.#pendingOwnedIdles.get(sessionId)?.assistantId === messageId) return true;
+    if (this.isTerminalCandidatePartForActivePrompt(sessionId, messageId)) return true;
+    const settled = this.#settledOwnedSessions.get(sessionId);
+    return settled !== undefined && settled.assistantId === messageId && !this.#activePromptMessageIds.has(sessionId);
+  }
+
+  private hasTerminalOwnedIdleArmed(sessionId: string): boolean {
+    return this.#pendingOwnedIdles.get(sessionId)?.assistantId !== undefined;
+  }
+
+  private isSettledOwnedSession(sessionId: string): boolean {
+    return this.#settledOwnedSessions.has(sessionId) && !this.#activePromptMessageIds.has(sessionId);
+  }
+
+  private shouldIgnoreWrapUpWorking(sessionId: string): boolean {
+    return this.hasTerminalOwnedIdleArmed(sessionId) || this.isSettledOwnedSession(sessionId);
+  }
+
+  private isSettledTerminalRepeat(sessionId: string, info: Record<string, unknown>): boolean {
+    const settled = this.#settledOwnedSessions.get(sessionId);
+    if (settled === undefined || this.#activePromptMessageIds.has(sessionId)) return false;
+    return info.role === "assistant"
+      && info.id === settled.assistantId
+      && (typeof info.parentID !== "string" || info.parentID === settled.parentId)
+      && isOpenCodeTurnExitFinish(info.finish);
+  }
+
+  private rememberSettledOwnedSession(sessionId: string, parentId: string, assistantId: string): void {
+    this.#settledOwnedSessions.delete(sessionId);
+    this.#settledOwnedSessions.set(sessionId, { parentId, assistantId });
+    while (this.#settledOwnedSessions.size > maxTrackedParts) {
+      const oldest = this.#settledOwnedSessions.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.#settledOwnedSessions.delete(oldest);
+    }
+  }
+
+  private armTerminalCompletion(sessionId: string, info: Record<string, unknown>, nativeEvent?: JsonObject): void {
+    const ownedPromptId = this.#activePromptMessageIds.get(sessionId);
+    if (info.role !== "assistant" || typeof info.id !== "string" || typeof info.parentID !== "string"
+      || (ownedPromptId !== undefined && ownedPromptId !== info.parentID)
+      || !isOpenCodeTurnExitFinish(info.finish) || info.error !== undefined || info.summary === true
+      || this.#continuingToolMessageIds.has(info.id) || this.isSettledTerminalRepeat(sessionId, info)
+      || this.#guardAbortGenerations.has(sessionId) || this.#terminalCleanupGenerations.has(sessionId)) return;
+    if (ownedPromptId !== undefined) this.rememberTerminalCandidate(info.parentID, info.id);
+    // Use the same persisted-history proof for observed turns without adopting
+    // them into the dispatch/abort ownership maps.
+    this.rememberPendingOwnedIdle(sessionId, info.parentID, nativeEvent, info.id);
+  }
+
   private rememberRunawayPrompt(parentId: string): void {
     this.#runawayPromptParents.delete(parentId);
     this.#runawayPromptParents.add(parentId);
@@ -1617,6 +2773,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     kind: TerminalCleanupGeneration["kind"],
     parentId: string | undefined,
   ): TerminalCleanupGeneration {
+    this.cancelPendingOwnedCompletion(sessionId);
     let resolveCleanupObserved!: () => void;
     const cleanupObservedSignal = new Promise<void>((resolve) => { resolveCleanupObserved = resolve; });
     const generation: TerminalCleanupGeneration = {
@@ -1749,10 +2906,16 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     this.retireGuardGeneration(sessionId, guard);
   }
 
-  private rememberGuardAbortGeneration(sessionId: string, parentId: string, continuationAssistantId: string): GuardAbortGeneration {
+  private rememberGuardAbortGeneration(
+    sessionId: string,
+    parentId: string,
+    continuationAssistantId: string,
+    terminalKind: GuardAbortGeneration["terminalKind"],
+  ): GuardAbortGeneration {
     const guard: GuardAbortGeneration = {
       parentId,
       continuationAssistantId,
+      terminalKind,
       outcome: "attempting",
       successorMessageId: undefined,
       completion: undefined,
@@ -1801,7 +2964,43 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       this.#sessionListSnapshotGeneration += 1;
       this.#sessionListSnapshots.clear();
     }
-    await this.#events.emit({ eventId: `opencode_event_${++this.#eventCounter}`, providerId: this.providerId, occurredAt: this.#now().toISOString(), ...input });
+    await this.#events.emit({ eventId: `opencode_event_${this.#eventNamespace}_${++this.#eventCounter}`, providerId: this.providerId, occurredAt: this.#now().toISOString(), ...input });
+  }
+
+  private async publishReportedSelection(
+    providerSessionId: string,
+    info: Record<string, unknown>,
+    options: { readonly source: "history" | "live"; readonly nativeEvent?: JsonObject },
+  ): Promise<void> {
+    const selection = openCodeMessageSelection(info);
+    if (selection === undefined) return;
+    const key = JSON.stringify([selection.modelId, selection.variantId ?? null]);
+    const previous = this.#reportedSelections.get(providerSessionId);
+    if (previous?.key === key) {
+      if (selection.messageCreatedAt !== undefined
+        && (previous.messageCreatedAt === undefined || selection.messageCreatedAt > previous.messageCreatedAt)) {
+        this.#reportedSelections.set(providerSessionId, { key, messageCreatedAt: selection.messageCreatedAt });
+      }
+      return;
+    }
+    if (previous !== undefined) {
+      if (previous.messageCreatedAt !== undefined
+        && (selection.messageCreatedAt === undefined || selection.messageCreatedAt < previous.messageCreatedAt)) return;
+      // A history refresh with no usable ordering evidence must never overwrite
+      // the newer selection already observed from the live feed.
+      if (options.source === "history" && previous.messageCreatedAt === undefined && selection.messageCreatedAt === undefined) return;
+    }
+    this.#reportedSelections.set(providerSessionId, {
+      key,
+      ...(selection.messageCreatedAt !== undefined ? { messageCreatedAt: selection.messageCreatedAt } : {}),
+    });
+    const { messageCreatedAt: _messageCreatedAt, ...payload } = selection;
+    await this.emit({
+      providerSessionId,
+      type: "session.updated",
+      payload,
+      ...(options.nativeEvent !== undefined ? { nativeEvent: options.nativeEvent } : {}),
+    });
   }
 
   private async withSessionLifecycleLock<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
@@ -1819,33 +3018,111 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     }
   }
 
-  private captureNativeStates(statuses: Record<string, unknown>): void {
-    this.#nativeStates = new Map(Object.entries(statuses).map(([id, status]) => [id, normalizeStatus(status)]));
+  private captureNativeStates(snapshot: NativeStatusSnapshot): void {
+    const next = new Map<string, RemoteSession["state"]>();
+    const nextStatuses = new Map<string, unknown>();
+    for (const [sessionId, status] of Object.entries(snapshot.statuses)) {
+      const normalized = normalizeStatus(status);
+      if (normalized === "working"
+        && (this.#guardAbortGenerations.get(sessionId)?.outcome === "confirmed"
+          || this.#terminalCleanupGenerations.has(sessionId)
+          || this.isSettledOwnedSession(sessionId))) continue;
+      next.set(sessionId, normalized);
+      nextStatuses.set(sessionId, status);
+    }
+    // The HTTP response has no sequence number. Preserve any per-session state
+    // changed by primary SSE after this request began instead of letting a slow
+    // old snapshot overwrite the newer event.
+    for (const [sessionId, state] of this.#nativeStates) {
+      if ((this.#nativeEventRevisionBySession.get(sessionId) ?? 0) > snapshot.nativeEventRevisionAtStart) {
+        next.set(sessionId, state);
+        if (this.#nativeStatuses.has(sessionId)) nextStatuses.set(sessionId, this.#nativeStatuses.get(sessionId));
+      }
+    }
+    this.#nativeStates = next;
+    this.#nativeStatuses = nextStatuses;
+  }
+
+  private nativeWorkingSessionIds(): ReadonlySet<string> {
+    return new Set([...this.#nativeStates].flatMap(([sessionId, state]) => state === "working" ? [sessionId] : []));
   }
 
   private resolvedStatus(sessionId: string, nativeStatus: unknown, persistedWorking: ReadonlySet<string>): unknown {
     return normalizeStatus(nativeStatus) === "unknown" && persistedWorking.has(sessionId) ? "busy" : nativeStatus;
   }
 
-  private async readPersistedWorking(): Promise<ReadonlySet<string>> {
-    return (await this.tryReadPersistedWorking()) ?? new Set<string>();
+  private activityDerivedState(providerSessionId: string, normalizedState: RemoteSession["state"]): RemoteSession["state"] {
+    if (this.#primaryEventStreamDisconnected || this.#disconnectedActiveSessionIds.has(providerSessionId)) return "disconnected";
+    if (normalizedState === "failed" || normalizedState === "needs_approval" || normalizedState === "needs_input") return normalizedState;
+    if (this.#activePrompts.has(providerSessionId) || this.#activePromptMessageIds.has(providerSessionId)) return "working";
+    if (this.isSettledOwnedSession(providerSessionId)) return "idle";
+    if (normalizedState !== "unknown") return normalizedState;
+    // Until one bounded database read succeeds, an empty status response from
+    // Tethoq's separate server cannot prove a Desktop-owned task is idle.
+    return this.#persistedActivityAvailable ? "idle" : "unknown";
   }
 
-  private async tryReadPersistedWorking(): Promise<ReadonlySet<string> | undefined> {
-    return await this.#activityReader.readWorkingSessionIds().catch(() => undefined);
+  private async tryReadPersistedWorking(
+    sessionIds: ReadonlySet<string>,
+    discovery?: "recent" | "complete",
+  ): Promise<ReadonlySet<string> | undefined> {
+    return await this.#activityReader.readWorkingSessionIds(
+      sessionIds,
+      discovery === undefined
+        ? undefined
+        : { discoverRecent: true, ...(discovery === "complete" ? { discoverAll: true } : {}) },
+    ).catch(() => undefined);
   }
 
-  private async activityDelay(): Promise<void> {
+  private async activityDelay(maximumWaitMs?: number): Promise<void> {
+    if (this.#activityRefreshRequested) return;
     await new Promise<void>((resolve) => {
       let timer: NodeJS.Timeout | undefined;
       const finish = (): void => {
         if (timer !== undefined) clearTimeout(timer);
+        if (this.#activityDelayWake === finish) this.#activityDelayWake = undefined;
         this.#abort.signal.removeEventListener("abort", finish);
         resolve();
       };
-      timer = setTimeout(finish, this.#activityPollIntervalMs);
+      this.#activityDelayWake = finish;
+      const knownActiveWait = this.#activePrompts.size > 0 || this.#persistedWorking.size > 0
+        ? knownActiveSafetyPollIntervalMs
+        : this.#activityPollIntervalMs;
+      timer = setTimeout(finish, Math.min(this.#activityPollIntervalMs, knownActiveWait, maximumWaitMs ?? this.#activityPollIntervalMs));
       this.#abort.signal.addEventListener("abort", finish, { once: true });
+      if (this.#activityRefreshRequested) finish();
     });
+  }
+
+  private ensureActivityChangeWatch(): void {
+    if (this.#stopActivityChangeWatch !== undefined || this.#activityReader.watchChanges === undefined) return;
+    this.#stopActivityChangeWatch = this.#activityReader.watchChanges(() => {
+      if (this.#disposed || this.#activityChangeDebounce !== undefined) return;
+      this.armActivityChangeWake(activityChangeSettleMs);
+    });
+  }
+
+  private armActivityChangeWake(waitMs: number): void {
+    if (this.#disposed || this.#activityChangeDebounce !== undefined) return;
+    this.#activityChangeDebounce = setTimeout(() => {
+      this.#activityChangeDebounce = undefined;
+      if (this.#disposed) return;
+      if (this.#initialActivitySnapshot !== undefined && !this.#persistedActivityAvailable) {
+        this.armActivityChangeWake(activityChangeSettleMs);
+        return;
+      }
+      // Startup or another provider-wide read may have established a newer
+      // deadline while this timer was settling the commit. Recompute here so
+      // the wake goes straight to discovery rather than causing an exact read.
+      const discoveryWait = Math.max(0, this.#nextActivityDiscoveryAt - this.#now().getTime());
+      if (discoveryWait > 0) {
+        this.armActivityChangeWake(discoveryWait);
+        return;
+      }
+      this.#activityDiscoveryPending = true;
+      this.#activityRefreshRequested = true;
+      this.#activityDelayWake?.();
+    }, waitMs);
   }
 }
 
@@ -1853,6 +3130,124 @@ function parseModel(modelId: string): { readonly providerID: string; readonly mo
   const slash = modelId.indexOf("/");
   if (slash <= 0 || slash === modelId.length - 1) return undefined;
   return { providerID: modelId.slice(0, slash), modelID: modelId.slice(slash + 1) };
+}
+
+function openCodeTurnToolOverrides(request: SendMessageRequest, visionHelper = false): Readonly<Record<string, boolean>> {
+  // OpenCode converts these overrides into session permission rules and removes
+  // denied tools from the model request, including arbitrary MCP/plugin names.
+  // Reassert on every helper turn, including helpers restored after a restart.
+  if (visionHelper || request.metadata?.internalPurpose === "vision_proxy") return { "*": false };
+  // OpenCode catalogues custom plugin definitions provider-wide even when a
+  // prompt denies execution. The installed definition is therefore neutral;
+  // these per-turn flags grant execution only for an explicitly routed image.
+  // Keep the former key until already-running OpenCode processes reload.
+  const enabled = request.clientToolOverrides?.ask_eyes === true;
+  return {
+    uar_mesh_ask_eyes: enabled,
+    uar_mesh_tethoq_turn_support: enabled,
+  };
+}
+
+function completedOpenCodeBranchBody(history: readonly unknown[]): Record<string, never> | { readonly messageID: string } | undefined {
+  let latestSafeIndex = -1;
+  for (let index = 0; index < history.length; index += 1) {
+    const candidate = history[index];
+    if (!isRecord(candidate)) continue;
+    const info = isRecord(candidate.info) ? candidate.info : candidate;
+    const parts = Array.isArray(candidate.parts) ? candidate.parts : [];
+    if (!isCompletedOpenCodeAssistant(info)
+      || (info.finish !== "stop" && info.finish !== "length")
+      || parts.some(isContinuingOpenCodeToolPart)) continue;
+    if (typeof info.id === "string" && info.id.length > 0) latestSafeIndex = index;
+  }
+  if (latestSafeIndex < 0) return undefined;
+
+  // OpenCode's native fork boundary is exclusive: it clones every message
+  // before `messageID`. Point at the first unsafe trailing message so the
+  // completed assistant response remains in the child. When that response is
+  // already the tail, omitting the boundary safely clones the whole history.
+  const next = history[latestSafeIndex + 1];
+  if (next === undefined) return {};
+  if (!isRecord(next)) return undefined;
+  const nextInfo = isRecord(next.info) ? next.info : next;
+  return typeof nextInfo.id === "string" && nextInfo.id.length > 0
+    ? { messageID: nextInfo.id }
+    : undefined;
+}
+
+function openCodeCompactionMarkerIds(history: readonly unknown[], excluded: ReadonlySet<string> = new Set()): ReadonlySet<string> {
+  const markers = new Set<string>();
+  for (const entry of history) {
+    if (!isRecord(entry)) continue;
+    const info = isRecord(entry.info) ? entry.info : entry;
+    const parts = Array.isArray(entry.parts) ? entry.parts : [];
+    if (info.role !== "user" || !parts.some((part) => isRecord(part) && part.type === "compaction")) continue;
+    if (typeof info.id === "string" && !excluded.has(info.id)) markers.add(info.id);
+  }
+  return markers;
+}
+
+function isCompletedOpenCodeCompactionAssistant(info: Record<string, unknown>): boolean {
+  const time = isRecord(info.time) ? info.time : {};
+  return info.role === "assistant"
+    && (info.mode === "compaction" || info.summary === true)
+    && typeof time.completed === "number"
+    && info.error === undefined;
+}
+
+function openCodeCompactionOutcome(history: readonly unknown[], markerIds: ReadonlySet<string>): "completed" | "failed" | undefined {
+  for (const entry of history) {
+    if (!isRecord(entry)) continue;
+    const info = isRecord(entry.info) ? entry.info : entry;
+    if (typeof info.parentID !== "string" || !markerIds.has(info.parentID) || info.role !== "assistant"
+      || (info.mode !== "compaction" && info.summary !== true)) continue;
+    if (info.error !== undefined && info.error !== null) return "failed";
+    if (isCompletedOpenCodeCompactionAssistant(info)) return "completed";
+  }
+  return undefined;
+}
+
+function isCompletedOpenCodeAssistant(info: Record<string, unknown>): boolean {
+  const time = isRecord(info.time) ? info.time : {};
+  return info.role === "assistant" && typeof time.completed === "number" && info.error === undefined;
+}
+
+/** OpenCode's prompt loop exits on any finish except `tool-calls` and `unknown`. */
+function isOpenCodeTurnExitFinish(finish: unknown): boolean {
+  return typeof finish === "string" && finish.length > 0 && finish !== "tool-calls" && finish !== "unknown";
+}
+
+function isCompletedUnknownOpenCodeAssistant(info: Record<string, unknown>): boolean {
+  return isCompletedOpenCodeAssistant(info) && info.finish === "unknown";
+}
+
+function hasExplicitZeroOpenCodeUsage(info: Record<string, unknown>): boolean {
+  if (!isRecord(info.tokens)) return false;
+  const tokens = info.tokens;
+  const cache = isRecord(tokens.cache) ? tokens.cache : {};
+  const values = [
+    tokens.input,
+    tokens.output,
+    tokens.reasoning,
+    cache.read ?? tokens.cacheRead,
+    cache.write ?? tokens.cacheWrite,
+  ];
+  return values.every((value) => typeof value === "number" && Number.isFinite(value) && value === 0);
+}
+
+function isPersistedEmptyUnknownAssistant(entry: Record<string, unknown>): boolean {
+  const info = isRecord(entry.info) ? entry.info : entry;
+  if (!isCompletedUnknownOpenCodeAssistant(info) || !hasExplicitZeroOpenCodeUsage(info)) return false;
+  const parts = Array.isArray(entry.parts) ? entry.parts : [];
+  let sawUnknownFinish = false;
+  for (const part of parts) {
+    if (!isRecord(part) || (part.type !== "step-start" && part.type !== "step-finish")) return false;
+    if (part.type === "step-finish") {
+      if (part.reason !== "unknown") return false;
+      sawUnknownFinish = true;
+    }
+  }
+  return sawUnknownFinish;
 }
 
 function firstText(...values: unknown[]): string | undefined {
@@ -1915,6 +3310,45 @@ function openCodeInputModalities(model: Record<string, unknown>): readonly ("tex
   return ["text" as const, ...(supportsImage ? ["image" as const] : []), ...(supportsAudio ? ["audio" as const] : [])];
 }
 
+function openCodeSupportsNativePdf(metadata: JsonObject): boolean {
+  const capabilities = isRecord(metadata.capabilities) ? metadata.capabilities : {};
+  const input = isRecord(capabilities.input) ? capabilities.input : {};
+  return input.pdf === true;
+}
+
+type OpenCodeMessageSelection = {
+  readonly modelId: string;
+  readonly variantId?: string;
+  readonly reasoningEffort?: string;
+  readonly messageCreatedAt?: number;
+};
+
+/** The model route OpenCode persisted on one native message record. */
+function openCodeMessageSelection(info: Record<string, unknown>): OpenCodeMessageSelection | undefined {
+  const nested = isRecord(info.model) ? info.model : {};
+  const user = info.role === "user";
+  const providerId = user
+    ? firstText(nested.providerID, nested.providerId)
+    : firstText(info.providerID, info.providerId, nested.providerID, nested.providerId);
+  const nativeModelId = user
+    ? firstText(nested.modelID, nested.modelId, nested.id)
+    : firstText(info.modelID, info.modelId, nested.modelID, nested.modelId, nested.id);
+  if (providerId === undefined || nativeModelId === undefined) return undefined;
+  const variant = user
+    ? firstText(nested.variant, info.variant)
+    : firstText(info.variant, nested.variant);
+  const reportedVariant = variant ?? "default";
+  const time = isRecord(info.time) ? info.time : {};
+  const messageCreatedAt = typeof time.created === "number" && Number.isFinite(time.created) ? time.created : undefined;
+  const modelId = nativeModelId.startsWith(`${providerId}/`) ? nativeModelId : `${providerId}/${nativeModelId}`;
+  return {
+    modelId,
+    variantId: reportedVariant,
+    reasoningEffort: reportedVariant,
+    ...(messageCreatedAt !== undefined ? { messageCreatedAt } : {}),
+  };
+}
+
 function sessionUpdatePayload(hostId: string, properties: Record<string, unknown>): JsonObject {
   if (!isRecord(properties.info)) return asJsonObject(properties);
   const info = properties.info;
@@ -1926,6 +3360,7 @@ function sessionUpdatePayload(hostId: string, properties: Record<string, unknown
     return asJsonObject(properties);
   }
   return {
+    ...(typeof info.title === "string" && info.title.trim() && session.title.trim() ? { title: session.title.trim() } : {}),
     ...(session.modelId !== undefined ? { modelId: session.modelId } : {}),
     ...(session.reasoningEffort !== undefined ? { reasoningEffort: session.reasoningEffort } : {}),
     ...(session.variantId !== undefined ? { variantId: session.variantId } : {}),
@@ -1949,10 +3384,17 @@ function isOpenCodeAbortError(value: unknown): boolean {
   return value.name === "MessageAbortedError" || value.name === "AbortError";
 }
 
-function toolEventType(part: Record<string, unknown>): "tool.started" | "tool.completed" | "agent.error" {
+function primaryEventCarriesActivityState(type: string): boolean {
+  return type === "session.status" || type === "session.idle" || type === "session.error"
+    || type === "message.updated" || type === "message.part.updated" || type === "message.part.delta"
+    || type === "permission.updated" || type === "permission.asked" || type === "command.executed";
+}
+
+function toolEventType(part: Record<string, unknown>): "tool.started" | "tool.completed" {
   const state = isRecord(part.state) ? part.state : {};
-  if (state.status === "completed") return "tool.completed";
-  if (state.status === "error") return "agent.error";
+  // A failed tool is still the terminal snapshot of that tool part. Emitting an
+  // agent.error here creates a second row and falsely marks the whole task failed.
+  if (state.status === "completed" || state.status === "error") return "tool.completed";
   return "tool.started";
 }
 

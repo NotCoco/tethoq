@@ -14,7 +14,7 @@ await build({ entryPoints: [join(appRoot, "src", "shared", "local_media.ts")], o
 const media = await import(`file:///${bundle.replaceAll("\\", "/")}`);
 process.on("exit", () => { void rm(outputDirectory, { recursive: true, force: true }); });
 
-test("local media URLs round-trip absolute video paths without exposing file URLs", () => {
+test("local media URLs classify and round-trip bounded image and video references", () => {
   const windowsPath = "C:\\Users\\test\\Videos\\demo review.mp4";
   const url = media.localMediaUrl(windowsPath);
   assert.equal(url, "tethoq-media://local/C%3A%5CUsers%5Ctest%5CVideos%5Cdemo%20review.mp4");
@@ -23,6 +23,18 @@ test("local media URLs round-trip absolute video paths without exposing file URL
   assert.equal(media.localMediaPathFromUrl("file:///C:/secret.mp4"), null);
   assert.equal(media.isLocalVideoPath(windowsPath), true);
   assert.equal(media.isLocalVideoPath("C:\\Users\\test\\Videos\\notes.txt"), false);
+  assert.equal(media.isLocalImagePath("C:\\Users\\test\\Pictures\\QA capture.PNG"), true);
+  assert.equal(media.isLocalImagePath("C:\\Users\\test\\Pictures\\unsafe.svg"), false);
+  assert.equal(media.localMediaContentType("C:\\capture.jpeg"), "image/jpeg");
+  assert.equal(media.localMediaContentType("C:\\capture.webp"), "image/webp");
+  assert.equal(media.localMediaContentType("C:\\clip.mov"), "video/quicktime");
+  assert.equal(media.localMediaContentType("C:\\notes.txt"), null);
+  assert.equal(media.localMediaPathFromReference("file:///C:/Users/test/Pictures/QA%20capture.png"), "C:/Users/test/Pictures/QA capture.png");
+  assert.equal(media.localMediaPathFromReference("C:\\Users\\test\\Pictures\\QA capture.png"), "C:\\Users\\test\\Pictures\\QA capture.png");
+  assert.equal(media.localMediaPathFromReference("/tmp/QA%20capture.png"), "/tmp/QA capture.png");
+  assert.equal(media.localMediaPathFromReference("file://server/share/private.png"), null);
+  assert.equal(media.localMediaPathFromReference("\\\\server\\share\\private.png"), null);
+  assert.equal(media.localMediaPathFromReference("relative.png"), null);
   assert.deepEqual(media.localMediaRange(null, 1_000), { kind: "full" });
   assert.deepEqual(media.localMediaRange("bytes=0-", 1_000), { kind: "partial", start: 0, end: 999 });
   assert.deepEqual(media.localMediaRange("bytes=100-249", 1_000), { kind: "partial", start: 100, end: 249 });
@@ -35,7 +47,9 @@ test("the local media protocol validates files before streaming them with reques
   assert.match(source, /supportFetchAPI: true, stream: true/);
   assert.match(source, /existingLocalTarget\(path\)/);
   assert.match(source, /target\.kind !== "file"/);
-  assert.match(source, /isLocalVideoPath\(path\)/);
+  assert.match(source, /localMediaContentType\(path\) === null/);
+  assert.match(source, /isLocalImagePath\(target\.path\)/);
+  assert.match(source, /MAX_LOCAL_IMAGE_BYTES\s*=\s*25 \* 1024 \* 1024/);
   assert.match(source, /openAsBlob\(target\.path, \{ type: contentType \}\)/);
   assert.match(source, /file\.slice\(start, end \+ 1, contentType\)/);
   assert.match(source, /status: range\.kind === "partial" \? 206 : 200/);

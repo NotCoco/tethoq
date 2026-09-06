@@ -21,9 +21,9 @@ test("desktop built-in provider allowlist stays explicit at every privileged bou
   assert.match(runtime, /new CodexAdapter\s*\(/);
   assert.match(runtime, /new OpenCodeAdapter\s*\(/);
   assert.match(runtime, /new GrokProviderAdapter\s*\(/);
-  assert.match(runtime, /new CodexAdapter\([\s\S]*?localActivity:\s*\{\}/);
+  assert.match(runtime, /new CodexAdapter\([\s\S]*?localActivity:\s*\{\s*retirementStatePath:\s*join\(dirname\(this\.#configPath\),\s*"codex-activity-retirements\.json"\)\s*\}/);
   assert.match(runtime, /new OpenCodeAdapter\([\s\S]*?localActivity:\s*openCodeDatabasePath === undefined \? \{\} : \{ databasePath: openCodeDatabasePath \}/);
-  assert.match(runtime, /new CodexAdapter\([\s\S]*?localActivity:\s*\{\},[\s\S]*?desktopQueue:\s*\{\}/);
+  assert.match(runtime, /new CodexAdapter\([\s\S]*?localActivity:\s*\{[^}]*retirementStatePath:[^}]*\},[\s\S]*?desktopQueue:\s*\{\}/);
 });
 
 test("preload exposes a narrow frozen API without Node or raw IPC access", async () => {
@@ -33,7 +33,7 @@ test("preload exposes a narrow frozen API without Node or raw IPC access", async
   assert.match(preload, /contextBridge\.exposeInMainWorld\(\s*"tethoqDesktop",\s*api\s*\)/);
   assert.match(preload, /const api:[^=]+=\s*Object\.freeze\(/s);
   assert.doesNotMatch(preload, /exposeInMainWorld\([^)]*(ipcRenderer|require|process)/s);
-  assert.doesNotMatch(api, /privateKey|pairingSecret|relayToken|credential/i);
+  assert.doesNotMatch(api, /privateKey|pairingSecret|relayToken|\bcredential\s*[?:]/i);
 
   const invokes = [...preload.matchAll(/ipcRenderer\.invoke\(IPC_CHANNELS\.([A-Za-z0-9_]+)/g)].map((match) => match[1]);
   assert.deepEqual(new Set(invokes), new Set([
@@ -48,6 +48,7 @@ test("preload exposes a narrow frozen API without Node or raw IPC access", async
     "localOpenHandlers",
     "openLocalTarget",
     "openDictationSetupPage",
+    "openHarnessSetupPage",
     "showWindow",
     "hideWindow",
     "openCodeStatus",
@@ -61,6 +62,8 @@ test("preload exposes a narrow frozen API without Node or raw IPC access", async
     "preferencesAction",
     "liveSessionGetState",
     "liveSessionAction",
+    "mobileConnectionGetState",
+    "mobileConnectionAction",
     "smokeQuit",
   ]));
   assert.match(preload, /process\.env\.TETHOQ_PACKAGED_SMOKE\s*===\s*"1"[\s\S]*?quitForSmoke[\s\S]*?IPC_CHANNELS\.smokeQuit/);
@@ -126,24 +129,31 @@ test("provider requests stay in the main process and event replay is bounded", a
   assert.match(runtime, /const MAX_EVENT_BATCH\s*=\s*200/);
   assert.match(runtime, /eventReplaySince\(this\.#latestSequence\)/);
   assert.match(runtime, /replay\.events\.slice\(0,\s*MAX_EVENT_BATCH\)/);
-  assert.match(runtime, /const ACTIVE_EVENT_POLL_MS\s*=\s*100/);
+  assert.match(runtime, /const ACTIVE_EVENT_POLL_MS\s*=\s*1_000/);
   assert.match(runtime, /const HIDDEN_EVENT_POLL_MS\s*=\s*1_000/);
   assert.match(runtime, /setWindowVisible\(visible: boolean\)[\s\S]*?scheduleEventPoll\(\)/);
   assert.doesNotMatch(runtime, /BridgeSocketServer|allowUnsignedRequests/);
-  const ensureOpenCode = runtime.match(/public async ensureOpenCode\([\s\S]*?\n  }/)?.[0] ?? "";
-  assert.match(ensureOpenCode, /#openCode\.ensureRunning\(\)/);
+  const ensureOpenCode = runtime.match(/public (?:async )?ensureOpenCode\([\s\S]*?\n  }/)?.[0] ?? "";
+  assert.match(ensureOpenCode, /#openCodeEnsurePromise/);
   assert.doesNotMatch(ensureOpenCode, /reconnectProvider/);
+  const ensureOpenCodeOnce = runtime.match(/private async ensureOpenCodeOnce\([\s\S]*?\n  }/)?.[0] ?? "";
+  assert.match(ensureOpenCodeOnce, /#openCode\.ensureRunning\(\)/);
   const startOnce = runtime.match(/private async startOnce\([\s\S]*?\n  }/)?.[0] ?? "";
   assert.match(startOnce, /#openCode\.probe\(\)/);
   // The desktop owns the OpenCode server for its whole lifetime, but a cold
   // server can take seconds to answer, so readiness is reported first and the
   // start runs behind it.
   assert.doesNotMatch(startOnce, /#openCode\.ensureRunning\(\)/);
-  assert.match(startOnce, /this\.#onState\(\{ state: "ready" \}\);\s*\n\s*this\.startOpenCodeInBackground\(bridge\)/);
+  assert.match(startOnce, /this\.#onState\(\{ state: "ready" \}\);[\s\S]*?this\.startOpenCodeInBackground\(bridge\)/);
   const backgroundStart = runtime.match(/private startOpenCodeInBackground\([\s\S]*?\n  }/)?.[0] ?? "";
   assert.match(backgroundStart, /this\.ensureOpenCode\(\)/);
-  assert.match(backgroundStart, /reconnectProvider\("opencode"\)/);
+  assert.match(backgroundStart, /this\.reconnectOpenCodeProvider\(bridge\)/);
   assert.match(runtime, /new MeshToolGateway\(/);
+  assert.match(
+    runtime,
+    /\(parentSessionId, tool, input, context\) => tool\.startsWith\("browser_"\)[\s\S]{0,200}bridge\.executeClientTool\(parentSessionId, tool, input, context\)/,
+    "Desktop must preserve the provider-owned tool call identity so EYES does not create a duplicate Bridge fallback",
+  );
   assert.match(runtime, /bridge\.configureClientTooling\(clientTools\)/);
   assert.match(runtime, /catch \(error\) \{[\s\S]*?#bridge\?\.dispose\(\)[\s\S]*?#clientTools\?\.close\(\)[\s\S]*?#connectorRegistry\?\.dispose\(\)[\s\S]*?#openCode\.dispose\(\)/);
 });
@@ -176,15 +186,25 @@ test("IPC request routing is allowlisted and provider targets are validated", as
   assert.ok(allowed.length >= 20, "desktop request allowlist unexpectedly collapsed");
   assert.equal(new Set(allowed).size, allowed.length, "desktop request allowlist contains duplicates");
   assert.ok(allowed.includes("session.create"));
+  assert.ok(allowed.includes("scheduled_task.list"));
+  assert.ok(allowed.includes("scheduled_task.create"));
+  assert.ok(allowed.includes("scheduled_task.cancel"));
+  assert.ok(allowed.includes("scheduled_task.run_now"));
+  assert.ok(allowed.includes("scheduled_task.retry"));
   assert.ok(allowed.includes("session.watch"));
   assert.ok(allowed.includes("session.unwatch"));
   assert.ok(allowed.includes("ears.process"));
   assert.ok(allowed.includes("ears.cancel"));
   assert.ok(allowed.includes("approval.respond"));
   assert.ok(allowed.includes("delegation.start"));
+  assert.ok(allowed.includes("delegation.prepare"));
   assert.ok(allowed.includes("session.context_handoff"));
   assert.ok(allowed.includes("session.branch"));
   assert.ok(allowed.includes("session.image.get"));
+  assert.ok(allowed.includes("session.goal.get"));
+  assert.ok(allowed.includes("session.goal.set"));
+  assert.ok(allowed.includes("session.goal.clear"));
+  assert.ok(allowed.includes("session.context.clear_threshold"));
   assert.ok(allowed.includes("wallet.get"));
   assert.ok(allowed.includes("wallet.configure"));
   assert.equal(allowed.includes("pairing.confirm"), false);
@@ -198,9 +218,10 @@ test("IPC request routing is allowlisted and provider targets are validated", as
 });
 
 test("the Electron window keeps renderer privileges disabled", async () => {
-  const [main, security] = await Promise.all([
+  const [main, security, rendererHtml] = await Promise.all([
     source("../src/main/index.ts"),
     source("../src/main/security.ts"),
+    source("../src/renderer/index.html"),
   ]);
 
   assert.match(main, /\.\.\.SECURE_WEB_PREFERENCES/);
@@ -208,30 +229,34 @@ test("the Electron window keeps renderer privileges disabled", async () => {
   assert.match(main, /hardenSession\(session\.defaultSession\)/);
   assert.match(main, /hardenWindow\(window\)/);
   assert.match(main, /titleBarStyle:\s*"hidden"/);
-  assert.match(main, /backgroundColor:\s*"#0b0b0a"/);
-  assert.match(main, /titleBarOverlay:\s*\{[\s\S]*?color:\s*"#0b0b0a"[\s\S]*?height:\s*46/);
+  assert.match(main, /const WINDOW_SURFACE_COLOR = "#0b0b0a"/);
+  assert.match(main, /backgroundColor:\s*WINDOW_SURFACE_COLOR/);
+  assert.match(main, /titleBarOverlay:\s*\{[\s\S]*?color:\s*WINDOW_SURFACE_COLOR[\s\S]*?height:\s*46/);
   assert.match(main, /minWidth:\s*760/);
   assert.match(main, /minHeight:\s*480/);
-  assert.match(main, /backgroundThrottling:\s*false/);
-  assert.match(main, /webContents\.setBackgroundThrottling\(false\)/);
-  assert.match(main, /disable-renderer-backgrounding/);
-  assert.match(main, /disable-background-timer-throttling/);
-  assert.match(main, /disable-backgrounding-occluded-windows/);
-  assert.match(main, /disable-features[\s\S]*CalculateNativeWinOcclusion/);
+  assert.match(main, /backgroundThrottling:\s*true/);
+  assert.match(main, /webContents\.setBackgroundThrottling\(true\)/);
+  assert.doesNotMatch(main, /disable-renderer-backgrounding/);
+  assert.doesNotMatch(main, /disable-background-timer-throttling/);
+  assert.doesNotMatch(main, /disable-backgrounding-occluded-windows/);
+  assert.doesNotMatch(main, /CalculateNativeWinOcclusion/);
+  assert.match(main, /window\.webContents\.send\(IPC_CHANNELS\.eventBatch, batch\)[\s\S]*?notifyForEvents\(window, batch\.events/);
   assert.match(main, /window\.on\("hide"[\s\S]*?setWindowVisible\(false\)[\s\S]*?setHostVisible\(false\)/);
-  // Revealing is gated on the renderer's first snapshot rather than first paint, but the
-  // smoke build must still stay invisible and inert, and a hidden start must stay hidden.
+  // The smoke build must stay invisible and inert, and a hidden start must stay hidden.
   assert.match(main, /const reveal = \(\): void =>[\s\S]*?TETHOQ_PACKAGED_SMOKE\s*===\s*"1"[\s\S]*?else if \(!startedHidden\(\)\) \{\s*window\.show\(\);\s*window\.focus\(\);/);
-  // Only this window's own renderer may reveal it. If Chromium never emits ready-to-show,
-  // a startup fallback still reveals an explicit launch so the process cannot sit invisible.
-  assert.match(main, /if \(event\.sender === window\.webContents\) reveal\(\)/);
-  assert.match(main, /ready-to-show[\s\S]*?revealTimer = setTimeout\(reveal, RENDERER_READY_REVEAL_MS\)/);
-  assert.match(main, /startupRevealTimer = setTimeout\(reveal, STARTUP_REVEAL_FALLBACK_MS\)/);
-  assert.match(main, /export const RENDERER_READY_REVEAL_MS = 4000/);
-  assert.match(main, /export const STARTUP_REVEAL_FALLBACK_MS = 8000/);
+  // Slow setup cannot reveal Chromium's initial blank document: the app-owned local
+  // startup page must finish loading before the first explicit reveal.
+  assert.match(main, /await loadStartupSurface\(window\);\s*(?:recordStartupProfile\([\s\S]*?\);\s*)?reveal\(\);\s*await delayStartupForVisualTest\(\)/);
+  assert.match(main, /async function loadRenderer\(window: BrowserWindow\): Promise<void> \{[\s\S]*?await window\.load(?:URL|File)\([\s\S]*?window\.webContents\.navigationHistory\.clear\(\);\s*\}/, "the startup surface must not remain reachable through shell Back/Forward commands");
+  assert.doesNotMatch(main, /startupRevealTimer|STARTUP_REVEAL_FALLBACK_MS/);
+  assert.match(main, /<main class="shell" role="status" aria-label="Tethoq is starting">[\s\S]*class="rail"[\s\S]*class="messages"[\s\S]*class="composer"/);
+  assert.doesNotMatch(main, /Connecting to your coding tools on this computer…/);
+  assert.match(main, /await loadStartupSurface\(window, "failed"\)/);
+  assert.match(rendererHtml, /:root, html, body, #root \{[^}]*background: #0b0b0a/);
+  assert.match(rendererHtml, /id="root"><main class="pre-react-startup" role="status" aria-label="Tethoq is starting">[\s\S]*class="pre-react-rail"[\s\S]*class="pre-react-messages"[\s\S]*class="pre-react-composer"/);
+  assert.doesNotMatch(rendererHtml, /Connecting to your coding tools on this computer…/);
   assert.match(main, /clampWindowStateToDisplay\(remembered, display\.workArea\)/);
   assert.match(main, /else if \(!startedHidden\(\)\) \{\s*window\.show\(\);\s*window\.focus\(\);/);
-  assert.match(main, /window\.once\("closed", \(\) => \{ ipcMain\.removeListener\(IPC_CHANNELS\.rendererReady, onRendererReady\); \}\)/);
   assert.match(security, /contextIsolation:\s*true/);
   assert.match(security, /nodeIntegration:\s*false/);
   assert.match(security, /sandbox:\s*true/);
@@ -239,13 +264,17 @@ test("the Electron window keeps renderer privileges disabled", async () => {
   assert.match(security, /details\.mediaTypes\?\.length === 1[\s\S]*?details\.mediaTypes\[0\] === "audio"/);
   assert.match(security, /callback\(audioOnly\)/);
   assert.doesNotMatch(security, /mediaTypes[^\n]+"video"/);
-  assert.match(security, /img-src 'self' data: blob: https: http:\/\/localhost:\* http:\/\/127\.0\.0\.1:\* http:\/\/\[::1\]:\*; connect-src 'none'/);
+  assert.match(security, /img-src 'self' data: blob: https: tethoq-media: http:\/\/localhost:\* http:\/\/127\.0\.0\.1:\* http:\/\/\[::1\]:\*; connect-src 'none'/);
+  assert.equal((security.match(/img-src[^;]*tethoq-media:/g) ?? []).length, 2);
+  assert.doesNotMatch(security, /img-src[^;]*file:/);
   assert.equal((security.match(/http:\/\/localhost:\*/g) ?? []).length, 2);
   assert.equal((security.match(/http:\/\/127\.0\.0\.1:\*/g) ?? []).length, 2);
   assert.equal((security.match(/http:\/\/\[::1\]:\*/g) ?? []).length, 2);
   assert.doesNotMatch(security, /img-src[^;]*\shttp:(?:\s|;)/);
   assert.doesNotMatch(security, /connect-src[^;]*http:/);
   assert.equal((security.match(/media-src 'self' blob: tethoq-media:/g) ?? []).length, 2);
+  assert.equal((security.match(/worker-src blob:/g) ?? []).length, 2);
+  assert.deepEqual([...security.matchAll(/worker-src ([^"`;]+)/g)].map((match) => match[1].trim()), ["blob:", "blob:"]);
   assert.match(main, /registerLocalMediaScheme\(\)/);
   assert.match(main, /registerLocalMediaProtocol\(session\.defaultSession\)/);
   assert.doesNotMatch(security, /connect-src[^;]*https:/);

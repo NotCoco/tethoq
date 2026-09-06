@@ -1,9 +1,14 @@
 import type { ProviderQueuedMessage } from "../../provider_contract/src/index.js";
 import { isRecord } from "./normalize.js";
 
+export interface GrokNativeQueuedMessage extends ProviderQueuedMessage {
+  /** Monotonic Grok queue revision required by versioned native mutations. */
+  readonly version: number;
+}
+
 export interface GrokNativeQueueSnapshot {
   readonly sessionId: string;
-  readonly entries: readonly ProviderQueuedMessage[];
+  readonly entries: readonly GrokNativeQueuedMessage[];
   readonly runningPromptId?: string;
 }
 
@@ -38,12 +43,26 @@ export function grokQueueEditParams(providerSessionId: string, messageId: string
   return { sessionId: providerSessionId, id: messageId, newText: content };
 }
 
+export function grokQueueInterjectParams(
+  providerSessionId: string,
+  messageId: string,
+  expectedVersion: number,
+  newText?: string,
+): Record<string, string | number> {
+  return {
+    sessionId: providerSessionId,
+    id: messageId,
+    expectedVersion,
+    ...(newText !== undefined ? { newText } : {}),
+  };
+}
+
 function parseGrokQueueEntry(
   providerSessionId: string,
   value: unknown,
   now: Date,
   index: number,
-): ProviderQueuedMessage | undefined {
+): GrokNativeQueuedMessage | undefined {
   if (typeof value === "string" && value.trim()) {
     return {
       id: `grok-queue-${index}`,
@@ -51,6 +70,7 @@ function parseGrokQueueEntry(
       content: value,
       state: "queued",
       createdAt: now.toISOString(),
+      version: 0,
     };
   }
   if (!isRecord(value)) return undefined;
@@ -59,12 +79,14 @@ function parseGrokQueueEntry(
   const content = firstString(value, ["text", "content", "prompt", "message"]);
   if (content === undefined) return undefined;
   const id = firstString(value, ["id", "entryId", "entry_id", "queue_entry_id"]) ?? `grok-queue-${index}`;
+  const version = firstNonNegativeInteger(value, ["version", "queueVersion", "queue_version"]) ?? 0;
   return {
     id,
     providerSessionId,
     content,
     state: "queued",
     createdAt: now.toISOString(),
+    version,
   };
 }
 
@@ -72,6 +94,14 @@ function firstString(source: Record<string, unknown>, keys: readonly string[]): 
   for (const key of keys) {
     const value = source[key];
     if (typeof value === "string" && value.trim().length > 0) return value;
+  }
+  return undefined;
+}
+
+function firstNonNegativeInteger(source: Record<string, unknown>, keys: readonly string[]): number | undefined {
+  for (const key of keys) {
+    const value = source[key];
+    if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return value;
   }
   return undefined;
 }

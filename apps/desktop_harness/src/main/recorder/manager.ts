@@ -89,6 +89,13 @@ interface ActiveDrag {
   lastScreenshotMs: number;
 }
 
+interface ActiveKeyPress {
+  readonly downEventId: string;
+  readonly startedAt: RecorderTimestamp;
+  readonly key?: string;
+  repeatCount: number;
+}
+
 interface ActiveSession {
   readonly write: WorkflowWriteSession;
   readonly started: RecorderTimestamp;
@@ -98,6 +105,7 @@ interface ActiveSession {
   readonly pendingCaptures: Set<Promise<void>>;
   readonly contextQueue: Promise<void>[];
   readonly framesByEvent: Map<string, CapturedFrame>;
+  readonly pressedKeys: Map<number, ActiveKeyPress>;
   manifest: WorkflowManifest;
   eventSequence: number;
   frameSequence: number;
@@ -233,6 +241,7 @@ export class RecorderManager {
           pendingCaptures: new Set(),
           contextQueue: [],
           framesByEvent: new Map(),
+          pressedKeys: new Map(),
           manifest,
           eventSequence: 0,
           frameSequence: 0,
@@ -283,6 +292,7 @@ export class RecorderManager {
       this.emitState();
       this.#shortcut.unregister(RECORDER_PANIC_SHORTCUT);
       await Promise.allSettled([this.#inputHook.stop()]);
+      this.flushPressedKeys(session, reason, this.timestamp(session));
 
       if (session.drag !== undefined) await this.finishDrag(session, session.drag, session.cursor ?? session.drag.path.at(-1) ?? session.drag.start, this.timestamp(session), true);
       await drainAsyncWork(session);
@@ -430,7 +440,31 @@ export class RecorderManager {
     const timestamp = this.timestamp(session);
     session.counts.keyEvents += 1;
     const needsContext = type === "key-down" && timestamp.monotonicMs - session.lastKeyContextMs >= this.#limits.keyContextIntervalMs;
-    const eventId = this.append(session, type, { keycode: event.keycode, modifiers: modifierPayload(event), textCaptured: false, contextPending: needsContext }, timestamp);
+    const active = session.pressedKeys.get(event.keycode);
+    const repeat = type === "key-down" && (event.repeat === true || active !== undefined);
+    const key = event.key?.trim();
+    const eventId = this.append(session, type, {
+      keycode: event.keycode,
+      ...(key ? { key } : {}),
+      modifiers: modifierPayload(event),
+      textCaptured: false,
+      repeat,
+      contextPending: needsContext,
+      ...(type === "key-down" && active ? { downEventId: active.downEventId, repeatIndex: active.repeatCount + 1 } : {}),
+      ...(type === "key-up" && active ? {
+        downEventId: active.downEventId,
+        holdDurationMs: Math.max(0, timestamp.monotonicMs - active.startedAt.monotonicMs),
+        repeatCount: active.repeatCount,
+        interrupted: false,
+      } : {}),
+      ...(type === "key-up" && !active ? { orphaned: true } : {}),
+    }, timestamp);
+    if (type === "key-down") {
+      if (active) active.repeatCount += 1;
+      else session.pressedKeys.set(event.keycode, { downEventId: eventId, startedAt: timestamp, ...(key ? { key } : {}), repeatCount: 0 });
+    } else {
+      session.pressedKeys.delete(event.keycode);
+    }
     if (needsContext) {
       session.lastKeyContextMs = timestamp.monotonicMs;
       this.enqueueContext(session, eventId, timestamp);
@@ -440,6 +474,26 @@ export class RecorderManager {
       this.enqueueCapture(session, eventId, session.cursor, timestamp);
     }
     this.progress(session);
+  }
+
+  private flushPressedKeys(session: ActiveSession, reason: RecorderStopReason, timestamp: RecorderTimestamp): void {
+    for (const [keycode, active] of session.pressedKeys) {
+      session.counts.keyEvents += 1;
+      this.append(session, "key-up", {
+        keycode,
+        ...(active.key ? { key: active.key } : {}),
+        modifiers: { alt: false, ctrl: false, meta: false, shift: false },
+        textCaptured: false,
+        repeat: false,
+        contextPending: false,
+        downEventId: active.downEventId,
+        holdDurationMs: Math.max(0, timestamp.monotonicMs - active.startedAt.monotonicMs),
+        repeatCount: active.repeatCount,
+        interrupted: true,
+        interruptionReason: reason,
+      }, timestamp);
+    }
+    session.pressedKeys.clear();
   }
 
   private handleMouseDown(event: HookMouseEvent): void {

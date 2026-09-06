@@ -1,24 +1,53 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { ProviderEvent } from "../../provider_contract/src/index.js";
+import type { RemoteSession } from "../../protocol/src/index.js";
 import { type FetchLike } from "./http_client.js";
-import type { OpenCodeActivityReader } from "./activity.js";
+import type { OpenCodeActivityReadOptions, OpenCodeActivityReader } from "./activity.js";
 import { OpenCodeAdapter } from "./opencode_adapter.js";
 
 class SequenceActivityReader implements OpenCodeActivityReader {
-  readonly #snapshots: readonly ReadonlySet<string>[];
+  readonly #snapshots: readonly (ReadonlySet<string> | undefined)[];
   #index = 0;
+  #changeListener: (() => void) | undefined;
   public closed = false;
   public reads = 0;
+  public readonly candidateReads: ReadonlySet<string>[] = [];
+  public readonly discoveryReads: boolean[] = [];
+  public readonly completeDiscoveryReads: boolean[] = [];
+  public readonly readStartedAt: number[] = [];
+  public nextReadGate: Promise<void> | undefined;
 
-  public constructor(...snapshots: readonly ReadonlySet<string>[]) {
+  public constructor(...snapshots: readonly (ReadonlySet<string> | undefined)[]) {
     this.#snapshots = snapshots;
   }
 
-  public async readWorkingSessionIds(): Promise<ReadonlySet<string>> {
+  public async readWorkingSessionIds(
+    sessionIds: ReadonlySet<string>,
+    options: OpenCodeActivityReadOptions = {},
+  ): Promise<ReadonlySet<string> | undefined> {
     this.reads += 1;
-    const snapshot = this.#snapshots[Math.min(this.#index, this.#snapshots.length - 1)] ?? new Set<string>();
+    this.readStartedAt.push(performance.now());
+    this.candidateReads.push(new Set(sessionIds));
+    this.discoveryReads.push(options.discoverRecent === true);
+    this.completeDiscoveryReads.push(options.discoverAll === true);
+    const gate = this.nextReadGate;
+    this.nextReadGate = undefined;
+    if (gate !== undefined) await gate;
+    const snapshot = this.#snapshots[Math.min(this.#index, this.#snapshots.length - 1)];
     this.#index += 1;
     return snapshot;
+  }
+
+  public watchChanges(listener: () => void): () => void {
+    this.#changeListener = listener;
+    return () => {
+      if (this.#changeListener === listener) this.#changeListener = undefined;
+    };
+  }
+
+  public signalChange(): void {
+    this.#changeListener?.();
   }
 
   public close(): void {
@@ -153,51 +182,404 @@ test("OpenCode lists only connected upstream models and preserves their route", 
   await adapter.dispose();
 });
 
-test("OpenCode async prompts use a native message ID separate from bridge deduplication", async () => {
-  let requestBody: Record<string, unknown> | undefined;
+test("OpenCode async prompts use a stable native message ID separate from bridge deduplication", async () => {
+  const requestBodies: Record<string, unknown>[] = [];
   const fetchLike: FetchLike = async (input, init) => {
     const url = requestUrl(input);
     assert.equal(url.pathname, "/session/ses_1/prompt_async");
     assert.equal(init?.method, "POST");
     assert.equal(typeof init?.body, "string");
-    requestBody = JSON.parse(init.body as string) as Record<string, unknown>;
+    requestBodies.push(JSON.parse(init.body as string) as Record<string, unknown>);
     return new Response(null, { status: 204 });
   };
   const adapter = new OpenCodeAdapter({ hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", fetch: fetchLike, activityReader: new SequenceActivityReader(new Set()) });
 
-  const result = await adapter.sendMessage("ses_1", {
+  const request = {
     requestId: "bridge_request_1",
     content: "Run the focused tests",
+    developerInstructions: "Use the configured EYES tool before answering image questions.",
     modelId: "openai/gpt-5",
     reasoningEffort: "high",
     attachments: [{ name: "phone.jpg", mimeType: "image/jpeg", dataBase64: "AQID", byteLength: 3 }],
-  });
+  } as const;
+  const result = await adapter.sendMessage("ses_1", request);
+  const repeated = await adapter.sendMessage("ses_1", request);
 
+  const requestBody = requestBodies[0];
   assert.ok(requestBody);
   const messageID = requestBody.messageID;
   assert.ok(typeof messageID === "string");
-  assert.match(messageID, /^msg/);
+  assert.match(messageID, /^msg_[a-f0-9]{32}$/u);
   assert.notEqual(messageID, "bridge_request_1");
+  assert.equal(requestBodies[1]?.messageID, messageID, "a safe retry changed OpenCode's native message identity");
   assert.deepEqual(requestBody.parts, [
     { type: "text", text: "Run the focused tests" },
     { type: "file", mime: "image/jpeg", filename: "phone.jpg", url: "data:image/jpeg;base64,AQID" },
   ]);
   assert.deepEqual(requestBody.model, { providerID: "openai", modelID: "gpt-5" });
+  assert.equal(requestBody.system, "Use the configured EYES tool before answering image questions.");
+  assert.deepEqual(requestBody.tools, {
+    uar_mesh_ask_eyes: false,
+    uar_mesh_tethoq_turn_support: false,
+  },
+    "EYES guidance-like prose must not expose the task-scoped tool without an explicit Bridge grant");
+  assert.doesNotMatch(JSON.stringify(requestBody.parts), /configured EYES tool/u,
+    "native hidden instructions must not be duplicated into the visible user message");
   assert.equal(requestBody.variant, "high");
   assert.deepEqual(result, {
     accepted: true,
     providerTurnId: messageID,
     details: ["OpenCode accepted the asynchronous prompt."],
   });
+  assert.equal(repeated.providerTurnId, messageID);
 });
 
-test("OpenCode branches with the documented session fork endpoint", async () => {
-  let requestBody: unknown;
+test("OpenCode EYES shares the existing workspace and removes all tools on every helper turn", async (t) => {
+  const calls: Array<{ path: string; directory: string | null; body: Record<string, unknown> }> = [];
   const fetchLike: FetchLike = async (input, init) => {
     const url = requestUrl(input);
+    const body = typeof init?.body === "string" ? JSON.parse(init.body) as Record<string, unknown> : {};
+    calls.push({ path: url.pathname, directory: url.searchParams.get("directory"), body });
+    if (url.pathname === "/path") return jsonResponse({ directory: "C:\\existing-server" });
+    if (url.pathname === "/session") return jsonResponse({ id: "eyes", title: "Visual support", directory: "C:\\existing-server", time: { created: 1, updated: 1 } });
+    return new Response(null, { status: 204 });
+  };
+  const adapter = new OpenCodeAdapter({ hostId: "host", fetch: fetchLike, activityReader: new SequenceActivityReader(new Set()) });
+  t.after(() => adapter.dispose());
+  const helper = await adapter.createSession({ workingDirectory: "C:\\unrelated-parent", metadata: { internalPurpose: "vision_proxy" } });
+  await adapter.sendMessage(helper.providerSessionId, { requestId: "helper", content: "Inspect", clientToolOverrides: { ask_eyes: true } });
+  await adapter.sendMessage("restored-eyes", { requestId: "restored", content: "Inspect", metadata: { internalPurpose: "vision_proxy" } });
+  await adapter.sendMessage("normal", { requestId: "normal", content: "Build", clientToolOverrides: { ask_eyes: true } });
+  const creation = calls.find(call => call.path === "/session")!;
+  assert.equal(creation.directory, "C:\\existing-server");
+  assert.deepEqual(creation.body.permission, [{ permission: "*", pattern: "*", action: "deny" }]);
+  const prompts = calls.filter(call => call.path.endsWith("/prompt_async"));
+  assert.deepEqual(prompts.map(call => call.body.tools), [
+    { "*": false }, { "*": false }, { uar_mesh_ask_eyes: true, uar_mesh_tethoq_turn_support: true },
+  ]);
+  assert.equal(calls.some(call => call.path === "/config" || call.path === "/mcp"), false);
+});
+
+test("OpenCode confirms a persisted stable prompt after its HTTP response disconnects", async (t) => {
+  let persistedMessageId: string | undefined;
+  const calls: string[] = [];
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    calls.push(`${init?.method ?? "GET"} ${url.pathname}`);
+    if (url.pathname === "/session/ses_ambiguous_send/prompt_async") {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      assert.equal(typeof body.messageID, "string");
+      persistedMessageId = String(body.messageID);
+      throw new Error("socket closed after OpenCode persisted the prompt");
+    }
+    assert.equal(url.pathname, `/session/ses_ambiguous_send/message/${persistedMessageId}`);
+    return jsonResponse({
+      info: {
+        id: persistedMessageId,
+        sessionID: "ses_ambiguous_send",
+        role: "user",
+        time: { created: 1 },
+      },
+      parts: [{ id: "persisted-text", type: "text", text: "Keep the optimistic row" }],
+    });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_ambiguous_send",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+  t.after(() => adapter.dispose());
+
+  const result = await adapter.sendMessage("ses_ambiguous_send", {
+    requestId: "ambiguous-send-request",
+    content: "Keep the optimistic row",
+  });
+
+  assert.deepEqual(result, {
+    accepted: true,
+    providerTurnId: persistedMessageId,
+    details: ["OpenCode accepted the asynchronous prompt before its response disconnected."],
+  });
+  assert.deepEqual(calls, [
+    "POST /session/ses_ambiguous_send/prompt_async",
+    `GET /session/ses_ambiguous_send/message/${persistedMessageId}`,
+  ]);
+  assert.equal(adapter.hasActiveTurn("ses_ambiguous_send"), true, "acceptance recovery rolled back the owned turn");
+});
+
+test("OpenCode rethrows the original prompt error when exact history does not prove acceptance", async (t) => {
+  let persistedMessageId: string | undefined;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/session/ses_rejected_send/prompt_async") {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      persistedMessageId = String(body.messageID);
+      return new Response("dispatch failed", { status: 503 });
+    }
+    assert.equal(url.pathname, `/session/ses_rejected_send/message/${persistedMessageId}`);
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_rejected_send",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+  t.after(() => adapter.dispose());
+
+  await assert.rejects(
+    () => adapter.sendMessage("ses_rejected_send", {
+      requestId: "rejected-send-request",
+      content: "Roll this row back",
+    }),
+    (error: unknown) => {
+      assert.equal(
+        typeof error === "object" && error !== null && "code" in error ? error.code : undefined,
+        "HTTP_503",
+        "the exact-read 404 replaced the original prompt_async failure",
+      );
+      return true;
+    },
+  );
+  assert.equal(adapter.hasActiveTurn("ses_rejected_send"), false, "a definite failure left a phantom owned turn");
+});
+
+test("OpenCode preserves native PDF attachments when the selected model explicitly supports PDF input", async (t) => {
+  let requestBody: Record<string, unknown> | undefined;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/provider") {
+      return jsonResponse({
+        connected: ["native-pdf"],
+        all: [{
+          id: "native-pdf",
+          models: {
+            reader: { id: "reader", capabilities: { input: { pdf: true } } },
+          },
+        }],
+      });
+    }
+    assert.equal(url.pathname, "/session/ses_pdf/prompt_async");
+    assert.equal(init?.method, "POST");
+    requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return new Response(null, { status: 204 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_pdf",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+  t.after(() => adapter.dispose());
+
+  await adapter.sendMessage("ses_pdf", {
+    requestId: "pdf-shape",
+    content: "Read the sentence.",
+    modelId: "native-pdf/reader",
+    attachments: [{
+      name: "one-sentence.pdf",
+      mimeType: "application/pdf",
+      dataBase64: "JVBERi0xLjQKJSBURVRIT1EgUERGCg==",
+      byteLength: 22,
+    }],
+  });
+
+  assert.deepEqual(requestBody?.parts, [
+    { type: "text", text: "Read the sentence." },
+    {
+      type: "file",
+      mime: "application/pdf",
+      filename: "one-sentence.pdf",
+      url: "data:application/pdf;base64,JVBERi0xLjQKJSBURVRIT1EgUERGCg==",
+    },
+  ]);
+  assert.doesNotMatch(JSON.stringify(requestBody), /byteLength/u, "renderer-only size metadata leaked into OpenCode's file part");
+});
+
+test("OpenCode grants turn support only for the explicitly routed task turn", async (t) => {
+  const requestBodies: { readonly sessionId: string; readonly body: Record<string, unknown> }[] = [];
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    const match = /^\/session\/([^/]+)\/prompt_async$/u.exec(url.pathname);
+    assert.ok(match);
+    requestBodies.push({
+      sessionId: decodeURIComponent(match[1]!),
+      body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+    });
+    return new Response(null, { status: 204 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_eyes_scope",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+  t.after(() => adapter.dispose());
+
+  await adapter.sendMessage("configured", {
+    requestId: "configured-image-turn",
+    content: "Inspect the routed image",
+    clientToolOverrides: { ask_eyes: true },
+  });
+  await adapter.sendMessage("fresh", {
+    requestId: "fresh-native-image-turn",
+    content: "Inspect this image directly",
+  });
+  await adapter.sendMessage("configured", {
+    requestId: "configured-text-followup",
+    content: "Continue without an image",
+  });
+
+  assert.deepEqual(requestBodies.map(({ sessionId, body }) => [sessionId, body.tools]), [
+    ["configured", { uar_mesh_ask_eyes: true, uar_mesh_tethoq_turn_support: true }],
+    ["fresh", { uar_mesh_ask_eyes: false, uar_mesh_tethoq_turn_support: false }],
+    ["configured", { uar_mesh_ask_eyes: false, uar_mesh_tethoq_turn_support: false }],
+  ]);
+});
+
+test("OpenCode scheduled retries do not resend a prompt already present in native history", async () => {
+  let acceptedMessageId: string | undefined;
+  let promptWrites = 0;
+  let historyReads = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname.startsWith("/session/ses_scheduled/message/")) {
+      historyReads += 1;
+      if (acceptedMessageId === undefined) return new Response("not found", { status: 404 });
+      assert.equal(url.pathname, `/session/ses_scheduled/message/${acceptedMessageId}`);
+      return jsonResponse({
+        info: {
+          id: acceptedMessageId,
+          sessionID: "ses_scheduled",
+          role: "user",
+          time: { created: 1 },
+        },
+        parts: [{ id: "scheduled-text", type: "text", text: "Run the scheduled task" }],
+      });
+    }
+    assert.equal(url.pathname, "/session/ses_scheduled/prompt_async");
+    assert.equal(init?.method, "POST");
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    assert.equal(typeof body.messageID, "string");
+    acceptedMessageId = String(body.messageID);
+    promptWrites += 1;
+    return new Response(null, { status: 204 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+
+  const request = {
+    requestId: "schedule_opencode_exactly_once",
+    content: "Run the scheduled task",
+    metadata: { tethoqScheduledTaskId: "schedule_opencode_exactly_once" },
+  } as const;
+  const first = await adapter.sendMessage("ses_scheduled", request);
+  const retry = await adapter.sendMessage("ses_scheduled", request);
+
+  assert.equal(promptWrites, 1, "the persisted scheduled prompt was posted twice");
+  assert.equal(historyReads, 2);
+  assert.equal(retry.providerTurnId, first.providerTurnId);
+  assert.deepEqual(retry.details, ["OpenCode already accepted this scheduled prompt."]);
+  await adapter.dispose();
+});
+
+test("OpenCode scheduled retries fail closed when native message history is unavailable", async () => {
+  let promptWrites = 0;
+  const fetchLike: FetchLike = async (input) => {
+    const url = requestUrl(input);
+    if (url.pathname.startsWith("/session/ses_scheduled_failure/message/")) {
+      return new Response("unavailable", { status: 500 });
+    }
+    promptWrites += 1;
+    return new Response(null, { status: 204 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+
+  await assert.rejects(
+    () => adapter.sendMessage("ses_scheduled_failure", {
+      requestId: "schedule_opencode_history_failure",
+      content: "Do not duplicate this scheduled task",
+      metadata: { tethoqScheduledTaskId: "schedule_opencode_history_failure" },
+    }),
+    /OpenCode returned 500/,
+  );
+  assert.equal(promptWrites, 0, "an unverified scheduled retry reached prompt_async");
+  await adapter.dispose();
+});
+
+test("OpenCode omits the internal default effort sentinel from native prompts", async () => {
+  let requestBody: Record<string, unknown> | undefined;
+  const fetchLike: FetchLike = async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return new Response(null, { status: 204 });
+  };
+  const adapter = new OpenCodeAdapter({ hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", fetch: fetchLike, activityReader: new SequenceActivityReader(new Set()) });
+
+  await adapter.sendMessage("ses_default", {
+    requestId: "bridge_request_default",
+    content: "Use the model's native default",
+    modelId: "opencode-go/glm-5.3-flash",
+    reasoningEffort: "default",
+  });
+
+  assert.ok(requestBody);
+  assert.equal(Object.hasOwn(requestBody, "variant"), false);
+  await adapter.dispose();
+});
+
+test("OpenCode branches at the latest completed response instead of copying an active tail", async () => {
+  let requestBody: unknown;
+  let forkedMessageIds: string[] = [];
+  const sourceHistory = [
+    {
+      info: { id: "user_safe", sessionID: "source", role: "user", time: { created: 1 } },
+      parts: [{ id: "safe_prompt", type: "text", text: "Complete this" }],
+    },
+    {
+      info: {
+        id: "assistant_safe",
+        sessionID: "source",
+        role: "assistant",
+        parentID: "user_safe",
+        finish: "stop",
+        time: { created: 2, completed: 3 },
+      },
+      parts: [{ id: "safe_text", type: "text", text: "Completed history" }],
+    },
+    {
+      info: { id: "user_active", sessionID: "source", role: "user", time: { created: 4 } },
+      parts: [{ id: "active_prompt", type: "text", text: "Still running" }],
+    },
+    {
+      info: { id: "assistant_active", sessionID: "source", role: "assistant", parentID: "user_active", time: { created: 5 } },
+      parts: [{ id: "active_reasoning", type: "reasoning", text: "Not complete" }],
+    },
+  ];
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/session/source/message") return jsonResponse(sourceHistory);
     assert.equal(url.pathname, "/session/source/fork");
     assert.equal(init?.method, "POST");
     requestBody = JSON.parse(String(init?.body));
+    const boundaryId = typeof requestBody === "object" && requestBody !== null && !Array.isArray(requestBody)
+      && typeof (requestBody as Record<string, unknown>).messageID === "string"
+      ? (requestBody as Record<string, unknown>).messageID as string
+      : undefined;
+    const boundaryIndex = boundaryId === undefined
+      ? sourceHistory.length
+      : sourceHistory.findIndex((entry) => entry.info.id === boundaryId);
+    assert.ok(boundaryIndex >= 0, "the adapter supplied an unknown native fork boundary");
+    forkedMessageIds = sourceHistory.slice(0, boundaryIndex).map((entry) => entry.info.id);
     return jsonResponse({
       id: "forked",
       directory: "C:\\workspace",
@@ -214,40 +596,204 @@ test("OpenCode branches with the documented session fork endpoint", async () => 
 
   const session = await adapter.branchSession("source");
 
-  assert.deepEqual(requestBody, {});
+  assert.deepEqual(requestBody, { messageID: "user_active" });
+  assert.deepEqual(
+    forkedMessageIds,
+    ["user_safe", "assistant_safe"],
+    "OpenCode's exclusive fork boundary dropped the completed response or copied the active tail",
+  );
   assert.equal(session.providerSessionId, "forked");
   assert.equal(session.workingDirectory, "C:\\workspace");
   await adapter.dispose();
 });
 
-test("OpenCode session listing overrides the native 100-session default before local pagination", async () => {
-  const nativeSessions = Array.from({ length: 125 }, (_, index) => ({
+test("OpenCode forks all history when the completed response is already the safe tail", async () => {
+  let requestBody: unknown;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/session/source/message") return jsonResponse([
+      {
+        info: { id: "user_safe", sessionID: "source", role: "user", time: { created: 1 } },
+        parts: [{ id: "safe_prompt", type: "text", text: "Complete this" }],
+      },
+      {
+        info: {
+          id: "assistant_safe",
+          sessionID: "source",
+          role: "assistant",
+          parentID: "user_safe",
+          finish: "stop",
+          time: { created: 2, completed: 3 },
+        },
+        parts: [{ id: "safe_text", type: "text", text: "Done" }],
+      },
+    ]);
+    assert.equal(url.pathname, "/session/source/fork");
+    requestBody = JSON.parse(String(init?.body));
+    return jsonResponse({ id: "forked", directory: "C:\\workspace", title: "Safe fork", time: { created: 1, updated: 2 } });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+
+  const session = await adapter.branchSession("source");
+
+  assert.equal(session.providerSessionId, "forked");
+  assert.deepEqual(requestBody, {}, "an exclusive boundary at the safe assistant would drop the completed response");
+  await adapter.dispose();
+});
+
+test("OpenCode serializes a safe-tail fork against a concurrent Tethoq send", async () => {
+  const calls: string[] = [];
+  let markHistoryStarted = (): void => {};
+  const historyStarted = new Promise<void>((resolve) => { markHistoryStarted = resolve; });
+  let releaseHistory = (): void => {};
+  const historyGate = new Promise<void>((resolve) => { releaseHistory = resolve; });
+  const fetchLike: FetchLike = async (input) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/session/source/message") {
+      calls.push("history:start");
+      markHistoryStarted();
+      await historyGate;
+      calls.push("history:end");
+      return jsonResponse([
+        {
+          info: { id: "user_safe", sessionID: "source", role: "user", time: { created: 1 } },
+          parts: [{ id: "safe_prompt", type: "text", text: "Complete this" }],
+        },
+        {
+          info: {
+            id: "assistant_safe",
+            sessionID: "source",
+            role: "assistant",
+            parentID: "user_safe",
+            finish: "stop",
+            time: { created: 2, completed: 3 },
+          },
+          parts: [{ id: "safe_text", type: "text", text: "Done" }],
+        },
+      ]);
+    }
+    if (url.pathname === "/session/source/fork") {
+      calls.push("fork");
+      return jsonResponse({ id: "forked", directory: "C:\\workspace", title: "Safe fork", time: { created: 1, updated: 2 } });
+    }
+    if (url.pathname === "/session/source/prompt_async") {
+      calls.push("send");
+      return new Response(null, { status: 204 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+
+  const branch = adapter.branchSession("source");
+  await historyStarted;
+  const send = adapter.sendMessage("source", { requestId: "concurrent_send", content: "Do not enter the fork" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(calls, ["history:start"], "the concurrent prompt escaped while the safe branch point was being read");
+
+  releaseHistory();
+  const [forked, sent] = await Promise.all([branch, send]);
+
+  assert.equal(forked.providerSessionId, "forked");
+  assert.equal(sent.accepted, true);
+  assert.deepEqual(calls, ["history:start", "history:end", "fork", "send"]);
+  await adapter.dispose();
+});
+
+test("OpenCode session listing keeps a small native request and its local continuation snapshot bounded", async () => {
+  const nativeSessions = Array.from({ length: 1_000 }, (_, index) => ({
     id: `ses_${index}`,
     directory: "/workspace/project",
     title: `Session ${index}`,
-    time: { created: index, updated: index },
+    time: { created: 1_000 - index, updated: 1_000 - index },
   }));
   let nativeListUrl: URL | undefined;
+  let nativeListReads = 0;
   const fetchLike: FetchLike = async (input) => {
     const url = requestUrl(input);
     if (url.pathname === "/session") {
+      nativeListReads += 1;
       nativeListUrl = url;
-      const nativeLimit = Number(url.searchParams.get("limit") ?? "100");
-      return jsonResponse(nativeSessions.slice(0, nativeLimit));
+      // Simulate an older server that ignores the query limit. The adapter must
+      // still keep only its bounded recent snapshot.
+      return jsonResponse(nativeSessions);
     }
     if (url.pathname === "/session/status") return jsonResponse({});
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({ hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", fetch: fetchLike, activityReader: new SequenceActivityReader(new Set()) });
 
-  const page = await adapter.listSessions({ cursor: "100", limit: 50 });
+  const ids: string[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await adapter.listSessions({ limit: 20, ...(cursor === undefined ? {} : { cursor }) });
+    ids.push(...page.sessions.map((session) => session.providerSessionId));
+    cursor = page.nextCursor ?? undefined;
+    if (page.nextCursor === null) break;
+  } while (true);
 
   assert.ok(nativeListUrl);
-  assert.equal(nativeListUrl.searchParams.get("limit"), String(Number.MAX_SAFE_INTEGER));
-  assert.equal(page.sessions.length, 25);
-  assert.equal(page.sessions[0]?.providerSessionId, "ses_100");
-  assert.equal(page.sessions[24]?.providerSessionId, "ses_124");
-  assert.equal(page.nextCursor, null);
+  assert.equal(nativeListUrl.searchParams.get("limit"), "100");
+  assert.equal(nativeListReads, 1);
+  assert.deepEqual(ids, Array.from({ length: 100 }, (_, index) => `ses_${index}`));
+  assert.equal(new Set(ids).size, 100);
+  await adapter.dispose();
+});
+
+test("OpenCode refuses to branch a non-empty task with no completed response", async () => {
+  let forkCalls = 0;
+  const fetchLike: FetchLike = async (input) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/session/source/message") return jsonResponse([{
+      info: { id: "assistant_active", sessionID: "source", role: "assistant", parentID: "user_active", time: { created: 1 } },
+      parts: [{ id: "active_reasoning", type: "reasoning", text: "Still running" }],
+    }]);
+    if (url.pathname === "/session/source/fork") forkCalls += 1;
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+
+  await assert.rejects(() => adapter.branchSession("source"), /completed response boundary/i);
+  assert.equal(forkCalls, 0);
+  await adapter.dispose();
+});
+
+test("OpenCode can still fork a genuinely empty task", async () => {
+  let requestBody: unknown;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/session/source/message") return jsonResponse([]);
+    if (url.pathname === "/session/source/fork") {
+      requestBody = JSON.parse(String(init?.body));
+      return jsonResponse({ id: "forked", directory: "C:\\workspace", title: "Empty fork", time: { created: 1, updated: 1 } });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+
+  const session = await adapter.branchSession("source");
+  assert.equal(session.providerSessionId, "forked");
+  assert.deepEqual(requestBody, {});
+  await adapter.dispose();
 });
 
 test("OpenCode multi-page listing reads and normalizes the native session snapshot once per cycle", async () => {
@@ -285,14 +831,15 @@ test("OpenCode multi-page listing reads and normalizes the native session snapsh
 
   assert.equal(ids.length, 121);
   assert.equal(new Set(ids).size, 121);
+  assert.deepEqual(ids, Array.from({ length: 121 }, (_, index) => `cycle_${120 - index}`));
   assert.equal(sessionReads, 1);
   assert.equal(statusReads, 1);
-  assert.equal(reader.reads, 1);
+  assert.equal(reader.reads, 1, "the first page waits for one bounded startup activity snapshot");
 
   await adapter.listSessions({ limit: 40 });
   assert.equal(sessionReads, 2, "a later cursorless refresh starts a fresh native read cycle");
   assert.equal(statusReads, 2);
-  assert.equal(reader.reads, 2);
+  assert.equal(reader.reads, 1, "later catalogue cycles reuse the startup activity snapshot");
   await adapter.dispose();
 });
 
@@ -351,15 +898,26 @@ test("OpenCode live provider events invalidate an in-progress list snapshot", as
   await adapter.dispose();
 });
 
-test("OpenCode child-session listing filters the complete native session array before pagination", async () => {
+test("OpenCode child-session pagination uses the dedicated child list instead of a bounded root catalogue", async () => {
+  let broadListReads = 0;
+  let childListReads = 0;
   const fetchLike: FetchLike = async (input) => {
     const url = requestUrl(input);
-    if (url.pathname === "/session") return jsonResponse([
-      { id: "root", title: "Root", time: { created: 1, updated: 1 } },
-      { id: "child-a", parentID: "root", agent: "build", model: { providerID: "openai", id: "gpt-a", variant: "high" }, title: "A", time: { created: 2, updated: 2 } },
-      { id: "child-b", parentID: "root", agent: "plan", model: { providerID: "openai", id: "gpt-b" }, title: "B", time: { created: 3, updated: 3 } },
-      { id: "other", parentID: "different", title: "Other", time: { created: 4, updated: 4 } },
-    ]);
+    if (url.pathname === "/session/root/children") {
+      childListReads += 1;
+      return jsonResponse([
+        { id: "child-a", parentID: "root", agent: "build", model: { providerID: "openai", id: "gpt-a", variant: "high" }, title: "A", time: { created: 2, updated: 2 } },
+        { id: "child-b", parentID: "root", agent: "plan", model: { providerID: "openai", id: "gpt-b" }, title: "B", time: { created: 3, updated: 3 } },
+      ]);
+    }
+    if (url.pathname === "/session") {
+      broadListReads += 1;
+      return jsonResponse(Array.from({ length: 200 }, (_, index) => ({
+        id: `unrelated-${index}`,
+        title: "Unrelated",
+        time: { created: 1_000 - index, updated: 1_000 - index },
+      })));
+    }
     if (url.pathname === "/session/status") return jsonResponse({});
     return new Response("not found", { status: 404 });
   };
@@ -368,12 +926,16 @@ test("OpenCode child-session listing filters the complete native session array b
   const first = await adapter.listSessions({ parentProviderSessionId: "root", limit: 1 });
   assert.ok(first.nextCursor);
   const second = await adapter.listSessions({ parentProviderSessionId: "root", cursor: first.nextCursor, limit: 1 });
-  assert.deepEqual(first.sessions.map((session) => session.providerSessionId), ["child-a"]);
+  assert.deepEqual(first.sessions.map((session) => session.providerSessionId), ["child-b"]);
   assert.equal(first.sessions[0]?.parentSessionId, "host_1/opencode/root");
-  assert.equal(first.sessions[0]?.modelId, "openai/gpt-a");
-  assert.equal(first.sessions[0]?.variantId, "high");
-  assert.deepEqual(second.sessions.map((session) => session.providerSessionId), ["child-b"]);
+  assert.equal(first.sessions[0]?.modelId, "openai/gpt-b");
+  assert.equal(first.sessions[0]?.variantId, "default");
+  assert.equal(first.sessions[0]?.reasoningEffort, "default");
+  assert.deepEqual(second.sessions.map((session) => session.providerSessionId), ["child-a"]);
+  assert.equal(second.sessions[0]?.variantId, "high");
   assert.equal(second.nextCursor, null);
+  assert.equal(childListReads, 1);
+  assert.equal(broadListReads, 0, "child paging must not lose old children behind the bounded root catalogue");
   await adapter.dispose();
 });
 
@@ -399,9 +961,11 @@ test("OpenCode history opens with a bounded latest-message window", async () => 
   await adapter.dispose();
 });
 
-test("OpenCode listing uses persisted work only when native status is unavailable", async () => {
-  const fetchLike: FetchLike = async (input) => {
+test("OpenCode listing uses cached persisted work only when native status is unavailable", async () => {
+  const events = new SseFixture();
+  const fetchLike: FetchLike = async (input, init) => {
     const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
     if (url.pathname === "/session") return jsonResponse([
       { id: "persisted", title: "Persisted", time: { created: 1, updated: 2 } },
       { id: "native-idle", title: "Native idle", time: { created: 1, updated: 2 } },
@@ -410,7 +974,20 @@ test("OpenCode listing uses persisted work only when native status is unavailabl
     return new Response("not found", { status: 404 });
   };
   const reader = new SequenceActivityReader(new Set(["persisted", "native-idle"]));
-  const adapter = new OpenCodeAdapter({ hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", fetch: fetchLike, activityReader: reader });
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: reader,
+    activityPollIntervalMs: 60_000,
+  });
+  let persistedWorkingSeen = false;
+  await adapter.subscribe(null, (event) => {
+    if (event.providerSessionId === "persisted" && event.type === "session.status_changed" && event.payload.state === "working") {
+      persistedWorkingSeen = true;
+    }
+  });
+  await waitFor(() => persistedWorkingSeen, "the independent activity watcher must populate its cached state");
 
   const page = await adapter.listSessions();
 
@@ -440,11 +1017,128 @@ test("OpenCode listing reports idle for sessions with no native status and no ac
   await adapter.dispose();
 });
 
-test("OpenCode persisted activity watcher emits working and idle transitions", async () => {
-  const fetchLike: FetchLike = async () => new Response("data: {\"payload\":{\"type\":\"server.connected\",\"properties\":{}}}\n\n", {
-    status: 200,
-    headers: { "content-type": "text/event-stream" },
+test("OpenCode history rehydrates final output produced across a Tethoq generation restart", async () => {
+  const history: Array<Record<string, unknown>> = [{
+    info: {
+      id: "user_restart",
+      sessionID: "ses_restart",
+      role: "user",
+      time: { created: 1 },
+    },
+    parts: [{ id: "user_restart_text", type: "text", text: "Keep working while the shell reconnects" }],
+  }, {
+    info: {
+      id: "assistant_restart",
+      sessionID: "ses_restart",
+      role: "assistant",
+      parentID: "user_restart",
+      time: { created: 2 },
+    },
+    parts: [{ id: "assistant_restart_reasoning", type: "reasoning", text: "Still working" }],
+  }];
+  const fetchLike: FetchLike = async (input) => requestUrl(input).pathname === "/session/ses_restart/message"
+    ? jsonResponse(history)
+    : new Response("not found", { status: 404 });
+
+  const first = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set(["ses_restart"])),
   });
+  const beforeRestart = await first.getMessages("ses_restart");
+  assert.equal(beforeRestart.at(-1)?.status, "streaming");
+  await first.dispose();
+
+  history[1] = {
+    info: {
+      id: "assistant_restart",
+      sessionID: "ses_restart",
+      role: "assistant",
+      parentID: "user_restart",
+      finish: "stop",
+      time: { created: 2, completed: 4 },
+    },
+    parts: [
+      { id: "assistant_restart_reasoning", type: "reasoning", text: "Still working" },
+      { id: "assistant_restart_text", type: "text", text: "The durable run completed." },
+    ],
+  };
+  const replacement = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+  const afterRestart = await replacement.getMessages("ses_restart");
+
+  assert.equal(afterRestart.at(-1)?.status, "completed");
+  assert.equal(afterRestart.at(-1)?.parts.some((part) => part.type === "text" && part.text === "The durable run completed."), true);
+  await replacement.dispose();
+});
+
+test("OpenCode listing preserves unknown when the bounded startup activity source is unavailable", async () => {
+  let activityReads = 0;
+  const fetchLike: FetchLike = async (input) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/session") return jsonResponse([{ id: "unproven", title: "Unproven", time: { created: 1, updated: 2 } }]);
+    if (url.pathname === "/session/status") return jsonResponse({});
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: {
+      async readWorkingSessionIds() {
+        activityReads += 1;
+        return undefined;
+      },
+      close() {},
+    },
+  });
+
+  const page = await adapter.listSessions();
+
+  assert.equal(activityReads, 1);
+  assert.equal(page.sessions[0]?.state, "unknown", "empty status is not idle authority when persisted activity could not be read");
+  await adapter.dispose();
+});
+
+test("OpenCode keeps a known busy state across a failed status refresh but clears it on an authoritative empty snapshot", async () => {
+  let statusReads = 0;
+  const fetchLike: FetchLike = async (input) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/session") return jsonResponse([
+      { id: "external-busy", title: "External busy", time: { created: 1, updated: 2 } },
+    ]);
+    if (url.pathname === "/session/status") {
+      statusReads += 1;
+      if (statusReads === 1) return jsonResponse({ "external-busy": { type: "busy" } });
+      if (statusReads === 2) return new Response("temporarily unavailable", { status: 503 });
+      return jsonResponse({});
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+
+  assert.equal((await adapter.listSessions()).sessions[0]?.state, "working");
+  assert.equal((await adapter.listSessions()).sessions[0]?.state, "working", "a transport failure is unknown, not idle");
+  assert.equal((await adapter.listSessions()).sessions[0]?.state, "idle", "a successful empty status snapshot clears the old busy state");
+
+  await adapter.dispose();
+});
+
+test("OpenCode persisted activity watcher emits working and idle transitions", async () => {
+  const events = new SseFixture();
+  const fetchLike: FetchLike = async (input, init) => requestUrl(input).pathname === "/global/event"
+    ? events.response(init?.signal ?? undefined)
+    : new Response("not found", { status: 404 });
   const reader = new SequenceActivityReader(new Set(["desktop-session"]), new Set());
   const adapter = new OpenCodeAdapter({
     hostId: "host_1",
@@ -465,15 +1159,495 @@ test("OpenCode persisted activity watcher emits working and idle transitions", a
   assert.equal(reader.closed, true);
 });
 
+test("known external activity settles promptly even when its filesystem wake is missed", async (t) => {
+  const events = new SseFixture();
+  const fetchLike: FetchLike = async (input, init) => requestUrl(input).pathname === "/global/event"
+    ? events.response(init?.signal ?? undefined)
+    : new Response("not found", { status: 404 });
+  const reader = new SequenceActivityReader(new Set(["desktop-session"]), new Set());
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: reader,
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const states: Array<{ readonly state: string; readonly at: number }> = [];
+  const startedAt = performance.now();
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "session.status_changed" && typeof event.payload.state === "string") {
+      states.push({ state: event.payload.state, at: performance.now() - startedAt });
+    }
+  });
+
+  await waitFor(() => states.some(({ state }) => state === "idle"), "the exact known-active safety read must settle the missed completion wake");
+
+  assert.deepEqual(states.map(({ state }) => state), ["working", "idle"]);
+  assert.ok((states.at(-1)?.at ?? Number.POSITIVE_INFINITY) < 2_750, `missed completion wake settled after ${states.at(-1)?.at.toFixed(1)}ms`);
+  assert.deepEqual(reader.discoveryReads.slice(0, 2), [true, false], "only the startup read is provider-wide");
+  assert.deepEqual([...(reader.candidateReads[1] ?? [])], ["desktop-session"], "the fast fallback rechecks only the known active id");
+});
+
+test("OpenCode database changes discover external work and exact checks retain it until idle", async (t) => {
+  const events = new SseFixture();
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/status") return jsonResponse({});
+    if (url.pathname === "/project") return jsonResponse([]);
+    if (url.pathname === "/session") return jsonResponse([{
+      id: "desktop-owned",
+      directory: "/external/project",
+      title: "Desktop owned",
+      time: { created: 1, updated: 2 },
+    }]);
+    return new Response("not found", { status: 404 });
+  };
+  const reader = new SequenceActivityReader(
+    new Set(["desktop-owned"]),
+    new Set(["desktop-owned"]),
+    new Set(),
+  );
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: reader,
+    activityPollIntervalMs: 60_000,
+    activityDiscoveryIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const states: string[] = [];
+  const catalogueSignals: string[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.providerSessionId === "desktop-owned" && event.type === "session.status_changed") {
+      states.push(String(event.payload.state));
+    }
+    if (event.providerSessionId === "desktop-owned" && event.type === "session.updated" && event.payload.activityDiscovered === true) {
+      catalogueSignals.push(event.providerSessionId);
+    }
+  });
+
+  await waitFor(() => states[0] === "working", "startup discovery must recover external work without selecting its task");
+  await waitFor(() => catalogueSignals.length === 1, "new external activity must invalidate the bounded catalogue so an unloaded task can materialize");
+  assert.equal(reader.discoveryReads[0], true);
+  assert.equal(reader.completeDiscoveryReads[0], true, "startup must reconcile the complete lightweight catalogue");
+  assert.equal(reader.candidateReads[0]?.size, 0);
+  const materialized = await adapter.listSessions();
+  assert.equal(materialized.sessions.find((session) => session.providerSessionId === "desktop-owned")?.state, "working");
+
+  reader.signalChange();
+  await waitFor(() => reader.reads >= 2, "a WAL change must wake the activity loop instead of waiting for the safety poll");
+  assert.equal(reader.discoveryReads[1], false, "provider-wide discovery is throttled between change wakes");
+  assert.deepEqual([...(reader.candidateReads[1] ?? [])], ["desktop-owned"], "known-active work is reconciled by exact id");
+
+  reader.signalChange();
+  await waitFor(() => states.includes("idle"), "an exact change-triggered check must publish the external task's idle transition");
+  assert.deepEqual(states, ["working", "idle"]);
+});
+
+test("OpenCode startup and reconnect preserve every simultaneous Desktop-owned active task", async () => {
+  const runGeneration = async (): Promise<void> => {
+    const events = new SseFixture();
+    const fetchLike: FetchLike = async (input, init) => {
+      const url = requestUrl(input);
+      if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+      if (url.pathname === "/session/status") return jsonResponse({});
+      if (url.pathname === "/project") return jsonResponse([]);
+      if (url.pathname === "/session") return jsonResponse([
+        { id: "desktop-owned-a", directory: "/external/a", title: "External A", time: { created: 1, updated: 4 } },
+        { id: "desktop-owned-b", directory: "/external/b", title: "External B", time: { created: 2, updated: 3 } },
+      ]);
+      return new Response("not found", { status: 404 });
+    };
+    const reader = new SequenceActivityReader(new Set(["desktop-owned-a", "desktop-owned-b"]));
+    const adapter = new OpenCodeAdapter({
+      hostId: "host_1",
+      // This represents Tethoq's managed server: it owns neither external turn
+      // and therefore reports an empty native status map. Persisted activity is
+      // the provider-wide recovery path when Desktop's authenticated server
+      // cannot be adopted directly.
+      baseUrl: "http://127.0.0.1:4096/",
+      fetch: fetchLike,
+      activityReader: reader,
+      activityPollIntervalMs: 60_000,
+    });
+    const working = new Set<string>();
+    await adapter.subscribe(null, (event) => {
+      if (event.type === "session.status_changed" && event.payload.state === "working" && event.providerSessionId) {
+        working.add(event.providerSessionId);
+      }
+    });
+
+    const page = await adapter.listSessions();
+    await waitFor(() => working.size === 2, "both externally owned tasks must publish working state");
+    assert.deepEqual([...working].sort(), ["desktop-owned-a", "desktop-owned-b"]);
+    assert.deepEqual([...adapter.activeSessionIds()].sort(), ["desktop-owned-a", "desktop-owned-b"],
+      "server handoff must retain every provider- or database-owned active task, not only prompts sent by Tethoq");
+    assert.deepEqual(page.sessions.map((session) => [session.providerSessionId, session.state]), [
+      ["desktop-owned-a", "working"],
+      ["desktop-owned-b", "working"],
+    ]);
+    assert.equal(reader.discoveryReads[0], true, "each adapter generation rehydrates provider-wide activity before its first page");
+    assert.equal(reader.completeDiscoveryReads[0], true, "every adapter generation performs one complete startup safety read");
+    await adapter.dispose();
+  };
+
+  await runGeneration();
+  await runGeneration();
+});
+
+test("OpenCode provider-wide status polling unions native and SQLite work and preserves the last native snapshot on failure", async (t) => {
+  const events = new SseFixture();
+  let statusCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname !== "/session/status") return new Response("not found", { status: 404 });
+    statusCalls += 1;
+    if (statusCalls === 1) return jsonResponse({ "native-active": { type: "busy" } });
+    if (statusCalls === 2) throw new Error("temporary status outage");
+    return await new Promise<Response>((_resolve, reject) => {
+      const abort = (): void => reject(new Error("aborted"));
+      if (init?.signal?.aborted === true) abort();
+      else init?.signal?.addEventListener("abort", abort, { once: true });
+    });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set(["sqlite-active"])),
+    activityPollIntervalMs: 60_000,
+    nativeStatusPollIntervalMs: 20,
+  });
+  t.after(() => adapter.dispose());
+  const states: Array<{ id: string; state: string }> = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.providerSessionId !== undefined && event.type === "session.status_changed") {
+      states.push({ id: event.providerSessionId, state: String(event.payload.state) });
+    }
+  });
+
+  await waitFor(() => adapter.activeSessionIds().includes("native-active") && adapter.activeSessionIds().includes("sqlite-active"),
+    "the unselected native task and SQLite-only task must both become active");
+  await waitFor(() => statusCalls >= 2, "the bounded native poll must retry after its first snapshot");
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
+  assert.deepEqual([...adapter.activeSessionIds()].sort(), ["native-active", "sqlite-active"],
+    "an unavailable native read is not evidence that the last-known working task ended");
+  assert.equal(states.some(({ id, state }) => id === "native-active" && state === "working"), true);
+  assert.equal(states.some(({ id, state }) => id === "sqlite-active" && state === "working"), true);
+  assert.equal(states.some(({ id, state }) => id === "native-active" && state === "idle"), false);
+  assert.equal(statusCalls, 3, "one provider-wide request may be in flight; polling never fans out per task");
+});
+
+test("a slow native status snapshot cannot erase a newer SSE working state", async (t) => {
+  const events = new SseFixture();
+  let resolveStatus!: (response: Response) => void;
+  let markStatusStarted!: () => void;
+  const statusStarted = new Promise<void>((resolve) => { markStatusStarted = resolve; });
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname !== "/session/status") return new Response("not found", { status: 404 });
+    return await new Promise<Response>((resolve, reject) => {
+      resolveStatus = resolve;
+      markStatusStarted();
+      const abort = (): void => reject(new Error("aborted"));
+      if (init?.signal?.aborted === true) abort();
+      else init?.signal?.addEventListener("abort", abort, { once: true });
+    });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+    nativeStatusPollIntervalMs: 20,
+  });
+  t.after(() => adapter.dispose());
+  const states: string[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.providerSessionId === "sse-newer" && event.type === "session.status_changed") states.push(String(event.payload.state));
+  });
+  await statusStarted;
+  events.push({ payload: { type: "session.status", properties: { sessionID: "sse-newer", status: { type: "busy" } } } });
+  await waitFor(() => states.includes("working"), "the newer SSE working state must arrive while the HTTP snapshot is pending");
+
+  resolveStatus(jsonResponse({}));
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
+  assert.deepEqual(states, ["working"], "the older empty HTTP snapshot must not emit a false idle after SSE");
+  assert.equal(adapter.activeSessionIds().includes("sse-newer"), true);
+});
+
+test("a slow native status snapshot cannot resurrect work after a newer SSE idle", async (t) => {
+  const events = new SseFixture();
+  let resolveStatus!: (response: Response) => void;
+  let markStatusStarted!: () => void;
+  const statusStarted = new Promise<void>((resolve) => { markStatusStarted = resolve; });
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname !== "/session/status") return new Response("not found", { status: 404 });
+    return await new Promise<Response>((resolve, reject) => {
+      resolveStatus = resolve;
+      markStatusStarted();
+      const abort = (): void => reject(new Error("aborted"));
+      if (init?.signal?.aborted === true) abort();
+      else init?.signal?.addEventListener("abort", abort, { once: true });
+    });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+    nativeStatusPollIntervalMs: 20,
+  });
+  t.after(() => adapter.dispose());
+  const states: string[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.providerSessionId === "sse-newer" && event.type === "session.status_changed") states.push(String(event.payload.state));
+  });
+  await statusStarted;
+  events.push({ payload: { type: "session.status", properties: { sessionID: "sse-newer", status: { type: "busy" } } } });
+  events.push({ payload: { type: "session.status", properties: { sessionID: "sse-newer", status: { type: "idle" } } } });
+  await waitFor(() => states.length === 2, "the newer SSE busy-to-idle transition must finish while the HTTP snapshot is pending");
+
+  resolveStatus(jsonResponse({ "sse-newer": { type: "busy" } }));
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
+  assert.deepEqual(states, ["working", "idle"], "the older busy HTTP snapshot must not resurrect the completed SSE state");
+  assert.equal(adapter.activeSessionIds().includes("sse-newer"), false);
+});
+
+test("one slow external task cannot delay another task's working signal", async (t) => {
+  const events = new SseFixture();
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set(["desktop-owned-a", "desktop-owned-b"])),
+    activityPollIntervalMs: 60_000,
+  });
+  let releaseFirst = (): void => {};
+  const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  let firstEntered = false;
+  let secondEntered = false;
+  t.after(() => {
+    releaseFirst();
+    return adapter.dispose();
+  });
+  await adapter.subscribe(null, async (event) => {
+    if (event.type !== "session.status_changed" || event.payload.state !== "working") return;
+    if (event.providerSessionId === "desktop-owned-a") {
+      firstEntered = true;
+      await firstGate;
+    }
+    if (event.providerSessionId === "desktop-owned-b") secondEntered = true;
+  });
+
+  await waitFor(() => firstEntered, "the first discovered task should enter its identity path");
+  await waitFor(() => secondEntered, "a separate discovered task should publish without waiting for the first task");
+  releaseFirst();
+});
+
+test("OpenCode startup discovery can exact-read a new active task without waiting on its own event", async (t) => {
+  const events = new SseFixture();
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/status") return jsonResponse({});
+    if (url.pathname === "/session/desktop-owned") return jsonResponse({
+      id: "desktop-owned",
+      directory: "/external/project",
+      title: "Desktop owned",
+      time: { created: 1, updated: 2 },
+    });
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set(["desktop-owned"])),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  let exactSession: RemoteSession | undefined;
+  let exactReadMs = Number.POSITIVE_INFINITY;
+
+  await adapter.subscribe(null, async (event) => {
+    if (event.providerSessionId !== "desktop-owned"
+      || event.type !== "session.status_changed"
+      || event.payload.state !== "working") return;
+    const startedAt = performance.now();
+    exactSession = await adapter.getSession("desktop-owned");
+    exactReadMs = performance.now() - startedAt;
+  });
+  await waitFor(() => exactSession !== undefined, "startup activity identity read must not deadlock its own event");
+
+  assert.equal(exactSession?.state, "working");
+  assert.ok(exactReadMs < 750, `exact identity read waited ${exactReadMs.toFixed(1)}ms on its own startup snapshot`);
+});
+
+test("OpenCode promptly discovers unknown external work after a quiet database change", async (t) => {
+  const events = new SseFixture();
+  const fetchLike: FetchLike = async (input, init) => requestUrl(input).pathname === "/global/event"
+    ? events.response(init?.signal ?? undefined)
+    : new Response("not found", { status: 404 });
+  const reader = new SequenceActivityReader(new Set(), new Set(["new-external-task"]));
+  let clockOffsetMs = 0;
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: reader,
+    activityPollIntervalMs: 60_000,
+    now: () => new Date(Date.now() + clockOffsetMs),
+  });
+  t.after(() => adapter.dispose());
+  const states: string[] = [];
+  const catalogueSignals: string[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.providerSessionId === "new-external-task" && event.type === "session.status_changed") {
+      states.push(String(event.payload.state));
+    }
+    if (event.providerSessionId === "new-external-task"
+      && event.type === "session.updated"
+      && event.payload.activityDiscovered === true) {
+      catalogueSignals.push(event.providerSessionId);
+    }
+  });
+  await waitFor(() => reader.reads === 1, "startup discovery must establish the initial throttle");
+  // Advance the injected clock without adding a second of wall time: this
+  // represents the ordinary case where OpenCode starts after Tethoq startup.
+  clockOffsetMs = 5_000;
+
+  const changedAt = performance.now();
+  reader.signalChange();
+  await waitFor(
+    () => states.includes("working") && catalogueSignals.length === 1,
+    "a quiet WAL change must materialize unknown external work",
+  );
+
+  const elapsedMs = performance.now() - changedAt;
+  assert.ok(elapsedMs < 700, `external activity surfaced after ${elapsedMs.toFixed(1)}ms`);
+  assert.deepEqual(states, ["working"]);
+  assert.deepEqual(catalogueSignals, ["new-external-task"]);
+  assert.deepEqual(reader.discoveryReads.slice(0, 2), [true, true]);
+});
+
+test("OpenCode retries an unavailable change discovery without another filesystem event", async (t) => {
+  const events = new SseFixture();
+  const fetchLike: FetchLike = async (input, init) => requestUrl(input).pathname === "/global/event"
+    ? events.response(init?.signal ?? undefined)
+    : new Response("not found", { status: 404 });
+  const reader = new SequenceActivityReader(new Set(), undefined, new Set(["recovered-external-task"]));
+  let clockOffsetMs = 0;
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: reader,
+    activityPollIntervalMs: 60_000,
+    activityDiscoveryIntervalMs: 250,
+    now: () => new Date(Date.now() + clockOffsetMs),
+  });
+  t.after(() => adapter.dispose());
+  const states: string[] = [];
+  const catalogueSignals: string[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.providerSessionId === "recovered-external-task" && event.type === "session.status_changed") {
+      states.push(String(event.payload.state));
+    }
+    if (event.providerSessionId === "recovered-external-task"
+      && event.type === "session.updated"
+      && event.payload.activityDiscovered === true) {
+      catalogueSignals.push(event.providerSessionId);
+    }
+  });
+  await waitFor(() => reader.reads === 1, "startup discovery must finish before the changed commit");
+  clockOffsetMs = 5_000;
+
+  reader.signalChange();
+  await waitFor(() => reader.reads >= 2, "the changed commit must trigger its first discovery attempt");
+  assert.equal(states.length, 0, "an unavailable read is not working evidence");
+  await waitFor(
+    () => states.includes("working") && catalogueSignals.length === 1,
+    "the pending discovery must retry without a second filesystem event",
+  );
+
+  assert.equal(reader.reads, 3);
+  assert.deepEqual(reader.discoveryReads, [true, true, true]);
+  assert.ok(
+    reader.readStartedAt[2]! - reader.readStartedAt[1]! >= 200,
+    "the unavailable helper read must retain the bounded discovery cadence",
+  );
+  assert.deepEqual(states, ["working"]);
+  assert.deepEqual(catalogueSignals, ["recovered-external-task"]);
+});
+
+test("OpenCode coalesces a database write storm without an early exact read", async (t) => {
+  const events = new SseFixture();
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    return new Response("not found", { status: 404 });
+  };
+  const reader = new SequenceActivityReader(
+    new Set(["already-active"]),
+    new Set(["already-active"]),
+  );
+  let releaseStartup = (): void => {};
+  reader.nextReadGate = new Promise<void>((resolve) => { releaseStartup = resolve; });
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: reader,
+    activityPollIntervalMs: 60_000,
+    activityDiscoveryIntervalMs: 300,
+  });
+  t.after(() => adapter.dispose());
+  await adapter.subscribe(null, () => undefined);
+  await waitFor(() => reader.reads === 1, "startup discovery must begin");
+
+  for (let index = 0; index < 20; index += 1) reader.signalChange();
+  await new Promise((resolve) => setTimeout(resolve, 130));
+  releaseStartup();
+  for (let index = 0; index < 20; index += 1) reader.signalChange();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(reader.reads, 1, "a startup race must not trigger an early exact helper read");
+
+  await waitFor(() => reader.reads >= 2, "the coalesced provider-wide read must run when discovery is due");
+  assert.equal(reader.reads, 2);
+  assert.deepEqual(reader.discoveryReads, [true, true], "no early exact read should precede due discovery");
+  assert.ok(
+    reader.readStartedAt[1]! - reader.readStartedAt[0]! >= 250,
+    "continuous writes must not hot-loop the packaged SQLite helper",
+  );
+  assert.deepEqual([...(reader.candidateReads[1] ?? [])], ["already-active"]);
+});
+
 test("OpenCode does not settle an unproven turn when the server never emits session.idle", async (t) => {
-  const fetchLike: FetchLike = async (input) => {
+  const events = new SseFixture();
+  const fetchLike: FetchLike = async (input, init) => {
     const url = requestUrl(input);
     if (url.pathname === "/session/dispatched/prompt_async") return jsonResponse({});
     if (url.pathname === "/session/dispatched/message") return jsonResponse([]);
-    return new Response("data: {\"payload\":{\"type\":\"server.connected\",\"properties\":{}}}\n\n", {
-      status: 200,
-      headers: { "content-type": "text/event-stream" },
-    });
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    return new Response("not found", { status: 404 });
   };
   const reader = new SequenceActivityReader(new Set(), new Set());
   const adapter = new OpenCodeAdapter({
@@ -528,7 +1702,8 @@ test("OpenCode exposes live steering and persists a second prompt while work is 
 test("OpenCode clears the dispatch mark once activity disappearance confirms an exact terminal response", async (t) => {
   let promptId: string | undefined;
   let historyCalls = 0;
-  const fetchLike: FetchLike = async (input) => {
+  const events = new SseFixture();
+  const fetchLike: FetchLike = async (input, init) => {
     const url = requestUrl(input);
     if (url.pathname === "/session/dispatched/prompt_async") return jsonResponse({});
     if (url.pathname === "/session/dispatched/message") {
@@ -545,10 +1720,8 @@ test("OpenCode clears the dispatch mark once activity disappearance confirms an 
         parts: [{ id: "dispatched_text", type: "text", text: "Done" }],
       }]);
     }
-    return new Response("data: {\"payload\":{\"type\":\"server.connected\",\"properties\":{}}}\n\n", {
-      status: 200,
-      headers: { "content-type": "text/event-stream" },
-    });
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    return new Response("not found", { status: 404 });
   };
   const reader = new SequenceActivityReader(new Set(["dispatched"]), new Set());
   const adapter = new OpenCodeAdapter({
@@ -620,21 +1793,112 @@ test("OpenCode session updates emit flat canonical relationship and model metada
   assert.deepEqual(updates.slice(0, 2), [
     {
       providerSessionId: "child-live",
+      title: "Live child",
       modelId: "openai/gpt-live",
       variantId: "high",
+      reasoningEffort: "high",
       parentSessionId: "host_1/opencode/root",
       agentRole: "build",
     },
     {
       providerSessionId: "child-live",
+      title: "Live child",
       modelId: "openai/gpt-live",
       variantId: "high",
+      reasoningEffort: "high",
       parentSessionId: "host_1/opencode/root",
       agentRole: "build",
       state: "working",
     },
   ]);
   await adapter.dispose();
+});
+
+test("OpenCode message metadata publishes only real model changes and never mistakes a message id for a model", async (t) => {
+  const infos = [
+    { id: "assistant-a", sessionID: "session-model", role: "assistant", providerID: "opencode-go", modelID: "model-a", variant: "high", time: { created: 1 } },
+    { id: "user-a", sessionID: "session-model", role: "user", model: { providerID: "opencode-go", modelID: "model-a", variant: "high" }, time: { created: 2 } },
+    { id: "user-b", sessionID: "session-model", role: "user", model: { providerID: "opencode-go", modelID: "model-b", variant: "max" }, time: { created: 3 } },
+    { id: "assistant-b", sessionID: "session-model", role: "assistant", providerID: "opencode-go", modelID: "model-b", variant: "max", time: { created: 4 } },
+    { id: "assistant-a-again", sessionID: "session-model", role: "assistant", providerID: "opencode-go", modelID: "model-a", variant: "low", time: { created: 5 } },
+    { id: "assistant-a-default", sessionID: "session-model", role: "assistant", providerID: "opencode-go", modelID: "model-a", time: { created: 6 } },
+    // A replayed older snapshot must not regress the current A/default selection.
+    { id: "late-old-b", sessionID: "session-model", role: "assistant", providerID: "opencode-go", modelID: "model-b", variant: "max", time: { created: 4 } },
+    { id: "message-not-a-model", sessionID: "session-model", role: "assistant", providerID: "opencode-go", time: { created: 7 } },
+  ];
+  let served = false;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/session/session-model/message") {
+      return jsonResponse([{ info: infos[3], parts: [] }]);
+    }
+    if (url.pathname === "/global/event" && !served) {
+      served = true;
+      return new Response(infos.map((info) => `data: ${JSON.stringify({ payload: { type: "message.updated", properties: { info } } })}\n\n`).join(""), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }
+    if (url.pathname === "/global/event") {
+      return await new Promise<Response>((_resolve, reject) => {
+        const abort = (): void => reject(new Error("aborted"));
+        if (init?.signal?.aborted === true) abort();
+        else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+    }
+    return jsonResponse({});
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const updates: Array<Record<string, unknown>> = [];
+  let starts = 0;
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "session.updated" && event.payload.modelId !== undefined) updates.push(event.payload);
+    if (event.type === "message.started") starts += 1;
+  });
+  await waitFor(() => starts === infos.length, "every native message update should remain visible");
+
+  assert.deepEqual(updates, [
+    { modelId: "opencode-go/model-a", variantId: "high", reasoningEffort: "high" },
+    { modelId: "opencode-go/model-b", variantId: "max", reasoningEffort: "max" },
+    { modelId: "opencode-go/model-a", variantId: "low", reasoningEffort: "low" },
+    { modelId: "opencode-go/model-a", variantId: "default", reasoningEffort: "default" },
+  ]);
+  await adapter.getMessages("session-model");
+  assert.equal(updates.length, 4, "an older history refresh regressed the live model selection");
+});
+
+test("opening existing OpenCode history reports the latest persisted model selection", async (t) => {
+  const history = [
+    { info: { id: "latest", sessionID: "existing", role: "assistant", providerID: "opencode-go", modelID: "glm-5.3-flash", variant: "max", time: { created: 3, completed: 4 } }, parts: [] },
+    { info: { id: "old", sessionID: "existing", role: "assistant", providerID: "opencode-go", modelID: "deepseek-v4-pro", variant: "high", time: { created: 1, completed: 2 } }, parts: [] },
+  ];
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/session/existing/message") return jsonResponse(history);
+    if (url.pathname === "/global/event") {
+      return await new Promise<Response>((_resolve, reject) => {
+        const abort = (): void => reject(new Error("aborted"));
+        if (init?.signal?.aborted === true) abort();
+        else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+    }
+    return jsonResponse({});
+  };
+  const adapter = new OpenCodeAdapter({ hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", fetch: fetchLike, activityReader: new SequenceActivityReader(new Set()) });
+  t.after(() => adapter.dispose());
+  const updates: Array<Record<string, unknown>> = [];
+  await adapter.subscribe(null, (event) => { if (event.type === "session.updated") updates.push(event.payload); });
+
+  await adapter.getMessages("existing");
+
+  assert.deepEqual(updates, [{ modelId: "opencode-go/glm-5.3-flash", variantId: "max", reasoningEffort: "max" }]);
 });
 
 test("OpenCode part snapshots stream as incremental deltas keyed by part", async () => {
@@ -705,6 +1969,16 @@ test("live OpenCode edit, write, and run events expose what changed and what ran
       id: "run_live", messageID: "assistant_tools", sessionID: "ses_tools", type: "tool", tool: "bash",
       state: { status: "completed", input: { command: "npm test", workdir: "C:\\work" }, output: "12 tests passed" },
     } } },
+  }, {
+    payload: { type: "message.part.updated", properties: { part: {
+      id: "failed_live", messageID: "assistant_tools", sessionID: "ses_tools", type: "tool", tool: "bash",
+      state: { status: "error", input: { command: "npm run missing", workdir: "C:\\work" }, output: "Missing script: missing" },
+    } } },
+  }, {
+    payload: { type: "message.part.updated", properties: { part: {
+      id: "eyes_failed_live", messageID: "assistant_tools", sessionID: "ses_tools", type: "tool", tool: "uar_mesh_ask_eyes",
+      state: { status: "error", input: { question: "What is visible?" }, output: "429 quota exhausted key=req_private C:\\private\\session" },
+    } } },
   }];
   let served = false;
   const fetchLike: FetchLike = async (_input, init) => {
@@ -728,23 +2002,34 @@ test("live OpenCode edit, write, and run events expose what changed and what ran
     activityReader: new SequenceActivityReader(new Set()),
     activityPollIntervalMs: 60_000,
   });
-  const payloads: Array<Record<string, unknown>> = [];
+  const toolEvents: ProviderEvent[] = [];
   await adapter.subscribe(null, (event) => {
-    if (event.type === "tool.completed") payloads.push(event.payload);
+    if (event.type === "tool.completed") toolEvents.push(event);
   });
   const deadline = Date.now() + 1_000;
-  while (payloads.length < 3 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  while (toolEvents.length < 5 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
 
-  assert.deepEqual(payloads.map((payload) => ({ name: payload.name, output: payload.output })), [{
+  assert.deepEqual(toolEvents.slice(0, 4).map(({ payload }) => ({ name: payload.name, output: payload.output, status: payload.status })), [{
     name: "Edit C:\\work\\src\\app.ts",
     output: "File: C:\\work\\src\\app.ts\n\nReplaced:\nold\n\nWith:\nnew",
+    status: "completed",
   }, {
     name: "Write C:\\work\\notes.md",
     output: "File: C:\\work\\notes.md\n\nWritten content:\nRelease ready",
+    status: "completed",
   }, {
     name: "Run npm test",
     output: "Command: npm test\n\nWorking directory: C:\\work\n\nResult:\n12 tests passed",
+    status: "completed",
+  }, {
+    name: "Run npm run missing",
+    output: "Command: npm run missing\n\nWorking directory: C:\\work\n\nResult:\nMissing script: missing",
+    status: "failed",
   }]);
+  const eyesFailure = toolEvents[4];
+  assert.match(String(eyesFailure?.payload.output), /usage limit was reached or it is temporarily rate-limited/u);
+  assert.doesNotMatch(JSON.stringify(eyesFailure), /req_private|private\\\\session/u);
+  assert.equal(eyesFailure?.nativeEvent, undefined, "raw failed EYES provider data must stop at the adapter boundary");
   await adapter.dispose();
 });
 
@@ -950,20 +2235,20 @@ test("OpenCode session listing merges every project because an unscoped list onl
     if (url.pathname === "/project") {
       return jsonResponse([
         { id: "global", worktree: "/" },
-        { id: "37b4", worktree: "C:\cli_remote" },
+        { id: "37b4", worktree: "C:\example-repo" },
         { id: "0af1", worktree: "C:\ExampleProject" },
       ]);
     }
     if (url.pathname === "/session") {
       const directory = url.searchParams.get("directory");
       requested.push(directory);
-      if (directory === "C:\cli_remote") {
-        return jsonResponse([{ id: "ses_cli", directory: "C:\cli_remote", title: "cli", time: { created: 3, updated: 3 } }]);
+      if (directory === "C:\example-repo") {
+        return jsonResponse([{ id: "ses_cli", directory: "C:\example-repo", title: "cli", time: { created: 1, updated: 3 } }]);
       }
       if (directory === "C:\ExampleProject") {
-        return jsonResponse([{ id: "ses_example", directory: "C:\ExampleProject", title: "example", time: { created: 2, updated: 2 } }]);
+        return jsonResponse([{ id: "ses_example", directory: "C:\ExampleProject", title: "example", time: { created: 3, updated: 2 } }]);
       }
-      return jsonResponse([{ id: "ses_global", directory: "/", title: "global", time: { created: 1, updated: 1 } }]);
+      return jsonResponse([{ id: "ses_global", directory: "/", title: "global", time: { created: 2, updated: 1 } }]);
     }
     if (url.pathname === "/session/status") return jsonResponse({});
     return new Response("not found", { status: 404 });
@@ -972,12 +2257,15 @@ test("OpenCode session listing merges every project because an unscoped list onl
 
   const page = await adapter.listSessions();
 
-  const ids = page.sessions.map((session) => session.providerSessionId).sort();
+  const ids = page.sessions.map((session) => session.providerSessionId);
   assert.deepEqual(ids, ["ses_cli", "ses_example", "ses_global"]);
   // The global project is the unscoped list; "/" is never sent as a directory.
   assert.equal(requested.filter((entry) => entry === null).length, 1);
-  assert.ok(requested.includes("C:\cli_remote"));
+  assert.ok(requested.includes("C:\example-repo"));
   assert.ok(!requested.includes("/"));
+
+  const createdAscending = await adapter.listSessions({ sortKey: "created_at", sortDirection: "asc" });
+  assert.deepEqual(createdAscending.sessions.map((session) => session.providerSessionId), ["ses_cli", "ses_global", "ses_example"]);
   await adapter.dispose();
 });
 
@@ -985,13 +2273,13 @@ test("OpenCode session listing keeps other projects when one project cannot be r
   const fetchLike: FetchLike = async (input) => {
     const url = requestUrl(input);
     if (url.pathname === "/project") {
-      return jsonResponse([{ id: "global", worktree: "/" }, { id: "37b4", worktree: "C:\cli_remote" }, { id: "bad", worktree: "C:\broken" }]);
+      return jsonResponse([{ id: "global", worktree: "/" }, { id: "37b4", worktree: "C:\example-repo" }, { id: "bad", worktree: "C:\broken" }]);
     }
     if (url.pathname === "/session") {
       const directory = url.searchParams.get("directory");
       if (directory === "C:\broken") return new Response("boom", { status: 500 });
-      if (directory === "C:\cli_remote") {
-        return jsonResponse([{ id: "ses_cli", directory: "C:\cli_remote", title: "cli", time: { created: 3, updated: 3 } }]);
+      if (directory === "C:\example-repo") {
+        return jsonResponse([{ id: "ses_cli", directory: "C:\example-repo", title: "cli", time: { created: 3, updated: 3 } }]);
       }
       return jsonResponse([{ id: "ses_global", directory: "/", title: "global", time: { created: 1, updated: 1 } }]);
     }
@@ -1031,17 +2319,17 @@ test("OpenCode session listing honours a pinned directory instead of walking pro
     }
     if (url.pathname === "/session") {
       requested.push(url.searchParams.get("directory"));
-      return jsonResponse([{ id: "ses_pinned", directory: "C:\cli_remote", title: "pinned", time: { created: 1, updated: 1 } }]);
+      return jsonResponse([{ id: "ses_pinned", directory: "C:\example-repo", title: "pinned", time: { created: 1, updated: 1 } }]);
     }
     if (url.pathname === "/session/status") return jsonResponse({});
     return new Response("not found", { status: 404 });
   };
-  const adapter = new OpenCodeAdapter({ hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", directory: "C:\cli_remote", fetch: fetchLike, activityReader: new SequenceActivityReader(new Set()) });
+  const adapter = new OpenCodeAdapter({ hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", directory: "C:\example-repo", fetch: fetchLike, activityReader: new SequenceActivityReader(new Set()) });
 
 const page = await adapter.listSessions();
 
   assert.equal(projectCalls, 0);
-  assert.deepEqual(requested, ["C:\cli_remote"]);
+  assert.deepEqual(requested, ["C:\example-repo"]);
   assert.equal(page.sessions.length, 1);
   await adapter.dispose();
 });
@@ -1130,11 +2418,18 @@ class SseFixture {
   readonly #encoder = new TextEncoder();
   #queue: Uint8Array[] = [];
   #pendingPull: ((chunk: Uint8Array) => void) | undefined;
+  #controller: ReadableStreamDefaultController<Uint8Array> | undefined;
 
   public response(signal?: AbortSignal): Response {
     const stream = new ReadableStream<Uint8Array>({
       start: (controller) => {
-        signal?.addEventListener("abort", () => controller.close(), { once: true });
+        this.#controller = controller;
+        signal?.addEventListener("abort", () => {
+          if (this.#controller !== controller) return;
+          this.#controller = undefined;
+          this.#pendingPull = undefined;
+          try { controller.close(); } catch {}
+        }, { once: true });
       },
       pull: (controller) => {
         const chunk = this.#queue.shift();
@@ -1158,15 +2453,157 @@ class SseFixture {
       this.#queue.push(chunk);
     }
   }
+
+  public fail(error = new Error("event stream disconnected")): void {
+    const controller = this.#controller;
+    this.#controller = undefined;
+    this.#pendingPull = undefined;
+    controller?.error(error);
+  }
+
+  public close(): void {
+    const controller = this.#controller;
+    this.#controller = undefined;
+    this.#pendingPull = undefined;
+    controller?.close();
+  }
 }
 
 async function waitFor(condition: () => boolean, message: string): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
     if (condition()) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`timed out: ${message}`);
 }
+
+test("OpenCode marks every active task disconnected before the provider and restores from fresh reconnect truth", async (t) => {
+  const events = new SseFixture();
+  let statusCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/status") {
+      statusCalls += 1;
+      return jsonResponse({ "still-working": { type: "busy" } });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set(), new Set()),
+    activityPollIntervalMs: 60_000,
+    nativeStatusPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const observed: ProviderEvent[] = [];
+  await adapter.subscribe(null, (event) => { observed.push(event); });
+
+  events.push({ payload: { type: "session.status", properties: { sessionID: "still-working", status: { type: "busy" } } } });
+  events.push({ payload: { type: "session.status", properties: { sessionID: "now-idle", status: { type: "busy" } } } });
+  await waitFor(() => adapter.activeSessionIds().length === 2, "both initial native tasks must be active");
+
+  events.fail();
+  await waitFor(() => observed.some((event) => event.type === "provider.disconnected"), "the broken SSE feed must publish provider disconnect");
+  const providerDisconnectIndex = observed.findIndex((event) => event.type === "provider.disconnected");
+  for (const sessionId of ["still-working", "now-idle"]) {
+    const sessionDisconnectIndex = observed.findIndex((event) => event.providerSessionId === sessionId
+      && event.type === "session.status_changed" && event.payload.state === "disconnected");
+    assert.ok(sessionDisconnectIndex >= 0 && sessionDisconnectIndex < providerDisconnectIndex,
+      `${sessionId} must become disconnected before the Bridge unsubscribes from its provider`);
+  }
+  assert.deepEqual(adapter.activeSessionIds(), [], "transport loss must suppress stale active claims");
+  assert.equal(observed.some((event) => event.type === "agent.completed"
+    || event.type === "agent.interrupted" || event.type === "agent.error"), false,
+  "disconnect must not invent any terminal outcome");
+
+  // The next stream is established after the bounded reconnect backoff. The
+  // event may be queued before its Response exists; SseFixture delivers it to
+  // that new stream as soon as it subscribes.
+  events.push({ payload: { type: "server.connected", properties: {} } });
+  await waitFor(() => statusCalls === 1, "reconnect must force one fresh provider-wide status read");
+  await waitFor(() => observed.some((event) => event.providerSessionId === "still-working"
+    && event.type === "session.status_changed" && event.payload.state === "working"),
+  "the still-busy task must be restored");
+  await waitFor(() => observed.some((event) => event.providerSessionId === "now-idle"
+    && event.type === "session.status_changed" && event.payload.state === "idle"),
+  "a task omitted by the authoritative reconnect snapshot must become idle");
+  assert.deepEqual(adapter.activeSessionIds(), ["still-working"]);
+});
+
+test("a delayed reconnect snapshot cannot overwrite a newer live session state", async (t) => {
+  const events = new SseFixture();
+  let resolveReconnectStatus!: (response: Response) => void;
+  let markReconnectStatusStarted!: () => void;
+  const reconnectStatusStarted = new Promise<void>((resolve) => { markReconnectStatusStarted = resolve; });
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/status") {
+      markReconnectStatusStarted();
+      return await new Promise<Response>((resolve, reject) => {
+        resolveReconnectStatus = resolve;
+        const abort = (): void => reject(new Error("aborted"));
+        if (init?.signal?.aborted === true) abort();
+        else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set(), new Set()),
+    activityPollIntervalMs: 60_000,
+    nativeStatusPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const states: string[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.providerSessionId === "race" && event.type === "session.status_changed") states.push(String(event.payload.state));
+  });
+  events.push({ payload: { type: "session.status", properties: { sessionID: "race", status: { type: "busy" } } } });
+  await waitFor(() => adapter.activeSessionIds().includes("race"), "the initial task must be active");
+
+  events.fail();
+  await waitFor(() => states.includes("disconnected"), "the task must show transport uncertainty");
+  events.push({ payload: { type: "server.connected", properties: {} } });
+  await reconnectStatusStarted;
+  events.push({ payload: { type: "session.status", properties: { sessionID: "race", status: { type: "idle" } } } });
+  await waitFor(() => states.at(-1) === "idle", "newer SSE idle must win while reconnect history is pending");
+
+  resolveReconnectStatus(jsonResponse({ race: { type: "busy" } }));
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.deepEqual(states, ["working", "disconnected", "idle"]);
+  assert.equal(adapter.activeSessionIds().includes("race"), false);
+});
+
+test("a clean OpenCode event-stream EOF is a disconnect, not completion", async (t) => {
+  const events = new SseFixture();
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: async (input, init) => requestUrl(input).pathname === "/global/event"
+      ? events.response(init?.signal ?? undefined)
+      : new Response("not found", { status: 404 }),
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+    nativeStatusPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const eventTypes: string[] = [];
+  await adapter.subscribe(null, (event) => { eventTypes.push(event.type); });
+  events.push({ payload: { type: "session.status", properties: { sessionID: "clean-eof", status: { type: "busy" } } } });
+  await waitFor(() => adapter.activeSessionIds().includes("clean-eof"), "the clean-EOF task must start active");
+
+  events.close();
+  await waitFor(() => eventTypes.includes("provider.disconnected"), "clean EOF must publish disconnect");
+  assert.deepEqual(eventTypes.slice(-2), ["session.status_changed", "provider.disconnected"]);
+  assert.equal(eventTypes.some((type) => type === "agent.completed" || type === "agent.interrupted" || type === "agent.error"), false);
+});
 
 test("an active OpenCode steer becomes the owned follow-up and settles on its own final answer", async (t) => {
   const events = new SseFixture();
@@ -3115,6 +4552,629 @@ test("OpenCode waits for an actual no-tool continuation before aborting a runawa
   assert.equal(abortCalls, 1);
 });
 
+test("OpenCode settles an exact persisted no-tool response without waiting for session.idle", async (t) => {
+  const events = new SseFixture();
+  let promptId: string | undefined;
+  let historyCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_persisted_terminal/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_persisted_terminal/message") {
+      historyCalls += 1;
+      return jsonResponse([{
+        info: {
+          id: "assistant_terminal",
+          sessionID: "ses_persisted_terminal",
+          role: "assistant",
+          parentID: promptId,
+          finish: "stop",
+          time: { created: 10, completed: 20 },
+        },
+        parts: [{ id: "terminal_text", type: "text", text: "The focused checks passed." }],
+      }]);
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  let completions = 0;
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "agent.completed") completions += 1;
+  });
+
+  const sent = await adapter.sendMessage("ses_persisted_terminal", { requestId: "persisted_terminal", content: "Run the checks" });
+  promptId = sent.providerTurnId;
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_terminal",
+    sessionID: "ses_persisted_terminal",
+    role: "assistant",
+    parentID: promptId,
+    finish: "stop",
+    time: { created: 10, completed: 20 },
+  } } } });
+
+  await waitFor(() => completions === 1, "persisted terminal history must settle the turn without session.idle");
+  assert.ok(historyCalls >= 2, "completion requires two matching persisted-history confirmations");
+  assert.equal(adapter.hasActiveTurn("ses_persisted_terminal"), false);
+});
+
+for (const origin of ["owned", "external", "recovered"] as const) {
+  test(`OpenCode settles ${origin} terminal output despite persistent database and native busy`, async (t) => {
+    const events = new SseFixture();
+    const sessionID = `terminal_${origin}`;
+    const reader = new SequenceActivityReader(new Set([sessionID]));
+    let parentID = "external_user";
+    let ready = false;
+    let historyCalls = 0;
+    let aborts = 0;
+    const info = (): Record<string, unknown> => ({
+      id: "terminal_answer", sessionID, role: "assistant", parentID,
+      finish: "stop", time: { created: 10 },
+    });
+    const adapter = new OpenCodeAdapter({
+      hostId: "host_1", baseUrl: "http://127.0.0.1:4096/",
+      activityReader: reader, activityPollIntervalMs: 20,
+      nativeStatusPollIntervalMs: origin === "recovered" ? 20 : 60_000,
+      fetch: async (input, init) => {
+        const path = requestUrl(input).pathname;
+        if (path === "/global/event") return events.response(init?.signal ?? undefined);
+        if (path.endsWith("/prompt_async")) return new Response(null, { status: 204 });
+        if (path.endsWith("/abort")) { aborts += 1; return jsonResponse(true); }
+        if (path === "/session/status") return jsonResponse({ [sessionID]: { type: "busy" } });
+        if (path === `/session/${sessionID}`) return jsonResponse({ id: sessionID, title: "Completion probe", time: { created: 1, updated: 10 } });
+        if (path.endsWith("/message")) {
+          historyCalls += 1;
+          return jsonResponse(ready ? [{ info: info(), parts: [{ id: "answer_text", type: "text", text: "Done" }] }] : []);
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    t.after(() => adapter.dispose());
+    const received: ProviderEvent[] = [];
+    await adapter.subscribe(null, (event) => { received.push(event); });
+    if (origin === "owned") parentID = (await adapter.sendMessage(sessionID, { requestId: "terminal_busy", content: "Answer" })).providerTurnId!;
+    events.push({ payload: { type: "session.status", properties: { sessionID, status: { type: "busy" } } } });
+    ready = true;
+    const started = performance.now();
+    if (origin !== "recovered") events.push({ payload: { type: "message.updated", properties: { info: info() } } });
+    await waitFor(() => received.some((event) => event.type === "agent.completed"), "terminal output must settle while the provider remains busy");
+    assert.ok(performance.now() - started < 1_000, "completion must not wait for runner cleanup");
+    assert.ok(historyCalls >= 2, "terminal state requires matching history reads");
+    assert.ok(reader.reads >= 2, "database activity must refresh during the confirmation window");
+
+    const boundary = received.length;
+    events.push({ payload: { type: "session.status", properties: { sessionID, status: { type: "busy" } } } });
+    events.push({ payload: { type: "message.updated", properties: { info: { ...info(), time: { created: 10, completed: 20 } } } } });
+    events.push({ payload: { type: "session.idle", properties: { sessionID } } });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(adapter.hasActiveTurn(sessionID), false);
+    assert.equal(adapter.activeSessionIds().includes(sessionID), false);
+    assert.equal((await adapter.getSession(sessionID)).state, "idle", "a stale busy poll must not revive the task");
+    assert.equal(received.filter((event) => event.type === "agent.completed").length, 1);
+    assert.equal(received.slice(boundary).some((event) => event.payload.state === "working"), false);
+    assert.equal(aborts, 0, "completion presentation must not abort the provider");
+  });
+}
+
+for (const continuation of ["tool", "summary", "new-user", "new-assistant", "owned-follow-up", "live-follow-up", "error", "disconnect"] as const) {
+  test(`OpenCode external terminal confirmation preserves a ${continuation} arriving during history checks`, async (t) => {
+    const events = new SseFixture();
+    const sessionID = "external_race";
+    const info = { id: "external_answer", sessionID, role: "assistant", parentID: "external_user", finish: "stop", time: { created: 10 } };
+    let historyCalls = 0;
+    let advance = false;
+    const adapter = new OpenCodeAdapter({
+      hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", nativeStatusPollIntervalMs: 60_000,
+      fetch: async (input, init) => {
+        const path = requestUrl(input).pathname;
+        if (path === "/global/event") return events.response(init?.signal ?? undefined);
+        if (path.endsWith("/prompt_async")) return new Response(null, { status: 204 });
+        if (path.endsWith("/message")) {
+          historyCalls += 1;
+          return jsonResponse([
+            { info: { ...info, ...(advance && continuation === "summary" ? { summary: true } : {}) }, parts: advance && continuation === "tool" ? [{ type: "tool", tool: "bash", state: { status: "running" } }] : [{ type: "text", text: "Done" }] },
+            ...(advance && (continuation === "new-user" || continuation === "new-assistant")
+              ? [{ info: { id: "new_message", sessionID, role: continuation === "new-user" ? "user" : "assistant", parentID: "new_parent", time: { created: 30 } }, parts: [] }]
+              : []),
+          ]);
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    t.after(() => adapter.dispose());
+    let completions = 0;
+    await adapter.subscribe(null, (event) => { if (event.type === "agent.completed") completions += 1; });
+    events.push({ payload: { type: "session.status", properties: { sessionID, status: { type: "busy" } } } });
+    events.push({ payload: { type: "message.updated", properties: { info } } });
+    await waitFor(() => historyCalls === 1, "the first external terminal confirmation must run");
+    advance = true;
+    if (continuation === "owned-follow-up") await adapter.sendMessage(sessionID, { requestId: "next_owned", content: "Keep going" });
+    if (continuation === "live-follow-up") events.push({ payload: { type: "message.updated", properties: { info: {
+      id: "live_next", sessionID, role: "assistant", parentID: "next_user", time: { created: 30 },
+    } } } });
+    if (continuation === "error") events.push({ payload: { type: "session.error", properties: { sessionID, error: { name: "UnknownError", data: { message: "Provider failed" } } } } });
+    if (continuation === "disconnect") events.fail();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(completions, 0, "an older external answer must not finish ongoing work");
+    assert.equal(adapter.hasActiveTurn(sessionID), continuation !== "error" && continuation !== "disconnect");
+  });
+}
+
+test("OpenCode wrap-up busy after a no-tool stop cannot keep the turn live", async (t) => {
+  const events = new SseFixture();
+  let promptId: string | undefined;
+  let historyCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_wrapup_busy/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_wrapup_busy/message") {
+      historyCalls += 1;
+      return jsonResponse([{
+        info: {
+          id: "assistant_wrapup",
+          sessionID: "ses_wrapup_busy",
+          role: "assistant",
+          parentID: promptId,
+          finish: "stop",
+          time: { created: 10 },
+        },
+        parts: [{ id: "wrapup_text", type: "text", text: "The answer is already on screen." }],
+      }]);
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+    nativeStatusPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  let completions = 0;
+  const states: string[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "agent.completed") completions += 1;
+    if (event.type === "session.status_changed" && typeof event.payload.state === "string") states.push(event.payload.state);
+  });
+
+  const sent = await adapter.sendMessage("ses_wrapup_busy", { requestId: "wrapup_busy", content: "Answer now" });
+  promptId = sent.providerTurnId;
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_wrapup",
+    sessionID: "ses_wrapup_busy",
+    role: "assistant",
+    parentID: promptId,
+    finish: "stop",
+    time: { created: 10 },
+  } } } });
+  events.push({ payload: { type: "session.status", properties: { sessionID: "ses_wrapup_busy", status: { type: "busy" } } } });
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_wrapup",
+    sessionID: "ses_wrapup_busy",
+    role: "assistant",
+    parentID: promptId,
+    finish: "stop",
+    time: { created: 10, completed: 20 },
+  } } } });
+  events.push({ payload: { type: "session.status", properties: { sessionID: "ses_wrapup_busy", status: { type: "busy" } } } });
+
+  await waitFor(() => completions === 1, "step-finish stop must settle without waiting for session.idle or time.completed");
+  assert.ok(historyCalls >= 2);
+  assert.equal(adapter.hasActiveTurn("ses_wrapup_busy"), false);
+
+  events.push({ payload: { type: "session.status", properties: { sessionID: "ses_wrapup_busy", status: { type: "busy" } } } });
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_wrapup",
+    sessionID: "ses_wrapup_busy",
+    role: "assistant",
+    parentID: promptId,
+    finish: "stop",
+    time: { created: 10, completed: 20 },
+  } } } });
+  events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_wrapup_busy" } } });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(completions, 1, "runner wrap-up busy and idle must not emit a second completion");
+  assert.equal(states.includes("working"), false, "wrap-up busy after the answer must not revive working");
+  assert.equal(adapter.hasActiveTurn("ses_wrapup_busy"), false);
+});
+
+test("OpenCode treats a persisted length finish as a completed no-tool turn", async (t) => {
+  const events = new SseFixture();
+  let promptId: string | undefined;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_length_finish/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_length_finish/message") {
+      return jsonResponse([{
+        info: {
+          id: "assistant_length",
+          sessionID: "ses_length_finish",
+          role: "assistant",
+          parentID: promptId,
+          finish: "length",
+          time: { created: 10, completed: 20 },
+        },
+        parts: [{ id: "length_text", type: "text", text: "The reply was cut at the output cap." }],
+      }]);
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  let completions = 0;
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "agent.completed") completions += 1;
+  });
+
+  const sent = await adapter.sendMessage("ses_length_finish", { requestId: "length_finish", content: "Write a long answer" });
+  promptId = sent.providerTurnId;
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_length",
+    sessionID: "ses_length_finish",
+    role: "assistant",
+    parentID: promptId,
+    finish: "length",
+    time: { created: 10, completed: 20 },
+  } } } });
+
+  await waitFor(() => completions === 1, "finish=length with no tools must settle the turn");
+  assert.equal(adapter.hasActiveTurn("ses_length_finish"), false);
+});
+
+test("OpenCode keeps no-idle completion armed through the terminal assistant's closing text and reasoning parts", async (t) => {
+  const events = new SseFixture();
+  let promptId: string | undefined;
+  let historyCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_terminal_part/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_terminal_part/message") {
+      historyCalls += 1;
+      return jsonResponse([{
+        info: {
+          id: "assistant_terminal_part",
+          sessionID: "ses_terminal_part",
+          role: "assistant",
+          parentID: promptId,
+          finish: "stop",
+          time: { created: 10, completed: 20 },
+        },
+        parts: [
+          { id: "terminal_reasoning", type: "reasoning", text: "The checks finished." },
+          { id: "terminal_text", type: "text", text: "The focused checks passed." },
+        ],
+      }]);
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  let completions = 0;
+  const deltas: string[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "agent.completed") completions += 1;
+    if (event.type === "message.delta" && typeof event.payload.text === "string") deltas.push(event.payload.text);
+  });
+
+  const sent = await adapter.sendMessage("ses_terminal_part", { requestId: "terminal_part", content: "Run the checks" });
+  promptId = sent.providerTurnId;
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_terminal_part",
+    sessionID: "ses_terminal_part",
+    role: "assistant",
+    parentID: promptId,
+    finish: "stop",
+    time: { created: 10, completed: 20 },
+  } } } });
+  events.push({ payload: { type: "message.part.updated", properties: { part: {
+    id: "terminal_reasoning",
+    messageID: "assistant_terminal_part",
+    sessionID: "ses_terminal_part",
+    type: "reasoning",
+    text: "The checks finished.",
+  } } } });
+  events.push({ payload: { type: "message.part.updated", properties: { part: {
+    id: "terminal_text",
+    messageID: "assistant_terminal_part",
+    sessionID: "ses_terminal_part",
+    type: "text",
+    text: "",
+  } } } });
+  events.push({ payload: { type: "message.part.delta", properties: {
+    sessionID: "ses_terminal_part",
+    messageID: "assistant_terminal_part",
+    partID: "terminal_text",
+    field: "text",
+    delta: "The focused checks passed.",
+  } } });
+
+  await waitFor(() => completions === 1, "closing text and reasoning parts must not cancel persisted terminal completion");
+  assert.deepEqual(
+    deltas,
+    ["The checks finished.", "The focused checks passed."],
+    "closing text and reasoning still reach the transcript",
+  );
+  assert.ok(historyCalls >= 2, "completion requires two matching persisted-history confirmations");
+  assert.equal(completions, 1, "the no-idle terminal emits exactly one completion");
+  assert.equal(adapter.hasActiveTurn("ses_terminal_part"), false);
+});
+
+test("OpenCode keeps a turn active when a tool continuation persists between terminal confirmations", async (t) => {
+  const events = new SseFixture();
+  let promptId: string | undefined;
+  let historyCalls = 0;
+  let toolPersisted = false;
+  const terminal = () => ({
+    info: {
+      id: "assistant_tool_step",
+      sessionID: "ses_delayed_tool",
+      role: "assistant",
+      parentID: promptId,
+      finish: "stop",
+      time: { created: 10, completed: 20 },
+    },
+    parts: toolPersisted
+      ? [{ id: "tool_part", type: "tool", tool: "bash", state: { status: "pending", input: { command: "npm test" } } }]
+      : [{ id: "provisional_text", type: "text", text: "Checking now." }],
+  });
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_delayed_tool/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_delayed_tool/message") {
+      historyCalls += 1;
+      return jsonResponse([terminal()]);
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  let completions = 0;
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "agent.completed") completions += 1;
+  });
+
+  const sent = await adapter.sendMessage("ses_delayed_tool", { requestId: "delayed_tool", content: "Run the tests" });
+  promptId = sent.providerTurnId;
+  events.push({ payload: { type: "message.updated", properties: { info: terminal().info } } });
+  await waitFor(() => historyCalls === 1, "the first terminal confirmation must read persisted history");
+  toolPersisted = true;
+  await waitFor(() => historyCalls >= 2, "the quiet confirmation must observe the delayed tool continuation");
+  await new Promise((resolve) => setTimeout(resolve, 120));
+
+  assert.equal(completions, 0);
+  assert.equal(adapter.hasActiveTurn("ses_delayed_tool"), true);
+});
+
+test("OpenCode does not complete an earlier assistant when a chronologically later same-parent assistant is already persisted", async (t) => {
+  const events = new SseFixture();
+  let promptId: string | undefined;
+  let historyCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_later_assistant/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_later_assistant/message") {
+      historyCalls += 1;
+      // Deliberately reverse array order: terminality follows provider time,
+      // not whichever record the endpoint happens to serialize last.
+      return jsonResponse([{
+        info: {
+          id: "assistant_later",
+          sessionID: "ses_later_assistant",
+          role: "assistant",
+          parentID: promptId,
+          time: { created: 30 },
+        },
+        parts: [{ id: "later_text", type: "text", text: "Continuing the same prompt." }],
+      }, {
+        info: {
+          id: "assistant_earlier",
+          sessionID: "ses_later_assistant",
+          role: "assistant",
+          parentID: promptId,
+          finish: "stop",
+          time: { created: 10, completed: 20 },
+        },
+        parts: [{ id: "earlier_text", type: "text", text: "First response." }],
+      }]);
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  let completions = 0;
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "agent.completed") completions += 1;
+  });
+
+  const sent = await adapter.sendMessage("ses_later_assistant", { requestId: "later_assistant", content: "Continue" });
+  promptId = sent.providerTurnId;
+  events.push({ payload: { type: "message.updated", properties: { info: {
+    id: "assistant_earlier",
+    sessionID: "ses_later_assistant",
+    role: "assistant",
+    parentID: promptId,
+    finish: "stop",
+    time: { created: 10, completed: 20 },
+  } } } });
+  await waitFor(() => historyCalls >= 2, "the earlier terminal candidate must be rechecked");
+  await new Promise((resolve) => setTimeout(resolve, 120));
+
+  assert.equal(completions, 0);
+  assert.equal(adapter.hasActiveTurn("ses_later_assistant"), true);
+});
+
+test("OpenCode stops a repeated zero-token empty-response loop and exposes one useful error", async (t) => {
+  const events = new SseFixture();
+  const history: unknown[] = [];
+  let abortCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_empty_loop/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_empty_loop/message") return jsonResponse(history);
+    if (url.pathname === "/session/ses_empty_loop/abort") {
+      abortCalls += 1;
+      return jsonResponse({});
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const started: string[] = [];
+  const errors: string[] = [];
+  let completions = 0;
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "message.started") {
+      const info = event.payload.info;
+      if (typeof info === "object" && info !== null && !Array.isArray(info) && typeof info.id === "string") started.push(info.id);
+    }
+    if (event.type === "agent.error" && typeof event.payload.message === "string") errors.push(event.payload.message);
+    if (event.type === "agent.completed") completions += 1;
+  });
+  const sent = await adapter.sendMessage("ses_empty_loop", { requestId: "empty_loop", content: "Say test" });
+  assert.ok(sent.providerTurnId);
+  const emptyAssistant = (id: string, created: number) => ({
+    info: {
+      id,
+      sessionID: "ses_empty_loop",
+      role: "assistant",
+      parentID: sent.providerTurnId,
+      finish: "unknown",
+      time: { created, completed: created + 1 },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    },
+    parts: [
+      { id: `${id}_start`, type: "step-start" },
+      { id: `${id}_finish`, type: "step-finish", reason: "unknown" },
+    ],
+  });
+
+  const first = emptyAssistant("assistant_empty_1", 1);
+  history.push(first);
+  events.push({ payload: { type: "message.updated", properties: { info: first.info } } });
+  await waitFor(() => started.includes("assistant_empty_1"), "the first empty generation must remain ordinary provider evidence");
+  assert.equal(abortCalls, 0, "one empty provider result is not enough to stop a task");
+
+  const second = emptyAssistant("assistant_empty_2", 3);
+  history.push(second);
+  events.push({ payload: { type: "message.updated", properties: { info: second.info } } });
+  await waitFor(() => abortCalls === 1 && errors.length === 1, "the confirmed repeated empty loop must fail once");
+
+  events.push({ payload: { type: "session.error", properties: {
+    sessionID: "ses_empty_loop",
+    error: { name: "MessageAbortedError", data: { message: "Aborted" } },
+  } } });
+  const third = emptyAssistant("assistant_empty_3", 5);
+  history.push(third);
+  events.push({ payload: { type: "message.updated", properties: { info: third.info } } });
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
+  assert.equal(abortCalls, 1);
+  assert.equal(completions, 0);
+  assert.deepEqual(started, ["assistant_empty_1"]);
+  assert.deepEqual(errors, ["OpenCode returned repeated empty responses, so Tethoq stopped the turn. Retry or choose another model."]);
+  assert.equal(adapter.hasActiveTurn("ses_empty_loop"), false);
+});
+
+test("OpenCode does not stop unknown-finish generations that contain real output", async (t) => {
+  const events = new SseFixture();
+  const history: unknown[] = [];
+  let abortCalls = 0;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname === "/session/ses_unknown_output/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_unknown_output/message") return jsonResponse(history);
+    if (url.pathname === "/session/ses_unknown_output/abort") {
+      abortCalls += 1;
+      return jsonResponse({});
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  await adapter.subscribe(null, () => undefined);
+  const sent = await adapter.sendMessage("ses_unknown_output", { requestId: "unknown_output", content: "Continue" });
+  assert.ok(sent.providerTurnId);
+  const info = (id: string, created: number) => ({
+    id,
+    sessionID: "ses_unknown_output",
+    role: "assistant",
+    parentID: sent.providerTurnId,
+    finish: "unknown",
+    time: { created, completed: created + 1 },
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+  });
+  history.push({ info: info("assistant_empty", 1), parts: [
+    { id: "empty_start", type: "step-start" },
+    { id: "empty_finish", type: "step-finish", reason: "unknown" },
+  ] });
+  events.push({ payload: { type: "message.updated", properties: { info: info("assistant_empty", 1) } } });
+  history.push({ info: info("assistant_text", 3), parts: [{ id: "real_text", type: "text", text: "Recovered" }] });
+  events.push({ payload: { type: "message.updated", properties: { info: info("assistant_text", 3) } } });
+  events.push({ payload: { type: "message.part.updated", properties: { part: {
+    id: "real_text",
+    messageID: "assistant_text",
+    sessionID: "ses_unknown_output",
+    type: "text",
+    text: "Recovered",
+  } } } });
+  await new Promise((resolve) => setTimeout(resolve, 180));
+
+  assert.equal(abortCalls, 0);
+  assert.equal(adapter.hasActiveTurn("ses_unknown_output"), true);
+});
+
 test("an early unlabelled idle cannot finish a slow Tethoq-owned prompt", async (t) => {
   const events = new SseFixture();
   const history: unknown[] = [];
@@ -3130,6 +5190,13 @@ test("an early unlabelled idle cannot finish a slow Tethoq-owned prompt", async 
       return new Response(null, { status: 204 });
     }
     if (url.pathname === "/session/ses_slow_first/message") return jsonResponse(history);
+    if (url.pathname === "/session/ses_slow_first") return jsonResponse({
+      id: "ses_slow_first",
+      directory: "C:\\workspace",
+      title: "Slow first token",
+      time: { created: 1, updated: 2 },
+    });
+    if (url.pathname === "/session/status") return jsonResponse({ ses_slow_first: { type: "idle" } });
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
@@ -3153,6 +5220,8 @@ test("an early unlabelled idle cannot finish a slow Tethoq-owned prompt", async 
   assert.deepEqual(states, [], "idle status is not allowed to pump the Bridge queue");
   assert.deepEqual(completions, [], "a slow first token cannot be mistaken for a completed turn");
   assert.equal(adapter.hasActiveTurn("ses_slow_first"), true);
+  assert.equal((await adapter.getSession("ses_slow_first")).state, "working",
+    "catalogue refresh cannot repaint an owned prompt as idle before its response exists");
 
   const terminal = {
     info: {
@@ -3502,6 +5571,101 @@ test("a normal completed prompt never suppresses the next user prompt in the sam
   assert.equal(adapter.hasActiveTurn("ses_followup"), false);
 });
 
+test("replacement adapters never reuse provider event ids", async (t) => {
+  const firstFeed = new SseFixture();
+  const secondFeed = new SseFixture();
+  const createAdapter = (feed: SseFixture) => new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: async (input, init) => requestUrl(input).pathname === "/global/event"
+      ? feed.response(init?.signal ?? undefined)
+      : jsonResponse({}),
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+  const first = createAdapter(firstFeed);
+  const replacement = createAdapter(secondFeed);
+  t.after(async () => {
+    await first.dispose();
+    await replacement.dispose();
+  });
+  const firstIds: string[] = [];
+  const replacementIds: string[] = [];
+  await first.subscribe(null, (event) => { firstIds.push(event.eventId); });
+  await replacement.subscribe(null, (event) => { replacementIds.push(event.eventId); });
+
+  firstFeed.push({ payload: { type: "session.status", properties: { sessionID: "ses_same", status: { type: "busy" } } } });
+  secondFeed.push({ payload: { type: "session.status", properties: { sessionID: "ses_same", status: { type: "busy" } } } });
+  await waitFor(() => firstIds.length === 1 && replacementIds.length === 1, "both adapter generations must publish their first event");
+
+  assert.notEqual(firstIds[0], replacementIds[0], "Bridge dedupe must not mistake the replacement generation's first event for the retired adapter's first event");
+  assert.equal(new Set([...firstIds, ...replacementIds]).size, 2);
+});
+
+test("retired same-session idle cannot complete a newer primary prompt", async (t) => {
+  const primary = new SseFixture();
+  const secondary = new SseFixture();
+  const history: unknown[] = [];
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") {
+      return url.port === "63791"
+        ? primary.response(init?.signal ?? undefined)
+        : secondary.response(init?.signal ?? undefined);
+    }
+    if (url.pathname === "/session/ses_replaced/prompt_async") return new Response(null, { status: 204 });
+    if (url.pathname === "/session/ses_replaced/message") return jsonResponse(history);
+    return jsonResponse({});
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:63791/",
+    secondaryBaseUrl: "http://127.0.0.1:4096/",
+    secondaryActiveSessionIds: ["ses_replaced"],
+    fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000,
+  });
+  t.after(() => adapter.dispose());
+  const states: string[] = [];
+  let completions = 0;
+  await adapter.subscribe(null, (event) => {
+    if (event.type === "session.status_changed" && typeof event.payload.state === "string") states.push(event.payload.state);
+    if (event.type === "agent.completed") completions += 1;
+  });
+
+  const prompt = await adapter.sendMessage("ses_replaced", { requestId: "replacement_prompt", content: "New primary turn" });
+  assert.ok(prompt.providerTurnId);
+
+  secondary.push({ payload: { type: "session.status", properties: { sessionID: "ses_replaced", status: { type: "idle" } } } });
+  secondary.push({ payload: { type: "message.updated", properties: { sessionID: "ses_replaced", info: { id: "retired_assistant", role: "assistant" } } } });
+  secondary.push({ payload: { type: "session.idle", properties: { sessionID: "ses_replaced" } } });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  assert.equal(completions, 0, "the retired server cannot complete the replacement server's prompt");
+  assert.equal(states.includes("idle"), false, "the retired server cannot make the replacement prompt look idle");
+  assert.equal(adapter.hasActiveTurn("ses_replaced"), true);
+  assert.equal(adapter.isSecondaryBusy(), false, "the retired feed still drains its own same-session activity");
+
+  const assistant = {
+    info: {
+      id: "replacement_assistant",
+      sessionID: "ses_replaced",
+      role: "assistant",
+      parentID: prompt.providerTurnId,
+      finish: "stop",
+      time: { created: 1, completed: 2 },
+    },
+    parts: [{ id: "replacement_text", type: "text", text: "New turn complete" }],
+  };
+  history.push(assistant);
+  primary.push({ payload: { type: "message.updated", properties: assistant } });
+  primary.push({ payload: { type: "session.idle", properties: { sessionID: "ses_replaced" } } });
+  await waitFor(() => completions === 1, "the replacement server's own idle must complete its prompt normally");
+
+  assert.equal(adapter.hasActiveTurn("ses_replaced"), false);
+  assert.equal(completions, 1);
+});
+
 test("a secondary feed streams the retired server's turn and reports busy until it drains", async (t) => {
   const primary = new SseFixture();
   const secondary = new SseFixture();
@@ -3559,10 +5723,12 @@ test("a secondary feed streams the retired server's turn and reports busy until 
 });
 
 test("OpenCode context occupancy survives a trailing turn that recorded no usage", async () => {
+  let providerCalls = 0;
   const assistant = (tokens: unknown) => ({ info: { role: "assistant", providerID: "crofai", modelID: "deepseek-v4-pro", ...(tokens === null ? {} : { tokens }), cost: 0.1 } });
   const fetchLike: FetchLike = async (input) => {
     const path = requestUrl(input).pathname;
     if (path === "/provider") {
+      providerCalls += 1;
       return jsonResponse({
         connected: ["crofai"],
         all: [{ id: "crofai", name: "Crof", models: { "deepseek-v4-pro": { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro", limit: { context: 1_000_000 } } } }],
@@ -3584,7 +5750,183 @@ test("OpenCode context occupancy survives a trailing turn that recorded no usage
   assert.equal(context.usedTokens, 141_000);
   assert.equal(context.contextWindowTokens, 1_000_000);
   assert.equal(Math.round((context.usedPercent ?? 0) * 100) / 100, 14.1);
+  const refreshed = await adapter.getSessionContext("ses_1");
+  assert.equal(refreshed.usedTokens, 141_000);
+  assert.equal(refreshed.contextWindowTokens, 1_000_000);
+  assert.equal(providerCalls, 1, "usage refreshes must not block on an unchanged model catalogue");
   await adapter.dispose();
+});
+
+test("OpenCode compaction is not cut off by the ordinary request timeout", async (t) => {
+  let summarizeCalls = 0;
+  let summarized = false;
+  const fetchLike: FetchLike = async (input, init) => {
+    const path = requestUrl(input).pathname;
+    if (path === "/session/ses_compact/message") {
+      return jsonResponse([{
+        info: {
+          role: "assistant",
+          providerID: "crofai",
+          modelID: "deepseek-v4-pro",
+          tokens: { input: 100_000, output: 2_000, cache: { read: 0, write: 0 } },
+        },
+      }, ...(summarized ? openCodeCompactionHistory() : [])]);
+    }
+    if (path === "/session/ses_compact/summarize") {
+      summarizeCalls += 1;
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, 40);
+        const abort = () => {
+          clearTimeout(timer);
+          reject(init?.signal?.reason ?? new Error("aborted"));
+        };
+        if (init?.signal?.aborted) abort();
+        else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+      summarized = true;
+      return jsonResponse({});
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    requestTimeoutMs: 10,
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+  t.after(() => adapter.dispose());
+
+  await adapter.compactSession("ses_compact");
+
+  assert.equal(summarizeCalls, 1);
+});
+
+function openCodeCompactionHistory(error?: unknown): unknown[] {
+  return [
+    { info: { id: "new-marker", role: "user" }, parts: [{ type: "compaction" }] },
+    { info: { id: "new-summary", parentID: "new-marker", role: "assistant", summary: true, mode: "compaction", time: { completed: 20 }, ...(error !== undefined ? { error } : {}) } },
+  ];
+}
+
+test("OpenCode compaction waits for new history after HTTP acknowledgment and shares concurrent requests", async (t) => {
+  const baseline = [{ info: { role: "assistant", providerID: "test", modelID: "test" } },
+    { info: { id: "old-marker", role: "user" }, parts: [{ type: "compaction" }] },
+    { info: { id: "old-summary", parentID: "old-marker", role: "assistant", summary: true, time: { completed: 10 } } }];
+  let history: unknown[] = baseline;
+  let summarizeCalls = 0;
+  const adapter = new OpenCodeAdapter({
+    hostId: "host", baseUrl: "http://localhost/", compactionTimeoutMs: 5000,
+    fetch: async (input) => {
+      if (requestUrl(input).pathname.endsWith("/message")) return jsonResponse(history);
+      summarizeCalls += 1;
+      return jsonResponse({});
+    },
+  });
+  t.after(() => adapter.dispose());
+  let settled = false;
+  const pending = adapter.compactSession("session").then(() => { settled = true; });
+  const duplicate = adapter.compactSession("session");
+  await new Promise(r => setTimeout(r, 30));
+  assert.equal(summarizeCalls, 1);
+  assert.equal(settled, false, "neither HTTP success nor a stale summary proves completion");
+  history = [...baseline, ...openCodeCompactionHistory()];
+  await Promise.all([pending, duplicate]);
+  assert.equal(settled, true);
+});
+
+for (const failure of ["error", "cancelled", "request-failed", "disconnect", "dispose", "timeout"] as const) {
+  test(`OpenCode compaction rejects ${failure} without reporting success`, async (t) => {
+    let reads = 0;
+    let disposed = false;
+    const adapter = new OpenCodeAdapter({
+      hostId: "host", baseUrl: "http://localhost/", compactionTimeoutMs: 60,
+      fetch: async (input, init) => {
+        if (requestUrl(input).pathname.endsWith("/message")) {
+          reads += 1;
+          if (reads > 1 && failure === "disconnect") throw new Error("disconnected");
+          return jsonResponse([{ info: { role: "assistant", providerID: "test", modelID: "test" } },
+            ...(reads > 1 && (failure === "error" || failure === "cancelled")
+              ? openCodeCompactionHistory({ name: failure === "cancelled" ? "MessageAbortedError" : "APIError" })
+              : reads > 1 && failure === "request-failed" ? openCodeCompactionHistory().slice(0, 1) : [])]);
+        }
+        if (failure === "request-failed") return new Response("failed", { status: 500 });
+        if (failure === "dispose") {
+          setTimeout(() => { disposed = true; void adapter.dispose(); }, 5);
+          return await new Promise((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(new Error("disposed")), { once: true }));
+        }
+        return jsonResponse({});
+      },
+    });
+    t.after(() => adapter.dispose());
+    await assert.rejects(adapter.compactSession("session"));
+    if (failure === "dispose") assert.equal(disposed, true);
+  });
+}
+
+test("OpenCode compaction completes from provider history when the summarize response never closes", async (t) => {
+  let messageReads = 0;
+  let summarizeCalls = 0;
+  let summarizeAborted = false;
+  const baseline = [{
+    info: {
+      id: "msg_before",
+      role: "assistant",
+      providerID: "crofai",
+      modelID: "deepseek-v4-pro",
+      tokens: { input: 100_000, output: 2_000, cache: { read: 0, write: 0 } },
+    },
+  }];
+  const completed = [
+    ...baseline,
+    { info: { id: "msg_compaction", role: "user" }, parts: [{ type: "compaction", auto: false }] },
+    {
+      info: {
+        id: "msg_summary",
+        parentID: "msg_compaction",
+        role: "assistant",
+        mode: "compaction",
+        summary: true,
+        time: { created: 10, completed: 20 },
+        finish: "stop",
+      },
+      parts: [{ type: "text", text: "Compacted context" }],
+    },
+  ];
+  const fetchLike: FetchLike = async (input, init) => {
+    const path = requestUrl(input).pathname;
+    if (path === "/session/ses_compact/message") {
+      messageReads += 1;
+      return jsonResponse(messageReads === 1 ? baseline : completed);
+    }
+    if (path === "/session/ses_compact/summarize") {
+      summarizeCalls += 1;
+      await new Promise<void>((_resolve, reject) => {
+        const abort = () => {
+          summarizeAborted = true;
+          reject(init?.signal?.reason ?? new Error("aborted"));
+        };
+        if (init?.signal?.aborted) abort();
+        else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+      return jsonResponse({});
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1",
+    baseUrl: "http://127.0.0.1:4096/",
+    fetch: fetchLike,
+    requestTimeoutMs: 10,
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+  t.after(() => adapter.dispose());
+
+  await adapter.compactSession("ses_compact");
+
+  assert.equal(summarizeCalls, 1);
+  assert.equal(messageReads, 2);
+  assert.equal(summarizeAborted, true, "the completed lifecycle left the hanging HTTP response open");
 });
 
 test("OpenCode reports an unknown occupancy rather than claiming an empty context", async () => {

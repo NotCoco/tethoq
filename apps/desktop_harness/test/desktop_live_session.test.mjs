@@ -230,6 +230,7 @@ test("preferences persist experimental, reasoning-display, and concrete agent de
   t.after(() => rm(path, { force: true }));
   const store = await preferencesModule.DesktopPreferencesStore.load(path);
   assert.equal(store.value().experimentalFeatures, false);
+  assert.equal(store.value().allowForeignSubagents, false);
   assert.equal(store.value().reasoningDisplay, "compact");
   assert.equal(store.value().localOpenHandlerId, "system");
   assert.deepEqual(store.value().agentDefaults, {});
@@ -242,16 +243,20 @@ test("preferences persist experimental, reasoning-display, and concrete agent de
   await store.setLocalOpenHandler("vscode");
   await store.setAgentDefault("codex", { modelId: "gpt-5.6-sol", reasoningEffort: "medium" });
   assert.equal(store.value().experimentalFeatures, true);
+  assert.equal(store.value().allowForeignSubagents, true);
   assert.equal(store.value().reasoningDisplay, "expanded");
   assert.equal(store.value().localOpenHandlerId, "vscode");
   assert.deepEqual(store.value().agentDefaults, { codex: { modelId: "gpt-5.6-sol", reasoningEffort: "medium" } });
   assert.equal(changed.length, 4);
   const reloaded = await preferencesModule.DesktopPreferencesStore.load(path);
   assert.equal(reloaded.value().experimentalFeatures, true);
+  assert.equal(reloaded.value().allowForeignSubagents, true);
   assert.equal(reloaded.value().reasoningDisplay, "expanded");
   assert.equal(reloaded.value().localOpenHandlerId, "vscode");
   assert.deepEqual(reloaded.value().agentDefaults, { codex: { modelId: "gpt-5.6-sol", reasoningEffort: "medium" } });
-  assert.deepEqual(preferencesModule.validateDesktopPreferences({ version: 9, experimentalFeatures: "yes", reasoningDisplay: "verbose", localOpenHandlerId: "unknown", agentDefaults: { codex: { modelId: "  gpt-5.6-sol  ", reasoningEffort: " high " }, bad: { modelId: "" } }, extra: 1 }), { version: 1, experimentalFeatures: false, reasoningDisplay: "compact", localOpenHandlerId: "system", closeAction: "tray", launchAtLogin: "off", alerts: "all", agentDefaults: { codex: { modelId: "gpt-5.6-sol", reasoningEffort: "high" } }, globalAgentsPath: null, taskOverrides: {}, allowForeignSubagents: false, foreignSubagentOverrides: {}, ears: { enabled: false, providerId: null, modelId: null, mode: "cleaned" } });
+  assert.deepEqual(preferencesModule.validateDesktopPreferences({ version: 9, experimentalFeatures: "yes", reasoningDisplay: "verbose", taskListMode: "folders", localOpenHandlerId: "unknown", agentDefaults: { codex: { modelId: "  gpt-5.6-sol  ", reasoningEffort: " high " }, bad: { modelId: "" } }, extra: 1 }), { version: 1, experimentalFeatures: false, reasoningDisplay: "compact", taskListMode: "recent", savedProjectDirectories: [], localOpenHandlerId: "system", closeAction: "tray", launchAtLogin: "off", alerts: "all", agentDefaults: { codex: { modelId: "gpt-5.6-sol", reasoningEffort: "high" } }, globalAgentsPath: null, taskOverrides: {}, allowForeignSubagents: false, foreignSubagentOverrides: {}, ears: { enabled: false, providerId: null, modelId: null, mode: "cleaned" } });
+  assert.equal(preferencesModule.validateDesktopPreferences({ experimentalFeatures: false, allowForeignSubagents: true }).allowForeignSubagents, false);
+  assert.equal(preferencesModule.validateDesktopPreferences({ experimentalFeatures: true, allowForeignSubagents: false }).allowForeignSubagents, true);
 
   const agentsPath = join(outputDirectory, "AGENTS.md");
   await writeFile(agentsPath, "Keep answers calm and concise.\n", "utf8");
@@ -271,7 +276,7 @@ test("every instant-session entry point is gated and the backend rejects while d
   ]);
 
   // Renderer: the composer entry renders only when the experimental gate is on.
-  assert.match(composer, /\{experimental && onInstantSession && !draftSession \? <button[\s\S]*?Instant session/);
+  assert.match(composer, /\{experimental && onInstantSession \? <button[\s\S]*?if \(draftSession\) void requestDraftAction\("instant"\)[\s\S]*?Instant session/);
   assert.match(composer, /onInstantSession\?: \(\) => void/);
   assert.doesNotMatch(composer, /session\.vision\.ask/);
   assert.doesNotMatch(composer, /liveSessionAction/);

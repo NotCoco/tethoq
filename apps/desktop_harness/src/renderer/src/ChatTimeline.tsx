@@ -1,18 +1,50 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { AlertIcon, AnnotationIcon, BranchIcon, CheckIcon, ChevronDownIcon, CompactionIcon, CopyIcon, ScreenshotIcon, WorkflowIcon, XIcon } from "./icons";
+import { AgentIcon, AlertIcon, AnnotationIcon, BranchIcon, CheckIcon, ChevronDownIcon, ChevronRightIcon, CompactionIcon, ContextHandoffIcon, CopyIcon, FileIcon, ScreenshotIcon, SubagentsIcon, WorkflowIcon, XIcon } from "./icons";
 import { copyText as copyToClipboard } from "./clipboard";
 import { ProviderLogo, providerDisplayName } from "./components";
 import { RichText } from "./RichText";
 import { AudioPlaybackChip } from "./audio_dictation";
 import type { Provider, ProviderId, ProviderStatus, TimelineItem, TimelineWorkflow } from "./types";
 import { responseAnnotationCopyText } from "./response_annotations";
+import { reasoningDisplayLabel } from "../../../../../packages/protocol/src/reasoning";
 
-const routineActivityKinds = new Set<TimelineItem["kind"]>(["tool", "command", "file", "subagent"]);
+const routineActivityKinds = new Set<TimelineItem["kind"]>(["tool", "command", "file"]);
 
 function isRoutineActivity(item: TimelineItem): boolean {
-  return routineActivityKinds.has(item.kind);
+  if (isContextHandoffItem(item)) return false;
+  return item.notice !== "eyes_failure" && (routineActivityKinds.has(item.kind)
+    || item.kind === "subagent" && !!item.childSessionId && (item.state === "completed" || item.state === "failed"));
 }
+
+export const CONTEXT_HANDOFF_TITLE = "Context handoff";
+
+export function isContextHandoffItem(item: TimelineItem): boolean {
+  if (item.kind !== "tool") return false;
+  const title = (item.title ?? "").trim().toLowerCase();
+  return title === "context handoff" || title === "custom context handoff";
+}
+
+export function contextHandoffCustomNote(item: TimelineItem): string {
+  return (item.body ?? "").trim();
+}
+
+const HandoffNotice = memo(function HandoffNotice({ item }: { item: TimelineItem }) {
+  const customNote = contextHandoffCustomNote(item);
+  const isCustom = customNote.length > 0;
+  const time = new Date(item.timestamp).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return <article className={`timeline-handoff${isCustom ? " timeline-handoff-custom" : ""}`} data-scroll-anchor={item.presentationId ?? item.id} aria-label={isCustom ? "Custom context handoff" : "Context handoff"}>
+    <div className="timeline-handoff-row">
+      <span className="timeline-handoff-glyph" aria-hidden="true"><ContextHandoffIcon /></span>
+      <div className="timeline-handoff-content">
+        <p className="timeline-handoff-eyebrow">{isCustom ? "Custom context handoff" : "Context handoff"}</p>
+        <p className="timeline-handoff-status">{isCustom ? "Handoff prompt requested in a side chat — main conversation unaffected" : "Handoff tool used — preparing a pickup prompt in a side chat"}</p>
+        {isCustom ? <blockquote className="timeline-handoff-quote"><RichText>{customNote}</RichText></blockquote> : null}
+      </div>
+      <time className="timeline-handoff-time" dateTime={item.timestamp}>{time}</time>
+    </div>
+  </article>;
+});
 
 /**
  * Work that stands in for the pulse.
@@ -28,7 +60,8 @@ function speaksForWork(item: TimelineItem): boolean {
 export function hasVisibleTimelineContent(item: TimelineItem): boolean {
   if (item.kind !== "user" && item.kind !== "assistant") return true;
   const body = item.body.trim();
-  if (item.images?.length || item.audio?.length || item.workflows?.length || item.annotations?.length) return true;
+  if (item.mesh?.targets.length) return true;
+  if (item.images?.length || item.audio?.length || item.files?.length || item.workflows?.length || item.annotations?.length) return true;
   if (!body || /^<!--[\s\S]*-->$/u.test(body)) return false;
   const rawBlock = body.match(/^<([a-z][\w:-]*)\b[^>]*>[\s\S]*<\/\1>$/iu);
   return !rawBlock && !/^<[a-z][\w:-]*\b[^>]*\/?>$/iu.test(body);
@@ -49,6 +82,13 @@ const automaticCompactionNotice = /\b(?:automatically\s+compacted|automatic\s+co
 const compactionSummaryNotice = /^another language model started to solve this problem and produced a summary of its thinking process\./iu;
 const compactionTitle = /^(?:(?:context|conversation|session)\s+)?compaction(?:\s+summary)?$/iu;
 const systemTitle = /^(?:system|system message|system update|notice)$/iu;
+const compactionPresentationMetadata = /\s*<oai-mem-citation>[\s\S]*?<\/oai-mem-citation>\s*$/iu;
+const timelineBoundaryLabelCache = new WeakMap<TimelineItem, string | null>();
+const compactionContentKeyCache = new WeakMap<TimelineItem, { ordinary?: string; compaction?: string }>();
+
+function visibleCompactionDetail(value: string): string {
+  return value.replace(compactionPresentationMetadata, "").trim();
+}
 
 function isCompactionItem(item: TimelineItem): boolean {
   if (item.kind === "user") return false;
@@ -61,23 +101,27 @@ function isCompactionItem(item: TimelineItem): boolean {
 
 /** Normalize sparse provider notices into quiet transcript boundaries. */
 export function timelineBoundaryLabel(item: TimelineItem): string | null {
+  const cached = timelineBoundaryLabelCache.get(item);
+  if (cached !== undefined || timelineBoundaryLabelCache.has(item)) return cached ?? null;
   if (item.kind === "user") return null;
   const title = cleanTitle(item.title ?? "");
   const body = item.body.trim();
-  if (isCompactionItem(item)) return "Session compacted";
-  if (systemTitle.test(title) && body.length <= 240) return body || "System update";
-  if (/^\s*\[(?:system|notice)\]\s*/iu.test(body) && body.length <= 240) {
-    return body.replace(/^\s*\[(?:system|notice)\]\s*/iu, "").trim() || "System update";
+  let label: string | null = null;
+  if (isCompactionItem(item)) label = "Session compacted";
+  else if (systemTitle.test(title) && body.length <= 240) label = body || "System update";
+  else if (/^\s*\[(?:system|notice)\]\s*/iu.test(body) && body.length <= 240) {
+    label = body.replace(/^\s*\[(?:system|notice)\]\s*/iu, "").trim() || "System update";
   }
-  return null;
+  timelineBoundaryLabelCache.set(item, label);
+  return label;
 }
 
 /** Prefer provider detail when available; otherwise explain the event without exposing trace metadata. */
 export function compactionDetailText(item: TimelineItem, _label: string): string {
   const detail = item.detail?.trim() ?? "";
-  if (detail && !compactionNotice.test(detail)) return detail;
+  if (detail && !compactionNotice.test(detail)) return visibleCompactionDetail(detail);
   const body = item.body.trim();
-  if (body && !compactionNotice.test(body)) return body;
+  if (body && !compactionNotice.test(body)) return visibleCompactionDetail(body);
   const automatic = automaticCompactionNotice.test(`${item.title ?? ""} ${item.body}`);
   return automatic
     ? "Earlier conversation context was automatically summarized so this task could continue within the model's context window."
@@ -85,15 +129,41 @@ export function compactionDetailText(item: TimelineItem, _label: string): string
 }
 
 function compactionContentKey(item: TimelineItem, compactionLabel?: string): string {
+  const cacheKey: "ordinary" | "compaction" = compactionLabel ? "compaction" : "ordinary";
+  const cached = compactionContentKeyCache.get(item)?.[cacheKey];
+  if (cached !== undefined) return cached;
   const raw = compactionLabel ? compactionDetailText(item, compactionLabel) : item.detail?.trim() || item.body;
   // Codex prefixes one stored copy with transport prose that the readable
   // reasoning copy omits. That prefix is not part of the summary itself.
   const comparable = compactionLabel ? raw.replace(compactionSummaryNotice, "").trim() || raw : raw;
-  return plainPreviewText(formatReasoningText(comparable)).toLocaleLowerCase();
+  const value = plainPreviewText(formatReasoningText(comparable)).toLocaleLowerCase();
+  compactionContentKeyCache.set(item, { ...compactionContentKeyCache.get(item), [cacheKey]: value });
+  return value;
 }
 
 function compactionContentMatches(left: string, right: string): boolean {
   return left === right || (Math.min(left.length, right.length) >= 120 && (left.includes(right) || right.includes(left)));
+}
+
+const adjacentCompactionMaximumDelayMs = 2_000;
+
+/**
+ * Codex writes the readable handoff immediately before its explicit compaction
+ * record. That record adjacency is the provenance; the two stored bodies are
+ * allowed to differ because one can carry transport prose or metadata suffixes.
+ */
+function adjacentCompactionSummary(timeline: readonly TimelineItem[], start: number, compactionIndex: number): number | null {
+  const candidateIndex = compactionIndex - 1;
+  if (candidateIndex < start) return null;
+  const candidate = timeline[candidateIndex];
+  const compaction = timeline[compactionIndex];
+  if (!candidate || !compaction || candidate.kind !== "assistant" || candidate.phase !== "final_answer") return null;
+  if (timelineBoundaryLabel(candidate) === "Session compacted") return null;
+  const candidateAt = Date.parse(candidate.timestamp);
+  const compactionAt = Date.parse(compaction.timestamp);
+  if (!Number.isFinite(candidateAt) || !Number.isFinite(compactionAt)) return null;
+  const delay = compactionAt - candidateAt;
+  return delay >= 0 && delay <= adjacentCompactionMaximumDelayMs ? candidateIndex : null;
 }
 
 /**
@@ -122,9 +192,10 @@ export function coalesceCompactionCopies(timeline: readonly TimelineItem[]): rea
       const label = timelineBoundaryLabel(compaction);
       if (label !== "Session compacted") continue;
       const key = compactionContentKey(compaction, label);
-      const matches: number[] = [];
+      const adjacent = adjacentCompactionSummary(timeline, start, compactionIndex);
+      const matches: number[] = adjacent === null ? [] : [adjacent];
       for (let index = start; index < end; index += 1) {
-        if (index === compactionIndex || removed.has(index)) continue;
+        if (index === compactionIndex || index === adjacent || removed.has(index)) continue;
         const candidate = replacements.get(index) ?? timeline[index]!;
         if (candidate.kind === "user") continue;
         const candidateLabel = timelineBoundaryLabel(candidate);
@@ -136,7 +207,7 @@ export function coalesceCompactionCopies(timeline: readonly TimelineItem[]): rea
         .map((index) => replacements.get(index) ?? timeline[index]!)
         .map((item) => item.detail?.trim() || item.body)
         .sort((left, right) => right.length - left.length)[0];
-      if (readable) replacements.set(compactionIndex, { ...compaction, detail: readable });
+      if (readable) replacements.set(compactionIndex, { ...compaction, detail: visibleCompactionDetail(readable) });
       for (const index of matches) removed.add(index);
     }
     start = end;
@@ -298,7 +369,11 @@ function foldedAssistantIndexes(timeline: readonly TimelineItem[], active: boole
     if (!(active && end === timeline.length) && !indexes.some((index) => timeline[index]?.state === "running")) {
       const assistants = indexes.filter((index) => {
         const item = timeline[index];
-        return item?.kind === "assistant" && hasVisibleTimelineContent(item) && (!timelineBoundaryLabel(item) || isCompactionItem(item));
+        // Compaction is a conversation boundary with its own compact widget. It
+        // must never disappear inside a collapsed Reasoning span: besides hiding
+        // the event from the reader, doing so lets many older byte pages collapse
+        // into the same single DOM row and makes upward history look stuck.
+        return item?.kind === "assistant" && hasVisibleTimelineContent(item) && timelineBoundaryLabel(item) === null;
       });
       const explicitFinals = assistants.filter((index) => timeline[index]?.phase === "final_answer");
       const finals = explicitFinals.length ? new Set(explicitFinals) : new Set(assistants.slice(-1));
@@ -563,6 +638,17 @@ export function timelineErrorNoticeText(item: TimelineItem): string {
   return readable.length > 360 ? `${readable.slice(0, 357).trimEnd()}…` : readable;
 }
 
+/** Only the latest unresolved interruption can resume the conversation. */
+export function recoverableTimelineNoticeId(timeline: readonly TimelineItem[]): string | undefined {
+  for (let index = timeline.length - 1; index >= 0; index -= 1) {
+    const item = timeline[index]!;
+    if (item.kind === "error" || item.notice === "eyes_failure") return item.id;
+    if (!hasVisibleTimelineContent(item) || timelineBoundaryLabel(item) === "Session compacted") continue;
+    return undefined;
+  }
+  return undefined;
+}
+
 function ReadingGlyph() {
   return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 5.5c3.4-.8 6.2-.1 8.5 2.1v11.2c-2.3-2.2-5.1-2.9-8.5-2.1Z"/><path d="M20.5 5.5c-3.4-.8-6.2-.1-8.5 2.1v11.2c2.3-2.2 5.1-2.9 8.5-2.1Z"/><path d="M7 9.1h2.3M7 12h2.3M14.7 9.1H17M14.7 12H17"/></svg>;
 }
@@ -660,8 +746,78 @@ function ThinkingFlow({ segment, onLinkOpen }: {
 }) {
   const { item } = segment;
   const body = formatReasoningText(item.body);
+  const flowRef = useRef<HTMLDivElement>(null);
+  const followsLatest = useRef(true);
+  const readerScrollTop = useRef(0);
+  const readerPointerHeld = useRef(false);
+  const readerPositionTimer = useRef<number | null>(null);
+
+  const captureReaderPosition = useCallback((flow: HTMLDivElement) => {
+    followsLatest.current = flow.scrollHeight - flow.scrollTop - flow.clientHeight <= 1;
+    readerScrollTop.current = flow.scrollTop;
+  }, []);
+
+  const queueReaderPositionCapture = useCallback((flow: HTMLDivElement) => {
+    if (readerPositionTimer.current !== null) window.clearTimeout(readerPositionTimer.current);
+    readerPositionTimer.current = window.setTimeout(() => {
+      readerPositionTimer.current = null;
+      if (flow.isConnected) captureReaderPosition(flow);
+    }, 400);
+  }, [captureReaderPosition]);
+
+  useEffect(() => {
+    const releasePointer = () => {
+      readerPointerHeld.current = false;
+      const flow = flowRef.current;
+      if (flow) queueReaderPositionCapture(flow);
+    };
+    window.addEventListener("pointerup", releasePointer);
+    window.addEventListener("pointercancel", releasePointer);
+    return () => {
+      window.removeEventListener("pointerup", releasePointer);
+      window.removeEventListener("pointercancel", releasePointer);
+      if (readerPositionTimer.current !== null) window.clearTimeout(readerPositionTimer.current);
+    };
+  }, [queueReaderPositionCapture]);
+
+  // The thought is a real nested reading surface. It follows its own physical
+  // end while the reader has left it there, without borrowing or changing the
+  // transcript's separate scroll ownership.
+  useLayoutEffect(() => {
+    const flow = flowRef.current;
+    if (!flow) return;
+    if (followsLatest.current) flow.scrollTop = flow.scrollHeight;
+    else flow.scrollTop = Math.min(readerScrollTop.current, flow.scrollHeight - flow.clientHeight);
+    readerScrollTop.current = flow.scrollTop;
+  }, [body]);
+
   return <div className="reasoning-segment reasoning-thinking-segment">
-    <div className={`reasoning-flow ${item.state === "running" ? "reasoning-flow-running" : ""}`}>
+    <div
+      ref={flowRef}
+      className={`reasoning-flow ${item.state === "running" ? "reasoning-flow-running" : ""}`}
+      onWheel={(event) => {
+        event.stopPropagation();
+        if (event.deltaY < 0) {
+          followsLatest.current = false;
+          readerScrollTop.current = event.currentTarget.scrollTop;
+        }
+        const flow = event.currentTarget;
+        queueReaderPositionCapture(flow);
+      }}
+      onPointerDown={() => { readerPointerHeld.current = true; }}
+      onKeyDown={(event) => {
+        if (["ArrowDown", "ArrowUp", "End", "Home", "PageDown", "PageUp", " "].includes(event.key)) {
+          if (["ArrowUp", "Home", "PageUp"].includes(event.key)) followsLatest.current = false;
+          const flow = event.currentTarget;
+          queueReaderPositionCapture(flow);
+        }
+      }}
+      onScroll={(event) => {
+        if (!readerPointerHeld.current) return;
+        captureReaderPosition(event.currentTarget);
+      }}
+      onScrollEnd={(event) => { captureReaderPosition(event.currentTarget); }}
+    >
       <RichText onLinkOpen={onLinkOpen}>{body}</RichText>
       <TimelineItemMeta item={item} copyText={body} copyLabel="Copy thinking"/>
     </div>
@@ -757,32 +913,22 @@ export function withCurrentActivity(timeline: readonly TimelineItem[], active: b
   let currentIndex = -1;
   let runningAssistantIndex = -1;
   if (active) {
+    // The canonical task state owns one live envelope. Raw provider rows are only
+    // candidates for where to paint it: an older command may remain `running`
+    // after newer reasoning has already arrived, and refreshes may settle those
+    // flags out of order. Let the bottommost real work row in the current span win
+    // so the shimmer cannot bounce backward through the transcript.
     for (let index = timeline.length - 1; index >= 0; index -= 1) {
       const item = timeline[index]!;
       if (item.kind === "user") break;
-      if (item.state === "running" && speaksForWork(item)) {
-        currentIndex = index;
-        break;
-      }
+      // These are hard presentation boundaries even when stale provider metadata
+      // before them still says running. A compaction in particular begins a new
+      // visible span; it must never let pre-compaction Reasoning light up again.
+      if (timelineBoundaryLabel(item) || item.kind === "error" || item.state === "failed"
+        || (item.kind === "assistant" && item.phase === "final_answer")) break;
+      if (!hasVisibleTimelineContent(item)) continue;
+      if (speaksForWork(item)) { currentIndex = index; break; }
       if (runningAssistantIndex < 0 && item.state === "running" && item.kind === "assistant") runningAssistantIndex = index;
-    }
-    // An externally owned harness can persist each reasoning/tool record only
-    // after that individual record finishes, while the surrounding turn keeps
-    // working. In that shape every row says `completed` even though the newest
-    // trailing reasoning span is still the live envelope. Later commentary is
-    // part of that same active envelope, not a reason to append a second inert
-    // WorkingPulse below it. Walk through commentary to the nearest real work
-    // row, but never cross a final answer, compaction boundary, failure, or user
-    // turn: historical reasoning behind those boundaries must remain settled.
-    if (currentIndex < 0) {
-      for (let index = timeline.length - 1; index >= 0; index -= 1) {
-        const item = timeline[index]!;
-        if (item.kind === "user") break;
-        if (timelineBoundaryLabel(item) || item.kind === "error" || item.state === "failed"
-          || (item.kind === "assistant" && item.phase === "final_answer")) break;
-        if (!hasVisibleTimelineContent(item)) continue;
-        if (speaksForWork(item)) { currentIndex = index; break; }
-      }
     }
     // Commentary-only harnesses still need their ordinary transcript row plus the
     // non-clickable pulse. Preserve the provider's live row only when there is no
@@ -791,6 +937,10 @@ export function withCurrentActivity(timeline: readonly TimelineItem[], active: b
   }
   const normalized: TimelineItem[] = timeline.map((candidate, candidateIndex) => {
     if (candidate.state === "failed") return candidate;
+    // A delegated child has its own lifecycle. The parent turn may settle while
+    // that task continues, so parent activity normalization must not mark the
+    // child finished before an authoritative delegation update does.
+    if (candidate.kind === "subagent") return candidate;
     if (candidateIndex === currentIndex) return candidate.state === "running" ? candidate : { ...candidate, state: "running" };
     return candidate.state === "running" ? { ...candidate, state: "completed" } : candidate;
   });
@@ -875,6 +1025,93 @@ export function normalizeFinalAnswerOrder(timeline: readonly TimelineItem[], act
 }
 
 /**
+ * A model may retry EYES more than once while answering one image turn. Keep the
+ * provider/tool records intact, but present one calm failure notice for that
+ * user turn. A later user message starts a new turn and may surface a new
+ * failure. Returning the original array when nothing changes also keeps settled
+ * transcripts out of unrelated React repaint paths.
+ */
+export function coalesceEyesFailureNotices(timeline: readonly TimelineItem[]): readonly TimelineItem[] {
+  let eyesFailureSeenInTurn = false;
+  let changed = false;
+  const visible: TimelineItem[] = [];
+  for (const item of timeline) {
+    if (item.kind === "user") eyesFailureSeenInTurn = false;
+    if (item.notice === "eyes_failure") {
+      if (eyesFailureSeenInTurn) {
+        changed = true;
+        continue;
+      }
+      eyesFailureSeenInTurn = true;
+    }
+    visible.push(item);
+  }
+  return changed ? visible : timeline;
+}
+
+/** Preparation timestamps precede provider user echoes; the Mesh prompt owns its children. */
+export function anchorMeshChildren(timeline: readonly TimelineItem[]): readonly TimelineItem[] {
+  const owners = new Set(timeline.flatMap((item) => item.kind === "user" && item.delegationId ? [item.delegationId] : []));
+  const children = new Map<string, TimelineItem[]>();
+  for (const item of timeline) {
+    if (item.kind !== "subagent" || !item.childSessionId || !item.delegationId || !owners.has(item.delegationId)) continue;
+    const siblings = children.get(item.delegationId) ?? [];
+    siblings.push(item);
+    children.set(item.delegationId, siblings);
+  }
+  if (!children.size) return timeline;
+  const ownedChildren = new Set([...children.values()].flat());
+  const ordinary = timeline.filter((item) => !ownedChildren.has(item));
+  const anchored: TimelineItem[] = [];
+  for (let index = 0; index < ordinary.length; index += 1) {
+    const item = ordinary[index]!;
+    anchored.push(item);
+    const siblings = item.kind === "user" && item.delegationId ? children.get(item.delegationId) : undefined;
+    if (!siblings) continue;
+    let end = index + 1;
+    while (end < ordinary.length && ordinary[end]!.kind !== "user") end += 1;
+    const turn = ordinary.slice(index + 1, end);
+    const dispatch = turn.findIndex((candidate) => candidate.kind === "tool" && /(?:^|_)dispatch_delegation\b/iu.test(candidate.title ?? ""));
+    let insertion = dispatch >= 0 ? dispatch + 1 : turn.findIndex((candidate) => candidate.kind === "assistant" && candidate.phase === "final_answer");
+    if (insertion < 0) {
+      for (let cursor = turn.length - 1; cursor >= 0; cursor -= 1) {
+        if (turn[cursor]!.kind === "assistant" && turn[cursor]!.phase !== "commentary") { insertion = cursor; break; }
+      }
+    }
+    if (insertion < 0) insertion = turn.length;
+    anchored.push(...turn.slice(0, insertion), ...siblings, ...turn.slice(insertion));
+    index = end - 1;
+  }
+  return anchored.every((item, index) => item === timeline[index]) ? timeline : anchored;
+}
+
+function timelineForRendering(timeline: readonly TimelineItem[], active: boolean): readonly TimelineItem[] {
+  return withCurrentActivity(normalizeFinalAnswerOrder(anchorMeshChildren(coalesceEyesFailureNotices(coalesceCompactionCopies(timeline))), active), active);
+}
+
+/**
+ * The exact stable row identities the collapsed transcript paints into the DOM.
+ *
+ * An older provider page can contain new raw records without adding a new row:
+ * adjacent reasoning and tool activity fold into one existing Reasoning control.
+ * Paging uses this view to keep walking a bounded number of cursors until one
+ * reader-visible row has actually appeared, rather than treating raw data as UI
+ * progress.
+ */
+export function renderedTimelineAnchorIds(timeline: readonly TimelineItem[], active = false): readonly string[] {
+  const visibleTimeline = timelineForRendering(timeline, active);
+  return groupTimeline(visibleTimeline, active).flatMap((group): string[] => {
+    if (group.kind === "boundary") return group.label === "Session compacted" ? [group.item.id] : [];
+    if (group.kind === "reasoning") {
+      const segments = reasoningSegments(group.items, reasoningGroupKey(group));
+      if (segments.length === 1 && segments[0]?.kind === "compaction") return [segments[0].item.id];
+      return [reasoningGroupKey(group)];
+    }
+    return group.item.kind === "error" ? [] : [group.item.presentationId ?? group.item.id];
+  });
+}
+
+/**
  * Whether a span is open is the reader's decision, so it is held by the transcript
  * rather than by this component. A streaming turn reshapes the rows around it -
  * history catches up, rows are reordered, a group splits - and any of that can give
@@ -882,16 +1119,17 @@ export function normalizeFinalAnswerOrder(timeline: readonly TimelineItem[], act
  * the panel closed itself under a reader who was watching a thought arrive, which is
  * also why live reasoning was so hard to see at all.
  */
-function ReasoningGroupImpl({ items, groupKey, expanded, onToggleGroup, onLinkOpen }: {
+function ReasoningGroupImpl({ items, groupKey, expanded, onToggleGroup, onLinkOpen, onOpenSubagent }: {
   items: readonly TimelineItem[];
   groupKey: string;
   expanded: boolean;
   onToggleGroup: () => void;
   onLinkOpen?: ((url: string) => void) | undefined;
+  onOpenSubagent?: ((item: TimelineItem) => void) | undefined;
 }) {
   const segments = reasoningSegments(items, groupKey);
   const running = items.some((item) => item.state === "running");
-  return <section className="reasoning-group" aria-busy={running || undefined} data-scroll-anchor={items[0]?.id} data-scroll-members={items.map((item) => encodeURIComponent(item.id)).join("|")}>
+  return <section className="reasoning-group" aria-busy={running || undefined} data-scroll-anchor={groupKey} data-scroll-members={items.map((item) => encodeURIComponent(item.id)).join("|")}>
     <button type="button" className={`reasoning-disclosure ${running ? "reasoning-running" : ""}`} aria-expanded={expanded} onClick={onToggleGroup}>
       <span className="reasoning-mark" aria-hidden="true"><i/><i/><i/></span>
       {/* The trailing ellipsis is the tense marker: dots alone read as decoration, so a
@@ -904,7 +1142,9 @@ function ReasoningGroupImpl({ items, groupKey, expanded, onToggleGroup, onLinkOp
         ? <ThinkingFlow key={segment.id} segment={segment} onLinkOpen={onLinkOpen}/>
         : segment.kind === "compaction"
           ? <CompactionDisclosure key={segment.id} item={segment.item} label={segment.label} nested/>
-          : <ActivityDisclosure key={segment.id} item={segment.items[0]!}/>)}</div>
+          : segment.items[0]?.kind === "subagent" && segment.items[0].childSessionId
+            ? <SpawnedSubagentRow key={segment.id} item={segment.items[0]} onOpen={onOpenSubagent}/>
+            : <ActivityDisclosure key={segment.id} item={segment.items[0]!}/>)}</div>
     </div> : null}
   </section>;
 }
@@ -916,6 +1156,7 @@ function ReasoningGroupImpl({ items, groupKey, expanded, onToggleGroup, onLinkOp
 const ReasoningGroup = memo(ReasoningGroupImpl, (previous, next) =>
   previous.groupKey === next.groupKey
   && previous.onLinkOpen === next.onLinkOpen
+  && previous.onOpenSubagent === next.onOpenSubagent
   && previous.expanded === next.expanded
   && previous.onToggleGroup === next.onToggleGroup
   && previous.items.length === next.items.length
@@ -963,12 +1204,44 @@ function QuietIssueIcon() {
   return <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5v6M12 16.7h.01"/></svg>;
 }
 
-const TimelineErrorNotice = memo(function TimelineErrorNotice({ item, onContinue }: { item: TimelineItem; onContinue?: (() => void) | undefined }) {
+const TimelineErrorNotice = memo(function TimelineErrorNotice({ item, onContinue, continuePending, continueDisabled }: { item: TimelineItem; onContinue?: (() => void) | undefined; continuePending: boolean; continueDisabled: boolean }) {
   return <div className="timeline-error-notice" role="alert" aria-live="assertive" aria-atomic="true">
     <QuietIssueIcon />
     <span>{timelineErrorNoticeText(item)}</span>
-    {onContinue ? <button type="button" className="timeline-error-recovery" onClick={onContinue}>Continue in composer</button> : null}
+    {onContinue ? <button type="button" className="timeline-error-recovery" onClick={onContinue} disabled={continueDisabled} aria-busy={continuePending}>{continuePending ? "Continuing…" : "Continue"}</button> : null}
   </div>;
+});
+
+function spawnedSubagentTarget(item: TimelineItem): string {
+  return [
+    item.childProviderId ? providerDisplayName(item.childProviderId as ProviderId) : "Sub-agent",
+    item.childModelId,
+    item.childReasoningEffort?.replaceAll("_", " "),
+  ].filter(Boolean).join(" · ");
+}
+
+const SpawnedSubagentRow = memo(function SpawnedSubagentRow({ item, onOpen }: {
+  item: TimelineItem;
+  onOpen?: ((item: TimelineItem) => void) | undefined;
+}) {
+  const state = item.state ?? "running";
+  const stateLabel = state === "completed" ? "finished" : state === "failed" ? "failed" : "running";
+  return <button
+    type="button"
+    className="spawned-subagent-row"
+    data-child-state={state}
+    data-scroll-anchor={item.id}
+    aria-label={`Open ${spawnedSubagentTarget(item)}, ${stateLabel}`}
+    aria-busy={state === "running" || undefined}
+    onClick={() => onOpen?.(item)}
+  >
+    <span className="spawned-subagent-glyph" aria-hidden="true"><SubagentsIcon /></span>
+    <span className="spawned-subagent-copy"><strong>Spawned sub-agent</strong><small>{spawnedSubagentTarget(item)}</small></span>
+    <span className="spawned-subagent-state">{state === "running"
+      ? <span className="spinner" aria-hidden="true" />
+      : state === "failed" ? <AlertIcon aria-hidden="true" /> : <CheckIcon aria-hidden="true" />}<span>{stateLabel}</span></span>
+    <ChevronRightIcon aria-hidden="true" />
+  </button>;
 });
 
 /** Keep retry information useful without exposing provider transport identifiers. */
@@ -1012,18 +1285,37 @@ const WorkingPulse = memo(function WorkingPulse() {
 
 function WorkflowMessageAttachment({ workflow, onOpen }: { workflow: TimelineWorkflow; onOpen?: ((id: string) => void) | undefined }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const closeDetails = useCallback((restoreFocus = true) => {
+    // Return keyboard ownership before removing the dialog. A live history
+    // reconciliation may replace this row during the close commit, so waiting
+    // only for the next frame can leave focus on the document body.
+    if (restoreFocus) trigger.current?.focus();
+    setDetailsOpen(false);
+    if (restoreFocus) requestAnimationFrame(() => trigger.current?.focus());
+  }, []);
+  useEffect(() => {
+    if (!detailsOpen) return;
+    const close = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      closeDetails();
+    };
+    window.addEventListener("keydown", close);
+    return () => window.removeEventListener("keydown", close);
+  }, [closeDetails, detailsOpen]);
   return <>
-    <button type="button" className="message-workflow-chip" onClick={() => setDetailsOpen(true)} aria-label={`View attached workflow ${workflow.name}`}>
+    <button ref={trigger} type="button" className="message-workflow-chip" onClick={() => setDetailsOpen(true)} aria-label={`View attached workflow ${workflow.name}`}>
       <WorkflowIcon />
       <span><strong>{workflow.name}</strong><small>{workflow.eventCount} events · {workflow.screenshotCount} screenshots</small></span>
     </button>
-    {detailsOpen ? <div className="message-workflow-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setDetailsOpen(false); }}>
+    {detailsOpen ? <div className="message-workflow-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeDetails(); }}>
       <section className="message-workflow-panel" role="dialog" aria-modal="true" aria-label={`${workflow.name} workflow details`}>
-        <header><span><WorkflowIcon /><strong>{workflow.name}</strong></span><button type="button" aria-label="Close workflow details" onClick={() => setDetailsOpen(false)}><XIcon /></button></header>
+        <header><span><WorkflowIcon /><strong>{workflow.name}</strong></span><button type="button" aria-label="Close workflow details" onClick={() => closeDetails()}><XIcon /></button></header>
         <p>Recorded workflow attached to this message.</p>
         <dl><div><dt>Events</dt><dd>{workflow.eventCount}</dd></div><div><dt>Screenshots</dt><dd>{workflow.screenshotCount}</dd></div></dl>
         {workflow.applications?.length ? <p className="message-workflow-apps">Captured in {workflow.applications.join(", ")}</p> : null}
-        {onOpen ? <button type="button" className="message-workflow-open" onClick={() => { setDetailsOpen(false); onOpen(workflow.id); }}>Open workflow</button> : null}
+        {onOpen ? <button type="button" className="message-workflow-open" onClick={() => { closeDetails(false); onOpen(workflow.id); }}>Open workflow</button> : null}
       </section>
     </div> : null}
   </>;
@@ -1054,7 +1346,87 @@ function MessageAnnotationBadges({ annotations }: { annotations: NonNullable<Tim
   </span>)}</div>;
 }
 
-export function ChatTimeline({ timeline, providerId, provider, providerStatus, reasoningDisplay = "compact", isCompacting = false, compactionKind = null, active = false, onLinkOpen, onWorkflowOpen, onAnnotateSelection, onContinueInComposer }: {
+type AnnotationAction = {
+  text: string;
+  x: number;
+  y: number;
+  ownerId: string;
+};
+
+function selectedAssistantResponse(container: HTMLElement): string | null {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) return null;
+  const range = selection.getRangeAt(0);
+  if (!container.contains(range.startContainer) || !container.contains(range.endContainer)) return null;
+  const text = selection.toString().trim().slice(0, 24_000);
+  return text || null;
+}
+
+/**
+ * Annotating is a deliberate request, so it is reached by right-clicking a
+ * selection and never offered merely because a selection exists: an action that
+ * appears on its own every time the reader drags across an answer interrupts
+ * ordinary reading and copying.
+ *
+ * Right-clicking cancels the window's own editing menu to show this one, so
+ * Copy is this menu's job too. Losing the ordinary right-click copy is not an
+ * acceptable price for an app action.
+ */
+function AnnotationActionPopover({ action, onAnnotate, onCopy }: {
+  action: AnnotationAction;
+  onAnnotate: (text: string, anchor: { x: number; y: number }) => void;
+  onCopy: (text: string) => void;
+}) {
+  const root = useRef<HTMLDivElement>(null);
+  const [position, setPosition] = useState<{ left: number; top: number } | null>(null);
+  useLayoutEffect(() => {
+    const element = root.current;
+    if (!element) return;
+    const bounds = element.getBoundingClientRect();
+    const margin = 8;
+    const gap = 8;
+    const maximumLeft = Math.max(margin, window.innerWidth - bounds.width - margin);
+    const maximumTop = Math.max(margin, window.innerHeight - bounds.height - margin);
+    const left = Math.max(margin, Math.min(action.x, maximumLeft));
+    const preferredTop = action.y;
+    const fallbackTop = action.y - bounds.height - gap;
+    const top = Math.max(margin, Math.min(preferredTop >= margin ? preferredTop : fallbackTop, maximumTop));
+    setPosition({ left, top });
+  }, [action.x, action.y]);
+  return <div
+    ref={root}
+    className="annotation-context-menu"
+    role="menu"
+    aria-label="Selected response actions"
+    style={{ left: position?.left ?? action.x, top: position?.top ?? action.y, visibility: position ? "visible" : "hidden" }}
+    onMouseDown={(event) => { event.preventDefault(); event.stopPropagation(); }}
+  ><button
+    type="button"
+    role="menuitem"
+    aria-label="Copy selected response"
+    // Unlike Annotate, copying does not consume the selection: leave it
+    // highlighted the way every other application does.
+    onClick={() => onCopy(action.text)}
+  ><CopyIcon />Copy</button><button
+    type="button"
+    role="menuitem"
+    aria-label="Annotate selected response"
+    onClick={() => {
+      window.getSelection()?.removeAllRanges();
+      onAnnotate(action.text, { x: action.x, y: action.y });
+    }}
+  ><AnnotationIcon />Annotate</button></div>;
+}
+
+function fileAttachmentLabel(mimeType: string | undefined): string {
+  if (mimeType === "text/plain") return "Text attachment";
+  if (mimeType === "text/markdown") return "Markdown attachment";
+  if (mimeType === "application/json") return "JSON attachment";
+  if (mimeType === "text/csv") return "CSV attachment";
+  return "Attached file";
+}
+
+interface ChatTimelineProps {
   timeline: readonly TimelineItem[];
   providerId: ProviderId;
   provider?: Provider | undefined;
@@ -1066,8 +1438,15 @@ export function ChatTimeline({ timeline, providerId, provider, providerStatus, r
   onLinkOpen?: ((url: string) => void) | undefined;
   onWorkflowOpen?: ((id: string) => void) | undefined;
   onAnnotateSelection?: ((text: string, anchor: { x: number; y: number }) => void) | undefined;
-  onContinueInComposer?: (() => void) | undefined;
-}) {
+  annotationOwnerId?: string | undefined;
+  onContinue?: (() => Promise<boolean>) | undefined;
+  continuePending?: boolean;
+  onRetryQueuedNewTaskDelivery?: ((deliveryId: string) => void) | undefined;
+  onOpenSubagent?: ((item: TimelineItem) => void) | undefined;
+}
+
+function ChatTimelineImpl({ timeline, providerId, provider, providerStatus, reasoningDisplay = "compact", isCompacting = false, compactionKind = null, active = false, onLinkOpen, onWorkflowOpen, onAnnotateSelection, annotationOwnerId = "", onContinue, continuePending = false, onRetryQueuedNewTaskDelivery, onOpenSubagent }: ChatTimelineProps) {
+  const [continuedNotices, setContinuedNotices] = useState<ReadonlySet<string>>(() => new Set());
   // Two sets, not one flag: in flow-through mode a span is open until the reader
   // closes it, and in compact mode closed until the reader opens it. Recording the
   // decision rather than the resulting state is what lets both modes share it.
@@ -1075,19 +1454,55 @@ export function ChatTimeline({ timeline, providerId, provider, providerStatus, r
   // thought that follows is already open when it arrives.
   const [openedGroups, setOpenedGroups] = useState<ReadonlySet<string>>(() => new Set());
   const [closedGroups, setClosedGroups] = useState<ReadonlySet<string>>(() => new Set());
-  const [annotationMenu, setAnnotationMenu] = useState<{ text: string; x: number; y: number } | null>(null);
+  const [annotationAction, setAnnotationAction] = useState<AnnotationAction | null>(null);
   useEffect(() => {
-    if (!annotationMenu) return;
-    const close = (event: KeyboardEvent | MouseEvent) => {
-      if (event instanceof KeyboardEvent && event.key !== "Escape") return;
-      setAnnotationMenu(null);
+    if (!annotationAction) return;
+    const closeForKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setAnnotationAction(null);
     };
-    window.addEventListener("keydown", close);
+    const close = () => setAnnotationAction(null);
+    const closeForSelection = () => {
+      if (window.getSelection()?.isCollapsed !== false) setAnnotationAction(null);
+    };
+    window.addEventListener("keydown", closeForKey);
     window.addEventListener("mousedown", close);
-    return () => { window.removeEventListener("keydown", close); window.removeEventListener("mousedown", close); };
-  }, [annotationMenu]);
-  const visibleTimeline = withCurrentActivity(normalizeFinalAnswerOrder(coalesceCompactionCopies(timeline), active), active);
-  const groups = groupTimeline(visibleTimeline, active);
+    window.addEventListener("resize", close);
+    window.addEventListener("blur", close);
+    window.addEventListener("scroll", close, true);
+    document.addEventListener("selectionchange", closeForSelection);
+    return () => {
+      window.removeEventListener("keydown", closeForKey);
+      window.removeEventListener("mousedown", close);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("scroll", close, true);
+      document.removeEventListener("selectionchange", closeForSelection);
+    };
+  }, [annotationAction]);
+  // Context/goal/status heartbeats rerender the workspace even when transcript
+  // identity has not changed. Long Codex histories make compaction coalescing
+  // deliberately thorough, so keep that work tied to transcript changes rather
+  // than repeating it on every unrelated parent render.
+  const visibleTimeline = useMemo(() => timelineForRendering(timeline, active), [timeline, active]);
+  const recoverableNoticeId = useMemo(() => recoverableTimelineNoticeId(visibleTimeline), [visibleTimeline]);
+  const groups = useMemo(() => groupTimeline(visibleTimeline, active), [visibleTimeline, active]);
+  const finishedMeshGroups = groups.flatMap((group) => group.kind === "reasoning"
+    && group.items.some((item) => item.kind === "subagent" && item.childSessionId)
+    && group.items.every((item) => item.state !== "running") ? [group.key] : []);
+  const finishedMeshKey = finishedMeshGroups.join("|");
+  const previousFinishedMeshGroups = useRef<ReadonlySet<string>>(new Set());
+  useEffect(() => {
+    // A finished Mesh turn returns its activity to the compact Reasoning view.
+    // Only newly finished groups close, preserving manually opened older turns.
+    const newlyFinished = finishedMeshGroups.filter((key) => !previousFinishedMeshGroups.current.has(key));
+    previousFinishedMeshGroups.current = new Set(finishedMeshGroups);
+    if (!newlyFinished.length) return;
+    setOpenedGroups((current) => {
+      let next = current;
+      for (const key of newlyFinished) next = withMember(next, key, false);
+      return next;
+    });
+  }, [finishedMeshKey]);
   const live = liveReasoningIds(groups);
   const liveKey = `${live.groups.join("|")}::${live.segments.join("|")}`;
   // The live ids make the first committed streaming render open immediately.
@@ -1126,26 +1541,70 @@ export function ChatTimeline({ timeline, providerId, provider, providerStatus, r
         expanded={groupExpanded(key)}
         onToggleGroup={() => toggleGroup(key)}
         onLinkOpen={onLinkOpen}
+        onOpenSubagent={onOpenSubagent}
       />;
     }
-    if (group.item.kind === "error") return <TimelineErrorNotice key={group.item.id} item={group.item} onContinue={onContinueInComposer}/>;
+    if (group.item.kind === "error" || group.item.notice === "eyes_failure") {
+      const noticeKey = `${annotationOwnerId}:${group.item.id}`;
+      const canContinue = group.item.id === recoverableNoticeId && !continuedNotices.has(noticeKey);
+      const continueNotice = onContinue && canContinue ? () => {
+        void onContinue().then((accepted) => {
+          if (accepted) setContinuedNotices(current => withMember(current, noticeKey, true));
+        });
+      } : undefined;
+      return <TimelineErrorNotice key={group.item.id} item={group.item} onContinue={continueNotice} continuePending={continuePending} continueDisabled={continuePending || active}/>;
+    }
+    if (isContextHandoffItem(group.item)) return <HandoffNotice key={group.item.presentationId ?? group.item.id} item={group.item}/>;
+    if (group.item.kind === "subagent") return group.item.childSessionId
+      ? <SpawnedSubagentRow key={group.item.id} item={group.item} onOpen={onOpenSubagent}/>
+      : <ActivityDisclosure key={group.item.id} item={group.item}/>;
     const finalBoundary = shouldSeparateFinalAnswer(visibleTimeline, group.index, active);
     const identityMode = assistantIdentityMode(visibleTimeline, group.index, active);
-    const card = <ChatTimelineCard key={group.item.id} item={group.item} providerId={providerId} provider={provider} identityMode={identityMode} copyText={identityMode === "final" ? finalAnswerCopyText(visibleTimeline, group.index) : undefined} onLinkOpen={onLinkOpen} onWorkflowOpen={onWorkflowOpen} onSelectionContextMenu={onAnnotateSelection ? (text, anchor) => setAnnotationMenu({ text, ...anchor }) : undefined}/>;
-    return finalBoundary ? <div className="final-answer-block" key={group.item.id}><TimelineBoundary label="Final answer" final/>{card}</div> : card;
-  })}{providerStatus ? <ProviderStatusNotice status={providerStatus}/> : null}{showsWorkingPulse(visibleTimeline, active, providerStatus?.kind === "retry") ? <WorkingPulse /> : null}{isCompacting ? <ActiveCompactionStatus kind={compactionKind} /> : null}{annotationMenu ? createPortal(<div className="annotation-context-menu" role="menu" style={{ left: Math.min(annotationMenu.x, window.innerWidth - 150), top: Math.min(annotationMenu.y, window.innerHeight - 58) }} onMouseDown={(event) => event.stopPropagation()}><button type="button" role="menuitem" onClick={() => { onAnnotateSelection?.(annotationMenu.text, { x: annotationMenu.x, y: annotationMenu.y }); setAnnotationMenu(null); }}><AnnotationIcon />Annotate</button></div>, document.body) : null}</>;
+    const presentationId = group.item.presentationId ?? group.item.id;
+    const card = <ChatTimelineCard key={presentationId} item={group.item} providerId={providerId} provider={provider} identityMode={identityMode} finalBoundary={finalBoundary} copyText={identityMode === "final" ? finalAnswerCopyText(visibleTimeline, group.index) : undefined} onLinkOpen={onLinkOpen} onWorkflowOpen={onWorkflowOpen} onAnnotationSelection={onAnnotateSelection ? (text, anchor) => setAnnotationAction({ text, ...anchor, ownerId: annotationOwnerId }) : undefined} onRetryQueuedNewTaskDelivery={onRetryQueuedNewTaskDelivery}/>;
+    return <Fragment key={presentationId}>{finalBoundary ? <TimelineBoundary label="Final answer" final/> : null}{card}</Fragment>;
+  })}{providerStatus ? <ProviderStatusNotice status={providerStatus}/> : null}{showsWorkingPulse(visibleTimeline, active, providerStatus?.kind === "retry") ? <WorkingPulse /> : null}{isCompacting ? <ActiveCompactionStatus kind={compactionKind} /> : null}{annotationAction?.ownerId === annotationOwnerId ? createPortal(<AnnotationActionPopover action={annotationAction} onAnnotate={(text, anchor) => { onAnnotateSelection?.(text, anchor); setAnnotationAction(null); }} onCopy={(text) => { void copyToClipboard(text); setAnnotationAction(null); }}/>, document.body) : null}</>;
 }
 
-export const ChatTimelineCard = memo(function ChatTimelineCard({ item, providerId, provider, identityMode = "final", copyText, onLinkOpen, onWorkflowOpen, onSelectionContextMenu }: {
+/** Unrelated session/context heartbeats must not repaint a settled transcript. */
+export const ChatTimeline = memo(ChatTimelineImpl);
+
+function meshMessageLabel(target: NonNullable<TimelineItem["mesh"]>["targets"][number]): string {
+  const model = target.modelName ?? target.modelId ?? `${target.providerId} default`;
+  const effort = reasoningDisplayLabel(target.reasoningEffort ?? "", { providerId: target.providerId, modelId: target.modelId, displayName: model });
+  return effort ? `${model} · ${effort}` : model;
+}
+
+function MeshMessageBody({ mesh, onLinkOpen }: { mesh: NonNullable<TimelineItem["mesh"]>; onLinkOpen?: ((url: string) => void) | undefined }) {
+  const inlineContent: Record<string, ReactNode> = {};
+  const original = mesh.segments.filter((segment) => segment.type === "text").map((segment) => segment.text).join("");
+  let code = 0xE000;
+  const markdown = mesh.segments.map((segment, index) => {
+    if (segment.type === "text") return segment.text;
+    const target = mesh.targets[segment.targetIndex];
+    if (!target) return "";
+    while (original.includes(String.fromCharCode(code))) code += 1;
+    const marker = String.fromCharCode(code++);
+    inlineContent[marker] = <span key={index} className="composer-mesh-widget message-mesh-widget" data-provider-id={target.providerId} data-target-index={segment.targetIndex}>
+      <span className="composer-mesh-widget-body" title={`${target.providerId} · ${meshMessageLabel(target)}`}>{meshMessageLabel(target)}</span>
+    </span>;
+    return marker;
+  }).join("");
+  return <RichText inlineContent={inlineContent} onLinkOpen={onLinkOpen}>{markdown}</RichText>;
+}
+
+export const ChatTimelineCard = memo(function ChatTimelineCard({ item, providerId, provider, identityMode = "final", finalBoundary = false, copyText, onLinkOpen, onWorkflowOpen, onAnnotationSelection, onRetryQueuedNewTaskDelivery }: {
   item: TimelineItem;
   providerId: ProviderId;
   provider?: Provider | undefined;
   /** Set with assistantIdentityMode when rendering a complete timeline. */
   identityMode?: AssistantIdentityMode;
+  finalBoundary?: boolean;
   copyText?: string | undefined;
   onLinkOpen?: ((url: string) => void) | undefined;
   onWorkflowOpen?: ((id: string) => void) | undefined;
-  onSelectionContextMenu?: ((text: string, anchor: { x: number; y: number }) => void) | undefined;
+  onAnnotationSelection?: ((text: string, anchor: { x: number; y: number }) => void) | undefined;
+  onRetryQueuedNewTaskDelivery?: ((deliveryId: string) => void) | undefined;
 }) {
   const [lightbox, setLightbox] = useState<{ dataUrl: string; name: string } | null>(null);
   useEffect(() => {
@@ -1155,43 +1614,68 @@ export const ChatTimelineCard = memo(function ChatTimelineCard({ item, providerI
     return () => window.removeEventListener("keydown", close);
   }, [lightbox]);
   const time = new Date(item.timestamp).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  if (isContextHandoffItem(item)) return <HandoffNotice item={item}/>;
   if (item.kind === "user" || item.kind === "assistant") {
     const assistantName = providerDisplayName(providerId, provider);
     const identity = item.kind === "assistant" && identityMode !== "none";
     const liveIdentity = identityMode === "live";
     const intermediate = item.kind === "assistant" && !identity;
     const progress = item.kind === "assistant" && (item.phase === "commentary" || item.state === "running");
-    const footerCopyText = item.kind === "user" ? item.body.trim() : identityMode === "final" ? copyText : undefined;
+    const footerCopyText = item.kind === "user" ? item.mesh
+      ? item.mesh.segments.map((segment) => segment.type === "text" ? segment.text : `@${meshMessageLabel(item.mesh!.targets[segment.targetIndex]!)}`).join("")
+      : item.body.trim() : identityMode === "final" ? copyText : undefined;
     const visibleFooterCopyText = item.kind === "user" && item.annotations?.length
       ? responseAnnotationCopyText(item.body, item.annotations)
       : footerCopyText;
     const footerCopyLabel = item.kind === "user" ? "Copy your message" : "Copy final answer";
-    const imageGallery = item.images?.length ? <div className={`message-images ${item.kind === "user" ? "message-images-before" : ""}`}>{item.images.map((image, index) => image.dataUrl ? <button type="button" key={`${image.name}-${index}`} aria-label={`Expand ${image.name}`} onClick={() => setLightbox({ dataUrl: image.dataUrl!, name: image.name })}><img src={image.dataUrl} alt={image.name} referrerPolicy="no-referrer"/></button> : <span className="message-image-unavailable" key={`${image.name}-${index}`}><ScreenshotIcon /><span><strong>{image.name}</strong><small>Image preview was not retained in history</small></span></span>)}</div> : null;
+    const imageCount = item.images?.length ?? 0;
+    const imageOnlyUserMessage = item.kind === "user" && imageCount > 0 && !item.body.trim()
+      && !item.audio?.length && !item.files?.length && !item.workflows?.length && !item.annotations?.length;
+    const imageGalleryLayout = imageCount >= 4 ? "many" : String(imageCount);
+    const deliveryFailed = item.kind === "user"
+      && item.queuedNewTaskDeliveryState === "failed"
+      && item.queuedNewTaskDeliveryId !== undefined;
+    const deliveryPending = item.kind === "user"
+      && (item.queuedNewTaskDeliveryState === "pending" || item.queuedNewTaskDeliveryState === "sending");
+    const imageGallery = imageCount ? <div
+      className={`message-images ${item.kind === "user" ? "message-images-before" : ""} ${imageOnlyUserMessage ? "message-images-user message-images-only" : ""}`}
+      data-image-layout={imageGalleryLayout}
+    >{item.images!.map((image, index) => image.dataUrl ? <button type="button" key={`${image.name}-${index}`} aria-label={`Open image ${index + 1} of ${imageCount}: ${image.name}`} onClick={() => setLightbox({ dataUrl: image.dataUrl!, name: image.name })}><img src={image.dataUrl} alt={image.name} referrerPolicy="no-referrer"/></button> : <span className="message-image-unavailable" key={`${image.name}-${index}`} role="img" aria-label={`Image ${index + 1} of ${imageCount}: ${image.name}. ${image.loading ? "Loading image preview" : "Image preview unavailable"}`}><ScreenshotIcon /><span><strong>{image.name}</strong><small>{image.loading ? "Loading image preview" : "Image preview was not retained in history"}</small></span></span>)}</div> : null;
     const audioGallery = item.audio?.length ? <div className={`message-audio ${item.kind === "user" ? "message-audio-before" : ""}`} aria-label="Voice recordings">{item.audio.map((audio, index) => audio.dataUrl ? <AudioPlaybackChip key={`${audio.name}-${index}`} name={audio.name} dataUrl={audio.dataUrl} dictation={audio.dictation === true} durationSeconds={audio.durationSeconds}/> : <span className="message-image-unavailable" key={`${audio.name}-${index}`}><span><strong>{audio.name}</strong><small>Recording preview was not retained in history</small></span></span>)}</div> : null;
+    const fileGallery = item.files?.length ? <div className="message-files" aria-label="Attached files">{item.files.map((file, index) => <span className="message-file-attachment" key={`${file.name}-${index}`}><FileIcon /><span><strong>{file.name}</strong><small>{fileAttachmentLabel(file.mimeType)}</small></span></span>)}</div> : null;
     const workflowGallery = item.workflows?.length ? <div className="message-workflows" aria-label="Attached workflows">{item.workflows.map((workflow) => <WorkflowMessageAttachment key={workflow.id} workflow={workflow} onOpen={onWorkflowOpen}/>)}</div> : null;
-    return <><article className={`message message-${item.kind} ${identity ? "message-with-identity" : "message-without-identity"} ${intermediate ? "message-intermediate" : ""} ${progress ? "message-progress" : ""}`} aria-busy={item.state === "running" || undefined} data-scroll-anchor={item.id}>
+    return <><article className={`message message-${item.kind} ${identity ? "message-with-identity" : "message-without-identity"} ${intermediate ? "message-intermediate" : ""} ${progress ? "message-progress" : ""} ${deliveryFailed ? "message-delivery-failed" : ""} ${finalBoundary ? "final-answer-block" : ""}`} aria-busy={item.state === "running" || deliveryPending || undefined} data-scroll-anchor={item.presentationId ?? item.id}>
       <div className={item.kind === "assistant" ? "assistant-message-row" : undefined}>
       {identity ? <span className="assistant-identity" data-mode={identityMode} aria-label={liveIdentity ? `${assistantName} thinking` : assistantName}>
         <ProviderLogo providerId={providerId} provider={provider} size={28}/>
       </span> : null}
       <div className="message-content">
-        {item.origin?.kind === "cross_session" ? <p className="message-origin"><BranchIcon /><span>From another Tethoq task · {item.origin.sourceTitle || "Untitled task"}</span></p> : null}
+        {item.origin?.kind === "cross_session" ? <p className="message-origin"><BranchIcon /><span>From another Tethoq task · {item.origin.sourceTitle || "Untitled task"}</span></p> : item.origin?.kind === "delegation" ? <p className="message-origin message-delegation-origin"><AgentIcon /><span>Sent by {item.origin.sender === "codex" ? "Codex" : "Tethoq"}</span></p> : null}
         {workflowGallery}
+        {fileGallery}
         {item.kind === "user" ? imageGallery : null}
         {item.kind === "user" ? audioGallery : null}
         {item.annotations?.length ? <MessageAnnotationBadges annotations={item.annotations}/> : null}
-        {item.body ? <div className="message-body" onContextMenu={item.kind === "assistant" && onSelectionContextMenu ? (event) => {
-          const selection = window.getSelection();
-          if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
-          const range = selection.getRangeAt(0);
-          if (!event.currentTarget.contains(range.commonAncestorContainer)) return;
-          const text = selection.toString().trim().slice(0, 24_000);
+        {/* Selecting an answer does nothing on its own; annotating is asked for
+            by right-clicking the selection. A keyboard context menu reports no
+            useful pointer position, so fall back to the answer's own corner. */}
+        {item.body || item.mesh ? <div className="message-body" onContextMenu={item.kind === "assistant" && onAnnotationSelection ? (event) => {
+          const text = selectedAssistantResponse(event.currentTarget);
           if (!text) return;
           event.preventDefault();
-          onSelectionContextMenu(text, { x: event.clientX, y: event.clientY });
-        } : undefined}><RichText onImageOpen={setLightbox} onLinkOpen={onLinkOpen}>{item.body}</RichText></div> : null}
+          const bounds = event.currentTarget.getBoundingClientRect();
+          onAnnotationSelection(text, {
+            x: event.clientX > 0 ? event.clientX : bounds.left + 24,
+            y: event.clientY > 0 ? event.clientY : bounds.top + 24,
+          });
+        } : undefined}>{item.mesh ? <MeshMessageBody mesh={item.mesh} onLinkOpen={onLinkOpen}/> : <RichText onImageOpen={setLightbox} onLinkOpen={onLinkOpen}>{item.body}</RichText>}</div> : null}
         {item.kind === "assistant" ? imageGallery : null}
         {item.kind === "assistant" ? audioGallery : null}
+        {deliveryFailed ? <div className="message-delivery-error" role="status" title={item.queuedNewTaskDeliveryError}>
+          <AlertIcon />
+          <span><strong>Message wasn&apos;t sent.</strong><small>{item.queuedNewTaskDeliveryError || "Something went wrong while sending this message."}</small></span>
+          <button type="button" onClick={() => onRetryQueuedNewTaskDelivery?.(item.queuedNewTaskDeliveryId!)}>Retry</button>
+        </div> : null}
         {footerCopyText ? <div className="message-footer">
           <time dateTime={item.timestamp}>{time}</time>
           <CopyButton className="copy-message" text={visibleFooterCopyText ?? footerCopyText} label={footerCopyLabel} />

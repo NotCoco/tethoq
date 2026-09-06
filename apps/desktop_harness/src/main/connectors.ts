@@ -7,6 +7,8 @@ import {
   type ConnectorCapabilities,
   type ConnectorEvent,
   type ConnectorHostDescriptor,
+  type ConnectorHostToolParams,
+  type ConnectorClientToolDefinition,
   type ConnectorManifestV1,
   type ConnectorMessage,
   type ConnectorModelDescriptor,
@@ -33,6 +35,7 @@ import {
   type ProviderEventSink,
   type ProviderQueuedMessage,
   type ProviderUserInputResponse,
+  type ProviderClientTooling,
   type SendMessageRequest,
   type SendMessageResult,
   type Subscription,
@@ -164,6 +167,10 @@ export async function loadDesktopConnectors(options: LoadDesktopConnectorsOption
           await adapter.receiveEvent(subscriptionId, event);
         },
         onProtocolError: (error) => { startupProtocolError = error; },
+        executeHostTool: async (params) => {
+          if (adapter === undefined) throw new Error("Connector tooling is not initialized");
+          return await adapter.executeHostTool(params);
+        },
       });
       adapter = new ExternalConnectorAdapter(options.host.id, runtimeManifest, client, async () => {
         await rm(runtimeCopyRoot, { recursive: true, force: true });
@@ -252,6 +259,36 @@ export class ExternalConnectorAdapter implements AgentProviderAdapter {
   #eventsInWindow = 0;
   #initialized = false;
   #disposed = false;
+  #clientTooling: ProviderClientTooling | undefined;
+  readonly #sessionTools = new Map<string, readonly ConnectorClientToolDefinition[]>();
+  readonly #toolDisabledSessions = new Set<string>();
+
+  public readonly sessionCreationFeatures = { hiddenDeveloperInstructions: false, ephemeralSessions: false, selectableClientTools: true };
+
+  public configureClientTooling(tooling: ProviderClientTooling): void {
+    this.#clientTooling = tooling;
+  }
+
+  public async executeHostTool(params: ConnectorHostToolParams) {
+    if (!isRecord(params) || !boundedString(params.sessionId, 1, 50_000) || !boundedString(params.name, 1, 200) || !isRecord(params.input)) {
+      throw new Error("Invalid connector tool call");
+    }
+    assertBoundedJson(params.input, "tool input");
+    const tooling = this.#clientTooling;
+    const allowed = this.#sessionTools.get(params.sessionId);
+    if (this.#disposed || tooling === undefined || !allowed?.some((tool) => tool.name === params.name)) {
+      throw new Error("This tool is not enabled for this connector session");
+    }
+    // The connector cannot select a host/provider or obtain a gateway token.
+    return await tooling.execute(this.providerId, params.sessionId, params.name, params.input);
+  }
+
+  private toolParams(sessionId: string, request: SendMessageRequest) {
+    if (this.#clientTooling === undefined) return {};
+    const tools = this.#toolDisabledSessions.has(sessionId) ? [] : this.#clientTooling.definitions.filter((tool) => request.clientToolOverrides?.[tool.name] !== false);
+    this.#sessionTools.set(sessionId, tools);
+    return { clientTools: tools };
+  }
 
   public readonly authenticate?: (request: AuthRequest) => Promise<AuthResult>;
   public readonly listModels?: () => Promise<readonly RemoteModel[]>;
@@ -350,6 +387,7 @@ export class ExternalConnectorAdapter implements AgentProviderAdapter {
   }
 
   public async createSession(options: CreateSessionOptions): Promise<RemoteSession> {
+    const toolsDisabled = options.clientTools === "none" || options.metadata?.internalPurpose === "vision_proxy";
     const session = await this.request("session.create", {
       workingDirectory: options.workingDirectory,
       ...(options.title !== undefined ? { title: options.title } : {}),
@@ -357,8 +395,11 @@ export class ExternalConnectorAdapter implements AgentProviderAdapter {
       ...(options.reasoningEffort !== undefined ? { reasoningEffort: options.reasoningEffort } : {}),
       ...(options.firstInstruction !== undefined ? { firstInstruction: options.firstInstruction } : {}),
       ...(options.metadata !== undefined ? { metadata: options.metadata } : {}),
+      ...(toolsDisabled ? { clientTools: "none" as const, mcpServers: "none" as const } : {}),
     });
-    return this.normalizeSession(session);
+    const normalized = this.normalizeSession(session);
+    if (toolsDisabled) this.#toolDisabledSessions.add(normalized.providerSessionId);
+    return normalized;
   }
 
   public async resumeSession(providerSessionId: string): Promise<void> {
@@ -366,11 +407,11 @@ export class ExternalConnectorAdapter implements AgentProviderAdapter {
   }
 
   public async sendMessage(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
-    return sendResult(this.providerId, await this.request("session.message.send", messageParams(providerSessionId, request)));
+    return sendResult(this.providerId, await this.request("session.message.send", { ...messageParams(providerSessionId, request), ...this.toolParams(providerSessionId, request) }));
   }
 
   private async steerConnectorMessage(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
-    return sendResult(this.providerId, await this.request("session.message.steer", messageParams(providerSessionId, request)));
+    return sendResult(this.providerId, await this.request("session.message.steer", { ...messageParams(providerSessionId, request), ...this.toolParams(providerSessionId, request) }));
   }
 
   private async editConnectorMessage(providerSessionId: string, request: EditMessageRequest): Promise<SendMessageResult> {
@@ -426,6 +467,8 @@ export class ExternalConnectorAdapter implements AgentProviderAdapter {
   public async dispose(): Promise<void> {
     if (this.#disposed) return;
     this.#disposed = true;
+    this.#sessionTools.clear();
+    this.#toolDisabledSessions.clear();
     for (const callback of this.#disposedCallbacks) callback();
     this.#disposedCallbacks.clear();
     this.#events.clear();
@@ -814,6 +857,7 @@ function messageParams(providerSessionId: string, request: SendMessageRequest | 
     sessionId: providerSessionId,
     requestId: request.requestId,
     content: request.content,
+    ...("developerInstructions" in request && request.developerInstructions !== undefined ? { developerInstructions: request.developerInstructions } : {}),
     ...(request.modelId !== undefined ? { modelId: request.modelId } : {}),
     ...(request.reasoningEffort !== undefined ? { reasoningEffort: request.reasoningEffort } : {}),
     ...("attachments" in request && request.attachments !== undefined ? { attachments: request.attachments } : {}),

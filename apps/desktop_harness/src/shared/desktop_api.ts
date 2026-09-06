@@ -14,10 +14,10 @@ export type { VisionProxySelection, VisionProxyStatus, VisionProxyTarget };
 
 /**
  * Renderer RPC seam for per-session visual support:
- * - `vision.targets` -> `{ targets: VisionProxyTarget[] }`
+ * - `vision.targets` -> `{ targets: VisionProxyTarget[], incomplete: boolean }`
  * - `session.vision.get` `{ sessionId }` -> `{ vision: VisionProxyStatus }`
  * - `session.vision.configure` `{ sessionId, selection: VisionProxySelection | null }`
- * - `session.vision.ask` `{ sessionId, question, attachments? }` -> `{ observation, helperSessionId }`
+ * - `session.vision.ask` `{ sessionId, question, attachments? }` -> `{ observation }`
  */
 export const VISION_PROXY_REQUESTS = Object.freeze({
   targets: "vision.targets",
@@ -44,6 +44,7 @@ export const IPC_CHANNELS = Object.freeze({
   localOpenHandlers: "tethoq:local-open-handlers",
   openLocalTarget: "tethoq:open-local-target",
   openDictationSetupPage: "tethoq:open-dictation-setup-page",
+  openHarnessSetupPage: "tethoq:open-harness-setup-page",
   showWindow: "tethoq:show-window",
   hideWindow: "tethoq:hide-window",
   /** Renderer has its first snapshot and is worth looking at. */
@@ -68,6 +69,9 @@ export const IPC_CHANNELS = Object.freeze({
   liveSessionEvent: "tethoq:live-session-event",
   liveSessionGetState: "tethoq:live-session-get-state",
   liveSessionAction: "tethoq:live-session-action",
+  mobileConnectionState: "tethoq:mobile-connection-state",
+  mobileConnectionGetState: "tethoq:mobile-connection-get-state",
+  mobileConnectionAction: "tethoq:mobile-connection-action",
   smokeQuit: "tethoq:smoke-quit",
 } as const);
 
@@ -84,6 +88,7 @@ export interface DesktopBootstrap {
   readonly connectors: DesktopConnectorState;
   readonly latestSequence: number;
   readonly openCode: OpenCodeProcessStatus;
+  readonly providerSetupIssues?: readonly { readonly providerId: string; readonly message: string }[];
 }
 
 export interface DesktopConnectorDescriptor {
@@ -151,6 +156,8 @@ export interface OpenCodeProcessStatus {
   readonly managed: boolean;
   readonly pid?: number;
   readonly message?: string;
+  /** Stable machine-readable cause used for safe supervision decisions. */
+  readonly reason?: "credentials_required" | "port_in_use";
 }
 
 export interface DesktopEventBatch {
@@ -163,6 +170,26 @@ export interface DesktopRuntimeState {
   readonly state: "starting" | "ready" | "stopping" | "failed";
   readonly message?: string;
 }
+
+export interface MobileConnectionDevice {
+  /** Opaque main-process handle used only to remove this pairing. */
+  readonly id: string;
+  readonly pairedAt: string;
+  /** True only while this saved phone has an authenticated live connection. */
+  readonly connected: boolean;
+}
+
+export interface MobileConnectionState {
+  readonly state: "idle" | "starting" | "ready" | "paired" | "error";
+  readonly devices: readonly MobileConnectionDevice[];
+  readonly qrDataUrl?: string;
+  readonly expiresAt?: string;
+  readonly message?: string;
+}
+
+export type MobileConnectionAction =
+  | { readonly type: "start" }
+  | { readonly type: "revoke"; readonly connectionId: string };
 
 export type AttachmentOrigin = "file-picker" | "drag-drop" | "clipboard" | "dictation";
 
@@ -200,6 +227,7 @@ export interface BrowserBounds { readonly x: number; readonly y: number; readonl
 export interface BrowserTabState {
   readonly id: string; readonly title: string; readonly url: string; readonly faviconUrl: string | null;
   readonly loading: boolean; readonly canGoBack: boolean; readonly canGoForward: boolean; readonly crashed: boolean; readonly error: string | null;
+  readonly muted: boolean; readonly audible: boolean;
 }
 export interface BrowserDownloadState {
   readonly id: string; readonly tabId: string | null; readonly filename: string; readonly url: string; readonly state: "progressing" | "completed" | "cancelled" | "interrupted";
@@ -217,6 +245,7 @@ export interface BrowserWorkspaceState {
   readonly pendingPermissions: readonly BrowserPermissionRequest[];
   readonly permissionDecisions: readonly { readonly origin: string; readonly permission: string; readonly decision: "allow" | "deny" }[];
   readonly overlaySnapshotDataUrl?: string;
+  readonly overlayToken?: number;
 }
 export interface BrowserNotice {
   readonly tone: "info" | "error";
@@ -227,11 +256,13 @@ export interface BrowserNotice {
 export type BrowserAction =
   | { readonly type: "create-tab"; readonly input?: string; readonly activate?: boolean }
   | { readonly type: "activate-tab" | "close-tab" | "back" | "forward" | "reload" | "stop"; readonly tabId: string }
+  | { readonly type: "set-muted"; readonly tabId: string; readonly muted: boolean }
   | { readonly type: "navigate"; readonly tabId: string; readonly input: string }
   | { readonly type: "set-bounds"; readonly bounds: BrowserBounds }
   | { readonly type: "set-visible"; readonly visible: boolean; readonly sessionId?: string }
   | { readonly type: "focus" | "clear-profile" | "clear-download-history" | "close-overlay" }
-  | { readonly type: "open-overlay"; readonly bounds: BrowserBounds }
+  | { readonly type: "prepare-overlay"; readonly bounds: BrowserBounds }
+  | { readonly type: "open-overlay"; readonly token: number }
   | { readonly type: "permission"; readonly requestId: string; readonly allow: boolean; readonly rememberForSession?: boolean }
   | { readonly type: "download"; readonly id: string; readonly action: "pause" | "resume" | "cancel" };
 
@@ -277,6 +308,10 @@ export interface DesktopPreferencesState {
   readonly version: 1;
   readonly experimentalFeatures: boolean;
   readonly reasoningDisplay: "compact" | "expanded";
+  /** How the task rail is organised. Recency remains the default. */
+  readonly taskListMode: TaskListMode;
+  /** Explicitly saved project folders, most recently used first. */
+  readonly savedProjectDirectories: readonly string[];
   readonly localOpenHandlerId: LocalOpenHandlerId;
   /** What the window close button does. Tray keeps active tasks and alerts alive. */
   readonly closeAction: DesktopCloseAction;
@@ -290,7 +325,7 @@ export interface DesktopPreferencesState {
   readonly globalAgentsPath: string | null;
   /** Local, user-owned task organisation keyed by session ID. Provider titles are never overwritten upstream. */
   readonly taskOverrides: Readonly<Record<string, TaskOverride>>;
-  /** Master gate for spawning subagents on a different provider/harness. Off by default. */
+  /** Backwards-compatible mirror of the experimental-features gate. */
   readonly allowForeignSubagents?: boolean;
   /** Explicit per-session choices recorded by the user; absent keys follow the gate's default. */
   readonly foreignSubagentOverrides?: Readonly<Record<string, boolean>>;
@@ -306,6 +341,7 @@ export interface EarsSettings {
 export type DesktopCloseAction = "tray" | "quit";
 export type DesktopLaunchAtLogin = "off" | "window" | "tray";
 export type DesktopAlertLevel = "all" | "attention" | "off";
+export type TaskListMode = "recent" | "project";
 export interface AgentModelDefault {
   readonly modelId: string;
   readonly reasoningEffort?: string;
@@ -321,11 +357,14 @@ export const MAX_TASK_TITLE_CHARACTERS = 120;
 export type PreferencesAction =
   | { readonly type: "set-experimental-features"; readonly enabled: boolean }
   | { readonly type: "set-reasoning-display"; readonly value: "compact" | "expanded" }
+  | { readonly type: "set-task-list-mode"; readonly value: TaskListMode }
+  | { readonly type: "save-project" | "use-project"; readonly directory: string }
   | { readonly type: "set-close-action"; readonly value: DesktopCloseAction }
   | { readonly type: "set-launch-at-login"; readonly value: DesktopLaunchAtLogin }
   | { readonly type: "set-alerts"; readonly value: DesktopAlertLevel }
   | { readonly type: "choose-global-agents" | "clear-global-agents" }
   | { readonly type: "set-task-override"; readonly sessionId: string; readonly override: TaskOverride }
+  | { readonly type: "move-task-override"; readonly fromSessionId: string; readonly toSessionId: string }
   | { readonly type: "set-agent-default"; readonly providerId: string; readonly modelId: string; readonly reasoningEffort?: string }
   | { readonly type: "set-allow-foreign-subagents"; readonly enabled: boolean }
   | { readonly type: "set-session-foreign-subagents"; readonly sessionId: string; readonly allowed: boolean }
@@ -459,6 +498,7 @@ export interface DesktopHarnessApi {
   localOpenHandlers(): Promise<LocalOpenState>;
   openLocalTarget(target: LocalOpenTarget): Promise<LocalOpenResult>;
   openDictationSetupPage(sourceId: "openai-stt" | "xai-stt"): Promise<void>;
+  openHarnessSetupPage(providerId: BuiltInDesktopProviderId): Promise<void>;
   showWindow(): Promise<void>;
   hideWindow(): Promise<void>;
   /** Tells the shell the first snapshot has landed, so the window can be revealed already populated. */
@@ -474,6 +514,8 @@ export interface DesktopHarnessApi {
   preferencesAction(action: PreferencesAction): Promise<DesktopPreferencesState>;
   liveSessionState(): Promise<LiveSessionState>;
   liveSessionAction(action: LiveSessionAction): Promise<LiveSessionState | UtteranceEvidence>;
+  mobileConnectionState(): Promise<MobileConnectionState>;
+  mobileConnectionAction(action: MobileConnectionAction): Promise<MobileConnectionState>;
   /** Present only in packaged-smoke processes started with the explicit env guard. */
   quitForSmoke?: () => Promise<boolean>;
   onEventBatch(listener: (batch: DesktopEventBatch) => void): () => void;
@@ -485,6 +527,7 @@ export interface DesktopHarnessApi {
   onPreferencesState(listener: (state: DesktopPreferencesState) => void): () => void;
   onLiveSessionState(listener: (state: LiveSessionState) => void): () => void;
   onLiveSessionEvent(listener: (event: LiveSessionEvent) => void): () => void;
+  onMobileConnectionState(listener: (state: MobileConnectionState) => void): () => void;
 }
 
 export function isBuiltInDesktopProvider(value: unknown): value is BuiltInDesktopProviderId {

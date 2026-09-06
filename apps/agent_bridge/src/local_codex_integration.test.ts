@@ -1,5 +1,6 @@
 ﻿import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   CURRENT_PROTOCOL_VERSION,
@@ -101,6 +102,16 @@ async function connect(url: string): Promise<{ readonly socket: WebSocket; reado
   });
   return { socket, inbox };
 }
+
+test("Codex mesh installation keeps its transient CLI hidden on Windows", async () => {
+  const source = await readFile(new URL("../../../../apps/agent_bridge/src/codex_tools.ts", import.meta.url), "utf8");
+  const spawnStart = source.indexOf("const child = spawn(");
+  const spawnEnd = source.indexOf("let stdout", spawnStart);
+  assert.ok(spawnStart >= 0 && spawnEnd > spawnStart, "the Codex mesh installer spawn must remain identifiable");
+  const spawnCall = source.slice(spawnStart, spawnEnd);
+  assert.match(spawnCall, /windowsHide:\s*true/u);
+  assert.match(spawnCall, /shell:\s*false/u);
+});
 
 test("real Codex end-to-end slice over the authenticated bridge socket (opt-in)", async (context) => {
   if ((process.env.TETHOQ_CODEX_INTEGRATION ?? process.env.UAR_CODEX_INTEGRATION) !== "1") {

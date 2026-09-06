@@ -1,7 +1,8 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import type { LocalOpenHandler, LocalOpenHandlerIcon, LocalOpenHandlerId, LocalOpenState } from "@shared/desktop_api";
-import { CheckIcon, ChevronDownIcon, CursorAppIcon, ExplorerIcon, NotepadPlusIcon, SublimeIcon, VSCodeIcon, WindsurfIcon, ZedIcon } from "./icons";
+import { CheckIcon, ChevronDownIcon, CopyIcon, CursorAppIcon, ExplorerIcon, NotepadPlusIcon, SublimeIcon, VSCodeIcon, WindsurfIcon, ZedIcon } from "./icons";
+import { copyText } from "./clipboard";
 
 export interface LocalOpenLocation {
   readonly path: string;
@@ -88,6 +89,11 @@ export function LocalPathAction({ location, children, className }: { location: L
     {menu && typeof document !== "undefined" ? createPortal(<div className="local-open-menu local-open-context-menu" role="menu" aria-label="Open in" style={{ "--local-menu-x": `${menu.x}px`, "--local-menu-y": `${menu.y}px` } as CSSProperties} onMouseDown={(event) => event.stopPropagation()}>
       <header>Open in</header>
       <div><HandlerItems handlers={localOpen.state.handlers} defaultHandlerId={localOpen.state.defaultHandlerId} onSelect={(handler) => { setMenu(null); void localOpen.open(location, handler.id); }} /></div>
+      {/* This link cancels the window's editing menu to open its own, so the
+          path still has to be copyable from somewhere. */}
+      <div className="local-open-copy"><button type="button" role="menuitem" onClick={() => { setMenu(null); void copyText(location.path); }}>
+        <CopyIcon /><span>Copy path</span><i aria-hidden="true" />
+      </button></div>
     </div>, document.body) : null}
   </>;
 }

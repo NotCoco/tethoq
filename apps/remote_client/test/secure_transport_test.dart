@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:universal_agent_remote/src/json.dart';
 import 'package:universal_agent_remote/src/models.dart';
@@ -11,8 +12,8 @@ import 'package:universal_agent_remote/src/security.dart';
 /// must reproduce exactly, or the phone and the computer would silently fail to
 /// agree a key.
 Future<JsonMap> loadVectors() async {
-  final file =
-      File('../../packages/protocol/test_vectors/secure_transport_vectors.json');
+  final file = File(
+      '../../packages/protocol/test_vectors/secure_transport_vectors.json');
   return jsonMap(jsonDecode(await file.readAsString()),
       name: 'secure transport vectors');
 }
@@ -42,6 +43,59 @@ Future<SecureTransportKeys> keysFrom(JsonMap vectors) async {
 }
 
 void main() {
+  test('draft journal key is generated once and persists securely', () async {
+    FlutterSecureStorage.setMockInitialValues(<String, String>{});
+    const storage = FlutterSecureStorage();
+    final security = DeviceSecurity(storage: storage);
+
+    final concurrent = await Future.wait<List<int>>(
+      List<Future<List<int>>>.generate(4, (_) => security.loadKey()),
+    );
+    final first = concurrent.first;
+    expect(first, hasLength(32));
+    expect(concurrent.skip(1), everyElement(first));
+    expect(() => first[0] = first[0] ^ 0xff, throwsUnsupportedError);
+
+    final restarted = DeviceSecurity(storage: storage);
+    expect(await restarted.loadKey(), first);
+    expect(
+      await storage.read(key: 'uar.draft_journal_aes256_key.v1'),
+      base64UrlNoPadding(first),
+    );
+  });
+
+  test('malformed stored draft journal key fails closed', () async {
+    const storageKey = 'uar.draft_journal_aes256_key.v1';
+    FlutterSecureStorage.setMockInitialValues(<String, String>{
+      storageKey: 'malformed-key',
+    });
+    const storage = FlutterSecureStorage();
+
+    await expectLater(
+      DeviceSecurity(storage: storage).loadKey(),
+      throwsA(isA<StateError>()),
+    );
+    expect(await storage.read(key: storageKey), 'malformed-key');
+  });
+
+  test('removing a paired host clears its secure transport requirement',
+      () async {
+    FlutterSecureStorage.setMockInitialValues(<String, String>{});
+    const storage = FlutterSecureStorage();
+    final host = hostFrom(await loadVectors());
+    final security = DeviceSecurity(storage: storage);
+
+    await security.saveHost(host);
+    await security.markSecureTransportRequired(host);
+    expect(await security.readSecureTransportRequired(host), true);
+
+    await security.removeHost(host.hostId);
+
+    final restarted = DeviceSecurity(storage: storage);
+    expect(await restarted.readHosts(), isEmpty);
+    expect(await restarted.readSecureTransportRequired(host), false);
+  });
+
   test('the signed handshake bind matches the Node canonical bytes', () async {
     final vectors = await loadVectors();
     final cases = jsonList(vectors['handshakeBind']);
@@ -145,8 +199,7 @@ void main() {
     final offer = SecureHandshakeOffer.tryParse(vectors['hostOffer']);
     expect(offer, isNotNull);
 
-    final result =
-        await acceptSecureHandshake(offer: offer!, host: host);
+    final result = await acceptSecureHandshake(offer: offer!, host: host);
     expect(result.accept['kind'], 'secure_handshake');
     expect(result.accept['deviceId'], host.deviceId);
     expect(result.accept['scheme'], secureTransportScheme);
@@ -154,10 +207,8 @@ void main() {
 
     // A relay that swaps in its own key cannot forge the host signature over it.
     final forged = SecureHandshakeOffer(
-      ephemeralPublicKey:
-          requireString(vectors, 'deviceEphemeralPublicKey'),
-      signature: requireString(
-          jsonMap(vectors['hostOffer']), 'signature'),
+      ephemeralPublicKey: requireString(vectors, 'deviceEphemeralPublicKey'),
+      signature: requireString(jsonMap(vectors['hostOffer']), 'signature'),
     );
     await expectLater(
       acceptSecureHandshake(offer: forged, host: host),

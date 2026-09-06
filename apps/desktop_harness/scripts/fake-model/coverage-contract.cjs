@@ -8,6 +8,10 @@
  * surface from being mistaken for tested merely because the app still boots.
  */
 const FEATURE_CONTRACT = Object.freeze([
+  ['startup.progressive-shell-no-blocking-copy', 'progressive-startup'],
+  ['startup.composer-usable-before-hydration', 'progressive-startup'],
+  ['startup.draft-survives-hydration', 'progressive-startup'],
+
   ['runtime.connected', 'boot-and-state-signals'],
   ['tasks.secondary-fixture-visible', 'boot-and-state-signals'],
   ['subagents.proven-child-hidden-from-rail', 'boot-and-state-signals'],
@@ -18,7 +22,25 @@ const FEATURE_CONTRACT = Object.freeze([
   ['subagents.open-child-back-to-parent', 'boot-and-state-signals'],
   ['transcript.copy-controls-clean', 'boot-and-state-signals'],
 
-  ['context.draft-live-percentage', 'context-threshold-lifecycle'],
+  ['goal.command-and-overflow-entry', 'goal-lifecycle'],
+  ['goal.lifecycle-controls', 'goal-lifecycle'],
+  ['goal.private-guidance-no-transcript', 'goal-lifecycle'],
+  ['goal.zero-token-and-reopen', 'goal-lifecycle'],
+  ['goal.compact-painted-popover', 'goal-lifecycle'],
+
+  ['luna.goal-enter-closes-and-focuses', 'luna-panel-sequences'],
+  ['luna.partial-command-deletion', 'luna-panel-sequences'],
+  ['luna.mesh-and-ears-single-panel', 'luna-panel-sequences'],
+  ['luna.delegation-draft-survives-task-switch', 'luna-panel-sequences'],
+  ['luna.project-groups-keep-path-identity', 'luna-panel-sequences'],
+  ['luna.project-collapse-expand', 'luna-panel-sequences'],
+  ['luna.project-draft-materializes-folder', 'luna-panel-sequences'],
+  ['luna.recency-project-toggle', 'luna-panel-sequences'],
+
+  ['projects.context-menu-actions-stay-in-viewport', 'project-context-menu-bounds'],
+  ['queue.new-task-picker-escape-preserves-item', 'queue-new-task-escape'],
+
+  ['context.draft-keeps-usage-stable', 'context-threshold-lifecycle'],
   ['context.escape-discards-draft', 'context-threshold-lifecycle'],
   ['context.outside-click-discards-draft', 'context-threshold-lifecycle'],
   ['context.apply-once', 'context-threshold-lifecycle'],
@@ -42,6 +64,7 @@ const FEATURE_CONTRACT = Object.freeze([
   ['stream.history-insertion-no-duplicates', 'master-stream-identity'],
   ['history.terminal-before-final-recovers-after-reload', 'terminal-history-race'],
   ['history.terminal-race-no-duplicate-or-stale-shimmer', 'terminal-history-race'],
+  ['history.later-live-activity-cancels-stale-terminal', 'terminal-live-cancellation'],
   ['annotation.create-edit-remove-send', 'response-annotation-journey'],
   ['annotation.metadata-hidden-from-transcript', 'response-annotation-journey'],
   ['annotation.provider-echo-reconciles-once', 'response-annotation-journey'],
@@ -59,6 +82,10 @@ const FEATURE_CONTRACT = Object.freeze([
   ['audio.no-queue-flash-or-success-toast', 'native-audio-sending'],
   ['audio.no-stale-answer-replay', 'native-audio-sending'],
   ['audio.gpt-5.6-sol-requires-ears', 'ears-transcription-send'],
+
+  ['attachments.image-send-stable-presentation', 'image-send-scroll-stability'],
+  ['scroll.image-send-follows-physical-bottom', 'image-send-scroll-stability'],
+  ['scroll.image-send-preserves-reader-position', 'image-send-scroll-stability'],
 
   ['scroll.reader-owned-during-stream', 'queue-steer-and-viewport-stability'],
   ['scroll.reasoning-expansion-preserves-anchor', 'queue-steer-and-viewport-stability'],
@@ -82,10 +109,18 @@ const FEATURE_CONTRACT = Object.freeze([
   ['responsive.model-picker-painted-above-header', 'overlays-and-responsive'],
   ['responsive.model-picker-focuses-search', 'overlays-and-responsive'],
   ['responsive.actions-popover-not-clipped', 'overlays-and-responsive'],
+  ['schedule.create-pending', 'scheduled-task-lifecycle'],
+  ['schedule.dispatching-failed-retry', 'scheduled-task-lifecycle'],
+  ['schedule.retry-starts-task', 'scheduled-task-lifecycle'],
+  ['schedule.run-now-starts-task', 'scheduled-task-lifecycle'],
+  ['schedule.cancel-clears-active-schedule', 'scheduled-task-lifecycle'],
+  ['schedule.failed-dismiss-clears-active-schedule', 'scheduled-task-lifecycle'],
+  ['schedule.compact-layout-contained', 'scheduled-task-lifecycle'],
   ['draft.task-local-restore', 'draft-restore-and-materialize'],
   ['draft.materialize-create-payload', 'draft-restore-and-materialize'],
   ['draft.materialize-once-no-duplicate', 'draft-restore-and-materialize'],
   ['draft.clear-after-materialize', 'draft-restore-and-materialize'],
+  ['draft.late-image-picker-follows-materialized-task', 'draft-late-picker-rebind'],
   ['settings.close-action-persist', 'settings-round-trip'],
   ['settings.alert-level-persist', 'settings-round-trip'],
   ['settings.startup-persist', 'settings-round-trip'],

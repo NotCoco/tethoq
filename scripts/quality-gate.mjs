@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 const root = new URL("..", import.meta.url);
 const ignoredDirectories = new Set([
   ".dart_tool", ".example-dist", ".git", ".next", ".playwright-cli", ".runtime", ".test-dist", ".tmp-appserver-schema",
-  "artifacts", "build", "coverage", "dist", "node_modules", "out", "release", "tmp", "work",
+  "artifacts", "build", "coverage", "dist", "local-artifacts", "node_modules", "out", "release", "tmp", "work",
 ]);
 const ignoredDirectoryPrefixes = ["qa-artifacts", "release-"];
 const sourceExtensions = new Set([".ts", ".tsx", ".cts", ".mts", ".dart", ".js", ".jsx", ".cjs", ".mjs"]);

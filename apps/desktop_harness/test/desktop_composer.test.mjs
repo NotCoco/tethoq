@@ -12,6 +12,17 @@ const outputDirectory = join(tmpdir(), `tethoq-composer-${process.pid}-${Date.no
 const helperBundle = join(outputDirectory, "helpers.mjs");
 const timelineBundle = join(outputDirectory, "timeline.mjs");
 const composerUiBundle = join(outputDirectory, "composer-ui.mjs");
+const modelHydrationBundle = join(outputDirectory, "model-hydration.mjs");
+const inlineWorkerStubPlugin = {
+  name: "inline-worker-stub",
+  setup(buildContext) {
+    buildContext.onResolve({ filter: /\?worker&inline$/ }, (args) => ({ path: args.path, namespace: "inline-worker-stub" }));
+    buildContext.onLoad({ filter: /.*/, namespace: "inline-worker-stub" }, () => ({
+      contents: "export default class InlineWorkerStub { constructor() { throw new Error('Workers are not started by unit tests'); } }",
+      loader: "js",
+    }));
+  },
+};
 await mkdir(outputDirectory, { recursive: true });
 await build({
   entryPoints: [join(appRoot, "src", "renderer", "src", "composer_helpers.ts")],
@@ -20,6 +31,7 @@ await build({
   format: "esm",
   platform: "node",
   target: "node22",
+  plugins: [inlineWorkerStubPlugin],
 });
 await build({
   entryPoints: [join(appRoot, "src", "renderer", "src", "ChatTimeline.tsx")],
@@ -28,6 +40,7 @@ await build({
   format: "esm",
   platform: "node",
   target: "node22",
+  plugins: [inlineWorkerStubPlugin],
 });
 await build({
   entryPoints: [join(appRoot, "src", "renderer", "src", "Composer.tsx")],
@@ -37,6 +50,15 @@ await build({
   platform: "node",
   target: "node22",
   loader: { ".css": "empty" },
+  plugins: [inlineWorkerStubPlugin],
+});
+await build({
+  entryPoints: [join(appRoot, "src", "renderer", "src", "model_hydration.ts")],
+  outfile: modelHydrationBundle,
+  bundle: true,
+  format: "esm",
+  platform: "node",
+  target: "node22",
 });
 // The composer reaches the bridge module now, and that module reads `window` as it
 // loads. Nothing here renders, so a bare stand-in is enough to import it.
@@ -45,8 +67,65 @@ globalThis.location ??= globalThis.window.location;
 const helpers = await import(`file:///${helperBundle.replaceAll("\\", "/")}`);
 const timelineHelpers = await import(`file:///${timelineBundle.replaceAll("\\", "/")}`);
 const composerUi = await import(`file:///${composerUiBundle.replaceAll("\\", "/")}`);
-process.on("exit", () => { void rm(outputDirectory, { recursive: true, force: true }); });
+const modelHydration = await import(`file:///${modelHydrationBundle.replaceAll("\\", "/")}`);
+
+test("Continue belongs only to the latest unresolved interruption", () => {
+  const issue = { id: "old-issue", kind: "error", body: "Task interrupted", state: "failed", timestamp: "2026-09-06T00:00:00Z" };
+  const next = (kind, body = "New work") => ({ id: "next", kind, body, state: "completed", timestamp: "2026-09-06T00:01:00Z" });
+  assert.equal(timelineHelpers.recoverableTimelineNoticeId([issue]), issue.id);
+  assert.equal(timelineHelpers.recoverableTimelineNoticeId([issue, next("user", "")]), issue.id, "a hidden control echo is not output");
+  for (const kind of ["user", "reasoning", "assistant", "tool", "command"]) {
+    assert.equal(timelineHelpers.recoverableTimelineNoticeId([issue, next(kind)]), undefined, `${kind} progressed beyond the interruption`);
+  }
+  assert.equal(timelineHelpers.recoverableTimelineNoticeId([issue, next("reasoning"), { ...issue, id: "new-issue" }]), "new-issue");
+  assert.equal(timelineHelpers.recoverableTimelineNoticeId([{ ...issue, kind: "tool", notice: "eyes_failure" }]), issue.id);
+});
+test.after(async () => { await rm(outputDirectory, { recursive: true, force: true }); });
 const source = async (path) => readFile(join(appRoot, path), "utf8");
+
+test("EYES keeps idle parent activity live only until its own completion or a newer boundary", () => {
+  const row = (id, kind, extra = {}) => ({ id, kind, body: id, state: "completed", timestamp: "2026-09-05T12:00:00.000Z", ...extra });
+  const eyes = row("eyes", "tool", { notice: "eyes_inspection", state: "running" });
+  const history = [row("question", "user"), row("thought", "reasoning"), eyes];
+  const active = (timeline, state = "idle") => helpers.sessionPresentsLiveTurn({ state }, timeline);
+  assert.equal(active(history), true);
+  assert.equal(helpers.sessionHoldsFollowUpQueue({ state: "idle" }, history), true);
+  assert.equal(helpers.sessionNeedsTranscriptCatchUp({ state: "idle" }, history), true);
+  assert.equal(timelineHelpers.withCurrentActivity(history, active(history)).at(-1).state, "running");
+  assert.equal(active([row("prior-interruption", "error"), eyes]), true, "a new Eyes call can precede the next user echo");
+  assert.equal(helpers.sessionNeedsTranscriptCatchUp({ state: "idle" }, [row("prior-interruption", "error"), eyes]), true);
+  assert.equal(active(history.map(item => ({ ...item, state: "completed" }))), false, "completion and explicit Stop settle Eyes");
+  assert.equal(active(history.map(item => item === eyes ? { ...eyes, notice: undefined } : item)), false, "ordinary stale tools remain settled");
+  for (const terminal of [
+    row("next-question", "user"), row("interrupted", "error"),
+    row("final", "assistant", { phase: "final_answer" }),
+    row("compaction", "assistant", { title: "System", body: "Session compacted" }),
+    row("eyes-failed", "tool", { notice: "eyes_failure" }),
+  ]) assert.equal(active([...history, terminal]), false, terminal.id);
+  for (const state of ["completed", "failed", "offline", "disconnected"]) assert.equal(active(history, state), false, state);
+  assert.equal(active([...history, row("new-thought", "reasoning", { body: "The screenshot says Session compacted." })]), true, "quoted image content is not a compaction boundary");
+});
+
+test("newer model hydration wins and failed or removed catalogues preserve the last good choices", () => {
+  const generations = new Map();
+  const older = modelHydration.beginModelHydration(generations, ["grok"]);
+  const newer = modelHydration.beginModelHydration(generations, ["grok"]);
+  const available = new Set(["grok"]);
+  const original = { grok: [{ id: "grok-stale", name: "Stale", efforts: [] }] };
+  const fresh = { grok: [{ id: "grok-4.6", name: "Grok 4.6", efforts: [] }] };
+  const afterFresh = modelHydration.mergeLatestModelCatalogues(original, available, fresh, newer, generations);
+  assert.equal(afterFresh.grok[0].id, "grok-4.6");
+  const afterLateOlder = modelHydration.mergeLatestModelCatalogues(afterFresh, available, original, older, generations);
+  assert.strictEqual(afterLateOlder, afterFresh, "a late older request replaced the current catalogue");
+
+  const failed = modelHydration.beginModelHydration(generations, ["grok"]);
+  assert.strictEqual(modelHydration.mergeLatestModelCatalogues(afterFresh, available, {}, failed, generations), afterFresh, "a failed probe erased the last successful catalogue");
+  const removed = modelHydration.beginModelHydration(generations, ["grok"]);
+  assert.strictEqual(modelHydration.mergeLatestModelCatalogues(afterFresh, new Set(), fresh, removed, generations), afterFresh, "a removed provider was restored by an in-flight request");
+  const empty = modelHydration.beginModelHydration(generations, ["grok"]);
+  const afterEmpty = modelHydration.mergeLatestModelCatalogues(afterFresh, available, { grok: [] }, empty, generations);
+  assert.deepEqual(afterEmpty.grok, [], "a successful empty catalogue was mistaken for a failed probe");
+});
 
 test("attachment upload is chunked and returns completed ids without invoking a provider", async () => {
   const calls = [];
@@ -63,10 +142,34 @@ test("attachment upload is chunked and returns completed ids without invoking a 
   assert.deepEqual(ids, ["attachment-1"]);
   assert.deepEqual(started, ["upload-1"]);
   assert.deepEqual(calls.map((call) => call.type), ["attachment.upload.begin", "attachment.upload.chunk", "attachment.upload.chunk", "attachment.upload.chunk", "attachment.upload.complete"]);
+  const chunks = calls.filter((call) => call.type === "attachment.upload.chunk");
+  assert.deepEqual(chunks.map((call) => call.payload.offset), [0, 32 * 1024 - 2, 2 * (32 * 1024 - 2)]);
+  assert.deepEqual(Buffer.concat(chunks.map((call) => Buffer.from(call.payload.dataBase64, "base64"))), Buffer.alloc(70 * 1024, 7));
   assert.equal(calls.some((call) => call.type.startsWith("session.")), false);
 });
 
-test("one idle externally-owned Codex submission queues exactly once without a direct send", async () => {
+test("attachment base64 chunking is byte-exact across worker boundaries", () => {
+  for (const size of [0, 1, 2, 3, 48 * 1024 - 1, 48 * 1024, 48 * 1024 + 1, 1024 * 1024 + 17]) {
+    const bytes = Uint8Array.from({ length: size }, (_, index) => (index * 31 + 7) % 256);
+    assert.equal(helpers.encodeAttachmentBytesToBase64(bytes), Buffer.from(bytes).toString("base64"), `size ${size}`);
+  }
+});
+
+test("an attachment worker startup failure never falls back to UI-thread encoding", async () => {
+  const originalWorker = globalThis.Worker;
+  globalThis.Worker = class WorkerStandIn {};
+  try {
+    await assert.rejects(
+      helpers.blobToUploadable(new Blob([new Uint8Array(1024)], { type: "image/png" }), "worker-failure.png"),
+      /Workers are not started by unit tests/,
+    );
+  } finally {
+    if (originalWorker === undefined) delete globalThis.Worker;
+    else globalThis.Worker = originalWorker;
+  }
+});
+
+test("an idle externally-owned Codex task resumes directly without requiring Desktop to be open", async () => {
   const session = { state: "idle", externalWriter: true };
   assert.equal(helpers.sessionHoldsFollowUpQueue(session), false, "writer ownership alone must not show Stop or a working spinner");
   const requestType = helpers.composerMessageRequestType({
@@ -80,34 +183,24 @@ test("one idle externally-owned Codex submission queues exactly once without a d
   const request = async (type) => { calls.push(type); return {}; };
   await request(requestType);
 
-  assert.deepEqual(calls, ["message_queue.enqueue"]);
-  assert.equal(calls.filter((type) => type === "session.send_message").length, 0);
+  assert.deepEqual(calls, ["session.send_message"]);
   assert.equal(helpers.composerMessageRequestType({
     liveGuidance: true,
     hasAttachments: false,
     blockedByAttention: true,
     queueingEnabled: false,
     externalWriter: true,
-  }), "message_queue.enqueue", "external ownership must outrank direct steering mode");
+  }), "message_queue.enqueue", "an actively owned task still uses the synchronized queue");
 });
 
-test("an externally-owned Codex attachment uses the acknowledged owner turn path", () => {
+test("an idle externally-owned Codex attachment uses the provider's direct fallback path", () => {
   assert.equal(helpers.composerMessageRequestType({
     liveGuidance: false,
     hasAttachments: true,
     blockedByAttention: false,
     queueingEnabled: true,
     externalWriter: true,
-    externalWriterAttachmentsSupported: true,
   }), "session.send_message");
-  assert.equal(helpers.composerMessageRequestType({
-    liveGuidance: false,
-    hasAttachments: true,
-    blockedByAttention: false,
-    queueingEnabled: true,
-    externalWriter: true,
-    externalWriterAttachmentsSupported: false,
-  }), "message_queue.enqueue", "unsupported owner transports must not fake an attachment send");
 });
 
 test("an idle attachment is a direct send, not a hidden queue entry", () => {
@@ -151,6 +244,76 @@ test("a genuine queued follow-up stays out of the transcript until it is deliver
     true,
     "an idle external-writer queue remains a hidden transport for an accepted send",
   );
+});
+
+test("an optimistic user row starts live presentation before provider output arrives", () => {
+  const timeline = [
+    { id: "previous-user", kind: "user", state: "completed" },
+    { id: "previous-final", messageId: "previous-final", kind: "assistant", phase: "final_answer", state: "completed" },
+    { id: "local-immediate", presentationId: "local-immediate", kind: "user", state: "completed" },
+  ];
+  assert.equal(helpers.sessionPresentsLiveTurn({ state: "working" }, timeline), true, "the reasoning shimmer starts from the immediate send boundary");
+  assert.equal(helpers.presentedSessionState({ state: "working" }, timeline), "working");
+});
+
+test("a failed composition is restored before work typed while it was sending", () => {
+  const submittedImage = { name: "submitted.png", path: "submitted.png", mimeType: "image/png", byteLength: 1, dataBase64: "AA==" };
+  const newerImage = { name: "newer.png", path: "newer.png", mimeType: "image/png", byteLength: 1, dataBase64: "AQ==" };
+  const submittedWorkflow = { id: "workflow-submitted", name: "Submitted", summary: { eventCount: 1, screenshotCount: 0, apps: [] } };
+  const newerWorkflow = { id: "workflow-newer", name: "Newer", summary: { eventCount: 2, screenshotCount: 1, apps: [] } };
+  const submittedAnnotation = { id: "annotation-submitted", text: "answer", annotation: "submitted note" };
+  const newerAnnotation = { id: "annotation-newer", text: "answer", annotation: "newer note" };
+
+  const restored = composerUi.mergeFailedComposerDraft({
+    content: "failed prompt",
+    attachments: [submittedImage],
+    workflowAttachments: [submittedWorkflow],
+    annotations: [submittedAnnotation],
+  }, {
+    content: "new draft",
+    // A repeated item is retained once, using the submitted snapshot first.
+    attachments: [{ ...submittedImage }, newerImage],
+    workflowAttachments: [{ ...submittedWorkflow }, newerWorkflow],
+    annotations: [{ ...submittedAnnotation }, newerAnnotation],
+  });
+
+  assert.equal(restored.content, "failed prompt\n\nnew draft");
+  assert.deepEqual(restored.attachments.map((item) => item.path), ["submitted.png", "newer.png"]);
+  assert.strictEqual(restored.attachments[0], submittedImage);
+  assert.deepEqual(restored.workflowAttachments.map((item) => item.id), ["workflow-submitted", "workflow-newer"]);
+  assert.deepEqual(restored.annotations.map((item) => item.id), ["annotation-submitted", "annotation-newer"]);
+
+  const submittedOnly = composerUi.mergeFailedComposerDraft({
+    content: "failed prompt",
+    attachments: [submittedImage],
+    workflowAttachments: [],
+    annotations: [],
+  }, { content: "", attachments: [], workflowAttachments: [], annotations: [] });
+  assert.equal(submittedOnly.content, "failed prompt");
+  assert.deepEqual(submittedOnly.attachments, [submittedImage]);
+});
+
+test("a failed side-chat send restores its snapshot without overwriting newer work", () => {
+  const submittedImage = { name: "submitted.png", path: "submitted.png", mimeType: "image/png", byteLength: 1, dataBase64: "AA==" };
+  const newerImage = { name: "newer.png", path: "newer.png", mimeType: "image/png", byteLength: 1, dataBase64: "AQ==" };
+  const restored = composerUi.mergeFailedSideChatDraft({
+    content: "failed side-chat prompt",
+    attachments: [submittedImage],
+  }, {
+    content: "new side-chat draft",
+    attachments: [{ ...submittedImage }, newerImage],
+  });
+
+  assert.equal(restored.content, "failed side-chat prompt\n\nnew side-chat draft");
+  assert.deepEqual(restored.attachments.map((item) => item.path), ["submitted.png", "newer.png"]);
+  assert.strictEqual(restored.attachments[0], submittedImage);
+  assert.deepEqual(composerUi.mergeFailedSideChatDraft({
+    content: "failed side-chat prompt",
+    attachments: [submittedImage],
+  }, { content: "", attachments: [] }), {
+    content: "failed side-chat prompt",
+    attachments: [submittedImage],
+  });
 });
 
 test("a persisted Codex final answer is immediate terminal evidence", () => {
@@ -290,11 +453,29 @@ test("dictation exposes a persistent microphone picker and a compact wide MP3 wi
   assert.match(composer, /Default microphone[\s\S]*?Follows the current Windows default/u);
   assert.match(composer, /requestMicrophoneStream\(\)[\s\S]*?recorder\.start\(stream\)/u);
   assert.match(composer, /const stream = await requestMicrophoneStream\(\);[\s\S]*?new MediaRecorder\(stream/u);
+  assert.match(composer, /new MicrophoneLevelMonitor\(\(level\) => liveTraceLevels\.push\(level\)\)[\s\S]*?await levelMonitor\.start\(stream\)/u);
+  assert.match(composer, /const recording = phase === "recording" \|\| phase === "audio-recording"/u);
+  assert.match(composer, /setAudioFinalizing\(true\);\s*setPhase\("transcribing"\)/u);
+  assert.match(composer, /const liveStrip = \(recording \|\| audioFinalizing\)/u);
+  assert.doesNotMatch(composer, /dictation-audio-stop/u, "the live strip must not duplicate the Dictate control's Stop action");
+  assert.match(composer, /recording \|\| audioFinalizing \? null : <Popover label="Choose dictation source"/u, "recording must give the whole lower pill to Stop instead of leaving a source-menu interception zone");
+  assert.match(composer, /const recordingStripHeight = audioStripHost\.current\?\.clientHeight \?\? 0;[\s\S]*?composerLimit - attachmentHeight - recordingStripHeight - 20[\s\S]*?composerEntryRow\.current\?\.getBoundingClientRect\(\)\.bottom[\s\S]*?target\.getBoundingClientRect\(\)\.height - Math\.ceil\(overflow\)/u);
+  assert.doesNotMatch(composer, /--dictation-connector-height/u, "recording layout must not retain geometry for the removed decorative connector");
+  assert.match(composer, /\[attachments, content, dictationPhase, meshTargets, resizeTextarea, workflowAttachments\]/u, "recording and Mesh target changes must recompute the bounded textarea height");
+  assert.match(composer, /composer-recording/u);
+  assert.match(composer, /onSettled\?\.\(committed\);\s*setAudioFinalizing\(false\);\s*setPhase\("idle"\)/u);
   assert.match(recorder, /public async start\(inputStream\?: MediaStream\)/u);
+  assert.match(recorder, /export function microphoneSignalLevel\(samples: Float32Array\)/u);
+  assert.match(recorder, /Math\.sqrt\(sum \/ samples\.length\) \* 4/u);
+  assert.match(recorder, /export class MicrophoneLevelMonitor/u);
   assert.match(css, /\.audio-playback-dictation \{[^}]*min-width:\s*252px[^}]*grid-template-columns:\s*26px 148px minmax\(30px,auto\) 22px[^}]*grid-template-rows:\s*18px 12px/u);
   assert.match(css, /\.audio-playback-dictation \.audio-dictation-mark \{[^}]*grid-column:\s*2[^}]*grid-row:\s*2/u);
   assert.match(css, /\.audio-playback-dictation \.audio-playback-remove \{[^}]*grid-column:\s*4[^}]*grid-row:\s*1/u);
   assert.match(css, /\.audio-playback-dictation \.audio-trace \{[^}]*width:\s*148px[^}]*height:\s*18px/u);
+  assert.doesNotMatch(css, /\.dictation-audio-strip::after/u, "the recording strip must end cleanly without a cone into Stop");
+  assert.match(css, /\.dictation-recording \.dictation-main,\s*\.dictation-audio-recording \.dictation-main,\s*\.dictation-transcribing \.dictation-main/u, "every live/finalizing recording phase retains the same red lower destination");
+  assert.match(css, /\.dictation-recording \.dictation-main:hover:not\(:disabled\),[\s\S]*?\.dictation-audio-recording \.dictation-main:focus-visible:not\(:disabled\) \{[^}]*background:\s*#5a3230;[^}]*box-shadow:\s*0 0 0 4px rgba\(242,118,108,\.14\)/u, "recording hover and keyboard focus must deepen both the red fill and its halo");
+  assert.doesNotMatch(css, /\.dictation-audio-stop/u);
 });
 
 test("sending needs a detected provider, not a live subscription state", () => {
@@ -337,7 +518,7 @@ test("quietness is per session, so another task's stream never hides this one's 
   assert.equal(helpers.selectedSessionLastDeltaAt(perSession, null, now - 500), now - 500);
 });
 
-test("an idle status cannot retire a live turn until its own stream is quiet", async () => {
+test("terminal task state applies immediately while a superseded signal is ignored", async () => {
   assert.equal(helpers.shouldApplySessionState("idle", false), false);
   assert.equal(helpers.shouldApplySessionState("completed", false), false);
   assert.equal(helpers.shouldApplySessionState("unknown", false), false);
@@ -347,24 +528,153 @@ test("an idle status cannot retire a live turn until its own stream is quiet", a
     assert.equal(helpers.shouldApplySessionState(state, false), true, `${state} must apply immediately`);
   }
 
+  assert.equal(helpers.terminalStateEventAction("idle", false, false), "apply");
+  assert.equal(helpers.terminalStateEventAction("completed", false, false), "apply");
+  assert.equal(helpers.terminalStateEventAction("idle", true, false), "apply");
+  assert.equal(helpers.terminalStateEventAction("completed", false, true), "ignore");
+  assert.equal(helpers.terminalStateEventAction("completed", false, true, true), "apply");
+
   const app = await source(join("src", "renderer", "src", "App.tsx"));
-  const wired = app.match(/shouldApplySessionState\(/gu) ?? [];
-  assert.equal(wired.length, 3, "session.updated, session.status_changed, and agent.completed must use the quiet-state gate");
+  assert.match(app, /\(event\.type === "session\.updated" \|\| event\.type === "session\.status_changed"\) && event\.payload\.state === "working"/u);
   assert.match(app, /if \(applyState && \(normalizedState === "idle" \|\| normalizedState === "completed" \|\| normalizedState === "failed"\)\) \{\s*const timeline[\s\S]*sessionNeedsTranscriptCatchUp/u);
 });
 
 test("slash commands open from a bare slash, filter without prefilling, and insert only on selection", () => {
-  assert.deepEqual(helpers.slashCommandSuggestions("/").map((item) => item.command), ["/simplify", "/mesh", "/ears", "/eyes"]);
+  assert.deepEqual(helpers.slashCommandSuggestions("/").map((item) => item.command), ["/simplify", "/mesh", "/goal", "/ears", "/eyes", "/schedule"]);
   assert.deepEqual(helpers.slashCommandSuggestions("/sim").map((item) => item.command), ["/simplify"]);
   assert.deepEqual(helpers.slashCommandSuggestions("/me").map((item) => item.command), ["/mesh"]);
+  assert.deepEqual(helpers.slashCommandSuggestions("/g").map((item) => item.command), ["/goal"]);
   assert.deepEqual(helpers.slashCommandSuggestions("/ea").map((item) => item.command), ["/ears"]);
   // The two settings commands share a first letter, so /e has to offer both.
   assert.deepEqual(helpers.slashCommandSuggestions("/e").map((item) => item.command), ["/ears", "/eyes"]);
   assert.deepEqual(helpers.slashCommandSuggestions("/ey").map((item) => item.command), ["/eyes"]);
+  assert.deepEqual(helpers.slashCommandSuggestions("/sc").map((item) => item.command), ["/schedule"]);
   assert.deepEqual(helpers.slashCommandSuggestions("/missing"), []);
-  assert.equal(helpers.slashCommandSuggestions("Explain /sim"), null);
+  assert.deepEqual(helpers.slashCommandSuggestions("Explain /sim").map((item) => item.command), ["/simplify"]);
+  assert.equal(helpers.slashCommandSuggestions("Explain tool/sim"), null);
+  assert.equal(helpers.slashCommandSuggestions("https://example.test/sim"), null);
   assert.equal(helpers.insertedSlashCommand(helpers.composerSlashCommands[0]), "/simplify ");
   assert.equal(helpers.insertedSlashCommand(helpers.composerSlashCommands[1]), "/mesh ");
+  assert.equal(helpers.insertedSlashCommand(helpers.composerSlashCommands[1], "Please /me"), "Please /mesh ");
+  assert.equal(helpers.insertedSlashCommand(helpers.composerSlashCommands[1], "Please /me keep this", 10), "Please /mesh  keep this");
+  assert.equal(helpers.insertedSlashCommand(helpers.composerSlashCommands[1], "\uE000/ suffix", 2), "\uE000/mesh  suffix");
+});
+
+test("draft scheduling validates real local times and preserves text added while persistence is pending", () => {
+  const now = new Date(2026, 7, 29, 12, 0, 30, 0);
+  assert.equal(composerUi.defaultDraftScheduleLocalValue(now), "2026-08-29T12:06");
+  assert.equal(composerUi.parseDraftScheduleLocalValue("2026-02-30T12:00"), null, "a normalized impossible date was accepted");
+  assert.match(composerUi.validateDraftScheduleLocalValue("not-a-date", now).error, /valid local date/u);
+  assert.match(composerUi.validateDraftScheduleLocalValue("2026-08-29T12:00", now).error, /future/u);
+  assert.match(composerUi.validateDraftScheduleLocalValue("2026-08-29T12:01", now).error, /at least one minute/u);
+  const valid = composerUi.validateDraftScheduleLocalValue("2026-08-29T12:05", now);
+  assert.equal(valid.error, null);
+  assert.equal(valid.date.toISOString(), new Date(2026, 7, 29, 12, 5, 0, 0).toISOString());
+  assert.equal(composerUi.draftScheduleLocalValueForOpen("2026-08-29T12:05", now), "2026-08-29T12:05");
+  assert.equal(
+    composerUi.draftScheduleLocalValueForOpen("2026-08-29T12:05", new Date(2026, 7, 29, 12, 6, 0, 0)),
+    "2026-08-29T12:11",
+    "reopening an aged scheduling panel retained its stale past default",
+  );
+  assert.deepEqual(composerUi.draftSchedulePresentation("  First line\nSecond line  "), {
+    title: "First line",
+    preview: "First line\nSecond line",
+  });
+  assert.equal(composerUi.clearScheduledDraftContent("Schedule this", "Schedule this"), "");
+  assert.equal(composerUi.clearScheduledDraftContent("Schedule this\nNew typing", "Schedule this"), "New typing");
+  assert.equal(composerUi.clearScheduledDraftContent("A replacement draft", "Schedule this"), "A replacement draft");
+});
+
+test("scheduling is a draft-only, text-only composer transaction that can retain explicit Mesh targets", async () => {
+  const [composer, helpersSource, css] = await Promise.all([
+    source(join("src", "renderer", "src", "Composer.tsx")),
+    source(join("src", "renderer", "src", "composer_helpers.ts")),
+    source(join("src", "renderer", "src", "composer.css")),
+  ]);
+  assert.match(helpersSource, /id: "schedule",\s*command: "\/schedule"/u);
+  assert.match(composer, /export interface DraftSessionScheduleInput/u);
+  assert.match(composer, /export interface DraftSessionScheduleAttemptState/u);
+  assert.match(composer, /onCreateDraftSchedule\?: \(input: DraftSessionScheduleInput\) => Promise<void>/u);
+  assert.match(composer, /onRetainDraftScheduleAttempt\?: \(input: DraftSessionScheduleInput\) => DraftSessionScheduleInput/u);
+  assert.match(composer, /draftSession \? <button[^>]*onClick=\{openDraftSchedule\}[\s\S]*?<strong>Schedule task<\/strong>/u);
+  assert.match(composer, /type="datetime-local"/u);
+  assert.match(composer, /role="dialog" aria-modal="false"/u);
+  assert.match(composer, /aria-label="Close task scheduling"/u);
+  assert.match(composer, /document\.addEventListener\("pointerdown", outside\)[\s\S]*window\.addEventListener\("keydown", escape\)/u);
+  assert.match(composer, /Remove dictation or audio attachments first/u);
+  assert.match(composer, /Remove attachments first/u);
+  assert.match(composer, /Remove workflows first/u);
+  assert.match(composer, /Remove response annotations first/u);
+  assert.match(composer, /meshTargets: readonly MeshTarget\[\]/u);
+  assert.match(composer, /const submittedMeshTargets = meshTargetsRef\.current\.map\(\(target\) => \(\{ \.\.\.target \}\)\)/u);
+  assert.match(composer, /Choose at least one Mesh target before scheduling this task/u);
+  assert.match(composer, /while \(hasSlashCommandToken\(scheduledContentWithoutCommands, "\/mesh"\)\)/u);
+  assert.doesNotMatch(composer, /Remove Mesh delegation first/u);
+  assert.match(composer, /let attempt = scheduleAttempt\.current[\s\S]*attempt = \{[\s\S]*draftSessionId: session\.id,[\s\S]*requestId: `schedule_\$\{globalThis\.crypto\.randomUUID\(\)\}`,[\s\S]*runAt: validation\.date\.toISOString\(\),[\s\S]*title: presentation\.title,[\s\S]*preview: presentation\.preview,[\s\S]*attempt = onRetainDraftScheduleAttempt\?\.\(attempt\) \?\? attempt[\s\S]*await onCreateDraftSchedule\(attempt\)/u);
+  assert.match(composer, /type="datetime-local" value=\{scheduleValue\} readOnly=\{scheduleBusy \|\| scheduleRetryPending\}/u);
+  assert.doesNotMatch(composer, /notify\(`Task scheduled for/u);
+  assert.match(css, /\.composer-schedule-panel header small \{[^}]*font-size:\s*12\.5px/u);
+  assert.match(css, /\.composer-schedule-resolved, \.composer-schedule-error \{[^}]*font-size:\s*12\.5px/u);
+  assert.match(css, /\.composer-schedule-panel \{[^}]*width:\s*min\(420px,calc\(100% - 50px\)\)[^}]*display:\s*grid/u);
+});
+
+test("mesh command tokens work anywhere in a draft without consuming surrounding text", () => {
+  assert.equal(helpers.hasSlashCommandToken("Please /mesh review this", "/mesh"), true);
+  assert.equal(helpers.hasSlashCommandToken("/mesh review this", "/mesh"), true);
+  assert.equal(helpers.hasSlashCommandToken("Please tool/mesh review this", "/mesh"), false);
+  assert.equal(helpers.hasSlashCommandToken("https://example.test/mesh", "/mesh"), false);
+  assert.equal(helpers.removeSlashCommandToken("Please /mesh review this", "/mesh"), "Please review this");
+  assert.equal(helpers.removeSlashCommandToken("/mesh review this", "/mesh"), "review this");
+  assert.equal(helpers.removeSlashCommandToken("Please review this /mesh", "/mesh"), "Please review this");
+  assert.equal(helpers.removeSlashCommandToken("Please tool/mesh review this", "/mesh"), "Please tool/mesh review this");
+});
+
+test("mesh quick selection prefers accepted parent recency, then real provider use, and reconciles stale choices", () => {
+  const models = {
+    opencode: [
+      { id: "model-default", name: "Default Model", isDefault: true, efforts: ["low", "high"], defaultEffort: "low" },
+      { id: "model-recent", name: "Recent Model", efforts: ["high", "max"], defaultEffort: "high" },
+    ],
+  };
+  const sessions = [
+    { id: "draft", providerId: "opencode", model: "model-default", effort: "low", draft: true, updatedAt: "2026-08-29T13:00:00.000Z" },
+    { id: "internal", providerId: "opencode", model: "model-default", effort: "low", sessionKind: "internal", updatedAt: "2026-08-29T12:00:00.000Z" },
+    { id: "accepted", providerId: "opencode", model: "Recent Model", effort: "max", updatedAt: "2026-08-29T11:00:00.000Z" },
+  ];
+  const snapshot = { providers: [], models, sessions };
+
+  assert.deepEqual(composerUi.resolveMeshTargetSelection(snapshot, "opencode", undefined), {
+    providerId: "opencode", modelId: "model-recent", reasoningEffort: "max",
+  });
+  assert.deepEqual(composerUi.resolveMeshTargetSelection(snapshot, "opencode", {
+    providerId: "opencode", modelId: "model-default", reasoningEffort: "high",
+  }), { providerId: "opencode", modelId: "model-default", reasoningEffort: "high" });
+  assert.deepEqual(composerUi.resolveMeshTargetSelection(snapshot, "opencode", {
+    providerId: "opencode", modelId: "removed-model", reasoningEffort: "ultra",
+  }), { providerId: "opencode", modelId: "model-recent", reasoningEffort: "max" });
+  assert.deepEqual(composerUi.resolveMeshTargetSelection({ ...snapshot, sessions: [] }, "opencode", undefined, {
+    opencode: { modelId: "model-default", reasoningEffort: "high" },
+  }), { providerId: "opencode", modelId: "model-default", reasoningEffort: "high" });
+});
+
+test("EARS offers only ready audio routes and remains explicit for audio-capable destinations", async () => {
+  const audio = { id: "audio", name: "Audio", efforts: ["low"], inputModalities: ["text", "audio"] };
+  const snapshot = {
+    providers: [
+      { id: "direct", state: "online", detected: true, authenticated: true },
+      { id: "codex", state: "offline", detected: true, authenticated: true },
+      { id: "opencode", state: "online", detected: true, authenticated: true },
+    ],
+    models: {
+      direct: [audio],
+      codex: [audio],
+      opencode: [{ ...audio, id: "locked-audio", walletKind: "user_api", apiKeyConfigured: true, apiKeyVerified: false }],
+    },
+  };
+  assert.deepEqual(composerUi.earsRoutesFromSnapshot(snapshot).map((route) => `${route.providerId}:${route.modelId}`), ["direct:audio"]);
+  const composer = await source(join("src", "renderer", "src", "Composer.tsx"));
+  assert.match(composer, /const shouldUseEars = ears\.enabled && dictationClips\.length > 0;/u);
+  assert.doesNotMatch(composer, /shouldUseEars = ears\.enabled[^;]+!audioDictationAvailable/u);
 });
 
 test("simplify command produces clean one-response metadata and bounded persisted settings", () => {
@@ -399,13 +709,19 @@ test("composer exposes a keyboard and pointer accessible slash command palette",
     source(join("src", "renderer", "src", "Composer.tsx")),
     source(join("src", "renderer", "src", "composer.css")),
   ]);
-  assert.match(composer, /slashCommandSuggestions\(content\)/u);
+  assert.match(composer, /slashCommandSuggestions\(slashPrefix\)/u);
+  assert.match(composer, /\(slashSuggestions\?\.length \?\? 0\) > 0/u);
   assert.match(composer, /role="listbox" aria-label="Commands"/u);
   assert.match(composer, /event\.key === "Enter" \|\| event\.key === "Tab"/u);
   assert.match(composer, /event\.key === "ArrowDown" \|\| event\.key === "ArrowUp"/u);
   assert.match(composer, /setSlashPaletteDismissed\(true\)/u);
+  assert.match(composer, /<SlashCommandIcon \/><span><strong>\{command\.command\}<\/strong>/u);
   assert.match(css, /\.slash-command-palette/u);
   assert.match(css, /button\[aria-selected="true"\]/u);
+  assert.match(css, /\.slash-command-palette \{[^}]*width:\s*min\(520px,calc\(100% - 46px\)\)[^}]*max-height:\s*221px[^}]*grid-auto-rows:\s*43px/u);
+  assert.match(css, /\.slash-command-palette > button \{[^}]*height:\s*43px[^}]*grid-template-columns:\s*20px minmax\(0,1fr\) 44px/u);
+  assert.match(css, /\.slash-command-palette small \{[^}]*font-size:\s*12\.5px/u);
+  assert.match(css, /\.slash-command-palette kbd \{[^}]*font-size:\s*12\.5px/u);
 });
 
 test("/eyes opens the existing vision picker as a settings route", async () => {
@@ -417,7 +733,8 @@ test("/eyes opens the existing vision picker as a settings route", async () => {
   assert.match(helpers, /id: "eyes",\s*command: "\/eyes",/u);
   assert.match(helpers, /description: "Choose the model that reads images"/u);
   // Same shape as /ears: consumed as a command, never sent as a message.
-  assert.ok(composer.includes('if (draftSession || !/^\\/eyes\\s*$/iu.test(content)) return;'));
+  assert.ok(composer.includes('if (draftSession || !hasSlashCommandToken(content, "/eyes")) return;'));
+  assert.ok(composer.includes('const next = removeSlashCommandToken(content, "/eyes");'));
   assert.match(composer, /setVisionAction\("settings"\);/u);
   // It reuses the picker rather than duplicating one.
   assert.match(composer, /type VisionPickerMode = VisualAction \| "settings";/u);
@@ -425,8 +742,28 @@ test("/eyes opens the existing vision picker as a settings route", async () => {
   assert.match(composer, /className="chat-picker vision-eyes-picker"/u);
   // Opened on its own there is nothing queued to resume, so it just confirms.
   assert.match(composer, /if \(action === "settings"\) \{ notify\("Vision model saved for this task"\); return; \}/u);
-  assert.match(composer, /action === "settings" \? "Pick the model this task uses to read images."/u);
+  // Selected controls carry the saved state without redundant header prose.
+  assert.doesNotMatch(composer, /eyesStateLine/u);
+  assert.match(composer, /draftChanged \? "Selected" : "Enabled"/u);
+  assert.match(composer, /className="vision-api-switch"/u);
+  // The off switch appears only once there is a saved choice to clear.
+  assert.match(composer, /savedSelection !== undefined \? <button type="button" disabled=\{saving\} onClick=\{\(\) => void disable\(\)\}>Turn off<\/button> : null/u);
+  assert.match(composer, /selection: null/u);
   assert.match(composer, /action === "settings" \? "Cancel" : "Not now"/u);
+});
+
+test("the overflow menu exposes EYES beside EARS and keeps Goal out of permanent chrome", async () => {
+  const [app, composer, helpers] = await Promise.all([
+    source(join("src", "renderer", "src", "App.tsx")),
+    source(join("src", "renderer", "src", "Composer.tsx")),
+    source(join("src", "renderer", "src", "composer_helpers.ts")),
+  ]);
+  assert.doesNotMatch(app, /className="goal-trigger"/u);
+  assert.match(composer, /<strong>EARS settings<\/strong>/u);
+  assert.match(composer, /<strong>EYES settings<\/strong><small>Choose the model that reads images<\/small>/u);
+  assert.match(composer, /setVisionAction\("settings"\)/u);
+  assert.match(composer, /<strong>Goal<\/strong>/u);
+  assert.match(helpers, /id: "goal",\s*command: "\/goal"/u);
 });
 
 test("mesh is a multi-target drop-up panel with per-target model and reasoning", async () => {
@@ -437,6 +774,12 @@ test("mesh is a multi-target drop-up panel with per-target model and reasoning",
   assert.match(composer, /className="mesh-panel-anchor"/u);
   assert.match(composer, /role="dialog" aria-label="Mesh delegation"/u);
   assert.match(composer, /className="mesh-model-picker"/u);
+  assert.match(composer, /className="mesh-model-picker-scroll"[\s\S]*?className="mesh-model-picker-reasoning"/u);
+  assert.match(composer, /onHydrateProviderModels\(provider\.id\)/u);
+  assert.match(composer, /className="mesh-catalogue-status" role="status"/u);
+  assert.match(composer, /disabled=\{catalogueLoading \|\| \(models\.length > 0 && !modelId\)\}/u);
+  assert.match(composer, /const startingTarget = existing \?\? initial/u);
+  assert.match(composer, /querySelector<HTMLElement>\('button\[role="radio"\]\[aria-checked="true"\]'\)/u);
   // /mesh and its description were already read in the command palette; the panel
   // must not repeat them, and the list references tools rather than adding one.
   assert.match(composer, /<span className="mesh-add-label">Reference coding tool<\/span>/u);
@@ -447,51 +790,65 @@ test("mesh is a multi-target drop-up panel with per-target model and reasoning",
   assert.match(composer, /<header className="mesh-panel-header">\s*<span className="mesh-add-label">/u);
   assert.match(css, /\.mesh-panel-header \{[^}]*justify-content: space-between;/u);
   assert.doesNotMatch(css, /\.mesh-add \{[^}]*padding-top/u);
-  // Typing the command opens the panel without consuming the text, and the panel
-  // is bound to it: anything that is no longer /mesh closes it again.
-  assert.ok(composer.includes('setMeshOpen(/^\\/mesh\\s*$/iu.test(content));'));
+  // The quiet row shows its real quick choice and has separate commit/detail hit
+  // targets. Arrow/Enter stay on the composer, where the command was typed.
+  assert.match(composer, /className="mesh-add-select"[\s\S]*\{modelLabel\} · \{effortLabel\}/u);
+  assert.match(composer, /className="mesh-add-details" aria-label=\{`Choose model and reasoning for \$\{provider\.name\}`\}/u);
+  assert.match(composer, /\{meshOpen && meshModelPicker === null \? <div className="mesh-panel-anchor"/u);
+  assert.match(composer, /meshOpen && meshModelPicker === null[\s\S]*event\.key === "ArrowDown" \|\| event\.key === "ArrowUp"[\s\S]*commitMeshTarget\(meshQuickTargets/u);
+  assert.match(css, /\.mesh-add-row \{[^}]*grid-template-columns: minmax\(0,1fr\) 34px/u);
+  assert.match(css, /\.mesh-add-details \{[^}]*border-left:/u);
+  assert.match(composer, /resolveMeshTargetSelection\(snapshot, candidate\.id, recent, agentDefaults\)/u);
+  assert.match(composer, /persistMeshRecentTargetsForSession\(session\.id, submittedMeshTargets\)/u);
+  // Typing the command at any whitespace-delimited position opens the panel
+  // without treating URL paths or embedded text as commands. It is a local,
+  // pre-paint interaction even in a new-task draft; provider task creation waits
+  // until a committed Mesh target is actually sent.
+  assert.ok(composer.includes('const matchesMeshCommand = hasSlashCommandToken(commandContent, "/mesh");'));
+  assert.ok(composer.includes('if (!matchesMeshCommand) setMeshModelPicker(null);'));
+  assert.match(composer, /useLayoutEffect\(\(\) => \{[\s\S]{0,500}const matchesMeshCommand = hasSlashCommandToken\(commandContent, "\/mesh"\);/u);
+  assert.doesNotMatch(composer, /const action = hasSlashCommandToken\(content, "\/goal"\)[\s\S]{0,350}hasSlashCommandToken\(content, "\/mesh"\)/u);
+  assert.doesNotMatch(composer, /meshOpen && \(!draftSession \|\| scheduleOpen\)/u);
+  assert.doesNotMatch(composer, /meshPickerProvider && \(!draftSession \|\| scheduleOpen\)/u);
+  assert.doesNotMatch(composer, /meshTargets\.length && \(!draftSession \|\| scheduleOpen\)/u);
   assert.doesNotMatch(composer, /setMeshOpen\(true\);\s*setContent\(""\);/u);
   // Closing the chooser keeps the referenced tools; only sending clears them.
-  assert.match(composer, /const closeMesh = \(\) => \{[^}]*setMeshOpen\(false\);\s*setMeshModelPicker\(null\);\s*\};/u);
-  assert.doesNotMatch(composer, /const closeMesh = \(\) => \{[^}]*setMeshTargets\(\[\]\)/u);
-  assert.match(composer, /else setMeshOpen\(false\);/u);
+  assert.match(composer, /const closeMesh = useCallback\(\(restoreFocus = true\) => \{[\s\S]*?setMeshOpen\(false\);[\s\S]*?setMeshModelPicker\(null\);[\s\S]*?textarea\.current\?\.focus/u);
+  assert.doesNotMatch(composer, /const closeMesh = useCallback\([\s\S]{0,500}setMeshTargets\(\[\]\)/u);
+  assert.match(composer, /if \(meshPanel\.current\?\.contains\(event\.target as Node\)\) return;[\s\S]{0,350}const willOwnFocus = [^;]+;\s*closeMesh\(!willOwnFocus\);/u);
+  assert.match(composer, /if \(meshModelPanel\.current\?\.contains\(event\.target as Node\)\) return;/u);
   // The command itself never becomes the instruction.
-  assert.ok(composer.includes('content.trim().replace(/^\\/mesh\\b\\s*/iu, "").trim()'));
+  assert.ok(composer.includes('removeSlashCommandToken(removeSlashCommandToken(content, "/mesh"), "/schedule").trim()'));
   // Referenced tools are widgets on the message line itself: the /mesh command is
   // consumed on commit, the target takes its place inline, and both backspace and
   // the corner X remove it. No chips above the composer.
-  assert.match(composer, /className="composer-inline-mesh" role="list" aria-label="Referenced coding tools"/u);
-  assert.match(composer, /<strong>\{modelLabel\}<\/strong>\{effortLabel \? <span className="composer-mesh-widget-effort">· \{effortLabel\}<\/span> : null\}/u);
-  assert.match(composer, /className="composer-mesh-widget-remove" aria-label=\{`Remove \$\{name\} from mesh`\}/u);
+  assert.match(composer, /<ComposerMessageInput/u);
+  assert.match(composer, /onRemove=\{removeMeshTarget\}/u);
   assert.doesNotMatch(composer, /function MeshChips\(/u);
   assert.doesNotMatch(composer, /className="mesh-chips"/u);
   assert.doesNotMatch(css, /\.mesh-chips/u);
+  assert.match(css, /\.composer-input-flow > textarea, \.composer-rich-input \{[^}]*min-width: 160px;[^}]*flex: 1 1 220px;/u);
   assert.match(css, /\.composer-mesh-widget-remove \{[^}]*width: 20px/u);
-  assert.match(css, /\.composer-mesh-widget:hover \.composer-mesh-widget-remove[^}]*opacity: 1/u);
-  assert.match(css, /\.composer-mesh-widget-text strong \{[^}]*font-size: 12\.5px/u);
-  assert.match(css, /\.composer-mesh-widget-effort \{[^}]*font-size: 11\.5px/u);
-  // The committed target consumes the /mesh command text; the panel closes with it.
-  assert.match(composer, /const commitMeshTarget = \(target: MeshTarget\) => \{[\s\S]*?setMeshModelPicker\(null\);[\s\S]*?setContent\(""\);/u);
-  assert.match(composer, /setContent\(""\);\s*historyIndex\.current = null;\s*unsentHistoryDraft\.current = "";\s*requestAnimationFrame\(\(\) => textarea\.current\?\.focus\(\)\);/u);
-  // Backspace at the start of the line deletes the newest widget like a word.
-  assert.match(composer, /event\.key === "Backspace" && event\.currentTarget\.selectionStart === 0 && event\.currentTarget\.selectionEnd === 0 && meshTargets\.length && !draftSession/u);
-  assert.match(composer, /removeMeshTarget\(meshTargets\[meshTargets\.length - 1\]!\.providerId\);/u);
+  assert.match(css, /\.mesh-model-picker \{[^}]*grid-template-rows: auto minmax\(0,1fr\) auto auto/u);
+  assert.match(css, /\.mesh-model-picker-reasoning \{[^}]*border-top: 1px solid #30302d/u);
+  assert.match(css, /\.mesh-model-picker-reasoning-options \{[^}]*grid-template-columns: repeat\(3,minmax\(0,1fr\)\)/u);
   // The inert sliders glyph on a target row is gone along with the row itself.
   assert.doesNotMatch(composer, /className="mesh-target-edit"/u);
   assert.doesNotMatch(css, /\.mesh-target-edit/u);
   assert.doesNotMatch(css, /\.mesh-targets/u);
-  assert.match(composer, /request\("delegation\.start", \{ parentSessionId: session\.id, prompt: trimmed, targets: meshTargets\.map/u);
-  assert.match(composer, /existing\.modelId \? \{ modelId: existing\.modelId \} : \{\}/u);
+  assert.doesNotMatch(composer, /request\("delegation\.start"/u);
   assert.match(composer, /resolveConcreteModelSelection\(models, currentSelection\)/u);
   assert.match(composer, /\(chosenModel\?\.efforts \?\? \[\]\)\.filter/);
   assert.match(composer, /maximumMeshTargets/u);
-  assert.match(composer, /next\.slice\(0, maximumMeshTargets\)/u);
   assert.match(composer, /"Send mesh delegation"/u);
   assert.match(composer, /meshTargets\.length \? false/u);
   assert.match(composer, /"Optional instruction for the mesh…"/u);
   assert.match(css, /\.mesh-panel\s*\{[^}]*border-radius:\s*7px/u);
   assert.match(css, /\.mesh-model-picker\s*\{[^}]*bottom:\s*calc\(100% \+ 6px\)/u);
-  assert.match(css, /\.mesh-panel\s*\{[^}]*overflow-y:\s*auto/u);
+  assert.match(css, /\.mesh-panel\s*\{[^}]*overflow:\s*hidden/u);
+  assert.match(css, /\.mesh-add\s*\{[^}]*min-height:\s*0;[^}]*overflow-y:\s*auto/u);
+  assert.match(css, /\.mesh-add-row\s*\{[^}]*min-height:\s*44px/u);
+  assert.match(css, /@media \(max-height: 560px\)\s*\{\s*\.mesh-panel\s*\{[^}]*max-height:\s*126px/u);
   assert.doesNotMatch(css, /\.mesh[^{]*\{[^}]*font-size:\s*(?:9|10)(?:\.\d+)?px/u);
 });
 
@@ -502,7 +859,30 @@ test("composer preserves the session model by stable id across refresh and creat
   ];
   assert.equal(helpers.resolveComposerModelId(models, "custom::gpt-selected"), "custom::gpt-selected");
   assert.equal(helpers.resolveComposerModelId(models, "GPT Selected"), "custom::gpt-selected");
+  assert.equal(helpers.resolveComposerModelId(models, "opencode-go/glm-5.3-flash"), "opencode-go/glm-5.3-flash");
   assert.equal(helpers.resolveComposerModelId(models, "CLI default"), "default");
+});
+
+test("existing tasks keep concrete provider-reported model truth through partial catalogue loading", () => {
+  const partial = [{ id: "opencode-go/deepseek-v4-pro", name: "DeepSeek V4 Pro", isDefault: true, efforts: ["high"] }];
+  assert.deepEqual(helpers.resolveReportedSessionSelection(
+    partial,
+    { modelId: "opencode-go/glm-5.3-flash", reasoningEffort: "max" },
+    { modelId: "opencode-go/deepseek-v4-pro", reasoningEffort: "high" },
+  ), { modelId: "opencode-go/glm-5.3-flash", reasoningEffort: "max" });
+
+  const hydrated = [...partial, { id: "opencode-go/glm-5.3-flash", name: "GLM 5.3 Flash", efforts: ["low", "high", "max"] }];
+  assert.deepEqual(helpers.resolveReportedSessionSelection(
+    hydrated,
+    { modelId: "GLM 5.3 Flash", reasoningEffort: "MAX" },
+    { modelId: "opencode-go/deepseek-v4-pro", reasoningEffort: "high" },
+  ), { modelId: "opencode-go/glm-5.3-flash", reasoningEffort: "max" });
+
+  assert.deepEqual(helpers.resolveReportedSessionSelection(
+    partial,
+    { modelId: "CLI default", reasoningEffort: "Default" },
+    { modelId: "opencode-go/deepseek-v4-pro", reasoningEffort: "high" },
+  ), { modelId: "opencode-go/deepseek-v4-pro", reasoningEffort: "high" });
 });
 
 test("composer presents compact model and reasoning labels without changing provider values", () => {
@@ -550,6 +930,39 @@ test("terminal task state and a completed final answer clear stale interruptibil
   ]), true, "live evidence may fill an unknown state but never override a terminal one");
 });
 
+test("newer running or completed work outranks only an earlier interim final", () => {
+  const interimFinalThenRunning = [
+    { kind: "user", state: "completed" },
+    { kind: "assistant", phase: "final_answer", state: "completed" },
+    { kind: "tool", state: "running" },
+  ];
+  assert.equal(helpers.latestTurnHasCompletedFinal(interimFinalThenRunning), false, "a final is not terminal when the same turn produces newer live output");
+  assert.equal(helpers.sessionHoldsFollowUpQueue({ state: "working" }, interimFinalThenRunning), true, "a follow-up remains queued behind the newer live work");
+  assert.equal(helpers.sessionNeedsTranscriptCatchUp({ state: "working" }, interimFinalThenRunning), true, "history keeps following the newer live work");
+  assert.equal(helpers.sessionPresentsLiveTurn({ state: "working" }, interimFinalThenRunning), true, "the delegated task remains visibly live");
+
+  for (const kind of ["reasoning", "tool", "command", "subagent", "assistant"]) {
+    const interimFinalThenCompletedWork = [
+      { kind: "user", state: "completed" },
+      { kind: "assistant", phase: "final_answer", state: "completed" },
+      { kind, state: "completed" },
+    ];
+    assert.equal(helpers.latestTurnHasCompletedFinal(interimFinalThenCompletedWork), false, `completed ${kind} is newer continuation evidence`);
+    assert.equal(helpers.sessionHoldsFollowUpQueue({ state: "working" }, interimFinalThenCompletedWork), true, `completed ${kind} cannot release the follow-up queue`);
+    assert.equal(helpers.sessionPresentsLiveTurn({ state: "working" }, interimFinalThenCompletedWork), true, `completed ${kind} keeps the delegated task visibly live`);
+  }
+
+  const runningThenFinal = [
+    { kind: "user", state: "completed" },
+    { kind: "tool", state: "running" },
+    { kind: "assistant", phase: "final_answer", state: "completed" },
+  ];
+  assert.equal(helpers.latestTurnHasCompletedFinal(runningThenFinal), true, "a newer completed final remains terminal over stale running output");
+  assert.equal(helpers.sessionHoldsFollowUpQueue({ state: "working" }, runningThenFinal), false, "the terminal final releases queued follow-ups even if transport lags");
+  assert.equal(helpers.sessionNeedsTranscriptCatchUp({ state: "working" }, runningThenFinal), false, "the newer final completes transcript delivery");
+  assert.equal(helpers.sessionPresentsLiveTurn({ state: "working" }, runningThenFinal), false, "stale live output cannot revive the completed turn");
+});
+
 test("task controls and delayed transcript delivery settle independently", () => {
   const unfinished = [
     { kind: "user", state: "completed" },
@@ -557,9 +970,13 @@ test("task controls and delayed transcript delivery settle independently", () =>
   ];
   assert.equal(helpers.sessionHoldsFollowUpQueue({ state: "completed" }, unfinished), false, "a completed task cannot be stopped");
   assert.equal(helpers.sessionNeedsTranscriptCatchUp({ state: "completed" }, unfinished), true, "its missing final reply must still be fetched");
+  assert.equal(helpers.sessionPresentsLiveTurn({ state: "completed" }, unfinished), false, "a completed task heals its missing final without painting old reasoning as live work");
+  assert.equal(helpers.terminalSessionNeedsCanonicalHistory({ state: "completed" }, unfinished), true, "task completion without visible final text forces canonical history");
 
   const finalAfterReasoning = [...unfinished, { kind: "assistant", phase: "final_answer", state: "completed" }];
   assert.equal(helpers.sessionNeedsTranscriptCatchUp({ state: "completed" }, finalAfterReasoning), false, "the final reply ends catch-up even when stale reasoning still says running");
+  assert.equal(helpers.sessionPresentsLiveTurn({ state: "completed" }, finalAfterReasoning), false, "the persisted final reply settles presentation independently of stale running rows");
+  assert.equal(helpers.terminalSessionNeedsCanonicalHistory({ state: "completed" }, finalAfterReasoning), false, "visible final text completes successful reconciliation");
   assert.equal(helpers.sessionNeedsTranscriptCatchUp({ state: "completed" }, [
     { kind: "user", state: "completed" },
     { kind: "assistant", state: "completed" },
@@ -573,22 +990,146 @@ test("task controls and delayed transcript delivery settle independently", () =>
     { kind: "user", state: "completed" },
     { kind: "assistant", phase: "final_answer", state: "completed" },
   ]), false, "a final reply that arrives before terminal state is already authoritative");
+  assert.equal(helpers.sessionNeedsTranscriptCatchUp({ state: "completed" }, [
+    { kind: "user", state: "completed" },
+    { kind: "assistant", phase: "commentary", state: "completed" },
+  ]), true, "terminal state without a final or error keeps healing automatically");
 
   assert.equal(helpers.sessionNeedsTranscriptCatchUp({ state: "idle" }, [
     ...unfinished,
     { kind: "error", state: "failed" },
   ]), false, "an authoritative error cannot poll forever");
+  assert.equal(helpers.terminalSessionNeedsCanonicalHistory({ state: "idle" }, [
+    ...unfinished,
+    { kind: "error", state: "failed" },
+  ]), false, "a visible interruption or failure is the unsuccessful terminal artifact");
   assert.equal(helpers.sessionNeedsTranscriptCatchUp({ state: "failed" }, unfinished), false, "a failed task cannot poll forever");
+});
+
+test("visible turn outcome is independent from the provider transport state", () => {
+  const unfinished = [
+    { kind: "user", state: "completed" },
+    { kind: "reasoning", state: "completed" },
+  ];
+  const final = [...unfinished, { kind: "assistant", phase: "final_answer", state: "completed" }];
+  const interrupted = [...unfinished, { kind: "error", state: "failed" }];
+
+  assert.equal(helpers.presentedSessionState({ state: "idle" }, final), "completed", "a later idle listing cannot erase a visible final answer");
+  assert.equal(helpers.presentedSessionState({ state: "working" }, final), "completed", "stale working transport cannot keep a visible final labelled live");
+  assert.equal(helpers.presentedSessionState({ state: "working" }, [...final, { kind: "reasoning", state: "running" }]), "working", "new live output must put the task-list spinner above the previous turn's final");
+  assert.equal(helpers.presentedSessionState({ state: "completed" }, unfinished), "idle", "task-complete without a visible final must not claim the reply is complete");
+  assert.equal(helpers.presentedSessionState({ state: "idle" }, interrupted), "idle", "an interrupted turn remains idle and keeps its visible interruption row");
+  assert.equal(helpers.presentedSessionState({ state: "failed" }, interrupted), "failed", "an explicit failed turn remains failed");
+});
+
+test("compaction is a non-terminal row while the same turn keeps producing work", () => {
+  const compactedTurn = [
+    { id: "user-live", kind: "user", state: "completed", body: "Keep working" },
+    { id: "reasoning-before", kind: "reasoning", state: "completed", body: "Preparing the change" },
+    { id: "compaction", kind: "assistant", phase: "final_answer", state: "completed", title: "System", body: "Session compacted" },
+    { id: "reasoning-after", kind: "reasoning", state: "completed", body: "Continuing after compaction" },
+  ];
+
+  assert.equal(helpers.presentedSessionState({ state: "working" }, compactedTurn), "working");
+  assert.equal(helpers.sessionPresentsLiveTurn({ state: "working" }, compactedTurn), true, "the reasoning shimmer remains live");
+  assert.equal(helpers.sessionHoldsFollowUpQueue({ state: "working" }, compactedTurn), true, "Stop and queue ownership stay with the active turn");
+
+  const completedTurn = [...compactedTurn, { id: "final", kind: "assistant", phase: "final_answer", state: "completed", body: "Done" }];
+  assert.equal(helpers.presentedSessionState({ state: "completed" }, completedTurn), "completed");
+  assert.equal(helpers.sessionPresentsLiveTurn({ state: "completed" }, completedTurn), false);
+});
+
+test("a Codex compaction handoff final is not a terminal answer", () => {
+  const handoff = [
+    { id: "user-live", kind: "user", state: "completed", body: "Keep working" },
+    { id: "handoff-summary", kind: "assistant", phase: "final_answer", state: "completed", body: "Current task progress" },
+    { id: "compaction", kind: "assistant", state: "completed", title: "System", body: "Session compacted" },
+  ];
+  assert.equal(helpers.latestTurnHasCompletedFinal(handoff), false, "the explicit compaction boundary proves that the preceding final was a handoff summary");
+  assert.equal(helpers.sessionHoldsFollowUpQueue({ state: "working" }, handoff), true, "queue and Stop remain owned while compaction continues");
+
+  const continued = [...handoff, { id: "reasoning-after", kind: "reasoning", state: "completed", body: "Continuing after compaction" }];
+  assert.equal(helpers.latestTurnHasCompletedFinal(continued), false, "completed post-compaction work remains continuation evidence");
+  assert.equal(helpers.sessionPresentsLiveTurn({ state: "working" }, continued), true, "the shimmer and spinner remain live after completed post-compaction work");
+
+  const completed = [...continued, { id: "real-final", kind: "assistant", phase: "final_answer", state: "completed", body: "Done" }];
+  assert.equal(helpers.latestTurnHasCompletedFinal(completed), true, "a later genuine final settles the continued turn");
+  assert.equal(helpers.sessionHoldsFollowUpQueue({ state: "working" }, completed), false, "only the later genuine final releases the queue");
+});
+
+test("a fresh provider working transition outranks only the ending visible when that turn began", () => {
+  const previousFinal = [
+    { id: "user-1", kind: "user", state: "completed" },
+    { id: "final-1", messageId: "message-1", kind: "assistant", phase: "final_answer", state: "completed" },
+  ];
+  const boundary = helpers.captureSessionWorkingBoundary(previousFinal);
+
+  assert.deepEqual(boundary, { visibleEndingIdentity: "final:message-1" });
+  assert.equal(helpers.presentedSessionState({ state: "working" }, previousFinal), "completed", "an unlabelled working scalar remains too weak to revive an old final");
+  assert.equal(helpers.presentedSessionState({ state: "working" }, previousFinal, boundary), "working", "the event boundary paints the new turn before its first transcript row");
+  assert.equal(helpers.sessionHoldsFollowUpQueue({ state: "working" }, previousFinal, boundary), true, "Stop and follow-up queue ownership use the same live fact");
+  assert.equal(helpers.sessionNeedsTranscriptCatchUp({ state: "working" }, previousFinal, boundary), true, "the old final cannot stop transcript follow-up for the new turn");
+
+  assert.equal(helpers.terminalStateEventAction("completed", false, false), "apply", "completion is not held behind transcript quietness");
+  assert.equal(helpers.sessionHoldsFollowUpQueue({ state: "completed" }, previousFinal, boundary), false, "transport completion retires Stop and queue ownership immediately");
+  assert.equal(helpers.presentedSessionState({ state: "completed" }, previousFinal, boundary), "idle", "transport completion alone cannot relabel the previous final as this turn's answer");
+  assert.equal(helpers.sessionNeedsTranscriptCatchUp({ state: "completed" }, previousFinal, boundary), true, "history keeps healing until this turn has a visible ending");
+  assert.equal(helpers.terminalSessionNeedsCanonicalHistory({ state: "completed" }, previousFinal, boundary), true, "terminal transport state forces a canonical read while the visible ending is missing");
+
+  const withRunningRow = [...previousFinal, { id: "reasoning-2", kind: "reasoning", state: "running" }];
+  assert.equal(helpers.presentedSessionState({ state: "working" }, withRunningRow), "working", "concrete new output remains sufficient without a boundary");
+
+  const nextFinal = [...previousFinal, { id: "final-2", providerPartId: "part-2", kind: "assistant", phase: "final_answer", state: "completed" }];
+  assert.equal(helpers.presentedSessionState({ state: "working" }, nextFinal, boundary), "completed", "a different final identity closes the boundary even if the scalar lags");
+  assert.equal(helpers.sessionHoldsFollowUpQueue({ state: "working" }, nextFinal, boundary), false);
+  assert.equal(helpers.sessionNeedsTranscriptCatchUp({ state: "working" }, nextFinal, boundary), false);
+  assert.equal(helpers.sessionBoundaryNeedsVisibleEnding(nextFinal, boundary), false);
+
+  const interrupted = [...previousFinal, { id: "interrupted-2", turnId: "turn-2", kind: "error", state: "failed" }];
+  assert.equal(helpers.presentedSessionState({ state: "idle" }, interrupted, boundary), "idle", "an explicit interruption remains terminal");
+  assert.equal(helpers.sessionPresentsLiveTurn({ state: "idle" }, interrupted, boundary), false);
+  assert.equal(helpers.sessionBoundaryNeedsVisibleEnding(interrupted, boundary), false, "a visible interruption closes the same pending boundary as a final reply");
+  assert.equal(helpers.sessionNeedsTranscriptCatchUp({ state: "idle" }, interrupted, boundary), false);
+  assert.equal(helpers.terminalSessionNeedsCanonicalHistory({ state: "idle" }, interrupted, boundary), false);
+});
+
+test("canonical history clears only the completed working boundary", () => {
+  const previousFinal = [
+    { id: "user-1", kind: "user", state: "completed" },
+    { id: "final-1", messageId: "message-1", kind: "assistant", phase: "final_answer", state: "completed" },
+  ];
+  const boundary = helpers.canonicalSessionWorkingBoundary({ state: "working" }, previousFinal, undefined);
+  assert.deepEqual(boundary, { visibleEndingIdentity: "final:message-1" });
+  assert.strictEqual(helpers.canonicalSessionWorkingBoundary({ state: "completed" }, previousFinal, boundary), boundary, "task completion alone does not erase transcript recovery");
+
+  const nextFinal = [...previousFinal, { id: "final-2", kind: "assistant", phase: "final_answer", state: "completed" }];
+  assert.equal(helpers.canonicalSessionWorkingBoundary({ state: "completed" }, nextFinal, boundary), undefined, "the new visible ending clears the boundary");
+  assert.equal(helpers.canonicalSessionWorkingBoundary({ state: "working" }, nextFinal, boundary), undefined, "a lagging working scalar cannot immediately invent another turn");
+  assert.deepEqual(helpers.canonicalSessionWorkingBoundary({ state: "working" }, nextFinal, undefined), { visibleEndingIdentity: "final:final-2" }, "a later genuine transition can seed a fresh boundary");
+});
+
+test("provider attention cannot be hidden by the previous turn's final answer", () => {
+  const previousFinal = [
+    { id: "user-1", kind: "user", state: "completed" },
+    { id: "final-1", messageId: "message-1", kind: "assistant", phase: "final_answer", state: "completed" },
+  ];
+
+  for (const state of ["needs_approval", "needs_input"]) {
+    assert.equal(helpers.presentedSessionState({ state }, previousFinal), state);
+    assert.equal(helpers.sessionHoldsFollowUpQueue({ state }, previousFinal), true);
+    assert.equal(helpers.sessionNeedsTranscriptCatchUp({ state }, previousFinal), true);
+    assert.equal(helpers.sessionPresentsLiveTurn({ state }, previousFinal), true);
+  }
 });
 
 test("the close-follow timer uses terminal turn evidence, not a stale working scalar", async () => {
   const app = await source(join("src", "renderer", "src", "App.tsx"));
   assert.match(app, /const session = current\?\.sessions\.find\(\(candidate\) => candidate\.id === selected\);/u);
-  assert.match(app, /!session \|\| !sessionNeedsTranscriptCatchUp\(session, current\?\.timelines\[selected\] \?\? \[\]\)/u);
+  assert.match(app, /!session \|\| !sessionNeedsTranscriptCatchUp\(session, current\?\.timelines\[selected\] \?\? \[\], workingBoundaryBySession\.current\.get\(selected\)\)/u);
   assert.match(app, /const refreshSelectedView = useCallback\(async \(sessionId: string, force = false\)/u);
   assert.match(app, /forcedPass \|\| quietCatchUpDue/u);
-  assert.match(app, /terminalTranscriptCatchUpMaxAttempts/u);
-  assert.match(app, /The task finished, but its final reply was not available\./u);
+  assert.doesNotMatch(app, /terminalTranscriptCatchUpMaxAttempts|Response incomplete|final reply was not available/u);
+  assert.match(app, /session\.state !== "working" && session\.state !== "needs_approval" && session\.state !== "needs_input"/u);
   assert.doesNotMatch(app, /sessions\.find\(\(session\) => session\.id === selected\)\?\.state !== "working"/u);
   assert.match(app, /void refreshVisibleState\(false\)\.catch/u);
   assert.doesNotMatch(app, /setTimeout\(\(\) => void tick\(\), 1_500\)/u);
@@ -643,6 +1184,7 @@ test("OpenCode file gating, bounded prompt history, and queued-message parsing s
     id: "keep",
     content: "Run this next",
     state: "queued",
+    retryable: true,
     attachmentCount: 1,
     attachments: [{ name: "notes.md", mimeType: "application/octet-stream", byteLength: 0 }],
   }]);
@@ -835,6 +1377,40 @@ test("an active task animates its latest reasoning and otherwise pulses beside t
   assert.deepEqual(timelineHelpers.withCurrentActivity(lingeringPlaceholder, false), [timeline[0]]);
 });
 
+test("live reasoning stays on the bottommost disclosure and never crosses compaction", () => {
+  const row = (id, kind, state = "completed", body = id, phase) => ({ id, kind, body, phase, timestamp: "2026-08-29T12:00:00.000Z", state });
+  const compacted = { ...row("compacted", "assistant", "completed", "Session compacted"), title: "Session compacted" };
+  const history = [
+    row("user", "user"),
+    compacted,
+    row("older-reasoning", "reasoning", "running", "The older command is still reconciling."),
+    row("commentary-a", "assistant", "completed", "The first result arrived.", "commentary"),
+    row("middle-reasoning", "reasoning", "completed", "Checking the next result."),
+    row("commentary-b", "assistant", "completed", "The next result arrived.", "commentary"),
+    row("latest-reasoning", "reasoning", "completed", "Reviewing the newest state."),
+    row("commentary-c", "assistant", "completed", "Still working.", "commentary"),
+  ];
+  const runningIds = (timeline) => timeline.filter((item) => item.state === "running").map((item) => item.id);
+
+  const olderStillRunning = timelineHelpers.withCurrentActivity(history, true);
+  assert.deepEqual(runningIds(olderStillRunning), ["latest-reasoning"], "an older command flag must not pull the shimmer up from the bottommost disclosure");
+  const groups = timelineHelpers.groupTimeline(olderStillRunning, true).filter((group) => group.kind === "reasoning");
+  assert.deepEqual(timelineHelpers.liveReasoningIds(groups).groups, [timelineHelpers.reasoningGroupKey(groups.at(-1))], "only the bottommost clickable Reasoning group owns the live envelope");
+
+  const middleNowRunning = timelineHelpers.withCurrentActivity(history.map((item) => item.id === "older-reasoning"
+    ? { ...item, state: "completed" }
+    : item.id === "middle-reasoning" ? { ...item, state: "running" } : item), true);
+  assert.deepEqual(runningIds(middleNowRunning), ["latest-reasoning"], "provider refreshes must not bounce the shimmer between stale historical flags");
+
+  const beforeCompactionStillRunning = timelineHelpers.withCurrentActivity([
+    row("user", "user"),
+    row("pre-compaction-reasoning", "reasoning", "running", "Preparing the context summary."),
+    compacted,
+    row("post-compaction-reasoning", "reasoning", "completed", "Continuing after compaction."),
+  ], true);
+  assert.deepEqual(runningIds(beforeCompactionStillRunning), ["post-compaction-reasoning"], "live state must never project backward across Session compacted");
+});
+
 test("the version is told where it is asked for, not stamped on the rail", async () => {
   const app = await source(join("src", "renderer", "src", "App.tsx"));
   const nav = await source(join("src", "renderer", "src", "NavigationPanels.tsx"));
@@ -999,6 +1575,27 @@ test("a short thought written between tool calls can still be read in full", asy
   assert.equal(live.segments.length, 1);
 });
 
+test("streamed reasoning follows its own bottom until the reader moves it", async () => {
+  const [chat, styles] = await Promise.all([
+    source(join("src", "renderer", "src", "ChatTimeline.tsx")),
+    source(join("src", "renderer", "src", "styles.css")),
+  ]);
+
+  // This is deliberately local to ThinkingFlow: the main conversation keeps its
+  // existing follow/preserve policy while each open thought remembers its own.
+  assert.match(chat, /const flowRef = useRef<HTMLDivElement>\(null\);\s*\n\s*const followsLatest = useRef\(true\);\s*\n\s*const readerScrollTop = useRef\(0\);/u);
+  assert.match(chat, /useLayoutEffect\(\(\) => \{[\s\S]*?if \(followsLatest\.current\) flow\.scrollTop = flow\.scrollHeight;[\s\S]*?else flow\.scrollTop = Math\.min\(readerScrollTop\.current, flow\.scrollHeight - flow\.clientHeight\);[\s\S]*?\}, \[body\]\);/u);
+
+  // Wheel-up revokes follow before the browser's scroll event, scrollbar and
+  // keyboard moves are covered by the physical-bottom scroll sample, and wheel
+  // ownership never bubbles into the transcript.
+  assert.match(chat, /onWheel=\{\(event\) => \{\s*event\.stopPropagation\(\);[\s\S]*?if \(event\.deltaY < 0\) \{\s*followsLatest\.current = false;/u);
+  assert.match(chat, /const captureReaderPosition = useCallback\(\(flow: HTMLDivElement\) => \{\s*followsLatest\.current = flow\.scrollHeight - flow\.scrollTop - flow\.clientHeight <= 1;/u);
+  assert.match(chat, /onScroll=\{\(event\) => \{\s*if \(!readerPointerHeld\.current\) return;\s*captureReaderPosition\(event\.currentTarget\);/u);
+  assert.match(chat, /onScrollEnd=\{\(event\) => \{ captureReaderPosition\(event\.currentTarget\); \}\}/u);
+  assert.match(styles, /\.reasoning-flow \{[^}]*overflow-anchor: none;[^}]*overscroll-behavior: contain;/u);
+});
+
 test("a turn another app is driving is followed closely instead of landing in one lump", async () => {
   const app = await source(join("src", "renderer", "src", "App.tsx"));
 
@@ -1013,9 +1610,12 @@ test("a turn another app is driving is followed closely instead of landing in on
   // It follows only the open task while the current turn is genuinely live. A
   // terminal final answer outranks a stale working scalar, so a settled task can
   // never stay on this aggressive timer and remount its transcript every 1.5s.
-  assert.match(app, /!session \|\| !sessionNeedsTranscriptCatchUp\(session, current\?\.timelines\[selected\] \?\? \[\]\)\) return;/);
+  assert.match(app, /!session \|\| !sessionNeedsTranscriptCatchUp\(session, current\?\.timelines\[selected\] \?\? \[\], workingBoundaryBySession\.current\.get\(selected\)\)\) return;/);
   assert.match(app, /quietCatchUpDue\(selectedLastDelta\(selected\), Date\.now\(\), unownedTurnSilenceMs\)/);
   assert.match(app, /\}, unownedTurnFollowMs\);/);
+  assert.match(app, /const incrementallyObserved = await watchSession\(sessionId\)\.catch\(\(\) => false\)/);
+  assert.match(app, /const needsCanonicalHistory = forcedPass \|\| !incrementallyObserved/);
+  assert.match(app, /canonicalHistoryGenerationBySession\.current\.get\(sessionId\) === generation\) break/);
   const now = Date.now();
   assert.equal(helpers.quietCatchUpDue(now - 200, now, helpers.unownedTurnSilenceMs), false, "live chunks keep the follow away");
   assert.equal(helpers.quietCatchUpDue(now - 5_000, now, helpers.unownedTurnSilenceMs), true);
@@ -1102,7 +1702,7 @@ test("thinking outlives its turn as a collapsed dropdown the reader controls", a
   // Every settled work span keeps one collapsed outer control. Tool output and
   // narration are artifacts of the turn even when a harness emitted no formal thought.
   assert.doesNotMatch(chat, /if \(thinking\.length === 0 && !running\) \{/);
-  assert.match(chat, /return <section className="reasoning-group"[^>]*data-scroll-members=/);
+  assert.match(chat, /return <section className="reasoning-group"[^>]*data-scroll-anchor=\{groupKey\}[^>]*data-scroll-members=/);
   // Whether a span is open is the reader's decision, so the transcript holds it and
   // tells the group. Keeping it inside the group meant any reshape of a streaming turn
   // could hand the component a new identity and silently close the panel under someone
@@ -1167,7 +1767,8 @@ test("a live reasoning span names its own tense and carries the thinking sheen",
   ]);
   // Animated dots alone read as decoration; the word itself has to say it is ongoing.
   assert.match(chat, /\{running \? "Reasoning…" : "Reasoning"\}/);
-  assert.match(composer, /active=\{sessionHoldsFollowUpQueue\(session, visible\)\}/);
+  assert.match(composer, /const activeTurn = sessionHoldsFollowUpQueue\(session, visible \?\? \[\]\);/);
+  assert.match(composer, /active=\{activeTurn\}/);
   // A repeating tile translated by exactly its own width; a non-repeating gradient cannot
   // loop without the highlight snapping back across the text.
   assert.match(styles, /\.reasoning-running \.reasoning-label \{[^}]*background-repeat: repeat-x[^}]*animation: reasoning-label-shimmer/);
@@ -1383,6 +1984,11 @@ test("folding earlier narration does not rename an existing Reasoning disclosure
   assert.deepEqual(settledGroup.items.map((item) => item.id), ["narration", "thought"]);
   assert.equal(timelineHelpers.reasoningGroupKey(liveGroup), "reasoning:part:prt_reasoning:0");
   assert.equal(timelineHelpers.reasoningGroupKey(settledGroup), timelineHelpers.reasoningGroupKey(liveGroup));
+  const liveAnchors = timelineHelpers.renderedTimelineAnchorIds(timeline, true);
+  const settledAnchors = timelineHelpers.renderedTimelineAnchorIds(timeline, false);
+  assert.equal(liveAnchors.includes("reasoning:part:prt_reasoning:0"), true);
+  assert.equal(settledAnchors.includes("reasoning:part:prt_reasoning:0"), true, "live-to-settled folding keeps the Reasoning scroll anchor");
+  assert.equal(settledAnchors.includes("narration"), false, "folded narration no longer claims a separate painted row");
 });
 
 test("timeline omits empty provider deltas instead of rendering control-only shells", () => {
@@ -1432,9 +2038,9 @@ test("timeline marks real compaction notices and the transition into a final ans
   const summary = { ...item("summary", "assistant", summaryText), phase: "commentary" };
   assert.equal(timelineHelpers.timelineBoundaryLabel(summary), "Session compacted");
   assert.equal(timelineHelpers.compactionDetailText(summary, "Session compacted"), summaryText);
-  const nestedGroups = timelineHelpers.groupTimeline([timeline[0], timeline[2], summary, timeline[3]], false);
-  assert.deepEqual(nestedGroups.map((group) => group.kind), ["item", "reasoning", "item"]);
-  assert.deepEqual(timelineHelpers.reasoningSegments(nestedGroups[1].items).map((segment) => segment.kind), ["thinking", "compaction"]);
+  const boundaryGroups = timelineHelpers.groupTimeline([timeline[0], timeline[2], summary, timeline[3]], false);
+  assert.deepEqual(boundaryGroups.map((group) => group.kind), ["item", "reasoning", "boundary", "item"]);
+  assert.equal(boundaryGroups[2].item.id, "summary", "compaction remains a directly visible transcript widget");
   const formattedSummary = { ...item("formatted-summary", "reasoning", summaryText.replace(/^.*?\n\n/u, "")), messageId: "compaction-turn" };
   const repeatedSummary = { ...summary, id: "repeated-summary", messageId: "compaction-turn" };
   const deduplicated = timelineHelpers.reasoningSegments([formattedSummary, repeatedSummary]);
@@ -1445,6 +2051,12 @@ test("timeline marks real compaction notices and the transition into a final ans
   const activeCopies = timelineHelpers.coalesceCompactionCopies([timeline[0], formattedSummary, repeatedSummary]);
   assert.deepEqual(activeCopies.map((entry) => entry.id), ["user", "repeated-summary"], "active external history keeps only the later compaction event");
   assert.equal(activeCopies[1].detail, formattedSummary.body, "the one disclosure retains the readable summary as hidden detail");
+  const citationSuffix = "\n\n<oai-mem-citation>private presentation metadata</oai-mem-citation>";
+  const transportCopy = { ...repeatedSummary, id: "transport-copy", body: `${repeatedSummary.body}\n\nThe worktree remains dirty.` , timestamp: "2026-08-14T12:00:01.000Z" };
+  const readableCopy = { ...item("readable-copy", "assistant", `${formattedSummary.body}${citationSuffix}`), phase: "final_answer", timestamp: "2026-08-14T12:00:00.000Z" };
+  const provenanceMatched = timelineHelpers.coalesceCompactionCopies([timeline[0], readableCopy, transportCopy]);
+  assert.deepEqual(provenanceMatched.map((entry) => entry.id), ["user", "transport-copy"], "adjacent explicit compaction provenance does not depend on equal bodies");
+  assert.equal(provenanceMatched[1].detail, formattedSummary.body, "presentation metadata is absent from the disclosure detail");
   assert.equal(timelineHelpers.coalesceCompactionCopies([
     timeline[0],
     formattedSummary,
@@ -1477,30 +2089,36 @@ test("composer and chat sources implement the reviewed compact interaction surfa
   assert.match(composer, /dictation\.transcribe/);
   assert.match(composer, /onTranscript\(transcript\)/);
   assert.match(composer, /preferredDictationKey\(providerId\)/);
-  assert.match(composer, /recorder\.onstop = null[\s\S]*recorder\.ondataavailable = null[\s\S]*recorder\.onerror = null[\s\S]*recorder\.stop\(\)/);
+  assert.match(composer, /Source\/provider refreshes must not destroy a recording[\s\S]*if \(recorder && recorder\.state !== "inactive"\) recorder\.stop\(\)/);
   assert.match(composer, /Open session browser/);
   assert.match(app, /browserAction\(\{ type: "navigate", tabId: active\.id, input: url \}\)/);
   assert.match(app, /onLinkOpen=\{onLinkOpen\}/);
   assert.match(composer, /Attach workflow/);
-  assert.match(composer, /request\("session\.vision\.get", \{ sessionId: session\.id \}\)/);
+  assert.match(composer, /const requestedSessionId = session\.id;[\s\S]*?request\("session\.vision\.get", \{ sessionId: requestedSessionId \}\);[\s\S]*?activeSessionId\.current !== requestedSessionId/);
   assert.match(composer, /status\.primaryModelSupportsImageInput === false && status\.configured === null/);
   assert.match(composer, /request\("vision\.targets", \{\}\)/);
   assert.match(composer, /request\("session\.vision\.configure", \{ sessionId: session\.id, selection \}\)/);
   assert.doesNotMatch(composer, /session\.vision\.ask/);
   assert.doesNotMatch(composer, /Â|â€¦|â€|Ã|�/);
   assert.match(composer, /Delegate a task/);
-  assert.match(composer, /className="chat-picker delegation-chat-picker"/);
+  assert.match(composer, /ref=\{root\} className="chat-picker delegation-chat-picker"/);
+  assert.match(composer, /document\.addEventListener\("mousedown", closeOutside, true\)/);
+  assert.match(composer, /document\.addEventListener\("keydown", closeEscape, true\)/);
   assert.match(composer, /onManageWorkflow\(attachment\.id\)/);
-  assert.match(composer, /session\.context_handoff/);
-  assert.match(composer, /request\("session\.context_handoff", \{ sessionId: session\.id \}\)/);
-  assert.match(composer, /100–1000 word handoff range/);
-  assert.match(composer, /onComplete\(sessionValue as Record<string, unknown>, summary, prompt\)/);
+  assert.match(composer, /buildContextHandoffInstruction/);
+  assert.match(composer, /onContextHandoff\?: \(parentSessionId: string, customNote: string\) => Promise<void>/);
+  assert.match(composer, /Prepare handoff/);
+  assert.match(composer, /Same model drafts a pickup prompt in a side chat/);
+  assert.doesNotMatch(composer, /request\("session\.context_handoff", \{ sessionId: session\.id \}\)/);
+  assert.doesNotMatch(composer, /100–1000 word handoff range/);
+  assert.doesNotMatch(composer, /onComplete\(sessionValue as Record<string, unknown>, summary, prompt\)/);
   assert.match(composer, /Branch in New Task/);
-  assert.match(composer, /request\("session\.branch", \{ sessionId: session\.id \}\)/);
+  assert.match(composer, /const requestedSessionId = session\.id;[\s\S]*?request\("session\.branch", \{ sessionId: requestedSessionId \}\);[\s\S]*?activeSessionId\.current !== requestedSessionId/);
   assert.match(composer, /event\.clipboardData\.files/);
   assert.match(composer, /Pasted image attached/);
   assert.match(composer, /className="attachment-thumbnail"/);
-  assert.match(composer, /onClick=\{\(\) => setAttachmentPreview\(attachment\)\}/);
+  assert.match(composer, /onPreview\(\{ name: attachment\.name, dataUrl \}\)/);
+  assert.match(composer, /const previewAttachment = useCallback\(\(attachment: \{ readonly name: string; readonly dataUrl: string \}\) => \{\s*setAttachmentPreview\(attachment\);/);
   assert.match(composer, /className="image-lightbox composer-image-lightbox"/);
   assert.match(composer, /aria-label="Close attachment preview"/);
   assert.match(composer, /event\.key === "Escape"[\s\S]*setAttachmentPreview\(null\)/);
@@ -1509,6 +2127,11 @@ test("composer and chat sources implement the reviewed compact interaction surfa
   assert.match(composer, /className="model-picker-dropup"/);
   assert.match(composer, /<h4>Recent<\/h4>/);
   assert.match(composer, /data-provider-group/);
+  assert.match(composer, /const canonicalSelected = selected && !recent/);
+  assert.match(composer, /aria-current=\{canonicalSelected \? "true" : undefined\}/);
+  assert.match(composer, /\{canonicalSelected \? <CheckIcon \/> : null\}/);
+  assert.match(composer, /data-complete-row-viewport="true"/);
+  assert.match(composer, /completeRows\.reduce/);
   assert.doesNotMatch(composer, /defaultKeys\.has\(entry\.key\) \? <small>Default<\/small>/);
   assert.doesNotMatch(composer, /model\.isDefault \? <small>Default<\/small>/);
   assert.match(composer, /function reasoningLabel\(value: string/);
@@ -1521,7 +2144,7 @@ test("composer and chat sources implement the reviewed compact interaction surfa
   assert.match(composer, /Open full model browser/);
   assert.match(composer, /Search models and providers/);
   assert.doesNotMatch(composer, /model-session-default|composer-context|CLI default/);
-  assert.match(composer, /appendAttachmentsWithinLimits\(attachments, images.map/);
+  assert.match(composer, /const addImages = useCallback\(\(images: readonly SelectedImage\[\]\) => addAttachments/);
   assert.match(composer, /maximumMessageAttachmentBytes/);
   assert.match(composer, /Attachments can total up to 50 MiB per message/);
   assert.match(composer, /supportsGenericFileAttachments\(providerId\)/);
@@ -1560,12 +2183,26 @@ test("composer and chat sources implement the reviewed compact interaction surfa
   assert.match(chat, /className=\{`message-images/);
   assert.match(chat, /item\.kind === "user" \? imageGallery : null[\s\S]*className="message-body"[\s\S]*item\.kind === "assistant" \? imageGallery : null/);
   assert.match(chat, /message-images-before/);
+  assert.match(chat, /imageOnlyUserMessage/);
+  assert.match(chat, /item\.kind === "user" \? "message-images-before" : ""[\s\S]*imageOnlyUserMessage \? "message-images-user message-images-only" : ""/);
+  assert.equal((chat.match(/message-images-user/g) ?? []).length, 1, "mixed user attachments must keep the regular gallery layout");
+  assert.match(chat, /data-image-layout=\{imageGalleryLayout\}/);
   assert.match(chat, /className="image-lightbox"/);
   assert.doesNotMatch(chat, /Click to expand/);
   assert.match(css, /grid-template-columns: repeat\(auto-fill,minmax\(112px,152px\)\)/);
+  assert.match(css, /\.message-images-user \{[^}]*display:\s*flex[^}]*justify-content:\s*flex-end/);
+  assert.match(css, /\.message-images-user\[data-image-layout="2"\][^{]*\{[^}]*width:\s*165px/);
+  assert.match(css, /\.message-images-user\[data-image-layout="3"\][^{]*\{[^}]*width:\s*202px/);
+  assert.match(css, /\.message-images-user\[data-image-layout="many"\][^{]*\{[^}]*width:\s*223px/);
+  assert.match(css, /\.message-images-only[^{]*\{[^}]*padding:\s*6px[^}]*background:\s*#2b2b29/);
+  assert.match(css, /\.message-images-user > button, \.message-images-user > \.message-image-unavailable \{[^}]*min-height:\s*0/);
+  assert.match(css, /\.message-images-only > \.message-image-unavailable > span \{[^}]*display:\s*none/);
   assert.match(css, /\.message-images > button \{[^}]*aspect-ratio: 4 \/ 3/);
   assert.equal((chat.match(/referrerPolicy="no-referrer"/g) ?? []).length, 2);
-  assert.match(css, /\.context-handoff-summary p[\s\S]*font-style:\s*italic/);
+  assert.match(chat, /timeline-handoff/);
+  assert.match(chat, /Custom context handoff/);
+  assert.match(chat, /timeline-handoff-quote/);
+  assert.match(styles, /\.timeline-handoff \{/);
   assert.match(app, /initialDraft=\{composerDrafts/);
   assert.doesNotMatch(app, />CLI default</);
   assert.match(composer, /const draftSession = session\.draft === true/);
@@ -1574,16 +2211,24 @@ test("composer and chat sources implement the reviewed compact interaction surfa
   assert.match(composer, /await onCreateDraftSend\(\{/);
   assert.match(composer, /draftSessionId: session\.id/);
   assert.doesNotMatch(composer, /request\("session\.create"/);
-  assert.match(composer, /!draftSession \? <>/);
+  assert.match(composer, /onMaterializeDraft\?: \(input: DraftSessionMaterializeInput, action: ComposerTaskAction\) => Promise<void>/);
+  assert.match(composer, /if \(draftSession\) void requestDraftAction\("browser"\)/);
+  assert.match(composer, /if \(draftSession\) void requestDraftAction\("side_chat"\)/);
+  assert.match(composer, /if \(draftSession\) void requestDraftAction\("delegate"\)/);
+  assert.match(composer, /if \(draftSession\) void requestDraftAction\("goal"\)/);
+  assert.match(composer, /if \(draftSession\) void requestDraftAction\("eyes"\)/);
   assert.match(composer, /<DictationControl providerId=\{providerId\}/);
   assert.match(app, /request\("wallet\.get", \{ providerId: "direct", endpointId: nextEndpointId \}\)/);
   assert.match(app, /value\.contextHandoffSummary/);
   assert.match(styles, /\.wallet-endpoint-checking/);
-  assert.match(app, /className="context-handoff-summary"/);
+  assert.doesNotMatch(app, /className="context-handoff-summary"/);
+  assert.match(app, /onContextHandoff=\{createContextHandoff\}/);
+  assert.match(app, /side_chat\.create.*parentSessionId/s);
+  assert.match(app, /Custom context handoff/);
   assert.doesNotMatch(composer, /<Modal/);
   assert.match(css, /bottom:\s*calc\(100% \+ 7px\)/);
   assert.match(css, /\.message:hover \.message-footer/);
-  assert.match(css, /\.composer-entry-row > textarea[\s\S]*font-size:\s*14px/);
+  assert.match(css, /\.composer-input-flow > textarea[\s\S]*font-size:\s*14px/);
   assert.match(composer, /className="composer-setting-label">Model/);
   assert.match(composer, /className="composer-setting-value model-setting-value"><ProviderLogo/);
   assert.match(composer, /className="composer-setting-value choice-setting-value"/);
@@ -1597,7 +2242,9 @@ test("composer and chat sources implement the reviewed compact interaction surfa
   assert.match(css, /\.composer-footer[\s\S]*display:\s*flex[\s\S]*justify-content:\s*flex-end[\s\S]*gap:\s*4px/);
   assert.match(composer, /function ComposerSurfaceOutline\(\)/);
   assert.match(composer, /className="composer-surface-outline"/);
-  assert.match(composer, /`C \$\{curveStart \+ 11\} \$\{shelfHeight\} \$\{shelfLeft - 11\} 0 \$\{shelfLeft\} 0`/);
+  assert.match(composer, /const curveStart = Math\.max\(18, shelfLeft - 18\)/);
+  assert.match(composer, /const curveControl = 7/);
+  assert.match(composer, /`C \$\{curveStart \+ curveControl\} \$\{shelfHeight\} \$\{shelfLeft - curveControl\} 0 \$\{shelfLeft\} 0`/);
   assert.doesNotMatch(css, /radial-gradient\(circle at 0 0/);
   assert.match(css, /\.composer-setting > button[\s\S]*border:\s*1px solid transparent[\s\S]*background:\s*transparent/);
   assert.match(css, /\.composer-setting > button[\s\S]*width:\s*auto[\s\S]*display:\s*flex/);
@@ -1607,11 +2254,22 @@ test("composer and chat sources implement the reviewed compact interaction surfa
   assert.match(css, /\.composer-setting-value[\s\S]*display:\s*flex[\s\S]*gap:\s*4px[\s\S]*border-left:\s*1px solid/);
   assert.match(css, /\.composer-setting-value strong[\s\S]*font-size:\s*13\.5px;[\s\S]*line-height:\s*18px[\s\S]*text-align:\s*left/);
   assert.match(css, /\.model-picker-trigger \.provider-logo[^{]*\{[^}]*transform:\s*translateY\(1px\)/);
+  assert.match(composer, /className="composer-setting-value model-setting-value"><ProviderLogo[^>]*size=\{24\}/);
+  assert.match(css, /\.model-picker-trigger \.provider-logo[^{]*\{[^}]*margin-right:\s*2px/);
+  assert.match(css, /\.model-picker-trigger \.provider-monogram\[data-monogram-length="2"\][^{]*\{[^}]*font-size:\s*15px/);
   assert.match(css, /\.conversation \.message-with-identity \.assistant-identity[^{]*\{[^}]*margin-top:\s*-2px/);
   assert.match(css, /@container \(max-width:\s*640px\)/);
   assert.match(css, /\.model-picker-dropup[\s\S]*width:\s*min\(390px/);
   assert.match(css, /\.model-picker-dropup[\s\S]*right:\s*0/);
-  assert.match(css, /\.composer-primary-actions \.send-button[\s\S]*width:\s*27px;\s*height:\s*27px/);
+  assert.match(css, /\.composer-primary-actions \.send-button[\s\S]*width:\s*38px;\s*height:\s*42px/);
+  assert.match(composer, /<SendIcon className="send-arrow-icon" \/>/);
+  assert.match(composer, /stopTaskAvailable \? <StopIcon \/> : mode === "steer" && !dictationRecording \? <SlidersIcon \/> : <SendIcon className="send-arrow-icon" \/>/);
+  assert.match(css, /\.composer-primary-actions \.send-button \.send-arrow-icon \{[^}]*transform:\s*translateX\(2px\)[^}]*transition:\s*transform \.11s ease-out/);
+  assert.match(css, /\.composer-primary-actions \.send-button:hover:not\(:disabled\) \.send-arrow-icon,\s*\.composer-primary-actions \.send-button:active:not\(:disabled\) \.send-arrow-icon \{[^}]*transform:\s*translate\(2px,1px\) scale\(\.94\)/);
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\) \{ \.composer-primary-actions \.send-button \.send-arrow-icon \{ transition:\s*none; \} \}/);
+  assert.match(composer, /<ProviderLogo providerId=\{entry\.provider\.id\} provider=\{entry\.provider\} size=\{18\}\/>/);
+  assert.match(css, /\.model-catalog-results section > button > \.provider-logo \{[^}]*width:\s*18px !important;[^}]*height:\s*18px !important/);
+  assert.match(css, /\.model-catalog-results section > button > \.provider-logo \.provider-monogram\[data-monogram-length="2"\] \{[^}]*font-size:\s*13px/);
   assert.match(css, /\.composer-actions-menu > button::before[\s\S]*width:\s*30px[\s\S]*height:\s*20px[\s\S]*border-radius:\s*7px/);
   assert.match(css, /\.composer-actions-menu > button[\s\S]*width:\s*36px !important[\s\S]*height:\s*36px !important[\s\S]*background:\s*transparent !important/);
   assert.match(css, /\.dictation-main > svg[\s\S]*width:\s*23px/);
@@ -1619,14 +2277,22 @@ test("composer and chat sources implement the reviewed compact interaction surfa
   assert.match(composer, /label="Choose dictation source"/);
   assert.match(composer, /EARS settings/);
   assert.match(composer, /function EarsSettingsPanel/);
+  assert.match(composer, /panelRef\?: RefObject<HTMLDivElement \| null>/);
+  assert.match(composer, /className="ears-settings" role="dialog" aria-label="EARS settings" ref=\{panelRef\} onKeyDownCapture=/);
+  assert.match(composer, /<input autoFocus type="checkbox" checked=\{settings\.enabled\}/);
+  assert.match(composer, /const closeEars = useCallback\(\(restoreFocus = true\) => \{/);
+  assert.match(composer, /document\.addEventListener\("pointerdown", outside\)[\s\S]*?window\.addEventListener\("keydown", escape\)/u);
+  assert.match(composer, /if \(!earsPanel\.current\?\.contains\(event\.target as Node\)\) closeEars\(false\)/);
+  assert.match(composer, /if \(meshPanel\.current\?\.contains\(event\.target as Node\)\) return;[\s\S]*?setMeshOpen\(false\)/u);
+  assert.match(composer, /requestAnimationFrame\(\(\) => textarea\.current\?\.focus\(\)\)/);
   assert.match(composer, /ears\.process/);
   assert.match(composer, /ears\.cancel/);
   assert.match(composer, /className="ears-cancel"/);
   assert.match(composer, /Cancel transcription/);
   assert.doesNotMatch(composer, /className=\{`send-button[\s\S]*Cancel transcription/);
   assert.match(composer, /origin: "dictation"/);
-  assert.match(composer, /origin: "clipboard"/);
-  assert.match(composer, /origin: "drag-drop"/);
+  assert.match(composer, /prepareDroppedAttachment\(file, "image", "clipboard"/);
+  assert.match(composer, /prepareDroppedAttachment\(file, "image", "drag-drop"/);
   assert.match(composer, /onDrop=\{\(event\) => void onComposerDrop\(event\)\}/);
   assert.match(composer, /filterAttachmentsForDestination\(attachments, false, ears\.enabled\)/);
   assert.match(composer, /isEarsCancelledError/);
@@ -1665,14 +2331,14 @@ test("composer and chat sources implement the reviewed compact interaction surfa
   assert.match(composer, /export function DictationSettings/u);
   assert.doesNotMatch(composer, /Set \$\{source\.setupEnvironmentVariable\} in Bridge/u);
   assert.match(css, /\.dictation-credential-setup[^{]*\{[^}]*width:\s*310px[^}]*display:\s*grid/);
-  assert.match(composer, /export type ComposerAttachment = SelectedImage \| SelectedFile/);
+  assert.match(composer, /export type ComposerAttachment = ReadyComposerAttachment \| PreparingComposerAttachment/);
   assert.match(composer, /initialAttachments\?: readonly ComposerAttachment\[\]/);
   assert.match(composer, /onAttachmentsChange\?: \(value: readonly ComposerAttachment\[\]\) => void/);
   assert.match(composer, /useState<readonly ComposerAttachment\[\]>\(\(\) => initialAttachments\)/);
-  assert.match(composer, /attachmentsChangeRef\.current\?\.\(attachments\)/);
+  assert.match(composer, /attachmentsChangeRef\.current\?\.\(next\)/);
   assert.match(composer, /label="Add attachment"[\s\S]*className="composer-attachment-menu"/);
-  assert.match(composer, /className="composer-entry-row"[\s\S]*<textarea[\s\S]*className="composer-primary-actions"/);
-  assert.match(composer, /<textarea id="composer-message"/);
+  assert.match(composer, /className="composer-entry-row"[\s\S]*<ComposerMessageInput[\s\S]*className="composer-primary-actions"/);
+  assert.match(await readFile(join(appRoot, "src", "renderer", "src", "ComposerMessageInput.tsx"), "utf8"), /id: "composer-message"/);
   assert.match(app, /<a className="skip-to-message" href="#composer-message">Skip to message<\/a>/);
   assert.match(styles, /\.skip-to-message[^{]*\{[^}]*font-size:\s*12\.5px/);
   assert.match(styles, /\.skip-to-message:focus-visible[^{]*\{[^}]*transform:\s*translateY\(0\)/);
@@ -1692,7 +2358,7 @@ test("composer and chat sources implement the reviewed compact interaction surfa
   assert.match(app, /new ResizeObserver\(measure\)/);
   assert.match(app, /const shouldFollow = historyAnchor\.current === null && scrollMode\.current\.kind === "follow_tail";[\s\S]*spacer\.style\.height = `\$\{next\}px`;[\s\S]*requestAnimationFrame\(\(\) => \{[\s\S]*measuredComposerClearance\.current === next && scrollMode\.current\.kind === "follow_tail"[\s\S]*scrollToLatest\(\)/);
   assert.match(app, /const scrollToLatest = useCallback\(\(\) => \{[\s\S]*setScrollMode\(followTailScrollMode\);[\s\S]*applyScrollTop\(element, element\.scrollHeight\)/);
-  assert.match(app, /const steppedOffEnd = !echoed && movedOffEnd\(element, lastScrollTop\.current\)/);
+  assert.match(app, /const steppedOffEnd = readerInitiated && movedOffEnd\(element, lastScrollTop\.current\)/);
   assert.match(app, /const returnedToEnd = !echoed && readerReturnedToEnd\(element, lastScrollTop\.current, readerInitiated\)/);
   assert.match(app, /const readerAboveEnd = readerInitiated && !isAtPhysicalBottom\(element\);[\s\S]*if \(readerAboveEnd \|\| steppedOffEnd\) \{[\s\S]*setScrollMode\(\{ kind: "preserve_view", anchor \}\);[\s\S]*else if \(returnedToEnd\) \{[\s\S]*setScrollMode\(followTailScrollMode\)/);
   assert.match(app, /className="conversation-tail-spacer" ref=\{tailSpacer\}/);
@@ -1712,11 +2378,15 @@ test("composer and chat sources implement the reviewed compact interaction surfa
   assert.doesNotMatch(chat, /assistant-identity[\s\S]{0,160}title=/);
   assert.match(chat, /function shouldShowAssistantIdentity/);
   assert.match(chat, /function finalAnswerCopyText/);
-  assert.match(chat, /const footerCopyText = item\.kind === "user" \? item\.body\.trim\(\) : identityMode === "final" \? copyText : undefined/);
+  assert.match(chat, /className="message-files" aria-label="Attached files"/);
+  assert.match(chat, /className="message-file-attachment"/);
+  assert.match(chat, /function WorkflowMessageAttachment[\s\S]*?if \(restoreFocus\) trigger\.current\?\.focus\(\);[\s\S]*?setDetailsOpen\(false\);[\s\S]*?requestAnimationFrame\(\(\) => trigger\.current\?\.focus\(\)\)/u);
+  assert.match(chat, /function WorkflowMessageAttachment[\s\S]*?event\.key !== "Escape"[\s\S]*?closeDetails\(\)/u);
+  assert.match(chat, /const footerCopyText = item\.kind === "user" \? item\.mesh[\s\S]*?: item\.body\.trim\(\) : identityMode === "final" \? copyText : undefined/);
   assert.match(chat, /footerCopyText \? <div className="message-footer">/);
   assert.match(chat, /className="timeline-error-notice" role="alert" aria-live="assertive" aria-atomic="true"/);
-  assert.match(chat, /className="timeline-error-recovery" onClick=\{onContinue\}>Continue in composer<\/button>/);
-  assert.match(app, /getElementById\("composer-message"\)[\s\S]*composer\.focus\(\{ preventScroll: true \}\)[\s\S]*composer\.scrollIntoView\(\{ block: "nearest" \}\)/);
+  assert.match(chat, /className="timeline-error-recovery" onClick=\{onContinue\} disabled=\{continueDisabled\} aria-busy=\{continuePending\}/);
+  assert.match(app, /await request\("session\.continue", \{\s*sessionId: session\.id/);
   assert.match(styles, /\.timeline-error-notice[^{]*\{[^}]*background:\s*#272725/);
   assert.doesNotMatch(styles, /\.timeline-error-notice[^{]*\{[^}]*var\(--danger\)|\.timeline-error-notice svg[^{]*\{[^}]*var\(--danger\)/);
   assert.match(chat, /className="timeline-item-meta"/);
@@ -1726,7 +2396,7 @@ test("composer and chat sources implement the reviewed compact interaction surfa
   assert.doesNotMatch(chat, /className="message-meta"/);
   assert.doesNotMatch(chat, /shouldShowTurnStartIdentity|reasoning-identity/);
   assert.doesNotMatch(styles, /\.reasoning-identity/);
-  assert.match(chat, /function ChatTimeline\(/);
+  assert.match(chat, /function ChatTimelineImpl\(/);
   assert.match(chat, /function ActiveCompactionStatus\(\{ kind \}/);
   assert.match(chat, /className="timeline-compaction-event timeline-compaction-active" role="status" aria-live="polite"/);
   assert.match(chat, /Automatically compacting context…/);
@@ -1740,7 +2410,8 @@ test("composer and chat sources implement the reviewed compact interaction surfa
   assert.match(chat, /function ThinkingFlow\(/);
   assert.match(chat, /<RichText onLinkOpen=\{onLinkOpen\}>\{body\}<\/RichText>/);
   assert.doesNotMatch(chat, /reasoning-category-controls|Expand thinking|Collapse thinking|Expand tool calls|Collapse tool calls|reasoning-segment-preview/);
-  assert.doesNotMatch(chat, /Fragment|activeSegments|toggleSegment|setSegments/);
+  assert.doesNotMatch(chat, /activeSegments|toggleSegment|setSegments/);
+  assert.match(chat, /<Fragment key=\{presentationId\}>\{finalBoundary \? <TimelineBoundary label="Final answer" final\/> : null\}\{card\}<\/Fragment>/);
   // The reasoning level lives in the composer's existing reasoning choice, not
   // as a badge next to the group label.
   assert.doesNotMatch(chat, /reasoning-effort-badge/);
@@ -1801,23 +2472,29 @@ test("composer and chat sources implement the reviewed compact interaction surfa
   assert.match(bridge, /request\("session\.watch"/);
   assert.match(app, /addEventListener\("focus", onFocus\)/);
   assert.match(app, /addEventListener\("visibilitychange", onVisibility\)/);
-  assert.match(app, /loadSessionTimelinePage\(sessionId, undefined, 40, true\)/);
+  assert.match(app, /loadTimelinePage\(sessionId, undefined, 40, true\)/);
   assert.match(app, /refreshVisibleState\(false\)/);
   assert.match(app, /quietCatchUpDue\(selectedLastDelta\(selected\), Date\.now\(\), 2_000\)/);
   assert.match(app, /request\("sync\.since"/);
   assert.match(app, /loadSessionContext\(session\.id\)[\s\S]*updateContextCompaction\(context\.isCompacting, context\.compactionKind\)/);
   assert.match(app, /onCompactionChange=\{updateContextCompaction\}/);
   assert.match(app, /isCompacting=\{contextCompaction\.isCompacting\}[\s\S]*compactionKind=\{contextCompaction\.kind\}/);
-  assert.match(app, /active=\{sessionHoldsFollowUpQueue\(session, timeline\)\}/);
+  assert.match(app, /workingBoundaryBySession = useRef\(new Map<string, SessionWorkingBoundary>\(\)\)/);
+  assert.match(app, /if \(isLiveTurnEvent\(event\)\)[\s\S]*workingBoundaryBySession\.current\.set\(event\.sessionId, captureSessionWorkingBoundary\(timeline\)\)/);
+  assert.match(app, /if \(workingBoundary && !sessionBoundaryNeedsVisibleEnding\(advancedTimeline, workingBoundary\)\) \{\s*workingBoundaryBySession\.current\.delete\(event\.sessionId\);/);
+  assert.match(app, /presentedSessionState\(session, timeline, workingBoundaryBySession\.current\.get\(session\.id\)\)/);
+  assert.match(app, /presentedView === "workspace" && selectedSession[\s\S]*?workingBoundary=\{workingBoundaryBySession\.current\.get\(selectedSession\.id\)\}/);
+  assert.match(app, /active=\{sessionPresentsLiveTurn\(session, timeline, workingBoundary\)\}/);
   assert.match(app, /onInterrupt:\s*interruptSession/);
-  assert.match(composer, /const stopTaskAvailable = canInterrupt && !dictationRecording && !content\.trim\(\) && annotations\.length === 0 && !attachments\.some\(isDictationAudioAttachment\)/);
+  assert.match(composer, /const compositionHasContent = removeSlashCommandToken\(removeSlashCommandToken\(content, "\/mesh"\), "\/schedule"\)\.trim\(\)\.length > 0[\s\S]*?workflowAttachments\.length > 0[\s\S]*?meshTargets\.length > 0;/u);
+  assert.match(composer, /const stopTaskAvailable = canInterrupt && !dictationRecording && !compositionHasContent && content\.trim\(\)\.length === 0;/u);
   assert.match(composer, /stopTaskAvailable \? "Stop task"/);
   assert.match(composer, /stopTaskAvailable \? <StopIcon \/>/);
   assert.match(composer, /const \[interrupting, setInterrupting\] = useState\(false\)/);
   assert.match(composer, /const interruptingRef = useRef\(false\)/);
   assert.match(composer, /if \(onInterrupt === undefined \|\| interruptingRef\.current\) return/);
   assert.match(composer, /interruptingRef\.current = true;[\s\S]*await onInterrupt\(\);[\s\S]*interruptingRef\.current = false;/);
-  assert.match(composer, /disabled=\{sending \|\| interrupting \|\|/);
+  assert.match(composer, /disabled=\{sending \|\| scheduleBusy \|\| interrupting \|\|/);
   assert.match(chat, /function withCurrentActivity\(/);
   assert.match(chat, /candidateIndex === currentIndex[\s\S]*candidate\.state === "running" \? \{ \.\.\.candidate, state: "completed" \}/);
   assert.match(styles, /\.rich-table-scroll table[\s\S]*border-collapse:\s*collapse/);
@@ -1859,7 +2536,8 @@ test("desktop queue, side-chat, and cross-task surfaces use the narrow bridge co
   assert.match(app, /Side chat copied to a full task/);
   assert.match(app, /event\.type === "message\.remote_received"/);
   assert.match(composer, /request\("message_queue\.edit", \{ messageId, content: nextContent \}\)/);
-  assert.match(composer, /request\("message_queue\.deliver", \{ messageId, mode: canSteer \? "steer" : "send" \}\)/);
+  assert.match(composer, /request\("message_queue\.deliver", \{ messageId, mode: "steer" \}\)/);
+  assert.doesNotMatch(composer, /message_queue\.deliver[\s\S]{0,160}mode: canSteer \? "steer" : "send"/);
   assert.match(composer, /Send to new task/);
   assert.match(composer, /request\("message_queue\.move_to_new_task"/);
   assert.match(composer, /className="queue-new-task-picker"/);
@@ -1867,10 +2545,20 @@ test("desktop queue, side-chat, and cross-task surfaces use the narrow bridge co
   assert.match(composer, /mostRecentReasoningForModel\(snapshot\.sessions/);
   assert.match(composer, /model\.walletKind !== "user_api" \|\| model\.apiKeyConfigured !== false/);
   assert.match(composer, /request\("session\.send_message", \{ sessionId: session\.id, content: trimmed/);
+  assert.match(composer, /const optimisticRow: TimelineItem = \{[\s\S]*id: acceptedId,[\s\S]*presentationId: acceptedId/);
+  assert.match(composer, /onSent\(optimisticRow, userRowIdsBeforeDelivery\);[\s\S]*commitDraft\(\{ content: "", attachments: \[\] \}\);[\s\S]*await request\("session\.send_message"/);
+  assert.match(composer, /const definitelyFailed = presentationPainted[\s\S]*onSendFailed\(acceptedId, timestamp, submittedDraft\)/);
+  assert.match(composer, /if \(definitelyFailed\)[\s\S]*"attachment\.upload\.cancel"[\s\S]*else \{[\s\S]*pendingUploadIds\.length = 0/);
+  assert.match(app, /onSent=\{\(sessionId, item, userRowIdsBeforeDelivery\) =>[\s\S]*mergeAcceptedComposerRow/);
+  assert.match(app, /rollbackOptimisticComposerRow\(currentTimeline, presentationId\)/);
+  assert.match(app, /observedPresentation\?\.presentationId === presentationId && observedPresentation\.id !== presentationId\) return false/);
+  assert.match(app, /mergeFailedSideChatDraft\(submittedDraft, currentDraft\)/);
+  assert.match(composer, /const generation = \+\+queuedMessagesGeneration\.current;[\s\S]*generation !== queuedMessagesGeneration\.current \|\| activeSessionId\.current !== session\.id/);
+  assert.match(composer, /fileAttachments\.length \? \{ files: fileAttachments\.map/);
   assert.match(composer, /<DictationControl providerId=\{session\.providerId\}/);
   assert.match(composer, /export interface SideChatDraft/);
   assert.match(composer, /Discard draft/);
-  assert.match(composer, /current\.content === sentContent \? "" : current\.content/);
+  assert.match(composer, /export function mergeFailedSideChatDraft/);
   assert.match(composer, /queuedAttachmentPreviewCache/);
   assert.match(composer, /className="queued-attachment-widgets"/);
   assert.match(composer, /message\.attachments\.map\(\(attachment, index\) => <QueuedAttachmentWidget/);
@@ -1880,19 +2568,37 @@ test("desktop queue, side-chat, and cross-task surfaces use the narrow bridge co
   assert.doesNotMatch(composer, /\[queueingEnabled, setQueueingEnabled\] = useState/);
   assert.match(navigation, />Show side chats</);
   assert.match(navigation, /allSideChats\.slice\(0, 2\)/);
+  assert.match(navigation, /collapsedSideChatParents/);
+  assert.match(navigation, /aria-expanded=\{!collapsed\}/);
   assert.match(navigation, /className="side-chat-controls"/);
   assert.match(navigation, /onSideChatAnchor/);
   assert.match(chat, /From another Tethoq task · \{item\.origin\.sourceTitle \|\| "Untitled task"\}/);
-  assert.match(bridge, /origin\.kind !== "cross_session"/);
+  assert.match(chat, /Sent by \{item\.origin\.sender === "codex" \? "Codex" : "Tethoq"\}/);
+  assert.match(chat, /<AgentIcon \/>/, "Codex and Tethoq delegation provenance must share one quiet icon");
+  assert.match(bridge, /origin\.kind === "delegation"/);
   assert.match(bridge, /sourceSessionId: origin\.sourceSessionId/);
   assert.match(css, /\.side-chat-connectors path \{[^}]*stroke-dasharray/);
   assert.match(css, /\.queued-attachment-image img \{[^}]*object-fit: cover/);
   assert.match(css, /\.queued-attachment-widgets \{[^}]*flex-wrap: wrap/);
-  assert.match(navigationCss, /\.session-side-chats \{ width: 80%; margin-left: 20%/);
+  assert.match(navigationCss, /\.session-side-chat-rail \{[^}]*width: 80%;[^}]*margin-left: 20%/);
+  assert.match(navigationCss, /\.session-row-group\.has-side-chats > \.session-row-shell > \.session-row \{[^}]*border-bottom-right-radius:\s*0/);
+  assert.match(navigationCss, /\.session-side-chat-toggle \{[^}]*left: -24px;[^}]*border-radius: 0 0 0 7px;[^}]*background: #292927/);
+  assert.match(navigationCss, /\.session-side-chat-rail\.collapsed \.session-side-chat-toggle \{[^}]*border-radius: 0 0 7px 7px/);
+  assert.match(navigationCss, /\.session-side-chats \{[^}]*overflow: hidden;[^}]*border-radius: 0 0 7px 7px;[^}]*background: #292927/);
+  assert.match(navigationCss, /\.session-side-chats\[hidden\] \{ display: none; \}/);
+  assert.match(navigationCss, /\.session-side-chats > button \{[^}]*border-radius: 0;[^}]*background: transparent/);
+  assert.match(navigationCss, /\.session-side-chats > button\.active \{[^}]*color: #f0f2ef;[^}]*\}/);
+  assert.doesNotMatch(navigationCss, /\.session-side-chats > button\.active[^}]*background/);
   assert.match(navigationCss, /\.side-chat-controls \{[^}]*opacity: 0;[^}]*pointer-events: none/);
-  assert.match(navigation, /session\.state === "working" \? <i className="session-row-working-spinner"/);
+  assert.match(navigation, /session\.state === "working" \? <span className="session-row-working-indicator"[^>]*><i className="spinner session-row-working-spinner"/);
   assert.doesNotMatch(navigation, /session-row-state-/);
-  assert.match(navigationCss, /\.session-row-working-spinner \{[^}]*border-right-color:\s*transparent;[^}]*animation:\s*spin/);
+  assert.match(navigation, /session\.state === "working" \? <span className="session-project-working-indicator"[^>]*><i className="spinner session-project-working-spinner"/);
+  assert.match(navigationCss, /\.session-project-working-indicator \{[^}]*color:\s*#7fd39b/);
+  assert.match(navigationCss, /\.session-row-working-indicator \{[^}]*color:\s*#7fd39b/);
+  assert.doesNotMatch(navigationCss, /\.session-(?:project|row)-working-spinner \{[^}]*animation:\s*spin/);
+  assert.doesNotMatch(navigationCss, /session-(?:project|row)-working-spinner[^}]*steps\(/);
+  assert.match(navigationCss, /@media \(prefers-reduced-motion: reduce\) \{ \.session-project-working-spinner \{[^}]*animation:\s*none;/);
+  assert.match(navigationCss, /@media \(prefers-reduced-motion: reduce\) \{ \.session-row-working-spinner \{[^}]*animation:\s*none;/);
 });
 
 test("queued new-task reasoning reuses only the newest supported concrete effort", () => {
@@ -1905,6 +2611,78 @@ test("queued new-task reasoning reuses only the newest supported concrete effort
   ];
   assert.equal(composerUi.mostRecentReasoningForModel(sessions, "codex", model), "high");
   assert.equal(composerUi.mostRecentReasoningForModel(sessions, "grok", { ...model, efforts: ["medium"] }), undefined);
+});
+
+test("recent models follow real session activity instead of unsent picker choices", () => {
+  const models = {
+    codex: [
+      { id: "gpt-5.6-sol", name: "GPT-5.6-Sol" },
+      { id: "gpt-5.6-luna", name: "GPT-5.6-Luna" },
+    ],
+    grok: [{ id: "grok-4.6", name: "Grok 4.6" }],
+    opencode: [
+      { id: "opencode-go/deepseek-v4-pro", name: "DeepSeek V4 Pro" },
+      { id: "deepseek/deepseek-v4-pro", name: "DeepSeek V4 Pro" },
+    ],
+  };
+  const sessions = [
+    { providerId: "codex", model: "gpt-5.6-luna", updatedAt: "2026-08-28T10:00:00.000Z" },
+    { providerId: "opencode", model: "deepseek/deepseek-v4-pro", updatedAt: "2026-08-28T11:00:00.000Z" },
+    { providerId: "opencode", model: "opencode-go/deepseek-v4-pro", updatedAt: "2026-08-28T12:00:00.000Z" },
+    { providerId: "grok", model: "GROK 4.6", updatedAt: "2026-08-28T13:00:00.000Z" },
+    { providerId: "codex", model: "gpt-5.6-sol", updatedAt: "2026-08-28T14:00:00.000Z" },
+    { providerId: "codex", model: "gpt-5.6-sol", updatedAt: "2026-08-28T15:00:00.000Z" },
+    { providerId: "opencode", model: "DeepSeek V4 Pro", updatedAt: "2026-08-28T16:00:00.000Z" },
+    { providerId: "codex", model: "gpt-5.6-luna", updatedAt: "2026-08-28T17:00:00.000Z", draft: true },
+    { providerId: "grok", model: "grok-4.6", updatedAt: "2026-08-28T18:00:00.000Z", sessionKind: "internal" },
+    { providerId: "codex", model: "default", updatedAt: "2026-08-28T19:00:00.000Z" },
+    { providerId: "codex", model: "model-no-longer-advertised", updatedAt: "2026-08-28T20:00:00.000Z" },
+  ];
+
+  assert.deepEqual(composerUi.recentModelKeysFromSessions(sessions, models), [
+    "codex:gpt-5.6-sol",
+    "grok:grok-4.6",
+    "opencode:opencode-go/deepseek-v4-pro",
+    "opencode:deepseek/deepseek-v4-pro",
+    "codex:gpt-5.6-luna",
+  ]);
+  assert.deepEqual(composerUi.recentModelKeysFromSessions(sessions, models, 2), [
+    "codex:gpt-5.6-sol",
+    "grok:grok-4.6",
+  ]);
+  assert.deepEqual(composerUi.recentModelKeysFromSessions(sessions, models, 0), []);
+});
+
+test("recent model usage keeps the previous model after a task switches models", () => {
+  const models = {
+    codex: [
+      { id: "model-a", name: "Model A" },
+      { id: "model-b", name: "Model B" },
+    ],
+    opencode: [{ id: "model-c", name: "Model C" }],
+  };
+  const previouslyUsed = [
+    { key: "codex:model-a", usedAt: Date.parse("2026-08-28T10:00:00.000Z") },
+    // Temporarily unavailable models stay in history without occupying a visible row.
+    { key: "opencode:model-temporarily-unavailable", usedAt: Date.parse("2026-08-28T09:00:00.000Z") },
+  ];
+  const switchedSession = [
+    { providerId: "codex", model: "model-b", updatedAt: "2026-08-28T11:00:00.000Z" },
+  ];
+
+  assert.deepEqual(composerUi.recentModelKeysFromUsage(switchedSession, models, previouslyUsed), [
+    "codex:model-b",
+    "codex:model-a",
+  ]);
+  assert.deepEqual(composerUi.mergeRecentModelUses(previouslyUsed, [
+    { key: "codex:model-b", usedAt: Date.parse("2026-08-28T11:00:00.000Z") },
+    { key: "codex:model-a", usedAt: Date.parse("2026-08-28T12:00:00.000Z") },
+    { key: "broken", usedAt: Number.NaN },
+  ], 5), [
+    { key: "codex:model-a", usedAt: Date.parse("2026-08-28T12:00:00.000Z") },
+    { key: "codex:model-b", usedAt: Date.parse("2026-08-28T11:00:00.000Z") },
+    { key: "opencode:model-temporarily-unavailable", usedAt: Date.parse("2026-08-28T09:00:00.000Z") },
+  ]);
 });
 
 test("side chat hides injected parent context and keeps only its own conversation", () => {
@@ -1920,7 +2698,8 @@ test("side chat hides injected parent context and keeps only its own conversatio
 });
 
 test("side chat owns its position, drags and resizes in the viewport, and routes an orthogonal masked tether", async () => {
-  const [composer, css] = await Promise.all([
+  const [app, composer, css] = await Promise.all([
+    source(join("src", "renderer", "src", "App.tsx")),
     source(join("src", "renderer", "src", "Composer.tsx")),
     source(join("src", "renderer", "src", "composer.css")),
   ]);
@@ -1950,6 +2729,10 @@ test("side chat owns its position, drags and resizes in the viewport, and routes
   assert.doesNotMatch(composer, /`M \$\{item\.anchor\.x\} \$\{item\.anchor\.y\} C /);
   assert.match(composer, /document\.addEventListener\("scroll", schedule, true\)/);
   assert.match(composer, /window\.addEventListener\("resize", schedule\)/);
+  assert.match(composer, /const resizeObserver = typeof ResizeObserver === "undefined" \? null : new ResizeObserver\(schedule\)/);
+  assert.match(composer, /for \(const element of \[root\.current, list, parentRow, document\.querySelector<HTMLElement>\("\.conversation-scroll"\)\]\)/);
+  assert.match(composer, /resizeObserver\?\.observe\(element\)/);
+  assert.match(composer, /resizeObserver\?\.disconnect\(\)/);
   // The tether vanishes over the conversation column via a blurred mask hole,
   // so it can never paint across message text.
   assert.match(composer, /document\.querySelector<HTMLElement>\("\.conversation-scroll"\)/);
@@ -1958,6 +2741,7 @@ test("side chat owns its position, drags and resizes in the viewport, and routes
   assert.match(composer, /fill="black" filter=\{`url\(#\$\{tetherMaskId\}-blur\)`\}/);
   assert.match(composer, /<path d=\{tether\.path\} mask=\{`url\(#\$\{tetherMaskId\}\)`\}\/>/);
   assert.match(composer, /className="side-chat-connectors" width=\{tether\.viewportWidth\}/);
+  assert.doesNotMatch(app, /<svg className="side-chat-connectors"/, "App must not draw a second stale connector");
   // The context injection is never rendered as messages; the empty state is a
   // single centred note, and the promote button sits in the header.
   assert.match(composer, /export function visibleSideChatTimeline/);
@@ -1965,19 +2749,31 @@ test("side chat owns its position, drags and resizes in the viewport, and routes
   assert.match(composer, /item\.messageId\?\.startsWith\("copied:"\) !== true/);
   assert.match(composer, /visible\.length \? <ChatTimeline timeline=\{visible\}/);
   assert.match(composer, /className="side-chat-context-note">This side chat already carries the parent task's context\.<\/p>/);
-  assert.match(composer, /className="side-chat-promote" aria-label="Send findings to the parent task" data-tooltip="Send findings to the parent task"/);
+  assert.match(composer, /const canPromote = Boolean\(visible\?\.length\)/);
+  assert.match(composer, /const hasHeaderActions = canPromote \|\| hasDraft/);
+  assert.match(composer, /\{hasHeaderActions \? <Popover label="Side chat actions"/);
+  assert.match(composer, /\{canPromote \? <button type="button" className="side-chat-promote" aria-label="Send findings to the parent task" data-tooltip="Send findings to the parent task"/);
   assert.match(composer, /onClick=\{\(\) => void promote\(\)\}/);
-  assert.match(composer, /className="side-chat-promote"[^>]*>[\s\S]*?aria-label="Close side chat"/);
+  assert.match(composer, /\{canPromote \? <button[^>]*className="side-chat-promote"[^>]*>[\s\S]*? : null\}<button type="button" aria-label="Close side chat"/, "Close must remain outside conditional action disclosure");
+  assert.match(composer, /<ProviderLogo providerId=\{session\.providerId\} provider=\{provider\} size=\{28\}\/><strong>Side chat<\/strong>/);
 
-  assert.match(css, /\.side-chat-layer > \.side-chat-connectors[^{]*\{[^}]*display:\s*none/);
+  assert.doesNotMatch(css, /\.side-chat-layer > \.side-chat-connectors[^{]*\{[^}]*display:\s*none/);
   assert.match(css, /\.side-chat-connectors path \{[^}]*stroke-dasharray/);
   assert.match(css, /\.side-chat-floating[^{]*\{[^}]*pointer-events:\s*none/);
   assert.match(css, /\.side-chat-panel[^{]*\{[^}]*position:\s*fixed[^}]*pointer-events:\s*auto/);
   assert.match(css, /\.side-chat-panel > header[^{]*\{[^}]*cursor:\s*grab[^}]*touch-action:\s*none/);
   assert.match(css, /\.side-chat-panel\.dragging > header[^{]*\{[^}]*cursor:\s*grabbing/);
+  assert.match(css, /\.side-chat-panel > header[^{]*\{[^}]*grid-row:\s*1/);
+  assert.match(css, /\.side-chat-transcript[^{]*\{[^}]*grid-row:\s*2/);
+  assert.match(css, /\.side-chat-attachments[^{]*\{[^}]*grid-row:\s*3/);
+  assert.match(css, /\.side-chat-composer[^{]*\{[^}]*grid-row:\s*4/);
   assert.match(css, /\.side-chat-transcript:has\(> \.side-chat-context-note\)[^{]*\{[^}]*place-content:\s*center/);
-  assert.match(css, /\.side-chat-resize[^{]*\{[^}]*cursor:\s*nwse-resize/);
-  assert.match(css, /\.side-chat-panel \[data-tooltip\]::after[^{]*\{[^}]*font-size:\s*11px/);
+  assert.match(css, /\.side-chat-panel > \.side-chat-resize[^{]*\{[^}]*position:\s*absolute[^}]*right:\s*0[^}]*bottom:\s*0[^}]*cursor:\s*nwse-resize/);
+  assert.match(css, /\.side-chat-panel > header > span > \.provider-logo \{[^}]*transform:\s*translateY\(-1px\)/);
+  assert.match(css, /\.side-chat-panel-menu \{[^}]*opacity:\s*0;[^}]*pointer-events:\s*none/);
+  assert.match(css, /\.side-chat-panel > header:hover \.side-chat-panel-menu,[\s\S]*\.side-chat-panel > header:focus-within \.side-chat-panel-menu/);
+  assert.match(css, /@media \(hover: none\), \(pointer: coarse\) \{ \.side-chat-panel-menu \{ opacity: 1; pointer-events: auto; \} \}/);
+  assert.doesNotMatch(css, /\.side-chat-panel \[data-tooltip\]::after/);
   // The app's font floor: nothing new in the panel drops below 11px.
   assert.doesNotMatch(css, /\.side-chat-context-note[^{]*\{[^}]*font-size:\s*(?:9|10)(?:\.\d+)?px/);
   assert.doesNotMatch(css, /\.side-chat-resize[^{]*\{[^}]*font-size:\s*(?:9|10)(?:\.\d+)?px/);
@@ -2020,6 +2816,33 @@ test("a settled unphased turn leaves only its last answer outside Reasoning", ()
   assert.deepEqual(timelineHelpers.groupTimeline(timeline, true).map((group) => group.kind), ["reasoning", "item", "reasoning", "item"]);
 });
 
+test("Mesh children stay with their exact originating prompt across completion and history ordering", () => {
+  const user = { id: "mesh-user", kind: "user", body: "Ask the four targets.", timestamp: "2026-09-05T11:48:02Z", delegationId: "mesh-one" };
+  const reasoning = { id: "mesh-reasoning", kind: "reasoning", body: "Assigning the work.", state: "completed" };
+  const dispatch = { id: "mesh-dispatch", kind: "tool", title: "Uar_mesh_dispatch_delegation", body: "", state: "completed" };
+  const answer = { id: "mesh-answer", kind: "assistant", body: "20, 10, 19, hello.", state: "completed" };
+  const nextUser = { id: "next-user", kind: "user", body: "A different request.", delegationId: "mesh-two" };
+  const children = Array.from({ length: 4 }, (_, index) => ({ id: `child-${index}`, kind: "subagent", childSessionId: `session-${index}`, delegationId: "mesh-one", timestamp: "2026-09-05T11:48:01Z", body: "Spawned sub-agent", state: "completed" }));
+  const nextChild = { ...children[0], id: "next-child", childSessionId: "next-session", delegationId: "mesh-two" };
+  for (const input of [
+    [...children, user, reasoning, dispatch, answer, nextUser, nextChild],
+    [user, reasoning, dispatch, answer, nextUser, nextChild, ...children],
+  ]) {
+    const anchored = timelineHelpers.anchorMeshChildren(input);
+    assert.deepEqual(anchored, [user, reasoning, dispatch, ...children, answer, nextUser, nextChild]);
+    assert.equal(timelineHelpers.anchorMeshChildren(anchored), anchored, "a refresh must not reshuffle an already anchored turn");
+    const groups = timelineHelpers.groupTimeline(anchored);
+    assert.deepEqual(groups[1].items, [reasoning, dispatch, ...children]);
+    assert.equal(groups[2].item, answer);
+    assert.equal(groups[3].item, nextUser);
+  }
+  const running = children.map((child) => ({ ...child, state: "running" }));
+  const liveGroups = timelineHelpers.groupTimeline(timelineHelpers.anchorMeshChildren([...running, user, reasoning, dispatch, answer]), true);
+  assert.equal(liveGroups.filter((group) => group.kind === "item" && group.item.kind === "subagent").length, 4, "unfinished workers must stay directly visible");
+  const partialHistory = [...children, nextUser];
+  assert.equal(timelineHelpers.anchorMeshChildren(partialHistory), partialHistory, "missing history must not attach a child to another user's prompt");
+});
+
 test("terminal reasoning folding is provider-neutral", () => {
   const item = (id, kind, body, phase) => ({ id, kind, body, ...(phase ? { phase } : {}), state: "completed", timestamp: "2026-08-20T00:00:00.000Z" });
   const codex = [
@@ -2044,6 +2867,48 @@ test("terminal reasoning folding is provider-neutral", () => {
   }
   // A live turn remains unfolded until terminal evidence arrives.
   assert.deepEqual(timelineHelpers.groupTimeline(codex, true).map((group) => group.kind), ["item", "item", "reasoning", "item"]);
+});
+
+test("history paging measures new collapsed transcript rows rather than raw provider records", () => {
+  const row = (id, kind, body, phase) => ({ id, messageId: id, kind, body, ...(phase ? { phase } : {}), state: "completed", timestamp: "2026-08-25T10:00:00.000Z" });
+  const boundary = row("reasoning-boundary", "reasoning", "Existing thought");
+  const final = row("final", "assistant", "Answer", "final_answer");
+  const before = [boundary, final];
+  // The provider can replay the boundary and add a tool member behind it. The
+  // DOM still has the same Reasoning anchor, so this is not visible progress.
+  const foldedOnly = [boundary, row("older-tool", "tool", "Older tool activity"), final];
+  const withCompaction = [boundary, row("older-tool", "tool", "Older tool activity"), row("older-compaction", "assistant", "Session compacted", "commentary"), final];
+  const withConversation = [row("older-user", "user", "Older question"), ...foldedOnly];
+
+  const reasoningAnchor = "reasoning:message:reasoning-boundary:0";
+  assert.deepEqual(timelineHelpers.renderedTimelineAnchorIds(before), [reasoningAnchor, "final"]);
+  assert.deepEqual(timelineHelpers.renderedTimelineAnchorIds(foldedOnly), [reasoningAnchor, "final"]);
+  assert.deepEqual(timelineHelpers.renderedTimelineAnchorIds(withCompaction), [reasoningAnchor, "older-compaction", "final"], "a compaction page creates a real visible history anchor");
+  assert.deepEqual(timelineHelpers.renderedTimelineAnchorIds(withConversation), ["older-user", reasoningAnchor, "final"]);
+});
+
+test("EYES retries paint one failure notice per user turn", () => {
+  const row = (id, kind, extra = {}) => ({
+    id,
+    kind,
+    body: id,
+    state: "completed",
+    timestamp: "2026-08-28T12:00:00.000Z",
+    ...extra,
+  });
+  const firstUser = row("user-one", "user");
+  const firstFailure = row("eyes-one", "tool", { notice: "eyes_failure" });
+  const retryFailure = row("eyes-two", "tool", { notice: "eyes_failure" });
+  const secondUser = row("user-two", "user");
+  const laterFailure = row("eyes-three", "tool", { notice: "eyes_failure" });
+  const timeline = [firstUser, firstFailure, retryFailure, secondUser, laterFailure];
+
+  assert.deepEqual(
+    timelineHelpers.coalesceEyesFailureNotices(timeline).map((item) => item.id),
+    ["user-one", "eyes-one", "user-two", "eyes-three"],
+  );
+  const alreadyClean = [firstUser, firstFailure, secondUser, laterFailure];
+  assert.strictEqual(timelineHelpers.coalesceEyesFailureNotices(alreadyClean), alreadyClean);
 });
 
 test("a spoken clip stays marked as voice all the way into the transcript", async () => {
@@ -2075,4 +2940,70 @@ test("the microphone is offered only where the model can genuinely hear audio", 
 
   const composerHelpers = await source(join("src", "renderer", "src", "composer_helpers.ts"));
   assert.doesNotMatch(composerHelpers, /gpt-5\.6-sol/iu);
+});
+
+test("typing and pasted attachment bytes stay off the App root render path", async () => {
+  const app = await source(join("src", "renderer", "src", "App.tsx"));
+  const composer = await source(join("src", "renderer", "src", "Composer.tsx"));
+  const helpersSource = await source(join("src", "renderer", "src", "composer_helpers.ts"));
+  const worker = await source(join("src", "renderer", "src", "attachment_encoding.worker.ts"));
+
+  // Composer owns the live field. App retains per-task values only in refs, so
+  // one key does not schedule a second commit across the task rail/transcript.
+  assert.match(app, /const composerDrafts = useRef<Record<string, string>>\(\{\}\);/);
+  assert.match(app, /const composerAttachments = useRef<Record<string, readonly ComposerAttachment\[\]>>\(\{\}\);/);
+  assert.match(app, /const composerAnnotations = useRef<Record<string, readonly ResponseAnnotation\[\]>>\(\{\}\);/);
+  assert.match(app, /const composerDraftRestoreTargets = useRef<Record<string, string>>\(\{\}\);/);
+  assert.match(app, /const restoreSessionId = composerDraftRestoreTargets\.current\[sessionId\] \?\? resolveComposerDraftSessionId\(sessionId\)/);
+  assert.match(app, /composerDraftRestoreTargets\.current\[input\.draftSessionId\] = result\.session\.id/);
+  assert.doesNotMatch(app, /setComposer(?:Drafts|Attachments|Annotations)/);
+  assert.match(app, /onDraftChange=\{\(value\) => \{[\s\S]{0,260}const sessionId = resolveComposerDraftWriteSessionId\(selectedSession\.id, value\.length > 0\);[\s\S]{0,160}composerDrafts\.current\[sessionId\]/u);
+  assert.match(app, /const sideChatDrafts = useRef<Record<string, SideChatDraft>>\(\{\}\);/);
+  assert.doesNotMatch(app, /setSideChatDrafts/);
+
+  // A stable leaf owns the expensive data URL. Re-rendering Composer for text
+  // must not concatenate an image's complete base64 payload again.
+  assert.match(composer, /const ComposerAttachmentChip = memo\(function ComposerAttachmentChip/);
+  assert.match(composer, /const dataUrl = useMemo\(\(\) => \{[\s\S]{0,220}attachment\.previewUrl[\s\S]{0,220}attachment\.dataBase64/);
+  assert.match(composer, /return attachment\.previewUrl \?\? `data:\$\{attachment\.mimeType\};base64,\$\{attachment\.dataBase64\}`/);
+  assert.match(composer, /attachments\.map\(\(attachment\) => <ComposerAttachmentChip key=\{attachment\.path\}/);
+  assert.match(composer, /const SideChatAttachmentChip = memo\(function SideChatAttachmentChip/);
+  assert.match(composer, /<SideChatAttachmentChip key=\{attachment\.path\} attachment=\{attachment\}/);
+
+  // Paste/drop paint an object-URL widget before encoding. The Blob is cloned
+  // into a dedicated worker, where byte extraction and base64 work happen.
+  const pasteStart = composer.indexOf("const onPaste =");
+  const pastePath = composer.slice(pasteStart, composer.indexOf("const submit =", pasteStart));
+  assert.match(pastePath, /prepareDroppedAttachment\(file, "image", "clipboard"/);
+  assert.match(pastePath, /const kind = classifyDroppedFile\(file\)/);
+  assert.match(pastePath, /if \(canAttachFiles\)[\s\S]*?prepareDroppedAttachment\(file, "file", "clipboard"/u);
+  assert.match(pastePath, /addAttachments\(incoming\)/);
+  assert.doesNotMatch(pastePath, /clipboardData\.files\]\.filter\(\(file\) => file\.type/);
+  assert.doesNotMatch(pastePath, /await blobToUploadable|Promise\.all/);
+  assert.match(composer, /preparation: \(\) => preparation \?\?= blobToUploadable\(file, name\)/);
+  assert.match(composer, /attachment\.preparation\(\)\.then/);
+  assert.match(composer, /requestAnimationFrame\(\(\) => prewarmAttachmentEncodingWorker\(\)\)/);
+  assert.match(composer, /requestAnimationFrame\(\(\) => \{[\s\S]{0,600}window\.setTimeout\(\(\) => \{[\s\S]{0,600}attachment\.preparation\(\)\.then/u);
+  assert.match(composer, /for \(const frame of frames\) cancelAnimationFrame\(frame\)/);
+  assert.match(composer, /for \(const task of tasks\) window\.clearTimeout\(task\)/);
+  assert.match(composer, /previewUrl: URL\.createObjectURL\(file\)/);
+  assert.match(composer, /\.{3}\(attachment\.previewUrl \? \{ previewUrl: attachment\.previewUrl \} : \{\}\)/);
+  assert.doesNotMatch(composer, /const readyDataUrl = `data:/);
+  assert.match(helpersSource, /import AttachmentEncodingWorker from "\.\/attachment_encoding\.worker\.ts\?worker&inline"/);
+  assert.match(helpersSource, /new AttachmentEncodingWorker\(\{ name: "tethoq-attachment-encoding" \}\)/);
+  assert.match(helpersSource, /export function prewarmAttachmentEncodingWorker\(\): void/);
+  assert.doesNotMatch(helpersSource, /attachmentEncodingWorkerIdleTimer|scheduleAttachmentEncodingWorkerIdleStop|stopIdleAttachmentEncodingWorker|30_000/);
+  assert.doesNotMatch(helpersSource, /new Worker\(new URL\("\.\/attachment_encoding\.worker\.ts", import\.meta\.url\)/);
+  assert.match(helpersSource, /encodingWorker\(\)\.postMessage\(\{ id, blob \}\)/);
+  assert.match(helpersSource, /const dataBase64 = await encodeBlobInWorker\(blob\);/);
+  assert.doesNotMatch(helpersSource, /encodeBlobCooperatively|encodeBlobInWorker\(blob\)\.catch/);
+  assert.match(worker, /blob\.arrayBuffer\(\)/);
+  assert.match(worker, /encodeAttachmentBytesToBase64/);
+
+  // Send slices the existing base64 on aligned boundaries. It never expands a
+  // 10 MiB attachment into a whole binary renderer string and re-encodes it.
+  const uploadPath = helpersSource.slice(helpersSource.indexOf("export async function uploadAttachments"), helpersSource.indexOf("export function chooseTranscriptionSource"));
+  assert.match(uploadPath, /alignedChunkBytes/);
+  assert.match(uploadPath, /item\.dataBase64\.slice/);
+  assert.doesNotMatch(uploadPath, /\batob\(|\bbtoa\(/);
 });

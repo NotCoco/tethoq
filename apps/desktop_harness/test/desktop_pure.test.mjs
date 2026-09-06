@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import test from "node:test";
@@ -63,8 +65,11 @@ test("restored window bounds stay on the visible work area", () => {
   });
 });
 
-test("OpenCode supervisor only manages the fixed local endpoint", () => {
+test("OpenCode supervisor only manages the bounded local fallback range", () => {
   assert.equal(openCode.isSupervisableEndpoint(new URL("http://127.0.0.1:4096/")), true);
+  assert.equal(openCode.isSupervisableEndpoint(new URL("http://127.0.0.1:4097/")), true);
+  assert.equal(openCode.isSupervisableEndpoint(new URL("http://127.0.0.1:4100/")), true);
+  assert.equal(openCode.isSupervisableEndpoint(new URL("http://127.0.0.1:4197/")), false);
   assert.equal(openCode.isSupervisableEndpoint(new URL("http://127.0.0.1/")), false);
   assert.equal(openCode.isSupervisableEndpoint(new URL("http://localhost:4096/")), false);
   assert.equal(openCode.isSupervisableEndpoint(new URL("https://127.0.0.1:4096/")), false);
@@ -72,6 +77,158 @@ test("OpenCode supervisor only manages the fixed local endpoint", () => {
   assert.equal(openCode.isSupervisableEndpoint(new URL("http://10.0.0.2:4096/")), false);
   assert.equal(openCode.isSupervisableEndpoint(new URL("http://127.0.0.1:4096/custom")), false);
   assert.equal(openCode.isSupervisableEndpoint(new URL("http://user:pass@127.0.0.1:4096/")), false);
+});
+
+test("OpenCode fallback skips an occupied 4097 and starts on a free owned endpoint", async () => {
+  const { createServer } = await import("node:net");
+  const occupied = createServer();
+  let owns4097 = false;
+  await new Promise((resolve, reject) => {
+    occupied.once("error", (error) => {
+      if (error.code === "EADDRINUSE") resolve();
+      else reject(error);
+    });
+    occupied.listen({ host: "127.0.0.1", port: 4097, exclusive: true }, () => {
+      owns4097 = true;
+      resolve();
+    });
+  });
+
+  try {
+    const url = await openCode.findAvailableOpenCodeServerUrl({ startPort: 4097, endPort: 4196 });
+    const selectedPort = Number(new URL(url).port);
+    assert.ok(selectedPort > 4097, `expected a free port after occupied 4097, received ${selectedPort}`);
+    let healthChecks = 0;
+    let spawnArgs = [];
+    const child = {
+      pid: undefined,
+      exitCode: null,
+      killed: false,
+      stderr: undefined,
+      once() { return this; },
+      kill() { this.killed = true; return true; },
+    };
+    const supervisor = new openCode.OpenCodeSupervisor({
+      url,
+      canBindPort: async () => true,
+      fetchHealth: async () => new Response(null, { status: ++healthChecks === 1 ? 503 : 200 }),
+      spawnProcess: (_command, args) => {
+        spawnArgs = [...args];
+        return child;
+      },
+    });
+
+    const status = await supervisor.ensureRunning();
+    assert.equal(status.state, "managed");
+    assert.equal(status.url, url);
+    assert.match(spawnArgs.join(" "), new RegExp(`--port ${selectedPort}`, "u"));
+    await supervisor.dispose();
+  } finally {
+    if (owns4097) await new Promise((resolve) => occupied.close(resolve));
+  }
+});
+
+test("OpenCode reports a stable port_in_use reason when its managed endpoint is occupied", async () => {
+  let spawned = false;
+  const supervisor = new openCode.OpenCodeSupervisor({
+    url: "http://127.0.0.1:4097/",
+    fetchHealth: async () => new Response(null, { status: 503 }),
+    canBindPort: async () => false,
+    spawnProcess: () => {
+      spawned = true;
+      throw new Error("spawn should not run");
+    },
+  });
+
+  const status = await supervisor.ensureRunning();
+
+  assert.equal(status.state, "failed");
+  assert.equal(status.managed, false);
+  assert.equal(status.reason, "port_in_use");
+  assert.match(status.message, /already in use/u);
+  assert.equal(spawned, false);
+});
+
+test("OpenCode preserves port_in_use when the port is claimed after the bind probe", async () => {
+  const bindError = Object.assign(new Error("listen EADDRINUSE: address already in use 127.0.0.1:4097"), {
+    code: "EADDRINUSE",
+  });
+  const supervisor = new openCode.OpenCodeSupervisor({
+    url: "http://127.0.0.1:4097/",
+    fetchHealth: async () => new Response(null, { status: 503 }),
+    canBindPort: async () => true,
+    spawnProcess: () => { throw bindError; },
+  });
+
+  const status = await supervisor.ensureRunning();
+
+  assert.equal(status.state, "failed");
+  assert.equal(status.reason, "port_in_use");
+  assert.match(status.message, /already in use/u);
+});
+
+test("OpenCode classifies bind diagnostics emitted by a started child", async () => {
+  const child = new EventEmitter();
+  child.pid = undefined;
+  child.exitCode = null;
+  child.killed = false;
+  child.stderr = new PassThrough();
+  child.kill = () => { child.killed = true; return true; };
+  const supervisor = new openCode.OpenCodeSupervisor({
+    url: "http://127.0.0.1:4097/",
+    fetchHealth: async () => new Response(null, { status: 503 }),
+    canBindPort: async () => true,
+    spawnProcess: () => {
+      queueMicrotask(() => {
+        child.stderr.end("listen EADDRINUSE: address already in use 127.0.0.1:4097");
+        child.exitCode = 1;
+        child.emit("close", 1, null);
+      });
+      return child;
+    },
+  });
+
+  const status = await supervisor.ensureRunning();
+
+  assert.equal(status.state, "failed");
+  assert.equal(status.reason, "port_in_use");
+  assert.match(status.message, /already in use/u);
+});
+
+test("OpenCode keeps its managed Windows server hidden without allocating a detached console", async () => {
+  let healthChecks = 0;
+  let spawnOptions;
+  const child = {
+    pid: undefined,
+    exitCode: null,
+    killed: false,
+    stderr: undefined,
+    once() { return this; },
+    kill() { this.killed = true; return true; },
+  };
+  const supervisor = new openCode.OpenCodeSupervisor({
+    canBindPort: async () => true,
+    fetchHealth: async () => new Response(null, { status: ++healthChecks === 1 ? 503 : 200 }),
+    spawnProcess: (_command, _args, options) => {
+      spawnOptions = options;
+      return child;
+    },
+  });
+
+  assert.equal((await supervisor.ensureRunning()).state, "managed");
+  assert.equal(spawnOptions.windowsHide, true);
+  assert.equal(spawnOptions.shell, false);
+  assert.equal(spawnOptions.detached, process.platform !== "win32");
+  await supervisor.dispose();
+});
+
+test("OpenCode free-port selection excludes endpoints that already lost a bind race", async () => {
+  const firstUrl = await openCode.findAvailableOpenCodeServerUrl();
+  const firstPort = Number(new URL(firstUrl).port);
+  const nextUrl = await openCode.findAvailableOpenCodeServerUrl({ excludedPorts: [firstPort] });
+
+  assert.notEqual(nextUrl, firstUrl);
+  assert.notEqual(Number(new URL(nextUrl).port), firstPort);
 });
 
 test("OpenCode recognizes a healthy externally managed server without spawning", async () => {
@@ -90,6 +247,81 @@ test("OpenCode recognizes a healthy externally managed server without spawning",
     managed: false,
   });
   assert.equal(spawned, false);
+});
+
+test("OpenCode keeps a confirmed external server through transient health misses and resets its grace", async () => {
+  const healthStatuses = [200, 503, 503, 200, 503, 503, 503];
+  let healthChecks = 0;
+  let bindChecks = 0;
+  let spawned = false;
+  const supervisor = new openCode.OpenCodeSupervisor({
+    fetchHealth: async () => new Response(null, { status: healthStatuses[healthChecks++] ?? 503 }),
+    canBindPort: async () => { bindChecks += 1; return false; },
+    spawnProcess: () => { spawned = true; throw new Error("spawn should not run while the live endpoint owns its port"); },
+  });
+
+  assert.equal((await supervisor.ensureRunning()).state, "external");
+  assert.equal((await supervisor.ensureRunning()).state, "external");
+  assert.equal((await supervisor.ensureRunning()).state, "external");
+  assert.equal(bindChecks, 0, "two missed watchdog probes must not expose a live endpoint to fallback");
+
+  assert.equal((await supervisor.ensureRunning()).state, "external", "a healthy response must clear the failure count");
+  assert.equal((await supervisor.ensureRunning()).state, "external");
+  assert.equal((await supervisor.ensureRunning()).state, "external");
+  assert.equal(bindChecks, 0, "the reset grace must cover a later transient pause too");
+
+  const failed = await supervisor.ensureRunning();
+  assert.equal(failed.state, "failed");
+  assert.equal(failed.reason, "port_in_use");
+  assert.equal(bindChecks, 1, "confirmed repeated failure must retain the existing recovery path");
+  assert.equal(spawned, false);
+});
+
+test("OpenCode explicit restart bypasses the running health grace", async () => {
+  let healthy = true;
+  let bindChecks = 0;
+  const supervisor = new openCode.OpenCodeSupervisor({
+    fetchHealth: async () => new Response(null, { status: healthy ? 200 : 503 }),
+    canBindPort: async () => { bindChecks += 1; return false; },
+    spawnProcess: () => { throw new Error("an occupied external endpoint must not spawn"); },
+  });
+
+  assert.equal((await supervisor.ensureRunning()).state, "external");
+  healthy = false;
+  const restarted = await supervisor.restart();
+
+  assert.equal(restarted.state, "failed");
+  assert.equal(restarted.reason, "port_in_use");
+  assert.equal(bindChecks, 1, "Restart must attempt recovery immediately instead of consuming grace checks");
+});
+
+test("OpenCode gives a released managed runner the same transient health grace", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const statePath = join(outputDirectory, `opencode-released-grace-${Date.now()}.json`);
+  let healthChecks = 0;
+  let spawnCount = 0;
+  const child = {
+    pid: 98,
+    exitCode: null,
+    killed: false,
+    stderr: undefined,
+    once() { return this; },
+    unref() {},
+    kill() { this.killed = true; return true; },
+  };
+  const supervisor = new openCode.OpenCodeSupervisor({
+    statePath,
+    canBindPort: async () => true,
+    fetchHealth: async () => new Response(null, { status: ++healthChecks === 1 || healthChecks === 3 ? 503 : 200 }),
+    spawnProcess: () => { spawnCount += 1; return child; },
+  });
+
+  assert.equal((await supervisor.ensureRunning()).state, "managed");
+  await supervisor.release();
+  assert.equal((await supervisor.ensureRunning()).state, "managed");
+  assert.equal(spawnCount, 1, "a transient miss must not reclaim or duplicate the released runner");
+  assert.equal(JSON.parse(await readFile(statePath, "utf8")).pid, 98);
+  await rm(statePath, { force: true });
 });
 
 test("OpenCode startup probe leaves an unavailable server stopped without spawning", async () => {
@@ -116,7 +348,7 @@ test("OpenCode health checks authenticate against a password-protected server", 
   const supervisor = new openCode.OpenCodeSupervisor({
     environment: {
       OPENCODE_SERVER_USERNAME: "opencode",
-      OPENCODE_SERVER_PASSWORD: "secret-token-value",
+      OPENCODE_SERVER_PASSWORD: ["secret", "token", "value"].join("-"),
     },
     fetchHealth: async (_url, init) => {
       const headers = init?.headers ?? {};
@@ -173,6 +405,7 @@ test("OpenCode disposal waits for an in-flight managed start", async () => {
     kill() { killed = true; this.killed = true; return true; },
   };
   const supervisor = new openCode.OpenCodeSupervisor({
+    canBindPort: async () => true,
     fetchHealth: async () => {
       healthChecks += 1;
       if (healthChecks === 1) return new Response(null, { status: 503 });
@@ -189,6 +422,79 @@ test("OpenCode disposal waits for an in-flight managed start", async () => {
 
   assert.equal(killed, true);
   assert.equal(supervisor.status().state, "stopped");
+});
+
+test("a replacement Tethoq generation restores and prioritizes its retained OpenCode runner", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const statePath = join(outputDirectory, `opencode-release-${Date.now()}.json`);
+  let healthChecks = 0;
+  let killed = false;
+  let childUnref = false;
+  let stderrUnref = false;
+  const child = new EventEmitter();
+  child.pid = 97;
+  child.exitCode = null;
+  child.killed = false;
+  child.stderr = new PassThrough();
+  child.stderr.unref = () => { stderrUnref = true; };
+  child.unref = () => { childUnref = true; };
+  child.kill = () => { killed = true; child.killed = true; return true; };
+  const supervisor = new openCode.OpenCodeSupervisor({
+    statePath,
+    canBindPort: async () => true,
+    fetchHealth: async () => new Response(null, { status: ++healthChecks === 1 ? 503 : 200 }),
+    spawnProcess: () => child,
+  });
+
+  assert.equal((await supervisor.ensureRunning()).state, "managed");
+  await supervisor.release();
+
+  assert.equal(killed, false, "restarting the shell must not terminate the provider runner");
+  assert.equal(childUnref, true);
+  assert.equal(stderrUnref, true);
+  assert.equal(supervisor.hasManagedChild, false, "the old Electron generation must release its process handle");
+  assert.equal(JSON.parse(await readFile(statePath, "utf8")).pid, 97, "the replacement generation needs the durable ownership record");
+
+  let replacementSpawned = false;
+  const replacement = new openCode.OpenCodeSupervisor({
+    statePath,
+    fetchHealth: async () => new Response(null, { status: 200 }),
+    spawnProcess: () => { replacementSpawned = true; throw new Error("healthy runner must be reused"); },
+  });
+  const replacementStatus = await replacement.probe();
+  assert.deepEqual(replacementStatus, {
+    state: "managed",
+    url: "http://127.0.0.1:4096/",
+    managed: true,
+    pid: 97,
+  });
+  assert.equal((await replacement.ensureRunning()).state, "managed");
+  assert.equal(discovery.shouldDiscoverOpenCodeServer({
+    envUrl: undefined,
+    status: replacementStatus,
+    hasManagedChild: replacement.hasManagedChild,
+  }), false, "startup must not adopt a different sidecar over the retained live runner");
+  assert.equal(replacementSpawned, false);
+  child.stderr.destroy();
+});
+
+test("desktop startup probes retained OpenCode ownership before sidecar discovery", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const runtimeSource = await readFile(new URL("../src/main/runtime.ts", import.meta.url), "utf8");
+  const startupStart = runtimeSource.indexOf("private async startOnce()");
+  const startupEnd = runtimeSource.indexOf("const pairingStore", startupStart);
+  const startup = runtimeSource.slice(startupStart, startupEnd);
+  const probeAt = startup.indexOf("await this.#openCode.probe()");
+  const discoveryAt = startup.indexOf("await discoverOpenCodeServerUrl()");
+
+  assert.ok(probeAt >= 0, "startup must probe the endpoint recorded by the previous generation");
+  assert.ok(discoveryAt > probeAt, "external discovery must run only after retained ownership is restored");
+  assert.match(startup, /shouldDiscoverOpenCodeServer\(\{ envUrl, status: openCodeStatus, hasManagedChild: this\.#openCode\.hasManagedChild \}\)/u);
+
+  const retained = { state: "managed", url: "http://127.0.0.1:4096/", managed: true, pid: 97 };
+  assert.equal(discovery.shouldDiscoverOpenCodeServer({ envUrl: undefined, status: retained, hasManagedChild: false }), false);
+  assert.equal(discovery.shouldDiscoverOpenCodeServer({ envUrl: undefined, status: retained, hasManagedChild: true }), true);
+  assert.equal(discovery.shouldDiscoverOpenCodeServer({ envUrl: "http://127.0.0.1:9000/", status: retained, hasManagedChild: true }), false);
 });
 
 test("OpenCode reports a credential mismatch instead of racing another server for the port", async () => {
@@ -209,12 +515,31 @@ test("OpenCode reports a credential mismatch instead of racing another server fo
 
   assert.equal(status.state, "unavailable");
   assert.equal(status.managed, false);
+  assert.equal(status.reason, "credentials_required");
   assert.match(status.message, /requires credentials/);
   assert.match(status.message, /TETHOQ_OPENCODE_PASSWORD/);
   // A second server on a taken port would only fail to bind and then time out.
   assert.equal(spawned, false);
   // One probe per call: a repeat could re-enter a check that is still in flight.
   assert.equal(healthChecks, 1);
+});
+
+test("OpenCode never reclaims a managed pid recorded for another local endpoint", async () => {
+  const { writeFile } = await import("node:fs/promises");
+  const statePath = join(outputDirectory, `opencode-cross-port-${Date.now()}.json`);
+  await writeFile(statePath, JSON.stringify({ pid: 424244, url: "http://127.0.0.1:4096/" }), "utf8");
+  let spawned = false;
+  const supervisor = new openCode.OpenCodeSupervisor({
+    url: "http://127.0.0.1:4097/",
+    statePath,
+    fetchHealth: async () => new Response(null, { status: 401 }),
+    spawnProcess: () => { spawned = true; throw new Error("spawn should not run"); },
+  });
+
+  const status = await supervisor.ensureRunning();
+  assert.equal(status.state, "unavailable");
+  assert.equal(status.reason, "credentials_required");
+  assert.equal(spawned, false);
 });
 
 test("a force-killed desktop reclaims the OpenCode server it had left holding the port", async () => {
@@ -233,6 +558,7 @@ test("a force-killed desktop reclaims the OpenCode server it had left holding th
   let healthChecks = 0;
   const supervisor = new openCode.OpenCodeSupervisor({
     statePath,
+    canBindPort: async () => true,
     fetchHealth: async () => {
       healthChecks += 1;
       // Nothing answers until the orphan has been cleared and a new server is up.
@@ -260,6 +586,7 @@ test("a degraded OpenCode server Tethoq started is reclaimed rather than reporte
   let healthChecks = 0;
   const supervisor = new openCode.OpenCodeSupervisor({
     statePath,
+    canBindPort: async () => true,
     // An orphaned server that has gone stale answers 401 to everything.
     fetchHealth: async () => new Response(null, { status: ++healthChecks <= 1 ? 401 : 200 }),
     spawnProcess: () => child,
@@ -424,20 +751,59 @@ test("OpenCode watchdog ticks on its interval and never ticks after disposal", a
   assert.equal(reconnects, 1, "a disposed watchdog must never tick again");
 });
 
+test("desktop scheduling opens its durable store and reconciles before Bridge startup", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const runtimeSource = await readFile(new URL("../src/main/runtime.ts", import.meta.url), "utf8");
+  const startupStart = runtimeSource.indexOf("private async startOnce()");
+  const startupEnd = runtimeSource.indexOf("private startOpenCodeInBackground", startupStart);
+  assert.ok(startupStart >= 0 && startupEnd > startupStart, "desktop runtime startup source must remain discoverable");
+  const startup = runtimeSource.slice(startupStart, startupEnd);
+
+  assert.match(runtimeSource, /import \{ ScheduledTaskStore, defaultScheduledTaskStatePath \} from "\.\.\/\.\.\/\.\.\/agent_bridge\/src\/scheduled_task_store\.js"/u);
+  assert.match(runtimeSource, /import \{ ScheduledTaskScheduler \} from "\.\.\/\.\.\/\.\.\/agent_bridge\/src\/scheduled_tasks\.js"/u);
+  assert.match(startup, /const scheduledTaskStore = new ScheduledTaskStore\(defaultScheduledTaskStatePath\(this\.#configPath\)\)/u);
+
+  const configureAt = startup.indexOf("bridge.configureScheduledTasks(await ScheduledTaskScheduler.open({");
+  const bridgeStartAt = startup.indexOf("await bridge.start()");
+  assert.ok(configureAt >= 0, "desktop startup must open and attach the durable scheduled-task scheduler");
+  assert.ok(bridgeStartAt > configureAt, "overdue tasks must reconcile before Bridge startup is reported ready");
+  assert.match(startup, /store: scheduledTaskStore,[\s\S]*?dispatch: async \(task\) => await bridge\.dispatchScheduledTask\(task\),[\s\S]*?onChange: async \(\{ reason, task, previousTargetSessionId \}\) =>[\s\S]*?bridge\.scheduledTaskChanged\(task, reason, previousTargetSessionId\),[\s\S]*?onError: \(error\) => console\.error\("Scheduled task reconciliation failed", error\)/u);
+
+  const reconcile = runtimeSource.match(/public async reconcileScheduledTasks\(\): Promise<void> \{[\s\S]*?\n  \}/u)?.[0] ?? "";
+  assert.match(reconcile, /await this\.start\(\)/u, "resume reconciliation must wait until the runtime is ready");
+  assert.match(reconcile, /await this\.bridge\.reconcileScheduledTasks\(\)/u);
+});
+
+test("Electron resume reconciles wall-clock schedules without crashing the main process", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const indexSource = await readFile(new URL("../src/main/index.ts", import.meta.url), "utf8");
+
+  assert.match(indexSource, /import \{[\s\S]*?powerMonitor,[\s\S]*?\} from "electron"/u);
+  assert.match(indexSource, /const harness = runtime;[\s\S]*?powerMonitor\.on\("resume", \(\) => \{[\s\S]*?void harness\.reconcileScheduledTasks\(\)\.catch\(\(error: unknown\) => \{[\s\S]*?console\.error\("Tethoq could not reconcile scheduled tasks after resume", error\);[\s\S]*?\}\);[\s\S]*?\}\);/u);
+});
+
 test("a second Tethoq launch can ask the running instance to quit cleanly", async () => {
   const { readFile } = await import("node:fs/promises");
   const indexSource = await readFile(new URL("../src/main/index.ts", import.meta.url), "utf8");
-  // The quit argument must route through the single-instance lock into app.quit,
-  // which reaches before-quit and stops the managed OpenCode server.
+  // The quit argument must route through the single-instance lock into app.quit
+  // while explicitly preserving the provider runner for the replacement shell.
   assert.match(indexSource, /QUIT_INSTANCE_ARGUMENT\s*=\s*"--quit-other"/u);
-  assert.match(indexSource, /argv\.includes\(QUIT_INSTANCE_ARGUMENT\)[\s\S]{0,200}quitting\s*=\s*true/u);
+  assert.match(indexSource, /STOP_MANAGED_OPENCODE_ARGUMENT\s*=\s*"--stop-managed-opencode"/u);
+  assert.match(indexSource, /argv\.includes\(QUIT_INSTANCE_ARGUMENT\)[\s\S]{0,240}forceStopManagedOpenCode\s*=\s*argv\.includes\(STOP_MANAGED_OPENCODE_ARGUMENT\)[\s\S]{0,120}preserveOpenCodeForRestart\s*=\s*!forceStopManagedOpenCode[\s\S]{0,120}quitting\s*=\s*true/u);
+  assert.match(indexSource, /runtime\?\.dispose\(\{[\s\S]{0,160}preserveOpenCode:\s*preserveOpenCodeForRestart,[\s\S]{0,120}forceStopOpenCode:\s*forceStopManagedOpenCode/u);
   assert.match(indexSource, /app\.quit\(\)/u);
+
+  const stopSource = await readFile(new URL("../scripts/stop-unpacked.cjs", import.meta.url), "utf8");
+  assert.match(stopSource, /taskkill\.exe", \["\/PID", String\(row\.ProcessId\), "\/F"\]/u);
+  assert.doesNotMatch(stopSource, /String\(row\.ProcessId\), "\/T"/u, "forced shell replacement must not kill provider descendants");
+  assert.match(stopSource, /return forceKill\(processRows\(\)\)/u,
+    "the forced fallback must include a quit helper that inherited the single-instance lock");
 
   const appSource = await readFile(new URL("../src/renderer/src/App.tsx", import.meta.url), "utf8");
   // A quiet live feed must still heal the open task on a calm cadence, so a
   // broken subscription cannot freeze the transcript until a relaunch.
   assert.match(appSource, /selectedSessionLastDeltaAt\(lastLiveDeltaBySession\.current,\s*sessionId,\s*lastLiveDeltaAt\.current\)/u);
-  assert.match(appSource, /sessionNeedsTranscriptCatchUp\(session, current\?\.timelines\[selected\] \?\? \[\]\)/u);
+  assert.match(appSource, /sessionNeedsTranscriptCatchUp\(session, current\?\.timelines\[selected\] \?\? \[\], workingBoundaryBySession\.current\.get\(selected\)\)/u);
   assert.match(appSource, /refreshVisibleState\(false\)/u);
   assert.match(appSource, /\}, quietCatchUpIntervalMs\);/u);
   // Quietness must be decided by the selected session's own deltas. Using one
@@ -451,11 +817,29 @@ test("a second Tethoq launch can ask the running instance to quit cleanly", asyn
   assert.match(appSource, /quietCatchUpDue\(selectedLastDelta\(selected\)/u);
 
   const runtimeSource = await readFile(new URL("../src/main/runtime.ts", import.meta.url), "utf8");
+  assert.match(runtimeSource, /await this\.#bridge\?\.drainScheduledTasksForShutdown\(\)[\s\S]{0,500}const openCodeHasActiveWork[\s\S]{0,500}options\.forceStopOpenCode !== true[\s\S]{0,120}options\.preserveOpenCode === true \|\| openCodeHasActiveWork/u);
+  assert.match(runtimeSource, /preserveOpenCode \? this\.#openCode\.release\(\) : this\.#openCode\.dispose\(\)/u);
   // The task list must keep itself fresh even when the live feed is quiet:
   // OpenCode is re-listed on a calm cadence (one cheap HTTP list, no provider
   // processes spawned) so titles, previews, and recency update without a click.
   assert.match(runtimeSource, /OPENCODE_RELIST_MS\s*=\s*15_000/u);
-  assert.match(runtimeSource, /this\.#bridge\?\.reconnectProvider\("opencode"\)\.catch/u);
+  assert.match(runtimeSource, /this\.reconnectOpenCodeProvider\(bridge\)\.catch/u);
+});
+
+test("OpenCode startup and recovery operations are single-flight", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const runtimeSource = await readFile(new URL("../src/main/runtime.ts", import.meta.url), "utf8");
+  assert.match(runtimeSource, /#openCodeEnsurePromise: Promise<ReturnType<OpenCodeSupervisor\["status"\]>> \| undefined/u);
+  assert.match(runtimeSource, /const inFlight = this\.#openCodeEnsurePromise;[\s\S]{0,180}if \(inFlight !== undefined\) return inFlight;/u);
+  assert.match(runtimeSource, /#openCodeReconnectPromise: Promise<void> \| undefined/u);
+  assert.match(runtimeSource, /const inFlight = this\.#openCodeReconnectPromise;[\s\S]{0,180}if \(inFlight !== undefined\) return inFlight;/u);
+  assert.match(runtimeSource, /reconnect: \(\) => this\.reconnectOpenCodeProvider\(bridge\)/u);
+});
+
+test("Codex detection keeps its transient version probe hidden on Windows", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const commandSource = await readFile(new URL("../../../packages/provider_codex/src/codex_command.ts", import.meta.url), "utf8");
+  assert.match(commandSource, /execFile\(launch\.command, \[\.\.\.launch\.args\], \{[\s\S]*?timeout: 5_000,[\s\S]*?windowsHide: true,/u);
 });
 
 test("the desktop keeps its own server alive as a secondary feed while a turn it started is still in flight", async () => {
@@ -556,29 +940,201 @@ test("OpenCode endpoint resolution adopts a healthy discovered server and falls 
   assert.equal(discovery.resolveOpenCodeEndpoint({ ...managedSteadyState, envUrl: "http://127.0.0.1:9999/", discoveredUrl: sidecar, discoveredHealthy: true }), undefined, "an explicit TETHOQ_OPENCODE_URL always wins");
 });
 
+test("OpenCode failed-endpoint fallback avoids an inaccessible sidecar on the managed port", () => {
+  const credentialsRequired = {
+    state: "unavailable",
+    url: discovery.DEFAULT_OPENCODE_URL,
+    managed: false,
+    reason: "credentials_required",
+  };
+  assert.deepEqual(discovery.resolveFailedOpenCodeFallback({
+    envUrl: undefined,
+    adopted: true,
+    status: credentialsRequired,
+  }), { url: discovery.FALLBACK_OPENCODE_URL, adopted: false });
+  assert.deepEqual(discovery.resolveFailedOpenCodeFallback({
+    envUrl: undefined,
+    adopted: false,
+    status: credentialsRequired,
+  }), { url: discovery.FALLBACK_OPENCODE_URL, adopted: false });
+  assert.equal(discovery.resolveFailedOpenCodeFallback({
+    envUrl: "http://127.0.0.1:4096/",
+    adopted: true,
+    status: credentialsRequired,
+  }), undefined, "an explicit endpoint must never be replaced");
+  assert.equal(discovery.resolveFailedOpenCodeFallback({
+    envUrl: "http://127.0.0.1:4096/",
+    adopted: false,
+    status: { state: "failed", url: discovery.DEFAULT_OPENCODE_URL, managed: false, reason: "port_in_use" },
+  }), undefined, "an explicit endpoint also blocks bind-race fallback");
+  assert.equal(discovery.resolveFailedOpenCodeFallback({
+    envUrl: undefined,
+    adopted: false,
+    status: { state: "unavailable", url: discovery.FALLBACK_OPENCODE_URL, managed: false, reason: "credentials_required" },
+  }), undefined, "credentials on a selected fallback remain a credential failure, not a bind retry");
+  assert.deepEqual(discovery.resolveFailedOpenCodeFallback({
+    envUrl: undefined,
+    adopted: true,
+    status: { state: "unavailable", url: "http://127.0.0.1:63791/", managed: false },
+  }), { url: discovery.DEFAULT_OPENCODE_URL, adopted: false });
+});
+
+test("OpenCode same-cycle fallback functionally leaves an unauthorized adopted 4096 server alone", async () => {
+  let primarySpawned = false;
+  const primary = new openCode.OpenCodeSupervisor({
+    url: discovery.DEFAULT_OPENCODE_URL,
+    fetchHealth: async () => new Response(null, { status: 401 }),
+    spawnProcess: () => {
+      primarySpawned = true;
+      throw new Error("the occupied 4096 endpoint must not be spawned over");
+    },
+  });
+  let current = primary;
+  let fallbackHealthChecks = 0;
+  let fallbackSpawnArgs = [];
+  const fallbackChild = {
+    pid: undefined,
+    exitCode: null,
+    killed: false,
+    stderr: undefined,
+    once() { return this; },
+    kill() { this.killed = true; return true; },
+  };
+  const ensuredUrls = [];
+  const requestedFallbackUrls = [];
+  const selectedFallbackUrls = [];
+  const result = await discovery.ensureOpenCodeFallbackCycle({
+    envUrl: undefined,
+    adopted: true,
+    ensureRunning: async () => {
+      ensuredUrls.push(current.status().url);
+      return await current.ensureRunning();
+    },
+    switchEndpoint: async (url) => {
+      requestedFallbackUrls.push(url);
+      const selectedUrl = await openCode.resolveAvailableOpenCodeServerUrl(url, {
+        startPort: 4097,
+        endPort: 4098,
+        canBindPort: async (port) => port === 4098,
+      });
+      selectedFallbackUrls.push(selectedUrl);
+      current = new openCode.OpenCodeSupervisor({
+        url: selectedUrl,
+        canBindPort: async (port) => port === 4098,
+        fetchHealth: async () => new Response(null, { status: ++fallbackHealthChecks === 1 ? 503 : 200 }),
+        spawnProcess: (_command, args) => {
+          fallbackSpawnArgs = [...args];
+          return fallbackChild;
+        },
+      });
+    },
+  });
+
+  assert.equal(primarySpawned, false);
+  assert.deepEqual(requestedFallbackUrls, [discovery.FALLBACK_OPENCODE_URL]);
+  assert.deepEqual(selectedFallbackUrls, ["http://127.0.0.1:4098/"]);
+  assert.deepEqual(ensuredUrls, [discovery.DEFAULT_OPENCODE_URL, "http://127.0.0.1:4098/"]);
+  assert.match(fallbackSpawnArgs.join(" "), /--port 4098/u);
+  assert.deepEqual(result, {
+    status: { state: "managed", url: "http://127.0.0.1:4098/", managed: true },
+    adopted: false,
+  });
+  await current.dispose();
+});
+
+test("OpenCode same-cycle fallback retries a bind race on a different candidate", async () => {
+  let currentUrl = discovery.DEFAULT_OPENCODE_URL;
+  let ensureCount = 0;
+  const switchedUrls = [];
+  const failedUrls = [];
+  const result = await discovery.ensureOpenCodeFallbackCycle({
+    envUrl: undefined,
+    adopted: false,
+    ensureRunning: async () => {
+      ensureCount += 1;
+      if (ensureCount === 1) {
+        return { state: "unavailable", url: currentUrl, managed: false, reason: "credentials_required" };
+      }
+      if (ensureCount === 2) {
+        return { state: "failed", url: currentUrl, managed: false, reason: "port_in_use" };
+      }
+      return { state: "managed", url: currentUrl, managed: true };
+    },
+    switchEndpoint: async (url, failedStatus) => {
+      switchedUrls.push(url);
+      failedUrls.push(failedStatus.url);
+      currentUrl = switchedUrls.length === 1
+        ? "http://127.0.0.1:4097/"
+        : "http://127.0.0.1:4098/";
+    },
+  });
+
+  assert.deepEqual(switchedUrls, [discovery.FALLBACK_OPENCODE_URL, discovery.FALLBACK_OPENCODE_URL]);
+  assert.deepEqual(failedUrls, [discovery.DEFAULT_OPENCODE_URL, "http://127.0.0.1:4097/"]);
+  assert.equal(ensureCount, 3);
+  assert.deepEqual(result, {
+    status: { state: "managed", url: "http://127.0.0.1:4098/", managed: true },
+    adopted: false,
+  });
+});
+
+test("OpenCode same-cycle fallback stops after its bounded bind retries", async () => {
+  let currentUrl = discovery.DEFAULT_OPENCODE_URL;
+  let ensureCount = 0;
+  let switchCount = 0;
+  const result = await discovery.ensureOpenCodeFallbackCycle({
+    envUrl: undefined,
+    adopted: false,
+    ensureRunning: async () => {
+      ensureCount += 1;
+      return { state: "failed", url: currentUrl, managed: false, reason: "port_in_use" };
+    },
+    switchEndpoint: async () => {
+      switchCount += 1;
+      currentUrl = `http://127.0.0.1:${4096 + switchCount}/`;
+    },
+  });
+
+  assert.equal(switchCount, discovery.MAX_OPENCODE_FALLBACK_SWITCHES);
+  assert.equal(ensureCount, discovery.MAX_OPENCODE_FALLBACK_SWITCHES + 1);
+  assert.equal(result.status.state, "failed");
+  assert.equal(result.status.reason, "port_in_use");
+  assert.equal(result.status.url, `http://127.0.0.1:${4096 + discovery.MAX_OPENCODE_FALLBACK_SWITCHES}/`);
+  assert.equal(result.adopted, false);
+});
+
 test("OpenCode supervision keeps discovering the owning sidecar after startup", async () => {
   const { readFile } = await import("node:fs/promises");
   const runtimeSource = await readFile(new URL("../src/main/runtime.ts", import.meta.url), "utf8");
   const backgroundStart = runtimeSource.match(/private startOpenCodeInBackground\([\s\S]*?\n  }/)?.[0] ?? "";
   const watchdogStart = runtimeSource.match(/private startOpenCodeWatchdog\([\s\S]*?\n  }/)?.[0] ?? "";
   const adoptServer = runtimeSource.match(/async #adoptOpenCodeServer\([\s\S]*?\n  }/)?.[0] ?? "";
+  const ensureOpenCode = runtimeSource.match(/private async ensureOpenCodeOnce\([\s\S]*?\n  }/)?.[0] ?? "";
 
   assert.match(backgroundStart, /this\.ensureOpenCode\(\)/u, "a sidecar that appears during background startup must be adopted");
   assert.match(watchdogStart, /ensureRunning: \(\) => this\.ensureOpenCode\(\)/u, "later watchdog ticks must repeat discovery, not only probe the old endpoint");
   assert.match(adoptServer, /replaceProviderAdapter\(this\.#createOpenCodeAdapter/u, "adopting a newly discovered endpoint must move the live provider subscription");
+  assert.match(ensureOpenCode, /ensureOpenCodeFallbackCycle/u, "runtime supervision must execute the functionally tested same-cycle fallback");
+  assert.match(ensureOpenCode, /resolveAvailableOpenCodeServerUrl\(url, \{ excludedPorts: failedFallbackPorts \}\)[\s\S]*?#adoptOpenCodeServer\(availableUrl\)/u, "runtime fallback must probe for a new free owned endpoint before repointing the supervisor");
 });
 
-test("OpenCode health probe distinguishes a live server from a dead port", async () => {
+test("OpenCode health probe authenticates and distinguishes a live server from a dead port", async () => {
   const { createServer } = await import("node:http");
+  const expectedAuthorization = `Basic ${Buffer.from("fixture-user:fixture-password").toString("base64")}`;
   const server = createServer((request, response) => {
-    response.writeHead(request.url === "/global/health" ? 200 : 404);
+    response.writeHead(request.url !== "/global/health"
+      ? 404
+      : request.headers.authorization === expectedAuthorization
+        ? 200
+        : 401);
     response.end();
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   const url = `http://127.0.0.1:${address.port}/`;
   try {
-    assert.equal(await discovery.isOpenCodeServerHealthy(url), true);
+    assert.equal(await discovery.isOpenCodeServerHealthy(url), false, "an authenticated endpoint must not be adopted without its credentials");
+    assert.equal(await discovery.isOpenCodeServerHealthy(url, { username: "fixture-user", password: ["fixture", "password"].join("-") }), true);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

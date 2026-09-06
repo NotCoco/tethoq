@@ -11,8 +11,28 @@ import type {
   ConfigureWalletRequest,
   ProviderWalletStatus,
   SessionContextState,
+  SessionGoalStatus,
   WorkflowReference,
 } from "../../protocol/src/index.js";
+
+export interface ProviderSessionGoal {
+  readonly objective: string;
+  readonly status: SessionGoalStatus;
+  readonly tokenBudget: number | null;
+  readonly tokensUsed: number;
+  readonly timeUsedSeconds: number;
+  /** Native providers may expose epoch seconds/milliseconds or an ISO string. */
+  readonly createdAt: number | string;
+  readonly updatedAt: number | string;
+  /** Optional provider-owned ordering token used to reject reordered updates. */
+  readonly revision?: number;
+}
+
+export interface ProviderSessionGoalUpdate {
+  readonly objective?: string;
+  readonly status?: SessionGoalStatus;
+  readonly tokenBudget?: number | null;
+}
 
 export interface ProviderDetection {
   readonly providerId: string;
@@ -56,6 +76,12 @@ export interface ListSessionsOptions {
 export interface PaginatedSessions {
   readonly sessions: readonly RemoteSession[];
   readonly nextCursor: string | null;
+  /**
+   * False means the provider returned a useful bounded window rather than its
+   * complete inventory. Clients may merge it, but must not delete older known
+   * sessions merely because they are absent from this window.
+   */
+  readonly authoritative?: boolean;
 }
 
 export interface CreateSessionOptions {
@@ -78,6 +104,8 @@ export interface CreateSessionOptions {
 }
 
 export interface SessionCreationFeatures {
+  /** Enforces tool isolation for sessions marked internalPurpose=vision_proxy. */
+  readonly visionToolIsolation?: boolean;
   readonly hiddenDeveloperInstructions: boolean;
   readonly ephemeralSessions: boolean;
   readonly selectableClientTools: boolean;
@@ -95,6 +123,8 @@ export interface SendMessageRequest {
   readonly content: string;
   /** Per-turn response guidance. Providers should keep this out of user-visible transcript text when their API permits it. */
   readonly developerInstructions?: string;
+  /** Turn-scoped availability overrides for app-owned client tools. */
+  readonly clientToolOverrides?: Readonly<Record<string, boolean>>;
   readonly modelId?: string;
   readonly reasoningEffort?: string;
   readonly attachments?: readonly MessageAttachment[];
@@ -127,12 +157,21 @@ export interface SessionMcpBinding {
   release(): void;
 }
 
+export type ClientToolLifecycleOwner = "bridge" | "provider";
+
+export interface ClientToolExecutionContext {
+  /** Stable provider-side identity for this one tool call. */
+  readonly callId?: string;
+  /** Provider means its adapter publishes the visible tool lifecycle itself; omission is Bridge-owned. */
+  readonly lifecycleOwner?: ClientToolLifecycleOwner;
+}
+
 export interface ProviderClientTooling {
   readonly definitions: readonly ClientToolDefinition[];
-  execute(providerId: string, providerSessionId: string, tool: string, input: JsonObject): Promise<JsonValue>;
-  mcpServer(providerId: string, providerSessionId: string): SessionMcpServer;
+  execute(providerId: string, providerSessionId: string, tool: string, input: JsonObject, context?: ClientToolExecutionContext): Promise<JsonValue>;
+  mcpServer(providerId: string, providerSessionId: string, lifecycleOwner?: ClientToolLifecycleOwner): SessionMcpServer;
   /** Creates an MCP endpoint before an ACP session/new response reveals its session ID. */
-  createSessionBinding?(providerId: string): SessionMcpBinding;
+  createSessionBinding?(providerId: string, lifecycleOwner?: ClientToolLifecycleOwner): SessionMcpBinding;
 }
 
 export interface ProviderQueuedMessage {
@@ -231,6 +270,16 @@ export interface Subscription {
   unsubscribe(): Promise<void>;
 }
 
+export interface RecentProviderMessages {
+  readonly messages: readonly RemoteMessage[];
+  /** True when this bounded read already contains the provider's whole transcript. */
+  readonly complete: boolean;
+  /** Opaque provider cursor for expanding this snapshot toward older history. */
+  readonly olderCursor?: string;
+  /** True when an older-history response contains only the newly read page. */
+  readonly pageOnly?: true;
+}
+
 export interface AgentProviderAdapter {
   readonly providerId: string;
   readonly displayName: string;
@@ -246,8 +295,18 @@ export interface AgentProviderAdapter {
 
   /** Returns provider-native usage/context data without starting an LLM turn. */
   getSessionContext?(providerSessionId: string): Promise<Omit<SessionContextState, "sessionId" | "compactionThresholdTokens" | "minimumThresholdTokens" | "supportsThreshold" | "isCompacting" | "compactionKind">>;
-  /** Requests provider-native context compaction without sending a user message. */
+  /**
+   * Compacts context without sending a user message. Resolves only after the
+   * compacted context is ready for the next turn, not on request acceptance.
+   * Rejects on failure, cancellation, or loss of completion confirmation.
+   */
   compactSession?(providerSessionId: string): Promise<void>;
+  /** Undefined result means this provider/version has no native goal API. */
+  getGoal?(providerSessionId: string): Promise<ProviderSessionGoal | null | undefined>;
+  /** Undefined result means this provider/version has no native goal API. */
+  setGoal?(providerSessionId: string, update: ProviderSessionGoalUpdate): Promise<ProviderSessionGoal | undefined>;
+  /** Undefined means this provider/version has no native goal API. */
+  clearGoal?(providerSessionId: string): Promise<boolean | undefined>;
   /** Returns the funding/authentication source without exposing credentials. */
   getWalletStatus?(modelId?: string, endpointId?: string): Promise<ProviderWalletStatus>;
   /** Configures a direct-API wallet. Harness/subscription adapters omit this. */
@@ -255,6 +314,10 @@ export interface AgentProviderAdapter {
 
   listSessions(options?: ListSessionsOptions): Promise<PaginatedSessions>;
   getSession(providerSessionId: string): Promise<RemoteSession>;
+  /** Optional fast bounded tail for rendering before complete history is needed. */
+  getRecentMessages?(providerSessionId: string): Promise<RecentProviderMessages>;
+  /** Returns an expanded snapshot, or a pageOnly older delta for the client to prepend. */
+  getOlderMessages?(providerSessionId: string, cursor: string): Promise<RecentProviderMessages>;
   getMessages(providerSessionId: string): Promise<readonly RemoteMessage[]>;
   /** Reads durable provider activity for explicit launches of another provider. */
   getExternalSessionLaunches?(providerSessionId: string, since: string): Promise<readonly ObservedExternalSessionLaunch[]>;
@@ -268,6 +331,8 @@ export interface AgentProviderAdapter {
   sendMessageToExternalOwner?(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult>;
   /** True while a model turn is still in flight, even if listed session status is stale. */
   hasActiveTurn?(providerSessionId: string): boolean;
+  /** True only when this adapter, rather than an external peer, owns the active writer. */
+  ownsActiveTurn?(providerSessionId: string): boolean;
   /** Provider-native session ids that currently have a model turn in flight. */
   activeSessionIds?(): readonly string[];
   /** True while any session streams through the adapter's secondary server feed. */
@@ -290,9 +355,15 @@ export interface AgentProviderAdapter {
   subscribe(providerSessionId: string | null, sink: ProviderEventSink): Promise<Subscription>;
   respondToApproval?(response: ProviderApprovalResponse): Promise<void>;
   respondToUserInput?(response: ProviderUserInputResponse): Promise<void>;
-  /** Keeps the provider transport attached so live session/update notifications continue. */
-  watchSession?(providerSessionId: string): Promise<void>;
+  /**
+   * Keeps live session/update notifications flowing without reloading complete
+   * history. Returning false asks the client to retain its bounded history-poll
+   * fallback because this adapter has no incremental watch path available.
+   */
+  watchSession?(providerSessionId: string): Promise<boolean | void>;
   unwatchSession?(providerSessionId: string): void;
+  /** Unload a private helper's runtime without deleting its transcript or stopping other sessions. */
+  releaseSession?(providerSessionId: string): Promise<void>;
   /** Releases a restartable provider transport while preserving cached session and event state. */
   releaseIdleResources?(): Promise<void>;
   dispose(): Promise<void>;

@@ -423,6 +423,18 @@ class _ActiveSessionCard extends StatelessWidget {
     return Material(
       color: Colors.transparent,
       child: InkWell(
+        splashFactory: NoSplash.splashFactory,
+        highlightColor: visual.accent.withValues(alpha: 0.20),
+        overlayColor: WidgetStateProperty.resolveWith((states) {
+          if (states.contains(WidgetState.pressed)) {
+            return visual.accent.withValues(alpha: 0.22);
+          }
+          if (states.contains(WidgetState.hovered) ||
+              states.contains(WidgetState.focused)) {
+            return visual.accent.withValues(alpha: 0.08);
+          }
+          return null;
+        }),
         onTap: onTap,
         child: Container(
           key: const Key('active-task-card'),
@@ -641,13 +653,14 @@ class _RecentSessionsCard extends StatelessWidget {
                       color: Colors.transparent,
                       child: InkWell(
                         key: ValueKey<String>('recent-session-${session.id}'),
-                        splashFactory: InkRipple.splashFactory,
+                        splashFactory: NoSplash.splashFactory,
+                        highlightColor: visual.accent.withValues(alpha: 0.20),
                         overlayColor: WidgetStateProperty.resolveWith((states) {
                           if (states.contains(WidgetState.pressed)) {
-                            return visual.accent.withValues(alpha: 0.14);
+                            return visual.accent.withValues(alpha: 0.22);
                           }
                           if (states.contains(WidgetState.hovered)) {
-                            return visual.accent.withValues(alpha: 0.06);
+                            return visual.accent.withValues(alpha: 0.08);
                           }
                           return null;
                         }),
@@ -754,15 +767,34 @@ class _RecentSessionsCard extends StatelessWidget {
                                     session,
                                     onOpen,
                                   ),
-                                  icon: Badge.count(
-                                    count: store
-                                        .childSessionsFor(session.id)
-                                        .length,
-                                    textColor: visual.background,
-                                    backgroundColor: visual.accent,
-                                    child: const Icon(
-                                        Icons.account_tree_outlined,
-                                        size: 17),
+                                  icon: ExcludeSemantics(
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: <Widget>[
+                                        Icon(
+                                          Icons.groups_2_outlined,
+                                          key: ValueKey<String>(
+                                              'recent-session-agents-icon-${session.id}'),
+                                          size: 18,
+                                        ),
+                                        const SizedBox(width: 3),
+                                        Text(
+                                          _compactChildSessionCount(store
+                                              .childSessionsFor(session.id)
+                                              .length),
+                                          key: ValueKey<String>(
+                                              'recent-session-agents-count-${session.id}'),
+                                          maxLines: 1,
+                                          softWrap: false,
+                                          style: const TextStyle(
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.w700,
+                                            height: 1,
+                                            letterSpacing: -0.15,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
                                   ),
                                 ),
                               SizedBox(
@@ -824,6 +856,8 @@ class _RecentSessionsCard extends StatelessWidget {
     );
   }
 }
+
+String _compactChildSessionCount(int count) => count >= 1000 ? '1k+' : '$count';
 
 Future<void> _showRecentChildSessions(
   BuildContext context,
@@ -1037,7 +1071,7 @@ class _ActivitySpinnerState extends State<_ActivitySpinner>
     super.initState();
     _controller = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 1050),
+      duration: const Duration(milliseconds: 780),
     );
     unawaited(_controller.repeat());
   }
@@ -1252,12 +1286,22 @@ RemoteSession? _activeSession(List<RemoteSession> sessions) {
           .firstOrNull;
 }
 
+final Expando<bool> _dashboardSessionRouteOpen =
+    Expando<bool>('dashboard-session-route-open');
+
 Future<void> _openSession(
     BuildContext context, RemoteAppStore store, RemoteSession session) async {
-  unawaited(HapticFeedback.selectionClick());
-  store.openSessionForView(session);
-  if (context.mounted) {
-    await Navigator.of(context).push(sessionScreenRoute(session.id));
+  final navigator = Navigator.of(context);
+  if (_dashboardSessionRouteOpen[navigator] == true) return;
+  _dashboardSessionRouteOpen[navigator] = true;
+  try {
+    unawaited(HapticFeedback.selectionClick());
+    store.openSessionForView(session);
+    if (context.mounted) {
+      await navigator.push(sessionScreenRoute(session.id));
+    }
+  } finally {
+    _dashboardSessionRouteOpen[navigator] = false;
   }
 }
 

@@ -16,10 +16,11 @@ const ONE_PIXEL_PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQ
 const TINY_WAV = 'data:audio/wav;base64,UklGRiwAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQgAAACAgICAgICAgA==';
 
 const MASTER_REASONING_LINES = [
-  'Reading the deterministic fixture state before answering.',
-  'The transcript is long enough to scroll, so reader position must stay owned by the reader.',
-  'Tool and command rows keep their identities across the stream; no remount is acceptable.',
-  'The final answer can now be composed from the verified state.',
+  'Reading the deterministic fixture state before answering. This first pass checks the active task, the latest provider event, the visible transcript, and the stable identity of every row already on screen. The reasoning surface should remain calm while this evidence is collected, but it should also keep the newest sentence visible as the provider continues to add text. '.repeat(2).trim(),
+  'The transcript and the thought are separate reading surfaces. The main conversation owns its place relative to messages, while this bounded reasoning view owns its place inside the current thought. Each surface must respond only to gestures directed at it, and neither may silently revoke the other surface’s bottom-follow choice. '.repeat(2).trim(),
+  'Tool and command rows keep their identities across the stream; no remount is acceptable. The same continuity rule applies to the prose around them, which now contains enough deterministic detail to overflow the reasoning viewport and prove that new chunks follow the physical bottom by default instead of remaining hidden below it. '.repeat(2).trim(),
+  'Reader-owned position checkpoint: this later reasoning chunk arrives after the reader has deliberately moved upward inside the thought. Its added height must not drag that nested viewport back to the newest line, even though the main transcript remains free to follow its own live tail.',
+  'Bottom-follow restoration checkpoint: after the reader returns the reasoning viewport to its exact end, this final reasoning chunk must become visible automatically. The final answer can now be composed from the verified state without changing either scroll surface’s independent ownership.',
 ];
 
 const MASTER_ANSWER_LINES = [
@@ -93,7 +94,7 @@ function masterHistory(sessionId, ctx, content) {
       providerMessageId: id('reasoning'),
       role: 'assistant',
       createdAt: ctx.at(60),
-      completedAt: ctx.at(1420),
+      completedAt: ctx.at(7000),
       parts: [fillReasoning('')],
       status: 'completed',
       nativeMetadata: { phase: 'commentary' },
@@ -125,8 +126,8 @@ function masterHistory(sessionId, ctx, content) {
       sessionId,
       providerMessageId: id('answer'),
       role: 'assistant',
-      createdAt: ctx.at(1580),
-      completedAt: ctx.at(3620),
+      createdAt: ctx.at(7500),
+      completedAt: ctx.at(9540),
       parts: [fillText('')],
       status: 'completed',
       nativeMetadata: { phase: 'final_answer' },
@@ -136,7 +137,7 @@ function masterHistory(sessionId, ctx, content) {
 
 function masterSteps(ctx, content) {
   const id = (part) => `${ctx.runId}-fake-stream-${part}`;
-  const answerDeltaOffsets = [1580, 1940, 2300, 2660, 3020, 3380];
+  const answerDeltaOffsets = [7500, 7860, 8220, 8580, 8940, 9300];
   const steps = [
     { at: 0, events: [ctx.event('message.started', { role: 'user', messageId: id('user'), text: content })] },
     { at: 60, events: [ctx.event('message.delta', { messageId: id('reasoning'), partType: 'reasoning', delta: `${MASTER_REASONING_LINES[0]}\n` })] },
@@ -147,10 +148,11 @@ function masterSteps(ctx, content) {
     { at: 940, events: [ctx.event('command.started', { commandId: id('command'), id: id('command'), command: 'npm run fake-check', text: 'npm run fake-check' })] },
     { at: 1100, events: [ctx.event('command.output', { commandId: id('command'), id: id('command'), command: 'npm run fake-check', output: 'fake check passed' })] },
     { at: 1260, events: [ctx.event('command.completed', { commandId: id('command'), id: id('command'), command: 'npm run fake-check', output: 'fake check passed' })] },
-    { at: 1420, events: [ctx.event('message.delta', { messageId: id('reasoning'), partType: 'reasoning', delta: `${MASTER_REASONING_LINES[3]}\n` })] },
+    { at: 5000, events: [ctx.event('message.delta', { messageId: id('reasoning'), partType: 'reasoning', delta: `${MASTER_REASONING_LINES[3]}\n` })] },
+    { at: 7000, events: [ctx.event('message.delta', { messageId: id('reasoning'), partType: 'reasoning', delta: `${MASTER_REASONING_LINES[4]}\n` })] },
     ...answerDeltaOffsets.map((offset, index) => ({ at: offset, events: [ctx.event('message.delta', { messageId: id('answer'), phase: 'final_answer', delta: `${MASTER_ANSWER_LINES[index]}\n` })] })),
-    { at: 3620, events: [ctx.event('message.completed', { messageId: id('answer'), phase: 'final_answer', text: MASTER_ANSWER_LINES.join('\n') })] },
-    { at: 3700, events: [ctx.event('agent.completed', { state: 'completed' })] },
+    { at: 9540, events: [ctx.event('message.completed', { messageId: id('answer'), phase: 'final_answer', text: MASTER_ANSWER_LINES.join('\n') })] },
+    { at: 9620, events: [ctx.event('agent.completed', { state: 'completed' })] },
   ];
   return steps;
 }

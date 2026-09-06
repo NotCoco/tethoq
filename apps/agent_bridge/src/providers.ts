@@ -10,7 +10,7 @@ import { OpenCodeAdapter } from "../../../packages/provider_opencode/src/index.j
 import { PiRpcProviderAdapter, piHarnessPresets } from "../../../packages/provider_pi/src/index.js";
 import { DirectApiProviderAdapter } from "../../../packages/provider_direct/src/index.js";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { BridgeConfig } from "./config.js";
 import { tethoqEnvironmentFlag, tethoqEnvironmentValue } from "./environment.js";
 import { piToolExtensionPath } from "./pi_tools.js";
@@ -43,9 +43,13 @@ export function createConfiguredProviders(
     const localStateEnabled = tethoqEnvironmentFlag(environment, "TETHOQ_ENABLE_CODEX_LOCAL_STATE");
     adapters.push(new CodexAdapter({
       hostId: config.hostId,
+      environment,
       ...(command !== undefined ? { command } : {}),
       ...(commandArgs !== undefined ? { commandArgs } : {}),
-      ...(localStateEnabled ? { localActivity: {}, desktopQueue: {} } : {}),
+      ...(localStateEnabled ? {
+        localActivity: { retirementStatePath: join(dirname(directApiStatePath), "codex-activity-retirements.json") },
+        desktopQueue: {},
+      } : {}),
     }));
   }
   if (enabled.has("opencode")) {

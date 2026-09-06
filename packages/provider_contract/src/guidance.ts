@@ -45,15 +45,24 @@ export function hiddenProviderControlContent(id: string): string {
   return `${hiddenControlStart}${safe}${hiddenControlEnd}`;
 }
 
-/** Keeps fallback control guidance out of normalized user-visible history. */
-export function stripProviderPromptGuidance(value: string): string {
+function withoutResponseGuidance(value: string): string {
   const trimmed = value.trimStart();
-  const visible = trimmed.startsWith(guidanceStart)
+  return trimmed.startsWith(guidanceStart)
     ? (() => {
         const end = trimmed.indexOf(guidanceEnd);
         return end < 0 ? value : trimmed.slice(end + guidanceEnd.length).trimStart();
       })()
     : value;
+}
+
+/** A Continue click hides only the control input; its assistant response stays visible. */
+export function isProviderContinuationContent(value: string): boolean {
+  return withoutResponseGuidance(value).trim() === hiddenProviderControlContent("continue");
+}
+
+/** Keeps fallback control guidance out of normalized user-visible history. */
+export function stripProviderPromptGuidance(value: string): string {
+  const visible = withoutResponseGuidance(value);
   const control = visible.trim();
   return control.startsWith(hiddenControlStart) && control.endsWith(hiddenControlEnd) ? "" : visible;
 }

@@ -103,6 +103,24 @@ Connector to host:
 `{ sessionId }` to filter the result to one session; connectors should support
 both forms for compatibility.
 
+### Tethoq client tools
+
+Desktop supplies optional `clientTools` definitions (name, description,
+inputSchema) in `session.message.send` and `session.message.steer`. Register
+exactly that list with the harness for the current session/turn, replacing
+previous definitions; `[]` disables host tools. A tool implementation calls
+`await context.executeHostTool({ sessionId, name, input })` and returns its
+actual structured result to the harness. Use the request's native session ID.
+Tools are enabled only when Desktop dispatches a turn, not during initialize
+or session creation. Hosts that omit this optional field do not promise tools.
+
+Desktop binds the callback to this connector's provider and the session's
+allowed tools. It rejects unexposed tools, unknown sessions and calls after
+disposal. Connectors receive no gateway credentials. `session.create` can
+specify `clientTools: "none"` and `mcpServers: "none"` for internal helpers;
+honor those settings without silently inheriting harness tools. Declare and
+test native capabilities independently of host tool support.
+
 Errors use standard JSON-RPC codes plus:
 
 - `-32001`: not initialized

@@ -3,7 +3,9 @@ import {
   delegationStates,
   sessionStates,
   type DelegationChild,
+  type DelegationPresentationSegment,
   type DelegationTask,
+  type DelegationTarget,
 } from "../../../packages/protocol/src/index.js";
 import { JsonFileStore } from "./persistence.js";
 
@@ -40,6 +42,32 @@ function child(value: unknown): DelegationChild {
   };
 }
 
+function target(value: unknown): DelegationTarget {
+  if (!isRecord(value) || typeof value.providerId !== "string" || value.providerId.length === 0) {
+    throw new Error("Persisted delegation target is invalid");
+  }
+  const modelId = optionalString(value.modelId);
+  const reasoningEffort = optionalString(value.reasoningEffort);
+  if (reasoningEffort !== undefined && modelId === undefined) {
+    throw new Error("Persisted delegation target reasoning requires a model");
+  }
+  return {
+    providerId: value.providerId,
+    ...(modelId !== undefined ? { modelId } : {}),
+    ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+  };
+}
+
+function presentationSegment(value: unknown, targetCount: number): DelegationPresentationSegment {
+  if (!isRecord(value)) throw new Error("Persisted delegation presentation segment is invalid");
+  if (value.type === "text" && typeof value.text === "string") return { type: "text", text: value.text };
+  if (value.type === "mesh" && Number.isSafeInteger(value.targetIndex)
+    && (value.targetIndex as number) >= 0 && (value.targetIndex as number) < targetCount) {
+    return { type: "mesh", targetIndex: value.targetIndex as number };
+  }
+  throw new Error("Persisted delegation presentation segment is invalid");
+}
+
 function task(value: unknown): DelegationTask {
   if (!isRecord(value) || typeof value.id !== "string" || typeof value.parentSessionId !== "string" ||
       typeof value.prompt !== "string" || typeof value.state !== "string" ||
@@ -48,6 +76,35 @@ function task(value: unknown): DelegationTask {
     throw new Error("Persisted delegation task is invalid");
   }
   const error = optionalString(value.error);
+  const orchestration = value.orchestration === "parent" ? "parent" as const : undefined;
+  if (value.orchestration !== undefined && orchestration === undefined) {
+    throw new Error("Persisted delegation orchestration is invalid");
+  }
+  const targets = value.targets === undefined
+    ? undefined
+    : Array.isArray(value.targets) ? value.targets.map(target) : (() => { throw new Error("Persisted delegation targets are invalid"); })();
+  const presentationSegments = value.presentationSegments === undefined
+    ? undefined
+    : Array.isArray(value.presentationSegments)
+      ? value.presentationSegments.map((segment) => presentationSegment(segment, targets?.length ?? 0))
+      : (() => { throw new Error("Persisted delegation presentation is invalid"); })();
+  if (orchestration === "parent") {
+    if (targets === undefined || targets.length === 0 || targets.length > 4 || presentationSegments === undefined) {
+      throw new Error("Persisted parent-orchestrated delegation is incomplete");
+    }
+    const indexes = presentationSegments.flatMap((segment) => segment.type === "mesh" ? [segment.targetIndex] : []);
+    if (indexes.length !== targets.length || new Set(indexes).size !== targets.length) {
+      throw new Error("Persisted delegation presentation does not match its targets");
+    }
+    if (presentationSegments.filter((segment) => segment.type === "text").map((segment) => segment.text).join("") !== value.prompt) {
+      throw new Error("Persisted delegation presentation does not reconstruct its prompt");
+    }
+  }
+  const parentModelId = optionalString(value.parentModelId);
+  const parentReasoningEffort = optionalString(value.parentReasoningEffort);
+  const parentTurnAcceptedAt = optionalString(value.parentTurnAcceptedAt);
+  const parentTurnId = optionalString(value.parentTurnId);
+  const dispatchFingerprint = optionalString(value.dispatchFingerprint);
   return {
     id: value.id,
     parentSessionId: value.parentSessionId,
@@ -56,6 +113,14 @@ function task(value: unknown): DelegationTask {
     createdAt: value.createdAt,
     updatedAt: value.updatedAt,
     children: value.children.map(child),
+    ...(orchestration !== undefined ? { orchestration } : {}),
+    ...(targets !== undefined ? { targets } : {}),
+    ...(presentationSegments !== undefined ? { presentationSegments } : {}),
+    ...(parentModelId !== undefined ? { parentModelId } : {}),
+    ...(parentReasoningEffort !== undefined ? { parentReasoningEffort } : {}),
+    ...(parentTurnAcceptedAt !== undefined ? { parentTurnAcceptedAt } : {}),
+    ...(parentTurnId !== undefined ? { parentTurnId } : {}),
+    ...(dispatchFingerprint !== undefined ? { dispatchFingerprint } : {}),
     ...(error !== undefined ? { error } : {}),
   };
 }

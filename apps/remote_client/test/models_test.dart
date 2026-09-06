@@ -119,6 +119,7 @@ void main() {
       'lastActivityAt': '2026-08-07T12:00:00.000Z',
       'needsApproval': false,
       'stale': false,
+      'externalWriter': true,
       'project': 'remote-app',
       'modelId': 'gpt-5.6-sol',
       'reasoningEffort': 'ultra',
@@ -129,6 +130,7 @@ void main() {
     });
     expect(session.providerId, 'codex');
     expect(session.state, 'working');
+    expect(session.externalWriter, isTrue);
     expect(session.project, 'remote-app');
     expect(session.modelId, 'gpt-5.6-sol');
     expect(session.reasoningEffort, 'ultra');
@@ -136,6 +138,7 @@ void main() {
     expect(session.parentSessionId, 'host/codex/parent');
     expect(session.agentNickname, 'Reviewer');
     expect(session.agentRole, 'reviewer');
+    expect(session.copyWith(externalWriter: false).externalWriter, isFalse);
   });
 
   test('provider connection parses relationship capability', () {
@@ -354,6 +357,21 @@ void main() {
     expect(model.defaultReasoningEffort, 'high');
   });
 
+  test('typed reasoning effort lists compose with missing fallback fields', () {
+    final model = RemoteModel.fromJson(<String, Object?>{
+      'id': 'gpt-5.6-sol',
+      'providerId': 'codex',
+      'displayName': 'GPT-5.6 Sol',
+      'isDefault': true,
+      'nativeMetadata': <String, Object?>{
+        'supportedReasoningEfforts': <String>['ultra'],
+      },
+    });
+
+    expect(
+        model.reasoningEfforts.map((effort) => effort.id), <String>['ultra']);
+  });
+
   test('model options omit automatic reasoning placeholders', () {
     final model = RemoteModel.fromJson(<String, Object?>{
       'id': 'gpt-5.6',
@@ -382,10 +400,12 @@ void main() {
       'state': 'queued',
       'createdAt': '2026-08-17T12:00:00.000Z',
       'attachments': <Object?>[],
+      'retryable': false,
     });
     expect(message.sessionId, 'host/grok/session-one');
     expect(message.content, 'Queued from the Grok CLI');
     expect(message.state, 'queued');
+    expect(message.retryable, isFalse);
   });
 
   test('Grok 4.6 documents selectable efforts including xhigh', () {
@@ -405,8 +425,7 @@ void main() {
             providerId: 'grok', modelId: 'grok-4.6', displayName: 'Grok 4.6'),
         'Low');
     expect(
-        reasoningDisplayLabel('xhigh',
-            providerId: 'grok', modelId: 'grok-4.6'),
+        reasoningDisplayLabel('xhigh', providerId: 'grok', modelId: 'grok-4.6'),
         'Extra high');
     expect(
         reasoningDisplayLabel('low',
@@ -541,7 +560,6 @@ void main() {
         'modelId': 'vision-model',
         'reasoningEffort': 'high',
       },
-      'helperSessionId': 'host/codex/eyes',
     });
 
     expect(target.models.single.supportsImageInput, isTrue);
@@ -551,6 +569,38 @@ void main() {
       'reasoningEffort': 'high',
     });
     expect(status.primaryModelSupportsImageInput, isFalse);
-    expect(status.helperSessionId, 'host/codex/eyes');
+  });
+
+  test('prepared Mesh tasks retain authorized targets before children exist',
+      () {
+    final task = RemoteDelegationTask.fromJson(<String, Object?>{
+      'id': 'mesh-1',
+      'parentSessionId': 'host/codex/parent',
+      'prompt': 'Ask  to investigate',
+      'state': 'awaiting_dispatch',
+      'createdAt': '2026-09-03T12:00:00.000Z',
+      'updatedAt': '2026-09-03T12:00:00.000Z',
+      'children': <Object?>[],
+      'orchestration': 'parent',
+      'targets': <Object?>[
+        <String, Object?>{
+          'providerId': 'opencode',
+          'modelId': 'deepseek-v4-flash',
+          'reasoningEffort': 'high',
+        },
+      ],
+      'presentationSegments': <Object?>[
+        <String, Object?>{'type': 'text', 'text': 'Ask '},
+        <String, Object?>{'type': 'mesh', 'targetIndex': 0},
+        <String, Object?>{'type': 'text', 'text': ' to investigate'},
+      ],
+    });
+
+    expect(task.children, isEmpty);
+    expect(task.targets, hasLength(1));
+    expect(task.targets.single.providerId, 'opencode');
+    expect(task.targets.single.modelId, 'deepseek-v4-flash');
+    expect(task.presentationSegments.map((segment) => segment.type),
+        <String>['text', 'mesh', 'text']);
   });
 }

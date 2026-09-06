@@ -4,6 +4,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
+import { runInNewContext } from "node:vm";
 
 const require = createRequire(import.meta.url);
 const { createManualClock } = require("../scripts/fake-model/deterministic-clock.cjs");
@@ -192,6 +193,86 @@ test("fake model: queue enqueue, steer delivery, and queue drain are determinist
   assert.equal(hostState.host.stateForTests().sessions.find((session) => session.id === "fake-main").state, "idle");
 });
 
+test("fake model: scheduled task requests expose pending, dispatching, failed, retry, started, run-now, and cancel", () => {
+  const hostState = collectHost();
+  const create = (requestId, title) => hostState.host.handleRequest("scheduled_task.create", {
+    providerId: "fake",
+    workingDirectory: "C:\\FakeModel\\scheduled",
+    title,
+    content: `${title} body`,
+    runAt: "2026-08-21T13:00:00.000Z",
+    modelId: "fake/deterministic-v1",
+    reasoningEffort: "low",
+  }, requestId);
+
+  const retryJourney = create("fake-schedule-retry", "Retry scheduled task");
+  assert.equal(retryJourney.ok, true);
+  assert.equal(retryJourney.payload.task.status, "pending");
+  const retryPlaceholderId = retryJourney.payload.task.targetSessionId;
+  assert.equal(retryPlaceholderId, "scheduled-task:fake-schedule-retry");
+  assert.equal(retryJourney.payload.session, undefined, "scheduling eagerly created a provider session");
+  assert.equal(hostState.host.stateForTests().sessions.some((session) => session.id === retryPlaceholderId), false, "the local placeholder leaked into provider sessions");
+  assert.deepEqual(hostState.host.handleRequest("scheduled_task.list", { sessionId: retryPlaceholderId }).payload.tasks.map((task) => task.requestId), ["fake-schedule-retry"]);
+  const retryCreated = events(hostState).find((event) => event.type === "scheduled_task.created" && event.payload.task?.requestId === "fake-schedule-retry");
+  assert.equal(retryCreated?.sessionId, retryPlaceholderId);
+  assert.equal(events(hostState).some((event) => event.type === "session.created" && event.sessionId === retryPlaceholderId), false, "placeholder creation emitted a provider session event");
+
+  const dispatching = hostState.host.setScheduledTaskStatusForTests("fake-schedule-retry", "dispatching");
+  assert.equal(dispatching.status, "dispatching");
+  assert.equal(typeof dispatching.dispatchingAt, "string");
+  const failed = hostState.host.setScheduledTaskStatusForTests("fake-schedule-retry", "failed", { failureMessage: "Injected scheduled dispatch failure." });
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.failureMessage, "Injected scheduled dispatch failure.");
+  const retried = hostState.host.handleRequest("scheduled_task.retry", { scheduledTaskId: "fake-schedule-retry" }, "fake-schedule-retry-action");
+  assert.equal(retried.ok, true);
+  assert.equal(retried.payload.task.status, "pending");
+  assert.equal(retried.payload.task.failureMessage, undefined);
+  hostState.host.setScheduledTaskStatusForTests("fake-schedule-retry", "dispatching");
+  const retryStarted = hostState.host.setScheduledTaskStatusForTests("fake-schedule-retry", "started");
+  assert.equal(retryStarted.status, "started");
+  assert.notEqual(retryStarted.targetSessionId, retryPlaceholderId, "dispatch kept the local placeholder as the provider session");
+  const retrySessions = hostState.host.stateForTests().sessions.filter((session) => session.title === "Retry scheduled task");
+  assert.equal(retrySessions.length, 1, "dispatch did not materialize exactly one provider session");
+  assert.equal(retrySessions[0].id, retryStarted.targetSessionId);
+  assert.equal(retrySessions[0].state, "working");
+  assert.equal(hostState.host.stateForTests().sessions.some((session) => session.id === retryPlaceholderId), false, "the stale placeholder remained in provider sessions");
+  const retryRemap = events(hostState).findLast((event) => event.type === "scheduled_task.updated" && event.payload.task?.requestId === "fake-schedule-retry" && event.payload.task?.status === "started");
+  assert.equal(retryRemap?.sessionId, retryStarted.targetSessionId);
+  assert.equal(retryRemap?.payload.previousTargetSessionId, retryPlaceholderId, "started dispatch omitted the placeholder remap identity");
+  assert.equal(events(hostState).filter((event) => event.type === "session.created" && event.sessionId === retryStarted.targetSessionId).length, 1, "dispatch materialized duplicate provider rows");
+
+  const runNowJourney = create("fake-schedule-run-now", "Run-now scheduled task");
+  const runNow = hostState.host.handleRequest("scheduled_task.run_now", { scheduledTaskId: "fake-schedule-run-now" }, "fake-schedule-run-now-action");
+  assert.equal(runNow.ok, true);
+  assert.equal(runNow.payload.task.status, "dispatching");
+  assert.equal(runNow.payload.task.runAt, hostState.clock.nowIso());
+  const runNowPlaceholderId = runNow.payload.task.targetSessionId;
+  const runNowStarted = hostState.host.setScheduledTaskStatusForTests("fake-schedule-run-now", "started");
+  assert.equal(runNowStarted.status, "started");
+  assert.notEqual(runNowStarted.targetSessionId, runNowPlaceholderId);
+
+  const cancelJourney = create("fake-schedule-cancel", "Cancel scheduled task");
+  const cancelled = hostState.host.handleRequest("scheduled_task.cancel", { scheduledTaskId: "fake-schedule-cancel" }, "fake-schedule-cancel-action");
+  assert.equal(cancelled.ok, true);
+  assert.equal(cancelled.payload.task.requestId, cancelJourney.payload.task.requestId);
+  assert.equal(hostState.host.stateForTests().scheduledTasks.some((task) => task.requestId === "fake-schedule-cancel"), false);
+
+  create("fake-schedule-dismiss", "Dismiss failed scheduled task");
+  hostState.host.setScheduledTaskStatusForTests("fake-schedule-dismiss", "dispatching");
+  hostState.host.setScheduledTaskStatusForTests("fake-schedule-dismiss", "failed", { failureMessage: "Dismiss this failed schedule." });
+  const dismissed = hostState.host.handleRequest("scheduled_task.cancel", { scheduledTaskId: "fake-schedule-dismiss" }, "fake-schedule-dismiss-action");
+  assert.equal(dismissed.ok, true);
+  assert.equal(dismissed.payload.task.status, "failed");
+  assert.equal(hostState.host.stateForTests().scheduledTasks.some((task) => task.requestId === "fake-schedule-dismiss"), false);
+
+  const scheduleEvents = events(hostState).filter((event) => event.type.startsWith("scheduled_task."));
+  assert.ok(scheduleEvents.some((event) => event.type === "scheduled_task.created" && event.payload.task.status === "pending"));
+  assert.ok(scheduleEvents.some((event) => event.type === "scheduled_task.updated" && event.payload.task.status === "dispatching"));
+  assert.ok(scheduleEvents.some((event) => event.type === "scheduled_task.updated" && event.payload.task.status === "failed"));
+  assert.ok(scheduleEvents.some((event) => event.type === "scheduled_task.updated" && event.payload.task.status === "started"));
+  assert.ok(scheduleEvents.some((event) => event.type === "scheduled_task.updated" && event.payload.change === "cancelled"));
+});
+
 test("fake model: queue management preserves item identity, sibling order, and failed delivery", () => {
   const hostState = collectHost();
   const queued = ["Queue sibling A", "Queue sibling B", "Queue sibling C"].map((content) =>
@@ -234,7 +315,12 @@ test("fake model: moving one queued item starts a task with its own content and 
   assert.equal(moved.payload.session.providerId, "fake");
   assert.equal(moved.payload.session.modelId, "fake/deterministic-v1");
   assert.equal(moved.payload.session.reasoningEffort, "high");
+  assert.equal(moved.payload.delivery.state, "pending");
   assert.deepEqual(hostState.host.stateForTests().queue.map((message) => message.id), [queued[0].id, queued[2].id]);
+  assert.deepEqual(hostState.host.handleRequest("session.open", { sessionId: moved.payload.session.id }).payload.messages, []);
+  const delivered = hostState.host.handleRequest("message_queue.deliver_new_task", { deliveryId: moved.payload.delivery.id });
+  assert.equal(delivered.ok, true);
+  assert.equal(delivered.payload.delivery.state, "sent");
   hostState.clock.advance(20_000);
   const history = hostState.host.handleRequest("session.open", { sessionId: moved.payload.session.id }).payload.messages;
   assert.ok(history.some((message) => message.role === "user" && message.parts.some((part) => part.text === "Move this exact middle instruction")));
@@ -391,6 +477,9 @@ test("fake model: queued mixed attachments keep bounded previews through edit, d
   const moved = hostState.host.handleRequest("message_queue.move_to_new_task", { messageId: movedQueue.id, providerId: "direct", modelId: "direct/vision-audio", reasoningEffort: "high" });
   assert.equal(moved.ok, true);
   assert.equal(hostState.host.stateForTests().queueAttachmentIds.has(movedQueue.id), false);
+  const movedDelivery = hostState.host.handleRequest("message_queue.deliver_new_task", { deliveryId: moved.payload.delivery.id });
+  assert.equal(movedDelivery.ok, true);
+  assert.equal(movedDelivery.payload.delivery.state, "sent");
   hostState.clock.advance(2_000);
   const movedUser = hostState.host.handleRequest("session.open", { sessionId: moved.payload.session.id }).payload.messages.find((message) => message.role === "user");
   assert.deepEqual(movedUser.parts.map((part) => part.type), ["text", "image", "audio", "file"]);
@@ -528,6 +617,22 @@ test("fake model: Eyes, EARS, and Mesh reject impossible routes and keep task-lo
   assert.equal(hostState.host.handleRequest("session.vision.get", { sessionId: "fake-main" }).payload.vision.configured.modelId, "gpt-5.6-sol");
   assert.equal(hostState.host.handleRequest("session.vision.get", { sessionId: "fake-side" }).payload.vision.configured, null, "Eyes configuration leaked between tasks");
 
+  const preparedMesh = hostState.host.handleRequest("delegation.prepare", {
+    parentSessionId: "fake-main",
+    prompt: "Have OpenCode inspect only the parser",
+    targets: [{ providerId: "opencode", modelId: "deepseek/deepseek-v4-flash", reasoningEffort: "max" }],
+    presentationSegments: [{ type: "mesh", targetIndex: 0 }, { type: "text", text: "Have OpenCode inspect only the parser" }],
+    modelId: "fake/deterministic-v1",
+    reasoningEffort: "high",
+  }, "fake-prepared-mesh");
+  assert.equal(preparedMesh.ok, true);
+  assert.equal(preparedMesh.payload.delegation.state, "awaiting_dispatch");
+  assert.equal(preparedMesh.payload.delegation.orchestration, "parent");
+  assert.deepEqual(preparedMesh.payload.delegation.children, [], "The fake prepared Mesh created a child before its parent dispatched an assignment");
+  assert.deepEqual(preparedMesh.payload.delegation.presentationSegments, [{ type: "mesh", targetIndex: 0 }, { type: "text", text: "Have OpenCode inspect only the parser" }]);
+  assert.equal(preparedMesh.payload.delegation.parentModelId, "fake/deterministic-v1");
+  assert.equal(preparedMesh.payload.delegation.parentReasoningEffort, "high");
+
   assert.equal(hostState.host.handleRequest("delegation.start", {
     parentSessionId: "fake-main",
     prompt: "invalid parent target",
@@ -577,17 +682,90 @@ test("fake model: annotation transport is retained as one provider user turn", (
   assert.equal(userMessages[0].parts[0].text, wire, "the fake provider did not retain the hidden annotation envelope for bridge parsing");
 });
 
-test("fake model: context compaction thresholds persist per task and change the displayed percentage", () => {
+test("fake model: context compaction thresholds persist per task without changing context usage", () => {
   const hostState = collectHost();
   const initial = hostState.host.handleRequest("session.context.get", { sessionId: "fake-main" }).payload.context;
   assert.equal(initial.compactionThresholdTokens, 96_000);
-  assert.equal(initial.usedPercent, 4_200 / 96_000 * 100);
+  assert.equal(initial.usedPercent, 4_200 / 128_000 * 100);
 
   const applied = hostState.host.handleRequest("session.context.set_threshold", { sessionId: "fake-main", thresholdTokens: 40_000 }).payload.context;
   assert.equal(applied.compactionThresholdTokens, 40_000);
-  assert.equal(applied.usedPercent, 10.5);
+  assert.equal(applied.usedPercent, initial.usedPercent);
   assert.equal(hostState.host.handleRequest("session.context.get", { sessionId: "fake-main" }).payload.context.compactionThresholdTokens, 40_000);
   assert.equal(hostState.host.handleRequest("session.context.get", { sessionId: "fake-side" }).payload.context.compactionThresholdTokens, 96_000, "one task's threshold leaked into another task");
+});
+
+test("fake model: provider-neutral goal lifecycle is zero-token, persistent, and private", () => {
+  const first = collectHost();
+  const before = first.host.stateForTests();
+  const overLimit = first.host.handleRequest("session.goal.set", { sessionId: "fake-main", objective: "x".repeat(4_001) });
+  assert.equal(overLimit.ok, false);
+  assert.match(overLimit.error.message, /4000/u);
+  const started = first.host.handleRequest("session.goal.set", {
+    sessionId: "fake-main",
+    objective: "Ship the reliable goal UI",
+    tokenBudget: 12_000,
+  });
+  assert.equal(started.ok, true);
+  assert.equal(started.payload.goal.source, "tethoq");
+  assert.equal(started.payload.goal.status, "active");
+  assert.equal(first.host.stateForTests().modelTurnCount, before.modelTurnCount, "setting a goal started a model turn");
+  assert.equal(first.host.stateForTests().modelTokenCount, before.modelTokenCount, "setting a goal spent model tokens");
+
+  const paused = first.host.handleRequest("session.goal.set", { sessionId: "fake-main", status: "paused" }).payload.goal;
+  const stalled = first.host.handleRequest("session.goal.set", { sessionId: "fake-main", status: "blocked" }).payload.goal;
+  const complete = first.host.handleRequest("session.goal.set", { sessionId: "fake-main", status: "complete" }).payload.goal;
+  const reopened = first.host.handleRequest("session.goal.set", { sessionId: "fake-main", status: "active" }).payload.goal;
+  assert.deepEqual([paused.status, stalled.status, complete.status, reopened.status], ["paused", "blocked", "complete", "active"]);
+  assert.ok(reopened.revision > started.payload.goal.revision);
+
+  const setRequestCount = first.host.stateForTests().requests.filter((request) => request.type === "session.goal.set").length;
+  assert.equal(setRequestCount, 6);
+  assert.equal(first.host.stateForTests().modelTurnCount, before.modelTurnCount, "goal lifecycle started a hidden turn");
+  assert.equal(first.host.stateForTests().modelTokenCount, 0);
+
+  const sent = first.host.handleRequest("session.send_message", { sessionId: "fake-main", content: "Continue toward the goal" });
+  assert.equal(sent.ok, true);
+  const sendRequest = first.host.stateForTests().requests.at(-1);
+  assert.match(sendRequest.payload.developerInstructions, /private control context/u);
+  assert.match(sendRequest.payload.developerInstructions, /Ship the reliable goal UI/u);
+  assert.match(sendRequest.payload.developerInstructions, /Token budget: 12000 tokens/u);
+  assert.equal(sendRequest.payload.content, "Continue toward the goal");
+  assert.equal(first.host.handleRequest("session.open", { sessionId: "fake-main" }).payload.messages.some((message) => message.parts.some((part) => typeof part.text === "string" && part.text.includes("private control context"))), false, "private goal guidance leaked into transcript text");
+  first.clock.advance(10_000);
+
+  const exported = first.host.exportStateForTests();
+  exported.goalsBySession["fake-main"].tokensUsed = 900;
+  exported.goalsBySession["fake-main"].timeUsedSeconds = 30;
+  first.host.dispose();
+  const restarted = createFakeModelHost({ clock: createManualClock("2026-08-21T12:05:00.000Z"), persistedState: exported });
+  assert.equal(restarted.handleRequest("session.goal.get", { sessionId: "fake-main" }).payload.goal.status, "active");
+  assert.equal(restarted.handleRequest("sessions.refresh", {}).payload.sessions.length >= 5, true, "provider refresh removed the task carrying the goal");
+  assert.equal(restarted.stateForTests().modelTurnCount, exported.modelTurnCount, "restart changed the fake turn counter");
+  const replaced = restarted.handleRequest("session.goal.set", { sessionId: "fake-main", objective: "Replace the completed objective" }).payload.goal;
+  assert.equal(replaced.tokensUsed, 0, "a replacement objective kept the previous usage count");
+  assert.equal(replaced.timeUsedSeconds, 0, "a replacement objective kept the previous elapsed time");
+  assert.equal(replaced.createdAt, "2026-08-21T12:05:00.000Z", "a replacement objective kept the previous creation time");
+  const cleared = restarted.handleRequest("session.goal.clear", { sessionId: "fake-main" });
+  assert.equal(cleared.ok, true);
+  assert.equal(restarted.handleRequest("session.goal.get", { sessionId: "fake-main" }).payload.goal, null);
+  assert.ok(events(first).filter((event) => event.type === "session.goal_updated").length >= 5);
+  assert.ok(events(first).some((event) => event.type === "session.goal_cleared") === false, "clear after restart should not mutate the original host");
+  restarted.dispose();
+});
+
+test("fake model: goal notifications retain revision order and do not create turns", () => {
+  const hostState = collectHost();
+  const first = hostState.host.handleRequest("session.goal.set", { sessionId: "fake-main", objective: "Keep the latest goal" }).payload.goal;
+  const second = hostState.host.handleRequest("session.goal.set", { sessionId: "fake-main", objective: "Keep the revised goal" }).payload.goal;
+  hostState.host.emitGoalUpdateForTests("fake-main", { ...first, revision: first.revision });
+  hostState.host.emitGoalClearedForTests("fake-main", first.revision);
+  const goalEvents = events(hostState).filter((event) => event.type.startsWith("session.goal_"));
+  assert.deepEqual(goalEvents.slice(0, 2).map((event) => event.payload.goal.objective), ["Keep the latest goal", "Keep the revised goal"]);
+  assert.equal(goalEvents.at(-1).type, "session.goal_cleared");
+  assert.ok(second.revision > first.revision);
+  assert.equal(hostState.host.stateForTests().modelTurnCount, 0);
+  assert.equal(hostState.host.stateForTests().modelTokenCount, 0);
 });
 
 test("fake model: response and test snapshots do not leak nested mutable state", () => {
@@ -612,6 +790,7 @@ test("fake model: the fake host answers every desktop request without throwing",
     ["session.watch", { sessionId: "fake-main" }],
     ["session.unwatch", { sessionId: "fake-main" }],
     ["session.context.get", { sessionId: "fake-main" }],
+    ["session.goal.get", { sessionId: "fake-main" }],
     ["session.children", { sessionId: "fake-main" }],
     ["side_chat.list", {}],
     ["user_input.list", {}],
@@ -676,6 +855,17 @@ test("fake model isolation: the test preload channels mirror the production IPC_
   for (const channel of channelNames) {
     assert.ok(preloadSource.includes(`'${channel}'`), `test preload is missing the production channel ${channel}`);
   }
+  let api;
+  const invocations = [];
+  runInNewContext(preloadSource, {
+    require: () => ({
+      contextBridge: { exposeInMainWorld: (_name, value) => { api = value; } },
+      ipcRenderer: { invoke: (...args) => { invocations.push(args); } },
+    }),
+  });
+  api.openHarnessSetupPage("codex");
+  assert.equal(invocations[0]?.[0], "tethoq:open-harness-setup-page");
+  assert.equal(invocations[0]?.[1]?.providerId, "codex");
 });
 
 test("fake model QA entrypoints preserve a nonzero failure status", async () => {
@@ -687,6 +877,11 @@ test("fake model QA entrypoints preserve a nonzero failure status", async () => 
   assert.doesNotMatch(driver, /app\.quit\(\)/u, "graceful quit can win before a failure status is applied");
   assert.doesNotMatch(scrollShim, /app\.quit\(\)/u, "graceful quit can win before a failure status is applied");
   assert.match(driver, /onlyScenario !== null && scenarios\.length === 0/u, "unknown focused scenarios must fail instead of silently passing");
+  assert.ok((driver.match(/show:\s*false/gu) ?? []).length >= 2, "every fake-model QA window must be created hidden");
+  assert.match(driver, /scenarioScheduledTaskLifecycle/u, "the hidden scheduling lifecycle journey is missing");
+  assert.match(driver, /scenarioStopPresentationBoundary/u, "the hidden delayed-interrupt journey is missing");
+  assert.match(driver, /keepWindowHidden:\s*\['mesh-parent-orchestration', 'scheduled-task-lifecycle', 'stop-presentation-boundary'\]\.includes\(name\)/u, "renderer requests can expose a hidden lifecycle window");
+  assert.match(driver, /if \(!\['mesh-parent-orchestration', 'scheduled-task-lifecycle', 'stop-presentation-boundary'\]\.includes\(name\)\) qaWindow\.showInactive\(\)/u, "a hidden lifecycle journey is not excluded from visible-window activation");
 });
 
 test("fake model coverage contract reports every missing user-visible feature id", () => {

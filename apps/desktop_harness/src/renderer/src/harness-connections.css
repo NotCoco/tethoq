@@ -1,0 +1,20 @@
+.harness-connections { width: min(720px, 100%); scroll-margin-top: 48px; }
+.harness-connection-card { border: 1px solid var(--line); border-radius: 9px; padding: 16px; background: var(--surface); }
+.harness-connection-picker { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.harness-connection-picker label { color: var(--muted); font-size: 12px; }
+.harness-connection-picker select { min-width: 160px; max-width: 100%; padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); }
+.harness-status { color: var(--muted); font-size: 12px; }
+.harness-status.ready { color: #7ccc9d; }
+.harness-connection-card p, .harness-connection-card li { color: var(--muted); font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.harness-connection-card ol { padding-left: 22px; }
+.harness-connection-card li + li { margin-top: 6px; }
+.harness-connection-card code { color: var(--text); font-size: 12px; }
+.harness-connection-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
+.harness-connection-actions button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--line); background: transparent; color: var(--text-soft); }
+.harness-connection-actions button:hover:not(:disabled), .harness-connection-actions button:focus-visible { background: var(--surface-2); border-color: var(--line-strong); }
+.harness-connection-actions svg { width: 14px; height: 14px; }
+.harness-setup-details { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 12px; }
+.harness-setup-details summary { cursor: pointer; font-size: 13px; }
+.harness-setup-details textarea { width: 100%; min-height: 230px; resize: vertical; margin-top: 8px; padding: 12px; font: 12px/1.6 var(--font-mono, monospace); color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; }
+.harness-connection-card .harness-setup-issue { color: #d7b477; }
+@media (max-width: 900px) { .harness-status { flex-basis: 100%; } }

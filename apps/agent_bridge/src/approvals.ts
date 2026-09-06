@@ -39,11 +39,40 @@ export class ApprovalRegistry {
     return normalized;
   }
 
-  public list(): readonly ApprovalRequest[] {
+  public list(onExpired?: (request: ApprovalRequest) => void): readonly ApprovalRequest[] {
     for (const [requestId, entry] of this.#pending) {
-      if (isExpired(entry.normalized)) this.#pending.delete(requestId);
+      if (!isExpired(entry.normalized)) continue;
+      this.#pending.delete(requestId);
+      onExpired?.(entry.normalized);
     }
     return [...this.#pending.values()].filter((entry) => !entry.resolving).map((entry) => entry.normalized);
+  }
+
+  public nextExpiryAt(): number | undefined {
+    let next: number | undefined;
+    for (const entry of this.#pending.values()) {
+      if (entry.normalized.expiresAt === undefined) continue;
+      const expiresAt = Date.parse(entry.normalized.expiresAt);
+      if (!Number.isFinite(expiresAt)) continue;
+      if (next === undefined || expiresAt < next) next = expiresAt;
+    }
+    return next;
+  }
+
+  public clearForSession(sessionId: string): readonly ApprovalRequest[] {
+    const removed: ApprovalRequest[] = [];
+    for (const [requestId, entry] of this.#pending) {
+      if (entry.normalized.sessionId !== sessionId || entry.resolving) continue;
+      this.#pending.delete(requestId);
+      removed.push(entry.normalized);
+    }
+    return removed;
+  }
+
+  /** Includes an in-flight response so snapshot reconciliation cannot briefly
+   * clear a session while the provider is still resolving its approval. */
+  public hasForSession(sessionId: string): boolean {
+    return [...this.#pending.values()].some((entry) => entry.normalized.sessionId === sessionId);
   }
 
   public async resolve(hostId: string, response: ApprovalResponse): Promise<ApprovalRequest> {

@@ -68,3 +68,31 @@ export interface AccountReadResponse {
   readonly account: unknown | null;
   readonly requiresOpenaiAuth: boolean;
 }
+
+export type ThreadGoalStatus = "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete";
+
+export interface ThreadGoal {
+  readonly threadId: string;
+  readonly objective: string;
+  readonly status: ThreadGoalStatus;
+  readonly tokenBudget: number | null;
+  readonly tokensUsed: number;
+  readonly timeUsedSeconds: number;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly revision?: number;
+}
+
+export interface ThreadGoalResponse {
+  readonly threadId?: string;
+  readonly goal: ThreadGoal | null;
+  readonly revision?: number;
+  readonly updatedAt?: number | string;
+}
+
+export interface ThreadGoalClearResponse {
+  readonly threadId?: string;
+  readonly cleared: boolean;
+  readonly revision?: number;
+  readonly updatedAt?: number | string;
+}

@@ -29,6 +29,8 @@ function runCodex(command: string, args: readonly string[]): Promise<{ readonly 
   return new Promise((resolve, reject) => {
     const child = spawn(launch.command, [...launch.args], {
       ...(launch.windowsVerbatimArguments === true ? { windowsVerbatimArguments: true } : {}),
+      windowsHide: true,
+      shell: false,
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";

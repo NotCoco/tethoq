@@ -14,6 +14,40 @@ export const sessionStates = [
 ] as const;
 export type SessionState = (typeof sessionStates)[number];
 
+export const sessionGoalStatuses = [
+  "active",
+  "paused",
+  "blocked",
+  "usageLimited",
+  "budgetLimited",
+  "complete",
+] as const;
+export type SessionGoalStatus = (typeof sessionGoalStatuses)[number];
+
+/** App Server-compatible bound for one persisted goal objective. */
+export const sessionGoalObjectiveMaxLength = 4_000;
+
+/** Persistent task intent, independent of whether a model turn is currently running. */
+export interface SessionGoal {
+  readonly sessionId: string;
+  readonly objective: string;
+  readonly status: SessionGoalStatus;
+  readonly source: "native" | "tethoq";
+  readonly tokenBudget: number | null;
+  readonly tokensUsed: number;
+  readonly timeUsedSeconds: number;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  /** Monotonic within one bridge process; clients use it to reject reordered events. */
+  readonly revision: number;
+}
+
+export interface SessionGoalUpdate {
+  readonly objective?: string;
+  readonly status?: SessionGoalStatus;
+  readonly tokenBudget?: number | null;
+}
+
 export const connectionStates = [
   "connecting",
   "online",
@@ -171,7 +205,7 @@ export interface WorkflowReference {
 export type ContentPart =
   | { readonly type: "text"; readonly text: string; readonly providerPartId?: string }
   | { readonly type: "reasoning"; readonly text: string; readonly redacted: boolean; readonly providerPartId?: string }
-  | { readonly type: "tool"; readonly name: string; readonly callId?: string; readonly input?: JsonValue; readonly output?: string; readonly status: "pending" | "running" | "completed" | "failed" }
+  | { readonly type: "tool"; readonly name: string; readonly providerPartId?: string; readonly callId?: string; readonly input?: JsonValue; readonly output?: string; readonly status: "pending" | "running" | "completed" | "failed" }
   | { readonly type: "command"; readonly command: string; readonly cwd?: string; readonly output?: string; readonly exitCode?: number; readonly status: "pending" | "running" | "completed" | "failed" }
   | { readonly type: "file_change"; readonly path: string; readonly patch?: string; readonly change: "added" | "modified" | "deleted" | "unknown" }
   | { readonly type: "error"; readonly message: string; readonly code?: string }
@@ -205,12 +239,17 @@ export interface RemoteMessage {
   readonly nativeMetadata: JsonObject;
 }
 
-export interface RemoteMessageOrigin {
-  readonly kind: "cross_session";
-  readonly envelopeId: string;
-  readonly sourceSessionId: string;
-  readonly sourceTitle: string;
-}
+export type RemoteMessageOrigin =
+  | {
+      readonly kind: "cross_session";
+      readonly envelopeId: string;
+      readonly sourceSessionId: string;
+      readonly sourceTitle: string;
+    }
+  | {
+      readonly kind: "delegation";
+      readonly sender: "codex" | "tethoq";
+    };
 
 export interface CrossSessionMessageEnvelope {
   readonly version: 1;
@@ -258,12 +297,20 @@ export interface QueuedMessage {
   readonly modelId?: string;
   readonly reasoningEffort?: string;
   readonly error?: string;
+  /** False quarantines an acknowledgement-ambiguous delivery until provider history confirms it. */
+  readonly retryable?: boolean;
 }
 
 export const agentEventTypes = [
   "session.created",
   "session.updated",
+  "session.catalog_changed",
   "session.status_changed",
+  "session.goal_updated",
+  "session.goal_cleared",
+  "session.vision_updated",
+  "scheduled_task.created",
+  "scheduled_task.updated",
   "message.started",
   "message.delta",
   "message.completed",
@@ -273,6 +320,7 @@ export const agentEventTypes = [
   "message.remote_received",
   "context.compaction_started",
   "context.compaction_completed",
+  "context.compaction_failed",
   "side_chat.created",
   "side_chat.updated",
   "side_chat.promoted",
@@ -286,6 +334,7 @@ export const agentEventTypes = [
   "approval.requested",
   "approval.resolved",
   "user_input.requested",
+  "user_input.resolved",
   "agent.error",
   "agent.completed",
   "agent.interrupted",
@@ -437,7 +486,9 @@ export interface DirectApiEndpointInput {
 export interface ConfigureWalletRequest {
   readonly endpointId: string;
   readonly apiKey?: string;
+  readonly validateApiKey?: boolean;
   readonly clearApiKey?: boolean;
+  readonly clearBalance?: boolean;
   readonly setBalance?: number;
   readonly addBalance?: number;
   readonly customEndpoint?: DirectApiEndpointInput;
@@ -455,15 +506,21 @@ export interface VisionProxyTarget {
   readonly models: readonly RemoteModel[];
 }
 
+export interface VisionProxyTargetCatalogue {
+  readonly targets: readonly VisionProxyTarget[];
+  /** True when at least one otherwise available provider could not be checked. */
+  readonly incomplete: boolean;
+}
+
 export interface VisionProxyStatus {
   readonly sessionId: string;
   readonly primaryModelId?: string;
   readonly primaryModelSupportsImageInput: boolean | null;
   readonly configured: VisionProxySelection | null;
-  readonly helperSessionId?: string;
 }
 
 export const delegationStates = [
+  "awaiting_dispatch",
   "spawning",
   "working",
   "needs_attention",
@@ -478,6 +535,11 @@ export interface DelegationTarget {
   readonly modelId?: string;
   readonly reasoningEffort?: string;
 }
+
+/** Ordered user text and Mesh references; positions also guide the parent's task assignments. */
+export type DelegationPresentationSegment =
+  | { readonly type: "text"; readonly text: string }
+  | { readonly type: "mesh"; readonly targetIndex: number };
 
 export interface DelegationChild {
   readonly id: string;
@@ -497,6 +559,18 @@ export interface DelegationTask {
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly children: readonly DelegationChild[];
+  /** Present only for turns whose selected targets are dispatched by the parent model. */
+  readonly orchestration?: "parent";
+  /** Server-authorized target slots. Tool calls can supply instructions, never replace these selections. */
+  readonly targets?: readonly DelegationTarget[];
+  readonly presentationSegments?: readonly DelegationPresentationSegment[];
+  readonly parentModelId?: string;
+  readonly parentReasoningEffort?: string;
+  /** Durable acknowledgement boundary for idempotent preparation replay. */
+  readonly parentTurnAcceptedAt?: string;
+  readonly parentTurnId?: string;
+  /** Hash of the first complete parent-authored assignment set; changed replays are rejected. */
+  readonly dispatchFingerprint?: string;
   readonly error?: string;
 }
 

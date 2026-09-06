@@ -1,11 +1,14 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import type { TaskOverride } from "@shared/desktop_api";
+import type { TaskListMode, TaskOverride } from "@shared/desktop_api";
 import { MAX_TASK_TITLE_CHARACTERS } from "@shared/desktop_api";
+import { reasoningDisplayLabel } from "../../../../../packages/protocol/src/reasoning";
 import { EmptyState, ProviderLogo, providerDisplayName, relativeTime } from "./components";
 import { listChildSessions } from "./bridge";
-import { ArchiveIcon, BranchIcon, ChatIcon, CheckIcon, ChevronDownIcon, ChevronRightIcon, FolderIcon, GridIcon, InfoIcon, PinIcon, PlusIcon, RenameIcon, SearchIcon, SettingsIcon, SlidersIcon, XIcon } from "./icons";
+import { AlertIcon, ArchiveIcon, BranchIcon, BridgeIcon, ChatIcon, CheckIcon, ChevronDownIcon, ChevronRightIcon, ClockIcon, FolderIcon, FolderPlusIcon, GridIcon, InfoIcon, MicrophoneIcon, PinIcon, PlusIcon, RenameIcon, SearchIcon, SettingsIcon, SlidersIcon, SubagentsIcon, XIcon } from "./icons";
 import { maximumUiSearchCharacters } from "./search_helpers";
+import type { RuntimeConnectionPresentation } from "./progressive_startup";
+import { groupSessionsByProject, initialProjectCount, isSideChatSession, projectDirectoryName, reconcileProjectDirectoryOrder, sideChatParentSessionId, visibleProjectSessions } from "./session_projects";
 import type { Provider, ProviderFilter, ProviderFilterSelection, ProviderId, Session, SessionState } from "./types";
 
 export type NavigationView = "workspace" | "dashboard" | "browser" | "settings";
@@ -37,7 +40,7 @@ function AvailableAgentsIcon() {
   return <svg className="available-agents-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3"/><path d="M4 19c.5-4 2.2-6 5-6s4.5 2 5 6"/><path d="m14.5 11.5 2 2 3.5-4"/></svg>;
 }
 
-function OverflowReveal({ axis, className, children }: { axis: "horizontal" | "vertical"; className: string; children: ReactNode }) {
+function OverflowReveal({ axis, className, children, prefix }: { axis: "horizontal" | "vertical"; className: string; children: ReactNode; prefix?: ReactNode }) {
   const root = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLSpanElement>(null);
   const [distance, setDistance] = useState(0);
@@ -57,10 +60,82 @@ function OverflowReveal({ axis, className, children }: { axis: "horizontal" | "v
   }, [axis, children]);
   const pixelsPerSecond = axis === "vertical" ? 18 : 28;
   const duration = distance / pixelsPerSecond;
-  return <div ref={root} className={`overflow-reveal overflow-reveal-${axis} ${className}`} data-overflow={distance > 1 || undefined} style={{ "--overflow-distance": `${Math.ceil(distance)}px`, "--overflow-duration": `${duration.toFixed(2)}s` } as CSSProperties}><span ref={content}>{children}</span></div>;
+  return <div ref={root} className={`overflow-reveal overflow-reveal-${axis} ${className}`} data-overflow={distance > 0 || undefined} style={{ "--overflow-distance": `${Math.ceil(distance)}px`, "--overflow-duration": `${duration.toFixed(2)}s` } as CSSProperties}>{prefix ? <i className="overflow-reveal-prefix">{prefix}</i> : null}<span ref={content}>{children}</span></div>;
+}
+
+function ProjectNewTaskButton({ directory, name, onNewTask }: { directory: string; name: string; onNewTask: (workingDirectory: string) => void }) {
+  const trigger = useRef<HTMLButtonElement>(null);
+  const tooltip = useRef<HTMLSpanElement>(null);
+  const hoverTimer = useRef<number | undefined>(undefined);
+  const [tooltipActive, setTooltipActive] = useState(false);
+  const [tooltipStyle, setTooltipStyle] = useState<CSSProperties>({});
+  const tooltipId = useId();
+  const label = `New task in ${name}`;
+  const clearHoverTimer = () => {
+    if (hoverTimer.current === undefined) return;
+    window.clearTimeout(hoverTimer.current);
+    hoverTimer.current = undefined;
+  };
+  const positionTooltip = () => {
+    const bounds = trigger.current?.getBoundingClientRect();
+    if (!bounds) return;
+    const tooltipHeight = tooltip.current?.offsetHeight ?? 34;
+    const right = Math.max(8, window.innerWidth - bounds.right);
+    if (bounds.bottom + 8 + tooltipHeight <= window.innerHeight - 8) {
+      setTooltipStyle({ right, top: bounds.bottom + 8, bottom: "auto" });
+    } else {
+      setTooltipStyle({ right, top: "auto", bottom: window.innerHeight - bounds.top + 8 });
+    }
+  };
+  const hideTooltip = () => {
+    clearHoverTimer();
+    setTooltipActive(false);
+  };
+  const showTooltipImmediately = () => {
+    clearHoverTimer();
+    positionTooltip();
+    setTooltipActive(true);
+  };
+  const showTooltipAfterDelay = () => {
+    clearHoverTimer();
+    hoverTimer.current = window.setTimeout(() => {
+      hoverTimer.current = undefined;
+      positionTooltip();
+      setTooltipActive(true);
+    }, 460);
+  };
+  useLayoutEffect(() => {
+    if (tooltipActive) positionTooltip();
+  }, [tooltipActive, label]);
+  useEffect(() => {
+    if (!tooltipActive) return;
+    window.addEventListener("resize", positionTooltip);
+    document.addEventListener("scroll", positionTooltip, true);
+    return () => {
+      window.removeEventListener("resize", positionTooltip);
+      document.removeEventListener("scroll", positionTooltip, true);
+    };
+  }, [tooltipActive]);
+  useEffect(() => () => clearHoverTimer(), []);
+  return <>
+    <button
+      ref={trigger}
+      type="button"
+      className="session-project-new-task"
+      aria-label={label}
+      aria-describedby={tooltipActive ? tooltipId : undefined}
+      onPointerEnter={showTooltipAfterDelay}
+      onPointerLeave={hideTooltip}
+      onFocus={showTooltipImmediately}
+      onBlur={hideTooltip}
+      onClick={() => { hideTooltip(); onNewTask(directory); }}
+    ><PlusIcon /></button>
+    {tooltipActive ? createPortal(<span ref={tooltip} id={tooltipId} className="session-project-new-task-tooltip" role="tooltip" style={tooltipStyle}>{label}</span>, document.body) : null}
+  </>;
 }
 
 export interface SidebarProps {
+  loading?: boolean;
   sessions: Session[];
   allSessions: Session[];
   providers: Provider[];
@@ -70,6 +145,7 @@ export interface SidebarProps {
   stateFilter: SessionFilter;
   view: NavigationView;
   connected: boolean;
+  runtimeConnectionState: RuntimeConnectionPresentation;
   hostName: string;
   /** Shown in the runtime indicator's own info box rather than stamped on the rail. */
   appVersion?: string | undefined;
@@ -82,7 +158,13 @@ export interface SidebarProps {
   onOpenDirectory: (path: string) => void;
   onView: (view: NavigationView) => void;
   onNewTask: () => void;
+  onNewTaskInProject: (workingDirectory: string) => void;
+  onNewProject: () => void;
+  taskListMode: TaskListMode;
+  savedProjectDirectories?: readonly string[];
+  onTaskListMode: (value: TaskListMode) => void;
   onCommandSearch: () => void;
+  onMobileConnection: () => void;
   showSideChats: boolean;
   activeSideChatIds: readonly string[];
   onShowSideChats: (value: boolean) => void;
@@ -97,7 +179,9 @@ export interface SidebarProps {
 
 export interface SideChatAnchor { readonly x: number; readonly y: number }
 
-export function Sidebar({ sessions, allSessions, providers, selected, selectedProvider, query, stateFilter, view, connected, hostName, appVersion, onQuery, onFilter, onProvider, onOpen, onOpenChild, onBranch, onOpenDirectory, onView, onNewTask, onCommandSearch, showSideChats, activeSideChatIds, onShowSideChats, onCreateSideChat, onOpenSideChat, onSideChatAnchor, showArchived, archivedCount, onShowArchived, onTaskOverride }: SidebarProps) {
+const noSavedProjects: readonly string[] = [];
+
+export function Sidebar({ loading = false, sessions, allSessions, providers, selected, selectedProvider, query, stateFilter, view, connected, runtimeConnectionState, hostName, appVersion, onQuery, onFilter, onProvider, onOpen, onOpenChild, onBranch, onOpenDirectory, onView, onNewTask, onNewTaskInProject, onNewProject, taskListMode, savedProjectDirectories = noSavedProjects, onTaskListMode, onCommandSearch, onMobileConnection, showSideChats, activeSideChatIds, onShowSideChats, onCreateSideChat, onOpenSideChat, onSideChatAnchor, showArchived, archivedCount, onShowArchived, onTaskOverride }: SidebarProps) {
   const [searchOpen, setSearchOpen] = useState(false);
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [sessionMenu, setSessionMenu] = useState<{ sessionId: string; title: string; workingDirectory: string; x: number; y: number } | null>(null);
@@ -108,7 +192,15 @@ export function Sidebar({ sessions, allSessions, providers, selected, selectedPr
   const sessionMenuElement = useRef<HTMLDivElement>(null);
   const sessionList = useRef<HTMLDivElement>(null);
   const [expandedSideChatParents, setExpandedSideChatParents] = useState<ReadonlySet<string>>(() => new Set());
+  const [collapsedSideChatParents, setCollapsedSideChatParents] = useState<ReadonlySet<string>>(() => new Set());
   const [sideChatInfoParent, setSideChatInfoParent] = useState<string | null>(null);
+  const [collapsedProjects, setCollapsedProjects] = useState<ReadonlySet<string>>(() => new Set());
+  const [expandedProjects, setExpandedProjects] = useState<ReadonlySet<string>>(() => new Set());
+  const [projectDirectoryOrder, setProjectDirectoryOrder] = useState(savedProjectDirectories);
+  const [showAllProjects, setShowAllProjects] = useState(false);
+  useEffect(() => {
+    setProjectDirectoryOrder((current) => reconcileProjectDirectoryOrder(current, savedProjectDirectories));
+  }, [savedProjectDirectories]);
   const selectedProviderKeys = providerFilterKeys(selectedProvider);
   const activeFilterCount = selectedProviderKeys.length + Number(stateFilter !== "all");
   const searchExpanded = searchOpen || Boolean(query);
@@ -118,7 +210,7 @@ export function Sidebar({ sessions, allSessions, providers, selected, selectedPr
   ].filter(Boolean).join(", ");
   const menuSession = sessionMenu ? allSessions.find((session) => session.id === sessionMenu.sessionId) : undefined;
   const menuProvider = menuSession ? providerFor(providers, menuSession.providerId) : undefined;
-  const canBranchMenuSession = connected && menuSession?.draft !== true && menuSession?.state !== "offline" && menuProvider?.detected === true && menuProvider.state === "online" && menuProvider.capabilities.includes("Create Session") && menuProvider.capabilities.includes("Send Message") && menuProvider.capabilities.includes("Session History");
+  const canBranchMenuSession = connected && menuSession?.draft !== true && menuSession?.schedule === undefined && menuSession?.state !== "offline" && menuProvider?.detected === true && menuProvider.state === "online" && menuProvider.capabilities.includes("Create Session") && menuProvider.capabilities.includes("Send Message") && menuProvider.capabilities.includes("Session History");
   const providerOptions = useMemo(() => {
     const known = new Set(providers.map((provider) => provider.id));
     const unavailable = [...new Set(allSessions.map((session) => session.providerId).filter((providerId) => !known.has(providerId)))];
@@ -132,14 +224,26 @@ export function Sidebar({ sessions, allSessions, providers, selected, selectedPr
   const sideChatsByParent = useMemo(() => {
     const grouped = new Map<string, Session[]>();
     for (const sideChat of allSessions) {
-      if (sideChat.sessionKind !== "side_chat" || !sideChat.parentSessionId) continue;
-      const current = grouped.get(sideChat.parentSessionId) ?? [];
+      const parentSessionId = sideChatParentSessionId(sideChat);
+      if (!isSideChatSession(sideChat) || !parentSessionId) continue;
+      const current = grouped.get(parentSessionId) ?? [];
       current.push(sideChat);
-      grouped.set(sideChat.parentSessionId, current);
+      grouped.set(parentSessionId, current);
     }
     for (const items of grouped.values()) items.sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt));
     return grouped;
   }, [allSessions]);
+  const projectGroups = useMemo(() => groupSessionsByProject(sessions, projectDirectoryOrder), [projectDirectoryOrder, sessions]);
+  const filteringProjects = Boolean(query || activeFilterCount || showArchived);
+  const matchingProjectGroups = filteringProjects ? projectGroups.filter((group) => group.sessions.length > 0) : projectGroups;
+  const visibleProjectGroups = [...(showAllProjects || filteringProjects ? matchingProjectGroups : matchingProjectGroups.slice(0, initialProjectCount))];
+  const selectedProject = matchingProjectGroups.find((group) => group.sessions.some((session) => session.id === selected));
+  if (selectedProject && !visibleProjectGroups.includes(selectedProject)) visibleProjectGroups.push(selectedProject);
+  const duplicateProjectNames = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const group of projectGroups) counts.set(group.name.toLocaleLowerCase(), (counts.get(group.name.toLocaleLowerCase()) ?? 0) + 1);
+    return new Set([...counts.entries()].flatMap(([name, count]) => count > 1 ? [name] : []));
+  }, [projectGroups]);
 
   useEffect(() => {
     if (searchOpen) searchInput.current?.focus();
@@ -200,6 +304,16 @@ export function Sidebar({ sessions, allSessions, providers, selected, selectedPr
     };
   }, [sessionMenu]);
 
+  useLayoutEffect(() => {
+    if (!sessionMenu || !sessionMenuElement.current) return;
+    const bounds = sessionMenuElement.current.getBoundingClientRect();
+    const inset = 8;
+    const x = Math.max(inset, Math.min(sessionMenu.x, window.innerWidth - bounds.width - inset));
+    const y = Math.max(inset, Math.min(sessionMenu.y, window.innerHeight - bounds.height - inset));
+    if (x === sessionMenu.x && y === sessionMenu.y) return;
+    setSessionMenu((current) => current ? { ...current, x, y } : current);
+  }, [sessionMenu]);
+
   useEffect(() => {
     if (!activeSideChatIds.length) return;
     const list = sessionList.current;
@@ -212,8 +326,9 @@ export function Sidebar({ sessions, allSessions, providers, selected, selectedPr
         for (const sessionId of activeSideChatIds) {
           const sideChat = allSessions.find((session) => session.id === sessionId);
           const sideElement = list.querySelector<HTMLElement>(`[data-side-chat-id="${CSS.escape(sessionId)}"]`);
-          const parentElement = sideChat?.parentSessionId ? list.querySelector<HTMLElement>(`[data-session-id="${CSS.escape(sideChat.parentSessionId)}"]`) : null;
-          const bounds = (sideElement ?? parentElement)?.getBoundingClientRect();
+          const parentSessionId = sideChat ? sideChatParentSessionId(sideChat) : undefined;
+          const parentElement = parentSessionId ? list.querySelector<HTMLElement>(`[data-session-id="${CSS.escape(parentSessionId)}"]`) : null;
+          const bounds = (parentElement ?? sideElement)?.getBoundingClientRect();
           const rawY = bounds ? bounds.top + bounds.height / 2 : listBounds.top;
           onSideChatAnchor(sessionId, { x: listBounds.right, y: Math.max(listBounds.top + 4, Math.min(listBounds.bottom - 4, rawY)) });
         }
@@ -237,6 +352,39 @@ export function Sidebar({ sessions, allSessions, providers, selected, selectedPr
     setSearchOpen(true);
     window.requestAnimationFrame(() => searchInput.current?.focus());
   };
+  const renderSession = (session: Session, compact = false) => {
+    const allSideChats = sideChatsByParent.get(session.id) ?? [];
+    const expanded = expandedSideChatParents.has(session.id);
+    const collapsed = collapsedSideChatParents.has(session.id);
+    const hasSideChatRail = showSideChats && allSideChats.length > 0;
+    const visibleSideChats = hasSideChatRail ? (expanded ? allSideChats : allSideChats.slice(0, 2)) : [];
+    const sideChatRegionId = `session-side-chats-${session.id}`;
+    return <div className={`session-row-group ${!collapsed && visibleSideChats.length ? "has-side-chats" : ""} ${hasSideChatRail && collapsed ? "side-chats-collapsed" : ""}`} key={session.id}>
+      <SessionRow compact={compact} session={session} provider={providerFor(providers, session.providerId)} providers={providers} selected={session.id === selected} renaming={renamingSessionId === session.id} onOpenChild={onOpenChild} onRename={(title) => { setRenamingSessionId(null); onTaskOverride(session.id, { title }); }} onCancelRename={() => setRenamingSessionId(null)} onOpen={() => { setSessionMenu(null); onOpen(session.id); }} onContextMenu={(event) => {
+        event.preventDefault();
+        const bounds = event.currentTarget.getBoundingClientRect();
+        const x = event.clientX || bounds.left + 24;
+        const y = event.clientY || bounds.top + 24;
+        setSessionMenu({
+          sessionId: session.id,
+          title: session.title,
+          workingDirectory: session.workingDirectory,
+          x: Math.max(8, Math.min(x, window.innerWidth - 208)),
+          y: Math.max(8, Math.min(y, window.innerHeight - 96)),
+        });
+      }} />
+      {hasSideChatRail ? <div className={`session-side-chat-rail ${collapsed ? "collapsed" : "expanded"}`}>
+        <button type="button" className="session-side-chat-toggle" aria-label={`${collapsed ? "Show" : "Hide"} side chats for ${session.title}`} aria-expanded={!collapsed} aria-controls={sideChatRegionId} data-tooltip={collapsed ? "Show side chats" : "Hide side chats"} onClick={() => setCollapsedSideChatParents((current) => { const next = new Set(current); if (next.has(session.id)) next.delete(session.id); else next.add(session.id); return next; })}><ChevronDownIcon /></button>
+        <div id={sideChatRegionId} className="session-side-chats" hidden={collapsed}>{visibleSideChats.map((sideChat) => <button type="button" key={sideChat.id} data-side-chat-id={sideChat.id} className={activeSideChatIds.includes(sideChat.id) ? "active" : ""} onClick={(event) => { const parentElement = event.currentTarget.closest<HTMLElement>(".session-row-group")?.querySelector<HTMLElement>(`[data-session-id="${CSS.escape(session.id)}"]`); const bounds = (parentElement ?? event.currentTarget).getBoundingClientRect(); onOpenSideChat(sideChat.id, { x: bounds.right, y: bounds.top + bounds.height / 2 }); }}><OverflowReveal axis="horizontal" className="side-chat-preview">{sideChat.preview || sideChat.title}</OverflowReveal></button>)}</div>
+      </div> : null}
+      {showSideChats && !collapsed && (!compact || allSideChats.length > 2) ? <div className="side-chat-controls">
+        {!compact && allSideChats.length ? <button type="button" aria-label="About side chats" data-tooltip="About side chats" onClick={() => setSideChatInfoParent((current) => current === session.id ? null : session.id)}><InfoIcon/></button> : null}
+        {allSideChats.length > 2 ? <button type="button" aria-label={expanded ? "Show fewer side chats" : "Show all side chats"} data-tooltip={expanded ? "Show fewer" : `${allSideChats.length - 2} more`} onClick={() => setExpandedSideChatParents((current) => { const next = new Set(current); if (next.has(session.id)) next.delete(session.id); else next.add(session.id); return next; })}><ChevronDownIcon className={expanded ? "expanded" : ""}/></button> : null}
+        {!compact ? <button type="button" aria-label="New side chat" data-tooltip="New side chat" onClick={() => void onCreateSideChat(session.id)}><PlusIcon/></button> : null}
+        {!compact && sideChatInfoParent === session.id ? <p className="side-chat-info" role="status">Side chats for this task.</p> : null}
+      </div> : null}
+    </div>;
+  };
   return <aside className={`sidebar sidebar-view-${view}`}>
     <div className="new-task-row">
       <button className="new-task-button" onClick={onNewTask} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); onNewTask(); } }} aria-label="New task"><PlusIcon /><span>New task</span></button>
@@ -249,8 +397,11 @@ export function Sidebar({ sessions, allSessions, providers, selected, selectedPr
     </nav>
 
     <section className="sidebar-tasks" aria-label="Tasks">
-      <header className="sidebar-task-header">
+      <header className={`sidebar-task-header ${searchExpanded ? "search-expanded" : ""}`}>
         <h2>Tasks</h2>
+        <div className="task-list-mode">
+          <button type="button" aria-label={taskListMode === "project" ? "Arrange tasks by recency" : "Arrange tasks by project"} aria-pressed={taskListMode === "project"} data-tooltip={taskListMode === "project" ? "Recent" : "Projects"} onClick={() => onTaskListMode(taskListMode === "project" ? "recent" : "project")}>{taskListMode === "project" ? <ClockIcon /> : <FolderIcon />}</button>
+        </div>
         <div className="sidebar-task-tools" ref={searchRegion}>
           <div className="sidebar-task-search" data-expanded={searchExpanded} role="search">
             <button type="button" className="sidebar-task-search-trigger" aria-label="Search tasks" aria-expanded={searchExpanded} aria-controls="sidebar-task-search-input" data-tooltip={searchExpanded ? undefined : "Search tasks"} onClick={openTaskSearch}><SearchIcon /></button>
@@ -279,39 +430,35 @@ export function Sidebar({ sessions, allSessions, providers, selected, selectedPr
             <footer>{sessions.length} matching {sessions.length === 1 ? "task" : "tasks"}</footer>
           </div> : null}
         </div>
-        <button type="button" onClick={onNewTask} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); onNewTask(); } }} aria-label="New task" data-tooltip="New task"><PlusIcon /></button>
+        <button type="button" onClick={taskListMode === "project" ? onNewProject : onNewTask} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); if (taskListMode === "project") onNewProject(); else onNewTask(); } }} aria-label={taskListMode === "project" ? "New project" : "New task"} data-tooltip={taskListMode === "project" ? "Choose or create a project folder" : "New task"}>{taskListMode === "project" ? <FolderPlusIcon className="folder-plus-icon" /> : <PlusIcon />}</button>
       </header>
       <div className="session-list-scroll" ref={sessionList}>
-        {sessions.length ? sessions.map((session) => {
-          const allSideChats = sideChatsByParent.get(session.id) ?? [];
-          const expanded = expandedSideChatParents.has(session.id);
-          const visibleSideChats = showSideChats ? (expanded ? allSideChats : allSideChats.slice(0, 2)) : [];
-          return <div className={`session-row-group ${visibleSideChats.length ? "has-side-chats" : ""}`} key={session.id}>
-          <SessionRow session={session} provider={providerFor(providers, session.providerId)} providers={providers} selected={session.id === selected} renaming={renamingSessionId === session.id} onOpenChild={onOpenChild} onRename={(title) => { setRenamingSessionId(null); onTaskOverride(session.id, { title }); }} onCancelRename={() => setRenamingSessionId(null)} onOpen={() => { setSessionMenu(null); onOpen(session.id); }} onContextMenu={(event) => {
-          event.preventDefault();
-          const bounds = event.currentTarget.getBoundingClientRect();
-          const x = event.clientX || bounds.left + 24;
-          const y = event.clientY || bounds.top + 24;
-          setSessionMenu({
-            sessionId: session.id,
-            title: session.title,
-            workingDirectory: session.workingDirectory,
-            x: Math.max(8, Math.min(x, window.innerWidth - 208)),
-            y: Math.max(8, Math.min(y, window.innerHeight - 96)),
-          });
-        }} />
-          {visibleSideChats.length ? <div className="session-side-chats">{visibleSideChats.map((sideChat) => <button type="button" key={sideChat.id} data-side-chat-id={sideChat.id} className={activeSideChatIds.includes(sideChat.id) ? "active" : ""} onClick={(event) => { const bounds = event.currentTarget.getBoundingClientRect(); onOpenSideChat(sideChat.id, { x: bounds.right, y: bounds.top + bounds.height / 2 }); }}><OverflowReveal axis="horizontal" className="side-chat-preview">{sideChat.preview || sideChat.title}</OverflowReveal></button>)}</div> : null}
-          {showSideChats ? <div className="side-chat-controls">
-            {allSideChats.length ? <button type="button" aria-label="About side chats" data-tooltip="About side chats" onClick={() => setSideChatInfoParent((current) => current === session.id ? null : session.id)}><InfoIcon/></button> : null}
-            {allSideChats.length > 2 ? <button type="button" aria-label={expanded ? "Show fewer side chats" : "Show all side chats"} data-tooltip={expanded ? "Show fewer" : `${allSideChats.length - 2} more`} onClick={() => setExpandedSideChatParents((current) => { const next = new Set(current); if (next.has(session.id)) next.delete(session.id); else next.add(session.id); return next; })}><ChevronDownIcon className={expanded ? "expanded" : ""}/></button> : null}
-            <button type="button" aria-label="New side chat" data-tooltip="New side chat" onClick={() => void onCreateSideChat(session.id)}><PlusIcon/></button>
-            {sideChatInfoParent === session.id ? <p className="side-chat-info" role="status">Side chats for this task.</p> : null}
-          </div> : null}
-        </div>;
-        }) : <EmptyState icon={<SearchIcon />} title="No matching tasks" description="Try another search or filter." />}
+        {loading ? <div className="session-list-skeleton" role="status" aria-label="Loading tasks" aria-busy="true">{[0, 1, 2, 3, 4].map((index) => <div className="session-row-skeleton" key={index} aria-hidden="true"><i/><span><b/><b/><b/></span></div>)}</div>
+          : taskListMode === "project" ? <>{visibleProjectGroups.map((group) => {
+          const collapsed = collapsedProjects.has(group.key);
+          const expanded = expandedProjects.has(group.key);
+          const duplicateName = duplicateProjectNames.has(group.name.toLocaleLowerCase());
+          const visibleSessions = visibleProjectSessions(group.sessions, selected, expanded);
+          const hiddenSessionCount = group.sessions.length - visibleSessions.length;
+          return <section className="session-project-group" key={group.key} data-project-key={group.key}>
+            <div className="session-project-heading">
+              <button type="button" className="session-project-header" aria-expanded={!collapsed} title={group.directory} onClick={() => setCollapsedProjects((current) => { const next = new Set(current); if (next.has(group.key)) next.delete(group.key); else next.add(group.key); return next; })}>
+                <FolderIcon /><span><strong>{group.name}</strong>{duplicateName && group.directory ? <small>{group.directory}</small> : null}</span><ChevronDownIcon className={collapsed ? "" : "expanded"}/>
+              </button>
+              {group.directory ? <ProjectNewTaskButton directory={group.directory} name={group.name} onNewTask={onNewTaskInProject}/> : null}
+            </div>
+            {!collapsed ? <div className="session-project-items">
+              {visibleSessions.map((session) => renderSession(session, true))}
+              {hiddenSessionCount > 0 ? <button type="button" className="session-project-show-more" aria-label={`Show ${hiddenSessionCount} more tasks in ${group.name}`} onClick={() => setExpandedProjects((current) => new Set(current).add(group.key))}>Show more</button> : null}
+            </div> : null}
+          </section>;
+        })}
+        {!filteringProjects && projectGroups.length > initialProjectCount ? <button type="button" className="session-projects-disclosure" aria-expanded={showAllProjects} onClick={() => setShowAllProjects((current) => !current)}>{showAllProjects ? "Show fewer projects" : "Show all projects"}</button> : null}
+        {!visibleProjectGroups.length ? projectGroups.length ? <EmptyState icon={<SearchIcon />} title="No matching tasks" description="Try another search or filter." /> : <EmptyState icon={<FolderIcon />} title="Add a project" description="Choose a folder to collect its tasks from every harness." /> : null}
+        </> : sessions.length ? sessions.map((session) => renderSession(session)) : <EmptyState icon={<SearchIcon />} title="No matching tasks" description="Try another search or filter." />}
       </div>
       {sessionMenu ? <div ref={sessionMenuElement} className="session-context-menu" role="menu" aria-label={`Task actions for ${sessionMenu.title}`} style={{ left: sessionMenu.x, top: sessionMenu.y }}>
-        <button type="button" role="menuitem" disabled={!menuSession || menuSession.draft === true} onClick={() => {
+        {menuSession?.schedule === undefined ? <><button type="button" role="menuitem" disabled={!menuSession || menuSession.draft === true} onClick={() => {
           const sessionId = sessionMenu.sessionId;
           setSessionMenu(null);
           setRenamingSessionId(sessionId);
@@ -326,28 +473,31 @@ export function Sidebar({ sessions, allSessions, providers, selected, selectedPr
           const sessionId = sessionMenu.sessionId;
           setSessionMenu(null);
           onBranch(sessionId);
-        }}><BranchIcon /><span>Branch in New Task</span></button>
+        }}><BranchIcon /><span>Branch in New Task</span></button></> : null}
         <button type="button" role="menuitem" disabled={!sessionMenu.workingDirectory} onClick={() => {
           const path = sessionMenu.workingDirectory;
           setSessionMenu(null);
           if (path) onOpenDirectory(path);
         }}><FolderIcon /><span>Open in File Explorer</span></button>
-        <button type="button" role="menuitem" disabled={!menuSession} onClick={() => {
+        {menuSession?.schedule === undefined ? <button type="button" role="menuitem" disabled={!menuSession} onClick={() => {
           const sessionId = sessionMenu.sessionId;
           const archived = menuSession?.archived === true;
           setSessionMenu(null);
           onTaskOverride(sessionId, { archived: !archived, ...(archived ? {} : { pinned: false }) });
-        }}><ArchiveIcon /><span>{menuSession?.archived ? "Restore" : "Archive"}</span></button>
+        }}><ArchiveIcon /><span>{menuSession?.archived ? "Restore" : "Archive"}</span></button> : null}
       </div> : null}
     </section>
 
     <div className="sidebar-footer">
-      <button className="sidebar-settings" type="button" aria-label={view === "settings" ? "Close settings" : "Open settings"} onClick={() => onView("settings")}><SettingsIcon /><span>Settings</span></button>
+      <div className="sidebar-footer-actions">
+        <button className="sidebar-mobile-connection" type="button" aria-label="Connect your phone" data-tooltip="Connect your phone" onClick={onMobileConnection}><BridgeIcon /></button>
+        <button className="sidebar-settings" type="button" aria-label={view === "settings" ? "Close settings" : "Open settings"} onClick={() => onView("settings")}><SettingsIcon /><span>Settings</span></button>
+      </div>
       {/* The version belongs with the thing it describes. Stamped on the rail it was
           a number floating in the corner of every screen for the one moment a year
           anybody needs it; here it is a line in the box that already answers "what is
           this dot telling me". */}
-      <span className={`sidebar-runtime-indicator ${connected ? "connected" : "offline"}`} role="status" aria-label={`${hostName}. Runtime ${connected ? "online" : "offline"}${appVersion ? `. Tethoq version ${appVersion}` : ""}`} data-tooltip={`${hostName} · Runtime ${connected ? "online" : "offline"}${appVersion ? ` · Tethoq v${appVersion}` : ""}`} />
+      <span className={`sidebar-runtime-indicator ${runtimeConnectionState === "online" ? "connected" : runtimeConnectionState}`} role="status" aria-label={`${hostName}. Runtime ${runtimeConnectionState}${appVersion ? `. Tethoq version ${appVersion}` : ""}`} data-tooltip={`${hostName} · Runtime ${runtimeConnectionState}${appVersion ? ` · Tethoq v${appVersion}` : ""}`} />
     </div>
   </aside>;
 }
@@ -394,46 +544,25 @@ function sidebarChildStateLabel(state: Session["state"]): string {
   return state === "completed" ? "Completed" : "Idle";
 }
 
-function SessionSubagentControl({ session, providers, onOpenChild }: { session: Session; providers: readonly Provider[]; onOpenChild: (session: Session) => void }) {
+function SessionSubagentControl({ compact = false, session, providers, onOpenChild }: { compact?: boolean; session: Session; providers: readonly Provider[]; onOpenChild: (session: Session) => void }) {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [children, setChildren] = useState<readonly Session[]>([]);
   const [childrenLoaded, setChildrenLoaded] = useState(false);
   const [popoverStyle, setPopoverStyle] = useState<CSSProperties>({});
-  const [tooltipActive, setTooltipActive] = useState(false);
-  const [tooltipStyle, setTooltipStyle] = useState<CSSProperties>({});
   const root = useRef<HTMLDivElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
+  const popover = useRef<HTMLElement>(null);
   const popoverId = `session-subagents-${session.id}`;
   const close = () => {
     setOpen(false);
     requestAnimationFrame(() => trigger.current?.focus());
   };
   const closeFromOutside = () => setOpen(false);
-  const providerId = session.childProviderIds?.[0] ?? "opencode";
-  const provider = providers.find((candidate) => candidate.id === providerId);
-  const displayedChildCount = childrenLoaded ? children.length : session.childCount;
+  const displayedChildCount = childrenLoaded ? children.length : (session.childCount ?? 0);
   const countLabel = `${displayedChildCount} sub-agent${displayedChildCount === 1 ? "" : "s"}`;
-  const positionTooltip = () => {
-    const bounds = trigger.current?.getBoundingClientRect();
-    if (!bounds) return;
-    const right = Math.max(8, window.innerWidth - bounds.right);
-    if (bounds.bottom + 40 <= window.innerHeight - 8) {
-      setTooltipStyle({ right, top: bounds.bottom + 8 });
-    } else {
-      setTooltipStyle({ right, bottom: window.innerHeight - bounds.top + 8 });
-    }
-  };
-  useEffect(() => {
-    if (!tooltipActive) return;
-    positionTooltip();
-    window.addEventListener("resize", positionTooltip);
-    document.addEventListener("scroll", positionTooltip, true);
-    return () => {
-      window.removeEventListener("resize", positionTooltip);
-      document.removeEventListener("scroll", positionTooltip, true);
-    };
-  }, [tooltipActive]);
+  const compactCountCapped = compact && displayedChildCount >= 1_000;
+  const visibleChildCount = compactCountCapped ? "1k+" : displayedChildCount;
   useEffect(() => {
     if (!open) return;
     const position = () => {
@@ -441,11 +570,12 @@ function SessionSubagentControl({ session, providers, onOpenChild }: { session: 
       if (!bounds) return;
       const gap = 6;
       const viewportInset = 8;
-      const popoverWidth = 270;
+      const popoverWidth = 300;
+      const popoverMaximumHeight = 318;
       const availableAbove = Math.max(0, bounds.top - viewportInset - gap);
       const availableBelow = Math.max(0, window.innerHeight - bounds.bottom - viewportInset - gap);
-      const openAbove = availableAbove >= Math.min(260, availableBelow);
-      const maxHeight = Math.max(80, Math.min(260, openAbove ? availableAbove : availableBelow));
+      const openAbove = availableAbove >= Math.min(popoverMaximumHeight, availableBelow);
+      const maxHeight = Math.max(80, Math.min(popoverMaximumHeight, openAbove ? availableAbove : availableBelow));
       setPopoverStyle({
         left: Math.max(viewportInset, Math.min(window.innerWidth - popoverWidth - viewportInset, bounds.right + gap)),
         maxHeight,
@@ -454,7 +584,10 @@ function SessionSubagentControl({ session, providers, onOpenChild }: { session: 
           : { top: bounds.bottom + gap, bottom: "auto" }),
       });
     };
-    const closeOutside = (event: PointerEvent) => { if (!root.current?.contains(event.target as Node)) closeFromOutside(); };
+    const closeOutside = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (!root.current?.contains(target) && !popover.current?.contains(target)) closeFromOutside();
+    };
     const closeEscape = (event: KeyboardEvent) => { if (event.key === "Escape") close(); };
     position();
     document.addEventListener("pointerdown", closeOutside);
@@ -499,43 +632,61 @@ function SessionSubagentControl({ session, providers, onOpenChild }: { session: 
     };
   }, [open, session.id]);
   if (!displayedChildCount) return null;
-  return <div className={`session-subagents ${open ? "open" : ""}`} ref={root}>
-    <button ref={trigger} type="button" className="session-subagents-trigger" aria-label={countLabel} aria-haspopup="dialog" aria-expanded={open} aria-controls={popoverId} aria-describedby={tooltipActive && !open ? `session-subagents-tooltip-${session.id}` : undefined} onPointerEnter={() => { positionTooltip(); setTooltipActive(true); }} onPointerLeave={() => setTooltipActive(false)} onFocus={() => { positionTooltip(); setTooltipActive(true); }} onBlur={() => setTooltipActive(false)} onClick={(event) => { event.stopPropagation(); if (open) close(); else setOpen(true); }}>
-      <ProviderLogo providerId={providerId} {...(provider ? { provider } : {})} size={18} tooltip={false}/><span>{displayedChildCount}</span><ChevronDownIcon />
+  return <div className={`session-subagents ${compact ? "compact" : ""} ${open ? "open" : ""}`} ref={root}>
+    <button ref={trigger} type="button" className="session-subagents-trigger" aria-label={countLabel} aria-haspopup="dialog" aria-expanded={open} aria-controls={popoverId} data-tooltip={open ? undefined : countLabel} onClick={(event) => { event.stopPropagation(); if (open) close(); else setOpen(true); }}>
+      <span className="session-subagents-summary"><SubagentsIcon className="session-subagents-icon"/><span className="session-subagents-count" data-count-capped={compactCountCapped || undefined}>{visibleChildCount}</span></span>
+      {!compact ? <ChevronDownIcon className="session-subagents-chevron" /> : null}
     </button>
-    {tooltipActive && !open ? createPortal(<span id={`session-subagents-tooltip-${session.id}`} className="session-subagents-tooltip visible" role="tooltip" style={tooltipStyle}>{countLabel}</span>, document.body) : null}
-    {open ? <section id={popoverId} className="session-subagents-popover" style={popoverStyle} role="dialog" aria-modal="false" aria-label={`Sub-agents for ${session.title}`}>
+    {open ? createPortal(<section ref={popover} id={popoverId} className="session-subagents-popover" style={popoverStyle} role="dialog" aria-modal="false" aria-label={`Sub-agents for ${session.title}`}>
       {loading ? <p><span className="spinner" /> Loading sub-agents…</p> : children.map((child) => {
         const childProvider = providers.find((candidate) => candidate.id === child.providerId);
-        return <button type="button" key={child.id} onClick={() => { close(); onOpenChild(child); }}>
-          <ProviderLogo providerId={child.providerId} {...(childProvider ? { provider: childProvider } : {})} size={20}/>
-          <span><strong>{child.agentNickname || child.title}</strong><small>{child.model} · {sidebarChildStateLabel(child.state)}</small></span>
-          {child.state === "working" ? <span className="spinner" aria-hidden="true" /> : null}<ChevronRightIcon />
+        const reasoning = reasoningDisplayLabel(child.effort, { providerId: child.providerId, modelId: child.model, displayName: child.model });
+        return <button type="button" key={child.id} data-session-id={child.id} onClick={() => { close(); onOpenChild(child); }}>
+          <ProviderLogo providerId={child.providerId} {...(childProvider ? { provider: childProvider } : {})} size={28}/>
+          <span><strong>{child.agentNickname || child.title}</strong><small className="session-subagent-metadata" aria-label={reasoning ? `${child.model}, reasoning ${reasoning}` : child.model}><span className="session-subagent-model">{child.model}</span>{reasoning ? <><span className="session-subagent-separator" aria-hidden="true">·</span><span className="session-subagent-reasoning">{reasoning}</span></> : null}</small></span>
+          <span className="session-subagent-state">{child.state === "working" ? <span className="spinner" aria-hidden="true" /> : null}<span>{sidebarChildStateLabel(child.state)}</span></span><ChevronRightIcon />
         </button>;
       })}{!loading && children.length === 0 ? <p>No sub-agents available.</p> : null}
-    </section> : null}
+    </section>, document.body) : null}
   </div>;
 }
 
-function SessionRow({ session, provider, providers, selected, renaming, onRename, onCancelRename, onOpen, onOpenChild, onContextMenu }: { session: Session; provider?: Provider | undefined; providers: readonly Provider[]; selected: boolean; renaming: boolean; onRename: (title: string) => void; onCancelRename: () => void; onOpen: () => void; onOpenChild: (session: Session) => void; onContextMenu: (event: ReactMouseEvent<HTMLElement>) => void }) {
+function SessionRow({ compact = false, session, provider, providers, selected, renaming, onRename, onCancelRename, onOpen, onOpenChild, onContextMenu }: { compact?: boolean; session: Session; provider?: Provider | undefined; providers: readonly Provider[]; selected: boolean; renaming: boolean; onRename: (title: string) => void; onCancelRename: () => void; onOpen: () => void; onOpenChild: (session: Session) => void; onContextMenu: (event: ReactMouseEvent<HTMLElement>) => void }) {
   const location = session.workingDirectory || session.project;
-  const content = <>
+  const projectLabel = projectDirectoryName(location, session.project);
+  const scheduledLabel = session.schedule
+    ? session.schedule.status === "failed"
+      ? "Scheduled task failed"
+      : session.schedule.status === "dispatching"
+        ? "Starting scheduled task"
+        : `Scheduled ${new Date(session.schedule.runAt).toLocaleString()}`
+    : undefined;
+  const scheduledIndicator = session.schedule
+    ? <span className={compact ? "session-project-schedule-indicator" : "session-row-schedule-indicator"} data-status={session.schedule.status} aria-label={scheduledLabel} data-tooltip={scheduledLabel}>{session.schedule.status === "failed" ? <AlertIcon /> : <ClockIcon />}</span>
+    : null;
+  const content = compact ? <>
+    <span className="session-project-harness">{session.draft ? <span className="session-draft-harness" aria-label="Unsent task" data-tooltip="Harness is set when the task starts"><ChatIcon /></span> : <ProviderLogo providerId={session.providerId} provider={provider} size={24}/>}</span>
+    {renaming
+      ? <TaskNameField value={session.title} onCommit={onRename} onCancel={onCancelRename} />
+      : <OverflowReveal axis="horizontal" className="session-project-row-title"><strong>{session.title}</strong></OverflowReveal>}
+    {session.state === "working" ? <span className="session-project-working-indicator" aria-label="Working" data-tooltip="Working"><i className="spinner session-project-working-spinner" aria-hidden="true" /></span> : scheduledIndicator}
+  </> : <>
     <div className="session-row-top">
-      <ProviderLogo providerId={session.providerId} provider={provider} size={36}/>
+      {session.draft ? <span className="provider-logo session-draft-harness" aria-label="Unsent task" data-tooltip="Harness is set when the task starts"><ChatIcon /></span> : <ProviderLogo providerId={session.providerId} provider={provider} size={36}/>}
       {renaming
         ? <TaskNameField value={session.title} onCommit={onRename} onCancel={onCancelRename} />
         : <OverflowReveal axis="horizontal" className="session-row-title"><strong>{session.title}</strong></OverflowReveal>}
-      <span className="session-row-trailing">{session.pinned ? <PinIcon className="session-row-pin" /> : null}<time>{relativeTime(session.updatedAt)}</time></span>
-      {session.state === "working" ? <i className="session-row-working-spinner" aria-label="Working" data-tooltip="Working" /> : null}
+      <span className="session-row-trailing">{session.state === "working" ? null : scheduledIndicator ?? (session.pinned ? <PinIcon className="session-row-pin" /> : null)}<time>{relativeTime(session.updatedAt)}</time></span>
+      {session.state === "working" ? <span className="session-row-working-indicator" aria-label="Working" data-tooltip="Working"><i className="spinner session-row-working-spinner" aria-hidden="true" /></span> : null}
     </div>
-    <OverflowReveal axis="vertical" className="session-row-preview">{session.preview}</OverflowReveal>
-    <div className="session-row-meta"><span className="session-location" title={location} aria-label={`${session.project}. Working directory: ${location}`}><FolderIcon />{session.project}</span>{session.pinned ? <span>Pinned</span> : null}{session.archived ? <span>Archived</span> : null}{session.unread ? <b className="unread-count">{session.unread}</b> : null}</div>
+    <OverflowReveal axis="vertical" className={`session-row-preview ${session.previewKind === "realtime_voice" ? "session-row-preview-realtime" : ""}`} prefix={session.previewKind === "realtime_voice" ? <MicrophoneIcon /> : undefined}>{session.preview}</OverflowReveal>
+    <div className="session-row-meta"><span className="session-location" title={location} aria-label={`${projectLabel}. Working directory: ${location}`}><FolderIcon />{projectLabel}</span>{session.pinned ? <span>Pinned</span> : null}{session.archived ? <span>Archived</span> : null}{session.unread ? <b className="unread-count">{session.unread}</b> : null}</div>
   </>;
-  const className = `session-row ${selected ? "selected" : ""} ${session.archived ? "archived" : ""} ${renaming ? "renaming" : ""}`;
+  const className = `session-row ${compact ? "compact" : ""} ${selected ? "selected" : ""} ${session.archived ? "archived" : ""} ${renaming ? "renaming" : ""}`;
   return <div className="session-row-shell" data-session-id={session.id} onContextMenu={onContextMenu}>
     {renaming
       ? <div className={className}>{content}</div>
       : <button type="button" className={className} aria-current={selected ? "page" : undefined} onClick={onOpen}>{content}</button>}
-    <SessionSubagentControl session={session} providers={providers} onOpenChild={onOpenChild}/>
+    <SessionSubagentControl compact={compact} session={session} providers={providers} onOpenChild={onOpenChild}/>
   </div>;
 }

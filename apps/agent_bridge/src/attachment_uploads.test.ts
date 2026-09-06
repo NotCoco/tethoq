@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   AttachmentUploadManager,
   maxAttachmentChunkBytes,
+  maxMessageAttachments,
   maxPendingAttachmentUploads,
 } from "./attachment_uploads.js";
 
@@ -100,4 +101,26 @@ test("a message cannot trigger an excessive attachment concatenation", () => {
     ids.push(manager.complete(started.uploadId).attachmentId);
   }
   assert.throws(() => manager.consume(ids), /50 MiB/);
+});
+
+test("a regular message accepts a screenshot set while retaining a finite count cap", () => {
+  const manager = new AttachmentUploadManager();
+  const ids: string[] = [];
+  for (let index = 0; index <= maxMessageAttachments; index += 1) {
+    const started = manager.begin({
+      name: `screenshot-${index + 1}.png`,
+      mimeType: "image/png",
+      byteLength: 1,
+    });
+    manager.append(started.uploadId, 0, Buffer.from([index]).toString("base64"));
+    ids.push(manager.complete(started.uploadId).attachmentId);
+  }
+
+  const accepted = manager.consume(ids.slice(0, 6));
+  assert.equal(accepted.attachments.length, 6);
+  accepted.release();
+  assert.throws(
+    () => manager.consume(ids),
+    new RegExp(`attach up to ${maxMessageAttachments} files`, "i"),
+  );
 });

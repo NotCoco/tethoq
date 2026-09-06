@@ -12,11 +12,12 @@
   "copyright": "Copyright (c) 2026 Tethoq",
   "main": "out/main/index.js",
   "scripts": {
+    "postinstall": "node node_modules/electron/install.js",
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "node --test test/*.test.mjs",
+    "test": "node --test --test-concurrency=1 test/*.test.mjs",
     "verify": "npm run typecheck && npm test && npm run build",
     "qa:visual": "npm run build && electron scripts/visual-qa.cjs",
     "qa:fake-model": "npm run build && electron scripts/fake-model-qa.cjs",

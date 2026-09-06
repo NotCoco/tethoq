@@ -1,7 +1,7 @@
-﻿import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+﻿import { randomUUID } from "node:crypto";
 import {
   makeGlobalSessionId,
+  sessionGoalObjectiveMaxLength,
   type ContentPart,
   type JsonObject,
   type JsonValue,
@@ -10,15 +10,16 @@ import {
   type RemoteModel,
   type RemoteSession,
   type SessionContextState,
+  type SessionGoalStatus,
   type SessionState,
 } from "../../protocol/src/index.js";
 import {
-  buildSpawnCommand,
   JsonLineProcessTransport,
   JsonRpcPeer,
+  JsonRpcRemoteError,
   ProviderAdapterError,
   ProviderEventHub,
-  resolveCommand,
+  providerPromptContent,
   type AgentProviderAdapter,
   type AuthRequest,
   type AuthResult,
@@ -35,6 +36,9 @@ import {
   type ProviderEvent,
   type ProviderEventSink,
   type ProviderQueuedMessage,
+  type RecentProviderMessages,
+  type ProviderSessionGoal,
+  type ProviderSessionGoalUpdate,
   type ProviderUserInputResponse,
   type RestoreProviderMessageRequest,
   type RpcId,
@@ -50,11 +54,13 @@ import {
   type CodexObservedMessage,
   type CodexTurnMetadata,
 } from "./activity.js";
+import { CodexCommandResolver, probeCodexVersion } from "./codex_command.js";
 import { externalSessionLaunchesFromCommand } from "./external_launches.js";
 import { codexTurnInput } from "./codex_input.js";
 import { CodexDesktopQueue } from "./desktop_queue.js";
-import { isRecord, jsonObject, messagesFromCodexThread, normalizeCodexStatus, normalizeCodexThread } from "./normalize.js";
-import type { AccountReadResponse, ModelListResponse, ThreadForkResponse, ThreadListResponse, ThreadResponse, TurnResponse } from "./wire.js";
+import { codexVisionIsolationConfig, prepareCodexVisionCatalog, type CodexVisionCatalog } from "./vision_isolation.js";
+import { isRecord, jsonObject, messagesFromCodexThread, normalizeCodexStatus, normalizeCodexThread, normalizeCodexThreadName, visibleCodexAssistantDelta, visibleCodexAssistantText } from "./normalize.js";
+import type { AccountReadResponse, ModelListResponse, ThreadForkResponse, ThreadGoalClearResponse, ThreadGoalResponse, ThreadListResponse, ThreadResponse, TurnResponse } from "./wire.js";
 
 interface PendingServerRequest {
   readonly method: string;
@@ -64,20 +70,50 @@ interface PendingServerRequest {
   readonly reject: (error: unknown) => void;
 }
 
+interface PendingCompaction {
+  readonly promise: Promise<void>;
+  readonly resolve: () => void;
+  readonly reject: (error: unknown) => void;
+  readonly previousTurnId: string | undefined;
+  turnId?: string;
+  itemId?: string;
+  itemCompleted?: boolean;
+}
+
+class CodexPreTurnStartError extends Error {
+  public override readonly cause: unknown;
+
+  public constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = "CodexPreTurnStartError";
+    this.cause = cause;
+  }
+}
+
 export interface CodexAdapterOptions {
+  /** Internal EYES runtime; never enabled on the user's ordinary adapter. */
+  readonly isolatedVisionRuntime?: boolean;
   readonly hostId: string;
   readonly command?: string;
   readonly commandArgs?: readonly string[];
   readonly cwd?: string;
-  readonly transportFactory?: () => JsonRpcTransport;
+  readonly environment?: NodeJS.ProcessEnv;
+  readonly transportFactory?: (args?: readonly string[]) => JsonRpcTransport;
   readonly requestTimeoutMs?: number;
+  readonly compactionTimeoutMs?: number;
   /** Grace period before a bridge-approved idle transport is closed. */
   readonly idleReleaseMs?: number;
   readonly now?: () => Date;
   /** Explicit opt-in to reading Codex-owned rollout and lock files. */
-  readonly localActivity?: false | Omit<CodexActivityReconcilerOptions, "onStateChanged" | "onMessage" | "onTurnMetadataChanged" | "onContextChanged">;
+  readonly localActivity?: false | Omit<CodexActivityReconcilerOptions, "onStateChanged" | "onMessage" | "onTurnMetadataChanged" | "onContextChanged" | "onActiveThreadDiscovered">;
   /** Explicit opt-in to Codex Desktop's private queue state and IPC surface. */
-  readonly desktopQueue?: false | { readonly statePath?: string; readonly pipePath?: string };
+  readonly desktopQueue?: false | {
+    readonly statePath?: string;
+    readonly pipePath?: string;
+    readonly ownerRecoveryWindowMs?: number;
+    readonly ownerRetryDelayMs?: number;
+    readonly requestTimeoutMs?: number;
+  };
 }
 
 const defaultIdleReleaseMs = 3_000;
@@ -110,38 +146,186 @@ const capabilities: ProviderCapabilities = {
 };
 
 function codexHistoryIdentity(message: RemoteMessage): string {
-  return `${message.role}:${message.providerMessageId}:${message.parts.map((part) => part.type).join(",")}`;
+  // One Codex item can reach us with a richer or differently ordered part list
+  // from the rollout than from App Server history. The provider item id is the
+  // identity; part shape is mergeable detail, not a second visible message.
+  return `${message.role}:${message.providerMessageId}`;
 }
 
-function messageTextSize(message: RemoteMessage): number {
-  return message.parts.reduce((total, part) => total + ((part.type === "text" || part.type === "reasoning") ? part.text.length : 0), 0);
+function messageDetailSize(message: RemoteMessage): number {
+  return message.parts.reduce((total, part) => {
+    if (part.type === "text" || part.type === "reasoning") return total + part.text.length;
+    if (part.type === "image") return total + (part.uri?.length ?? 0) + (part.retrievalId?.length ?? 0) + (part.name?.length ?? 0);
+    if (part.type === "audio") return total + part.uri.length + part.name.length;
+    if (part.type === "file") return total + part.name.length;
+    if (part.type === "workflow") return total + part.workflow.name.length;
+    return total;
+  }, 0);
 }
 
-/** Authoritative thread history owns chronology; rollout observations add fresher live detail. */
+function remoteMessageText(message: RemoteMessage): string {
+  return message.parts.flatMap((part) => part.type === "text" ? [part.text] : []).join("").trim();
+}
+
+function safeObservedAttachmentName(value: string | undefined): string {
+  const raw = value?.trim();
+  if (!raw || /^(?:data|file|https?):/iu.test(raw)) return "Attached image";
+  const name = raw.replaceAll("\\", "/").split("/").at(-1)?.trim();
+  if (!name || name === "." || name === ".." || /[\u0000-\u001f]|;base64,/iu.test(name)) return "Attached image";
+  return name.slice(0, 255);
+}
+
+function observedImageAttachments(parts: readonly ContentPart[]): JsonObject[] {
+  return parts.flatMap((part) => {
+    if (part.type !== "image") return [];
+    const mimeType = part.mimeType?.trim();
+    return [{
+      name: safeObservedAttachmentName(part.name),
+      ...(mimeType !== undefined && /^image\/[a-z0-9][a-z0-9.+-]*$/iu.test(mimeType) ? { mimeType } : {}),
+    }];
+  });
+}
+
+function isScheduledMessageRequest(request: SendMessageRequest): boolean {
+  const scheduledTaskId = request.metadata?.tethoqScheduledTaskId;
+  return typeof scheduledTaskId === "string" && scheduledTaskId.trim().length > 0;
+}
+
+function normalizedScheduledPrompt(value: string): string {
+  return value.replace(/\r\n?/gu, "\n").trim();
+}
+
+function codexUserMessageText(item: Record<string, unknown>): string | null {
+  const values = Array.isArray(item.content) ? item.content : [item.content ?? item.text];
+  const text = values.flatMap((value) => {
+    if (typeof value === "string") return [value];
+    if (!isRecord(value) || (value.type !== "text" && value.type !== "input_text")) return [];
+    return typeof value.text === "string" ? [value.text] : [];
+  });
+  return text.length > 0 ? text.join("\n") : null;
+}
+
+function persistedCodexUserTurn(
+  thread: ThreadResponse["thread"],
+  requestId: string,
+  expectedPrompt: string,
+): { readonly turnId?: string } | null {
+  for (const turn of thread.turns ?? []) {
+    if (!isRecord(turn) || !Array.isArray(turn.items)) continue;
+    const accepted = turn.items.some((item) => {
+      if (!isRecord(item) || item.type !== "userMessage" || item.id !== requestId) return false;
+      const text = codexUserMessageText(item);
+      return text !== null && normalizedScheduledPrompt(text) === expectedPrompt;
+    });
+    if (!accepted) continue;
+    return typeof turn.id === "string" && turn.id.length > 0 ? { turnId: turn.id } : {};
+  }
+  return null;
+}
+
+function mergeCodexMessageMetadata(current: RemoteMessage, observed: RemoteMessage): RemoteMessage["nativeMetadata"] {
+  const currentPhase = current.nativeMetadata.phase;
+  const observedPhase = observed.nativeMetadata.phase;
+  const phase = currentPhase === "final_answer" || observedPhase === "final_answer"
+    ? "final_answer"
+    : observedPhase === "commentary" || currentPhase === "commentary"
+      ? "commentary"
+      : undefined;
+  return {
+    ...current.nativeMetadata,
+    ...observed.nativeMetadata,
+    ...(phase !== undefined ? { phase } : {}),
+  };
+}
+
+function canonicalTimestampIsAuthoritative(message: RemoteMessage): boolean {
+  const source = message.nativeMetadata.tethoqCodexTimestampSource;
+  // Messages constructed by other adapters/tests predate the source marker;
+  // their explicit timestamps remain trustworthy. Codex turn/thread fallbacks
+  // are placeholders and must never participate in chronological ordering.
+  return source === undefined || source === "item";
+}
+
+function mergeMatchingCodexMessages(current: RemoteMessage, observed: RemoteMessage): RemoteMessage {
+  const preferred = observed.status === "streaming" || messageDetailSize(observed) > messageDetailSize(current)
+    ? observed
+    : current;
+  return {
+    ...preferred,
+    // The rollout is append-only and owns the real per-record time. Preserve
+    // richer canonical structure without preserving its invented task time.
+    createdAt: observed.createdAt,
+    ...(observed.completedAt !== undefined ? { completedAt: observed.completedAt } : {}),
+    nativeMetadata: mergeCodexMessageMetadata(current, observed),
+  };
+}
+
+/** Rollout history owns chronology; App Server history adds richer structured detail. */
 export function mergeCodexMessageHistory(
   canonical: readonly RemoteMessage[],
   observed: readonly RemoteMessage[],
 ): readonly RemoteMessage[] {
-  const merged = [...canonical];
-  const indexes = new Map(merged.map((message, index) => [codexHistoryIdentity(message), index]));
+  if (observed.length === 0) return [...canonical];
+
+  const canonicalByIdentity = new Map(canonical.map((message) => [codexHistoryIdentity(message), message]));
+  const matchedCanonical = new Set<string>();
+  const mergedIndexes = new Map<string, number>();
+  const merged: RemoteMessage[] = [];
   for (const message of observed) {
+    if (message.nativeMetadata.terminalFallback === true && canonical.some((candidate) =>
+      candidate.role === "assistant" && remoteMessageText(candidate) === remoteMessageText(message))) continue;
     const key = codexHistoryIdentity(message);
-    const index = indexes.get(key);
-    if (index === undefined) {
-      indexes.set(key, merged.length);
+    const existingIndex = mergedIndexes.get(key);
+    if (existingIndex !== undefined) {
+      merged[existingIndex] = mergeMatchingCodexMessages(merged[existingIndex]!, message);
+      continue;
+    }
+    const current = canonicalByIdentity.get(key);
+    if (current === undefined) {
+      mergedIndexes.set(key, merged.length);
       merged.push(message);
       continue;
     }
-    const current = merged[index]!;
-    if (message.status === "streaming" || messageTextSize(message) > messageTextSize(current)) merged[index] = message;
+    matchedCanonical.add(key);
+    mergedIndexes.set(key, merged.length);
+    merged.push(mergeMatchingCodexMessages(current, message));
   }
-  return merged.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+
+  // The rollout is the accurate ordered copy. Insert App Server-only records
+  // around its matching anchors while preserving their supplied sequence. An
+  // explicit per-item timestamp may place a record chronologically; a
+  // task/turn fallback never may.
+  for (let canonicalIndex = 0; canonicalIndex < canonical.length; canonicalIndex += 1) {
+    const message = canonical[canonicalIndex]!;
+    const key = codexHistoryIdentity(message);
+    if (matchedCanonical.has(key)) continue;
+
+    if (canonicalTimestampIsAuthoritative(message)) {
+      const insertion = merged.findIndex((candidate) => candidate.createdAt.localeCompare(message.createdAt) > 0);
+      if (insertion >= 0) merged.splice(insertion, 0, message);
+      else merged.push(message);
+      continue;
+    }
+
+    let nextAnchor = -1;
+    for (let next = canonicalIndex + 1; next < canonical.length; next += 1) {
+      const nextKey = codexHistoryIdentity(canonical[next]!);
+      const candidateIndex = merged.findIndex((candidate) => codexHistoryIdentity(candidate) === nextKey);
+      if (candidateIndex < 0) continue;
+      nextAnchor = candidateIndex;
+      break;
+    }
+    if (nextAnchor >= 0) merged.splice(nextAnchor, 0, message);
+    else merged.push(message);
+  }
+  return merged;
 }
 
 export class CodexAdapter implements AgentProviderAdapter {
   public readonly providerId = "codex";
   public readonly displayName = "OpenAI Codex";
   public readonly sessionCreationFeatures = {
+    visionToolIsolation: true,
     hiddenDeveloperInstructions: true,
     ephemeralSessions: true,
     selectableClientTools: true,
@@ -156,35 +340,61 @@ export class CodexAdapter implements AgentProviderAdapter {
   readonly #events = new ProviderEventHub();
   readonly #pendingServerRequests = new Map<string, PendingServerRequest>();
   readonly #currentTurns = new Map<string, string>();
+  readonly #compactions = new Map<string, PendingCompaction>();
+  readonly #compactionTurns = new Map<string, string>();
   readonly #ownedThreads = new Set<string>();
   readonly #hostId: string;
-  readonly #command: string;
+  readonly #displayCommand: string;
+  readonly #commandResolver: CodexCommandResolver;
+  readonly #automaticCommand: boolean;
   readonly #args: readonly string[];
   readonly #cwd: string | undefined;
-  readonly #transportFactory: (() => JsonRpcTransport) | undefined;
+  readonly #environment: NodeJS.ProcessEnv;
+  readonly #transportFactory: ((args?: readonly string[]) => JsonRpcTransport) | undefined;
   readonly #requestTimeoutMs: number;
   readonly #idleReleaseMs: number;
   readonly #now: () => Date;
   readonly #activity: CodexActivityReconciler | null;
   readonly #desktopQueue: CodexDesktopQueue | null;
+  readonly #inFlightMessageSends = new Map<string, Promise<SendMessageResult>>();
   readonly #sessionStates = new Map<string, SessionState>();
   readonly #sessionMetadata = new Map<string, CodexTurnMetadata>();
   readonly #sessionContext = new Map<string, Omit<SessionContextState, "sessionId" | "compactionThresholdTokens" | "minimumThresholdTokens" | "supportsThreshold" | "isCompacting" | "compactionKind">>();
+  readonly #threadsWithClientTools = new Set<string>();
+  readonly #threadsWithoutClientTools = new Set<string>();
+  readonly #visionThreads = new Set<string>();
+  readonly #visionMessages = new Map<string, RemoteMessage>();
+  readonly #visionChildren = new Map<string, { readonly adapter: CodexAdapter; readonly catalog: CodexVisionCatalog }>();
+  readonly #options: CodexAdapterOptions;
+  readonly #clientToolResumes = new Map<string, Promise<void>>();
+  readonly #observedHistory = new WeakMap<readonly CodexObservedMessage[], {
+    readonly providerSessionId: string;
+    readonly state: SessionState | undefined;
+    readonly messages: readonly RemoteMessage[];
+  }>();
   #peer: JsonRpcPeer | null = null;
   #startingPeer: JsonRpcPeer | null = null;
   #initializing: Promise<JsonRpcPeer> | null = null;
   #closing: Promise<void> | null = null;
   #idleReleaseTimer: ReturnType<typeof setTimeout> | null = null;
   #resourceGeneration = 0;
+  #activePeerRequests = 0;
   #disposed = false;
   #eventCounter = 0;
   #clientTooling: ProviderClientTooling | undefined;
 
   public constructor(options: CodexAdapterOptions) {
+    this.#options = options;
     this.#hostId = options.hostId;
-    this.#command = options.command ?? "codex";
+    this.#displayCommand = options.command ?? "codex";
+    this.#automaticCommand = options.command === undefined;
+    this.#commandResolver = new CodexCommandResolver({
+      ...(options.command !== undefined ? { configuredCommand: options.command } : {}),
+      env: options.environment ?? process.env,
+    });
     this.#args = options.commandArgs ?? ["app-server", "--listen", "stdio://"];
     this.#cwd = options.cwd;
+    this.#environment = options.environment ?? process.env;
     this.#transportFactory = options.transportFactory;
     this.#requestTimeoutMs = options.requestTimeoutMs ?? 60_000;
     this.#idleReleaseMs = options.idleReleaseMs ?? defaultIdleReleaseMs;
@@ -197,12 +407,16 @@ export class CodexAdapter implements AgentProviderAdapter {
           onMessage: (providerSessionId, message) => this.emitObservedMessage(providerSessionId, message),
           onTurnMetadataChanged: (providerSessionId, metadata) => this.applySessionMetadata(providerSessionId, metadata, true),
           onContextChanged: (providerSessionId, context) => this.applyObservedContext(providerSessionId, context),
+          onActiveThreadDiscovered: (providerSessionId) => this.publishDiscoveredActiveThread(providerSessionId),
         });
     this.#desktopQueue = options.desktopQueue === undefined || options.desktopQueue === false
       ? null
       : new CodexDesktopQueue({
           ...(options.desktopQueue.statePath !== undefined ? { statePath: options.desktopQueue.statePath } : {}),
           ...(options.desktopQueue.pipePath !== undefined ? { pipePath: options.desktopQueue.pipePath } : {}),
+          ...(options.desktopQueue.ownerRecoveryWindowMs !== undefined ? { ownerRecoveryWindowMs: options.desktopQueue.ownerRecoveryWindowMs } : {}),
+          ...(options.desktopQueue.ownerRetryDelayMs !== undefined ? { ownerRetryDelayMs: options.desktopQueue.ownerRetryDelayMs } : {}),
+          ...(options.desktopQueue.requestTimeoutMs !== undefined ? { requestTimeoutMs: options.desktopQueue.requestTimeoutMs } : {}),
           onChanged: (messages) => this.emitDesktopQueueChanges(messages),
         });
     if (this.#desktopQueue !== null) {
@@ -212,8 +426,12 @@ export class CodexAdapter implements AgentProviderAdapter {
         return desktopQueue.list();
       };
       this.enqueueQueuedMessage = async (providerSessionId, request) => await desktopQueue.enqueue(providerSessionId, request);
-      this.sendMessageToExternalOwner = async (providerSessionId, request) =>
-        await desktopQueue.tryStartTurn(providerSessionId, request) ?? await this.sendMessageToAppServer(providerSessionId, request);
+      this.sendMessageToExternalOwner = async (providerSessionId, request) => {
+        const existing = await this.acceptedScheduledMessage(providerSessionId, request);
+        if (existing !== null) return existing;
+        this.assertExternalOwnerToolRoutingSafe(request, "active_writer");
+        return await desktopQueue.startTurn(providerSessionId, request, this.dynamicToolsForRequest(request));
+      };
       this.restoreQueuedMessage = async (providerSessionId, request) => await desktopQueue.restore(providerSessionId, request);
       this.updateQueuedMessage = async (providerSessionId, messageId, content) => await desktopQueue.update(providerSessionId, messageId, content);
       this.cancelQueuedMessage = async (providerSessionId, messageId) => await desktopQueue.cancel(providerSessionId, messageId);
@@ -223,27 +441,111 @@ export class CodexAdapter implements AgentProviderAdapter {
 
   public configureClientTooling(tooling: ProviderClientTooling): void {
     this.#clientTooling = tooling;
+    // A new definition set must be persisted onto any pre-existing task before
+    // its next turn. New tasks receive the same set through thread/start.
+    this.#threadsWithClientTools.clear();
+  }
+
+  private dynamicTools(): readonly Record<string, unknown>[] | undefined {
+    if (this.#clientTooling === undefined) return undefined;
+    return this.#clientTooling.definitions.map((tool) => ({
+      type: "function",
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+    }));
+  }
+
+  private dynamicToolsForRequest(request: SendMessageRequest): readonly Record<string, unknown>[] | undefined {
+    const internalPurpose = request.metadata?.internalPurpose;
+    return internalPurpose === "vision_proxy" || internalPurpose === "ears"
+      ? undefined
+      : this.dynamicTools();
+  }
+
+  private requestRequiresLiveClientToolHandler(request: SendMessageRequest): boolean {
+    const overrides = request.clientToolOverrides;
+    const dynamicTools = this.dynamicToolsForRequest(request);
+    if (overrides === undefined || dynamicTools === undefined) return false;
+    const available = new Set(dynamicTools.flatMap((tool) => typeof tool.name === "string" ? [tool.name] : []));
+    return Object.entries(overrides).some(([name, enabled]) => enabled === true && available.has(name));
+  }
+
+  private assertExternalOwnerToolRoutingSafe(
+    request: SendMessageRequest,
+    failure: "active_writer" | "pre_delivery",
+  ): void {
+    if (!this.requestRequiresLiveClientToolHandler(request)) return;
+    throw new ProviderAdapterError(
+      this.providerId,
+      failure === "active_writer" ? "EXTERNAL_WRITER_UNAVAILABLE" : "SAFE_DELIVERY_UNAVAILABLE",
+      failure === "active_writer"
+        ? "Codex Desktop currently owns this task, but this turn needs a Tethoq tool that only works through Tethoq's live Codex connection. Close the task in Codex Desktop or hand it back to Tethoq, then retry. Your draft and attachments are unchanged."
+        : "This turn needs a Tethoq tool that only works through Tethoq's live Codex connection, so it cannot be handed to another Codex owner after local setup failed. Reopen the task in Tethoq, then retry. Your draft and attachments are unchanged.",
+      true,
+    );
+  }
+
+  /**
+   * Codex persists dynamic tools in thread metadata. Existing tasks predate
+   * Tethoq's thread/start call, so resume them once with the current tool set
+   * before starting a turn; this hot-applies the neutral Tethoq tool surface
+   * without an app restart.
+   */
+  private async ensureClientTools(providerSessionId: string): Promise<void> {
+    const dynamicTools = this.dynamicTools();
+    if (dynamicTools === undefined
+      || this.#threadsWithoutClientTools.has(providerSessionId)
+      || this.#threadsWithClientTools.has(providerSessionId)) return;
+    const pending = this.#clientToolResumes.get(providerSessionId);
+    if (pending !== undefined) return await pending;
+    const resume = (async () => {
+      const response = await this.request<ThreadResponse>("thread/resume", { threadId: providerSessionId, dynamicTools });
+      if (response.thread.id !== providerSessionId) throw new ProviderAdapterError(this.providerId, "RESUME_ID_MISMATCH", "Codex resumed a different thread ID", false);
+      this.#ownedThreads.add(providerSessionId);
+      this.#threadsWithClientTools.add(providerSessionId);
+    })();
+    this.#clientToolResumes.set(providerSessionId, resume);
+    try {
+      await resume;
+    } finally {
+      if (this.#clientToolResumes.get(providerSessionId) === resume) this.#clientToolResumes.delete(providerSessionId);
+    }
   }
 
   public async detect(): Promise<ProviderDetection> {
     if (this.#transportFactory !== undefined) return { providerId: this.providerId, available: true, version: "injected-transport", details: ["Transport supplied by caller."] };
-    return await new Promise((resolve) => {
-      const resolved = resolveCommand(this.#command);
-      const launch = buildSpawnCommand(resolved, ["--version"]);
-      execFile(launch.command, [...launch.args], { timeout: 5_000, ...(launch.windowsVerbatimArguments === true ? { windowsVerbatimArguments: true } : {}) }, (error, stdout) => {
-        if (error !== null) {
-          resolve({ providerId: this.providerId, available: false, executable: this.#command, details: [`${error.message} (resolved ${resolved.file})`] });
-          return;
-        }
-        const version = stdout.trim();
-        resolve({ providerId: this.providerId, available: true, executable: this.#command, ...(version ? { version } : {}), details: [`resolved ${resolved.file}`] });
-      });
-    });
+    let selection;
+    try {
+      selection = await this.#commandResolver.resolve();
+    } catch (error) {
+      return {
+        providerId: this.providerId,
+        available: false,
+        executable: this.#displayCommand,
+        details: [error instanceof Error ? error.message : String(error)],
+      };
+    }
+    const version = selection.version ?? await probeCodexVersion(selection.command, this.#environment);
+    if (version === undefined) {
+      return {
+        providerId: this.providerId,
+        available: false,
+        executable: selection.command,
+        details: [`Codex version probe failed for ${selection.command}`],
+      };
+    }
+    return {
+      providerId: this.providerId,
+      available: true,
+      executable: selection.command,
+      version,
+      details: [`selected ${selection.source} Codex executable ${selection.command}`],
+    };
   }
 
   public async getAuthStatus(): Promise<AuthStatus> {
-    const peer = await this.peer();
-    const response = await peer.request<AccountReadResponse>("account/read", { refreshToken: false });
+    const response = await this.request<AccountReadResponse>("account/read", { refreshToken: false });
     const account = response.account;
     const label = isRecord(account) ? [account.email, account.name].find((value): value is string => typeof value === "string") : undefined;
     return {
@@ -255,7 +557,6 @@ export class CodexAdapter implements AgentProviderAdapter {
   }
 
   public async authenticate(request: AuthRequest): Promise<AuthResult> {
-    const peer = await this.peer();
     const method = request.method ?? "chatgpt";
     let params: unknown;
     if (method === "apiKey") {
@@ -268,7 +569,7 @@ export class CodexAdapter implements AgentProviderAdapter {
     } else {
       throw new ProviderAdapterError(this.providerId, "AUTH_METHOD_UNSUPPORTED", `Unsupported Codex login method ${method}`, false);
     }
-    const response = await peer.request<unknown>("account/login/start", params);
+    const response = await this.request<unknown>("account/login/start", params);
     const result = isRecord(response) ? response : {};
     const verificationUri = [result.authUrl, result.verificationUri, result.verification_url].find((value): value is string => typeof value === "string");
     const userCode = [result.userCode, result.user_code].find((value): value is string => typeof value === "string");
@@ -286,18 +587,17 @@ export class CodexAdapter implements AgentProviderAdapter {
   }
 
   public async listModels(): Promise<readonly RemoteModel[]> {
-    const peer = await this.peer();
     const models: RemoteModel[] = [];
     let cursor: string | null | undefined;
     do {
-      const response = await peer.request<ModelListResponse>("model/list", { ...(cursor ? { cursor } : {}), limit: 100 });
+      const response = await this.request<ModelListResponse>("model/list", { ...(cursor ? { cursor } : {}), limit: 100 });
       const page = response.data ?? [];
       for (const value of page) {
         if (!isRecord(value)) continue;
         const id = [value.id, value.model, value.slug].find((candidate): candidate is string => typeof candidate === "string");
         if (id === undefined) continue;
         const displayName = [value.displayName, value.name].find((candidate): candidate is string => typeof candidate === "string") ?? id;
-        const modalities = codexModelInputModalities(id, value.inputModalities);
+        const modalities = inputModalities(value.inputModalities);
         models.push({
           id,
           providerId: this.providerId,
@@ -314,44 +614,147 @@ export class CodexAdapter implements AgentProviderAdapter {
   }
 
   public async listSessions(options: ListSessionsOptions = {}): Promise<PaginatedSessions> {
-    const peer = await this.peer();
-    const response = await peer.request<ThreadListResponse>("thread/list", {
+    const response = await this.request<ThreadListResponse>("thread/list", {
       ...(options.cursor !== undefined ? { cursor: options.cursor } : {}),
       ...(options.limit !== undefined ? { limit: options.limit } : {}),
       ...(options.sortKey !== undefined ? { sortKey: options.sortKey } : {}),
       ...(options.sortDirection !== undefined ? { sortDirection: options.sortDirection } : {}),
       ...(options.workingDirectory !== undefined ? { cwd: options.workingDirectory } : {}),
       ...(options.parentProviderSessionId !== undefined ? { parentThreadId: options.parentProviderSessionId } : {}),
+      // Older App Servers default to the configured model backend. Keep saved
+      // tasks discoverable after that setting changes by explicitly including all.
+      modelProviders: [],
+      // Catalogue rows come from Codex's indexed state. Allowing thread/list to
+      // repair that index by rescanning rollout JSONL files makes a small page
+      // rebuild enormous long-running tasks before it can answer. Tethoq loads
+      // transcript data through its dedicated progressive-history path.
+      useStateDbOnly: true,
       archived: false,
     });
     const sessions = [...await this.normalizeThreads(response.data)];
     if (options.cursor === undefined && this.#activity !== null) {
       const listed = new Set(response.data.map((thread) => thread.id));
       const missingActiveIds = (await this.#activity.activeThreadIds()).filter((providerSessionId) => !listed.has(providerSessionId));
-      const activeThreads = await Promise.all(missingActiveIds.map(async (providerSessionId) => {
-        try {
-          return (await peer.request<ThreadResponse>("thread/read", { threadId: providerSessionId, includeTurns: false })).thread;
-        } catch {
-          return null;
-        }
-      }));
-      const activeSessions = await Promise.all((await this.normalizeThreads(activeThreads.filter((thread): thread is NonNullable<typeof thread> => thread !== null)))
-        .map(async (session) => this.withRecentActivityPreview(session)));
+      const activeThreads: Array<ThreadResponse["thread"] | null> = [];
+      for (let offset = 0; offset < missingActiveIds.length; offset += 8) {
+        const batch = missingActiveIds.slice(offset, offset + 8);
+        activeThreads.push(...await Promise.all(batch.map(async (providerSessionId) => {
+          try {
+            return (await this.request<ThreadResponse>("thread/read", { threadId: providerSessionId, includeTurns: false })).thread;
+          } catch {
+            return null;
+          }
+        })));
+      }
+      // A catalogue row must stay a summary. Reading every missing writer's
+      // recent rollout here used to start one 32 MiB transcript parse per lock
+      // at the same time; a handful of externally owned tasks could therefore
+      // push Electron past a gigabyte before the user opened any of them.
+      // thread/read(includeTurns:false) already supplies the task title,
+      // preview, recency, and path needed to normalize state. Transcript detail
+      // is loaded progressively only when that task is opened.
+      const activeSessions = await this.normalizeThreads(activeThreads.filter((thread): thread is NonNullable<typeof thread> => thread !== null));
       sessions.unshift(...activeSessions);
     }
     return { sessions, nextCursor: response.nextCursor };
   }
 
   public async getSession(providerSessionId: string): Promise<RemoteSession> {
-    const response = await (await this.peer()).request<ThreadResponse>("thread/read", { threadId: providerSessionId, includeTurns: false });
+    const child = this.#visionChildren.get(providerSessionId);
+    if (child !== undefined) return await child.adapter.getSession(providerSessionId);
+    if (this.#visionThreads.has(providerSessionId) && this.#peer === null && this.#initializing === null) {
+      throw new ProviderAdapterError(this.providerId, "SESSION_NOT_FOUND", "The ephemeral EYES session is no longer loaded", true);
+    }
+    const params = { threadId: providerSessionId, includeTurns: false };
+    let response: ThreadResponse;
+    try {
+      response = await this.request<ThreadResponse>("thread/read", params);
+    } catch (error) {
+      if (!isCodexThreadNotFound(error)) throw error;
+      if (this.#visionThreads.has(providerSessionId)) {
+        throw new ProviderAdapterError(this.providerId, "SESSION_NOT_FOUND", "The ephemeral EYES session is no longer loaded", true, { cause: error });
+      }
+      await this.resumeSession(providerSessionId);
+      response = await this.request<ThreadResponse>("thread/read", params);
+    }
     return (await this.normalizeThreads([response.thread]))[0] ?? normalizeCodexThread(this.#hostId, response.thread);
   }
 
+  public async getRecentMessages(providerSessionId: string): Promise<RecentProviderMessages> {
+    const child = this.#visionChildren.get(providerSessionId);
+    if (child !== undefined) return await child.adapter.getRecentMessages(providerSessionId);
+    let recent = await this.#activity?.recentMessageWindow(providerSessionId);
+    if (recent === undefined && this.#activity !== null) {
+      // A task restored from Tethoq's persisted catalogue can be opened before
+      // Codex's current first page has taught the activity reader its rollout
+      // path. Hydrate only thread metadata, then retry the bounded local page.
+      // Falling straight through to includeTurns rebuilds the entire thread and
+      // can allocate hundreds of megabytes for a single visible history page.
+      await this.getSession(providerSessionId);
+      recent = await this.#activity.recentMessageWindow(providerSessionId);
+    }
+    // An empty bounded page is still a successful read. The rollout may contain
+    // only provider records, bootstrap metadata, or a large non-visible item;
+    // using message count as an availability signal caused a needless complete
+    // history reconstruction. Only fall back when the local rollout is absent.
+    if (recent !== undefined) {
+      return {
+        messages: this.observedRemoteMessages(providerSessionId, recent.messages),
+        complete: recent.complete,
+        ...(recent.olderCursor ? { olderCursor: recent.olderCursor } : {}),
+      };
+    }
+    return { messages: await this.getMessages(providerSessionId), complete: true };
+  }
+
+  public async getOlderMessages(providerSessionId: string, cursor: string): Promise<RecentProviderMessages> {
+    const older = await this.#activity?.olderMessageWindow(providerSessionId, cursor);
+    if (older !== undefined) {
+      return {
+        messages: this.observedRemoteMessages(providerSessionId, older.messages),
+        complete: older.complete,
+        ...(older.olderCursor ? { olderCursor: older.olderCursor } : {}),
+        pageOnly: true as const,
+      };
+    }
+    return { messages: await this.getMessages(providerSessionId), complete: true };
+  }
+
   public async getMessages(providerSessionId: string): Promise<readonly RemoteMessage[]> {
-    const observed = await this.#activity?.recentMessages(providerSessionId) ?? [];
+    const child = this.#visionChildren.get(providerSessionId);
+    if (child !== undefined) return await child.adapter.getMessages(providerSessionId);
+    if (this.#visionThreads.has(providerSessionId)) {
+      // Native ephemeral threads reject includeTurns. Keep only the latest
+      // completed observation, without persisting images or a helper transcript.
+      const message = this.#visionMessages.get(providerSessionId);
+      return message === undefined ? [] : [message];
+    }
+    const observed = await this.#activity?.allMessages(providerSessionId) ?? [];
+    const observedMessages = this.observedRemoteMessages(providerSessionId, observed);
+    // The append-only rollout already owns exact order, timestamps, attachments,
+    // tool activity, terminal state, and the complete pageable transcript. On a
+    // large task App Server's includeTurns reconstruction can take many seconds
+    // (or longer) because it rebuilds the whole thread before returning. Never
+    // put that work in front of the visible history page; keep thread/read as the
+    // fallback for sessions whose local rollout is unavailable.
+    if (observedMessages.length > 0) return observedMessages;
+    try {
+      const response = await this.request<ThreadResponse>("thread/read", { threadId: providerSessionId, includeTurns: true });
+      return messagesFromCodexThread(this.#hostId, response.thread);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/thread\s+[0-9a-f-]+\s+is not materialized yet; includeTurns is unavailable before first user message/iu.test(message)) return [];
+      throw error;
+    }
+  }
+
+  private observedRemoteMessages(providerSessionId: string, observed: readonly CodexObservedMessage[]): readonly RemoteMessage[] {
+    const state = this.#sessionStates.get(providerSessionId);
+    const cached = this.#observedHistory.get(observed);
+    if (cached?.providerSessionId === providerSessionId && cached.state === state) return cached.messages;
     const sessionId = makeGlobalSessionId(this.#hostId, this.providerId, providerSessionId);
     let latestLiveIndex = -1;
-    if (this.#sessionStates.get(providerSessionId) === "working") {
+    if (state === "working") {
       for (let index = observed.length - 1; index >= 0; index -= 1) {
         const message = observed[index];
         if (message?.role === "assistant" && (message.partType === "reasoning" || message.phase === "commentary")) {
@@ -360,7 +763,7 @@ export class CodexAdapter implements AgentProviderAdapter {
         }
       }
     }
-    const observedMessages: readonly RemoteMessage[] = observed.map((message, index) => {
+    const messages = observed.map((message, index) => {
       const createdAt = validIsoTimestamp(message.createdAt) ?? new Date(index).toISOString();
       const running = index === latestLiveIndex;
       return {
@@ -375,19 +778,21 @@ export class CodexAdapter implements AgentProviderAdapter {
           : message.parts?.length
             ? message.parts
             : [{ type: "text" as const, text: message.text }],
-        status: running ? "streaming" as const : "completed" as const,
-        nativeMetadata: message.phase !== undefined ? { phase: message.phase } : {},
+        status: running ? "streaming" as const : message.terminalError ? "failed" as const : "completed" as const,
+        ...(message.role === "user" && (message.parts?.every((part) => part.type === "text") ?? true) ? { editable: true } : {}),
+        ...(message.origin ? { origin: message.origin } : {}),
+        nativeMetadata: {
+          partType: message.partType,
+          ...(message.phase !== undefined ? { phase: message.phase } : {}),
+          ...(message.terminalFallback ? { terminalFallback: true } : {}),
+          ...(message.terminalError ? { terminalError: true } : {}),
+          ...(message.turnId !== undefined ? { turnId: message.turnId } : {}),
+          ...(message.canonicalUserMessage ? { canonicalUserMessage: true } : {}),
+        },
       };
     });
-    try {
-      const response = await (await this.peer()).request<ThreadResponse>("thread/read", { threadId: providerSessionId, includeTurns: true });
-      return mergeCodexMessageHistory(messagesFromCodexThread(this.#hostId, response.thread), observedMessages);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (observedMessages.length > 0) return observedMessages;
-      if (/thread\s+[0-9a-f-]+\s+is not materialized yet; includeTurns is unavailable before first user message/iu.test(message)) return [];
-      throw error;
-    }
+    this.#observedHistory.set(observed, { providerSessionId, state, messages });
+    return messages;
   }
 
   public async getSessionContext(providerSessionId: string): Promise<Omit<SessionContextState, "sessionId" | "compactionThresholdTokens" | "minimumThresholdTokens" | "supportsThreshold" | "isCompacting" | "compactionKind">> {
@@ -403,26 +808,141 @@ export class CodexAdapter implements AgentProviderAdapter {
   }
 
   public async compactSession(providerSessionId: string): Promise<void> {
-    await (await this.peer()).request("thread/compact/start", { threadId: providerSessionId });
+    const existing = this.#compactions.get(providerSessionId);
+    if (existing !== undefined) return await existing.promise;
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const completion = new Promise<void>((done, fail) => { resolve = done; reject = fail; });
+    const timer = setTimeout(() => reject(new ProviderAdapterError(
+      this.providerId, "COMPACTION_TIMEOUT", "Codex did not confirm compaction completion in time", true,
+    )), this.#options.compactionTimeoutMs ?? 10 * 60_000);
+    const start = async (): Promise<void> => {
+      const params = { threadId: providerSessionId };
+      try {
+        await this.request("thread/compact/start", params);
+      } catch (error) {
+        if (!isCodexThreadNotFound(error)) throw error;
+        // A persisted task must be loaded into a fresh App Server first.
+        await this.resumeSession(providerSessionId);
+        await this.request("thread/compact/start", params);
+      }
+    };
+    // Register before sending: native notifications may precede the RPC ack.
+    const promise = Promise.all([Promise.resolve().then(start), completion]).then(() => undefined).finally(() => {
+      clearTimeout(timer);
+      this.#compactions.delete(providerSessionId);
+      void this.releaseIdleResources();
+    });
+    this.#compactions.set(providerSessionId, {
+      promise, resolve, reject,
+      previousTurnId: this.#currentTurns.get(providerSessionId),
+    });
+    return await promise;
+  }
+
+  public async getGoal(providerSessionId: string): Promise<ProviderSessionGoal | null | undefined> {
+    try {
+      const response = await this.request<ThreadGoalResponse>("thread/goal/get", { threadId: providerSessionId });
+      if (!isRecord(response) || !("goal" in response)) throw invalidGoalResponse("thread/goal/get");
+      validateGoalEnvelope(response, providerSessionId, "thread/goal/get");
+      return response.goal === null ? null : requireNativeGoal(response.goal, "thread/goal/get", providerSessionId);
+    } catch (error) {
+      if (isUnsupportedGoalError(error)) return undefined;
+      throw error;
+    }
+  }
+
+  public async setGoal(providerSessionId: string, update: ProviderSessionGoalUpdate): Promise<ProviderSessionGoal | undefined> {
+    try {
+      const response = await this.request<ThreadGoalResponse>("thread/goal/set", {
+        threadId: providerSessionId,
+        ...(update.objective !== undefined ? { objective: update.objective } : {}),
+        ...(update.status !== undefined ? { status: update.status } : {}),
+        ...(update.tokenBudget !== undefined ? { tokenBudget: update.tokenBudget } : {}),
+      });
+      if (!isRecord(response) || !("goal" in response) || response.goal === null) throw invalidGoalResponse("thread/goal/set");
+      validateGoalEnvelope(response, providerSessionId, "thread/goal/set");
+      return requireNativeGoal(response.goal, "thread/goal/set", providerSessionId);
+    } catch (error) {
+      if (isUnsupportedGoalError(error)) return undefined;
+      throw error;
+    }
+  }
+
+  public async clearGoal(providerSessionId: string): Promise<boolean | undefined> {
+    try {
+      const response = await this.request<ThreadGoalClearResponse>("thread/goal/clear", { threadId: providerSessionId });
+      if (!isRecord(response) || typeof response.cleared !== "boolean") throw invalidGoalResponse("thread/goal/clear");
+      validateGoalEnvelope(response, providerSessionId, "thread/goal/clear");
+      return response.cleared;
+    } catch (error) {
+      if (isUnsupportedGoalError(error)) return undefined;
+      throw error;
+    }
   }
 
   public async createSession(options: CreateSessionOptions): Promise<RemoteSession> {
-    const response = await (await this.peer()).request<ThreadResponse>("thread/start", {
+    const visionHelper = options.metadata?.internalPurpose === "vision_proxy";
+    let visionConfig: JsonObject | undefined;
+    if (visionHelper) {
+      const effective = await this.request<unknown>("config/read", { cwd: options.workingDirectory, includeLayers: false });
+      if (!isRecord(effective) || !isRecord(effective.config)) {
+        throw new ProviderAdapterError(this.providerId, "VISION_ISOLATION_UNAVAILABLE", "Codex could not read the configuration needed to isolate EYES", false);
+      }
+      visionConfig = codexVisionIsolationConfig(effective.config);
+      if (this.#options.isolatedVisionRuntime !== true) {
+        const command = (await this.#commandResolver.resolve()).command;
+        const catalog = await prepareCodexVisionCatalog(command, options.modelId, effective.config, this.#environment);
+        const adapter = new CodexAdapter({
+          ...this.#options,
+          command,
+          commandArgs: [...this.#args, "-c", `model_catalog_json=${JSON.stringify(catalog.path)}`],
+          isolatedVisionRuntime: true,
+          localActivity: false,
+          desktopQueue: false,
+        });
+        let helperSessionId: string | undefined;
+        try {
+          await adapter.subscribe(null, async (event) => {
+            if (event.providerSessionId !== undefined) {
+              // Children share this provider ID, but not its event counter.
+              // Assign IDs at the parent to avoid Bridge deduplication losses.
+              const { eventId: _eventId, providerId: _providerId, occurredAt: _occurredAt, ...input } = event;
+              await this.emit(input);
+            }
+            else if (event.type === "provider.disconnected" && helperSessionId !== undefined) {
+              // A private runtime failure must not disconnect ordinary Codex
+              // chats sharing the provider ID on the parent adapter.
+              await this.emit({ type: "agent.error", providerSessionId: helperSessionId, payload: { message: "The private EYES runtime disconnected" } });
+            }
+          });
+          const session = await adapter.createSession(options);
+          helperSessionId = session.providerSessionId;
+          this.#visionChildren.set(session.providerSessionId, { adapter, catalog });
+          return session;
+        } catch (error) {
+          await adapter.dispose();
+          await catalog.dispose();
+          throw error;
+        }
+      }
+    }
+    const response = await this.request<ThreadResponse>("thread/start", {
       cwd: options.workingDirectory,
       ...(options.modelId !== undefined ? { model: options.modelId } : {}),
       ...(options.developerInstructions !== undefined ? { developerInstructions: options.developerInstructions } : {}),
       ...(options.ephemeral !== undefined ? { ephemeral: options.ephemeral } : {}),
-      ...(options.mcpServers === "none" ? { config: { mcp_servers: {} } } : {}),
-      ...(this.#clientTooling !== undefined && options.clientTools !== "none" ? {
-        dynamicTools: this.#clientTooling.definitions.map((tool) => ({
-          type: "function",
-          name: tool.name,
-          description: tool.description,
-          inputSchema: tool.inputSchema,
-        })),
-      } : {}),
+      ...(visionConfig !== undefined ? {
+        config: visionConfig,
+        baseInstructions: options.developerInstructions ?? "You are a private vision helper. Describe only the supplied images. You have no tools.",
+        dynamicTools: [],
+      } : options.mcpServers === "none" ? { config: { mcp_servers: {} } } : {}),
+      ...(!visionHelper && options.clientTools !== "none" && this.dynamicTools() !== undefined ? { dynamicTools: this.dynamicTools() } : {}),
     });
     this.#ownedThreads.add(response.thread.id);
+    if (visionHelper) this.#visionThreads.add(response.thread.id);
+    if (visionHelper || options.clientTools === "none") this.#threadsWithoutClientTools.add(response.thread.id);
+    else if (this.#clientTooling !== undefined) this.#threadsWithClientTools.add(response.thread.id);
     let session = (await this.normalizeThreads([response.thread]))[0] ?? normalizeCodexThread(this.#hostId, response.thread);
     if (options.modelId !== undefined) {
       await this.applySessionMetadata(response.thread.id, { modelId: options.modelId }, false);
@@ -432,6 +952,7 @@ export class CodexAdapter implements AgentProviderAdapter {
       await this.sendMessage(response.thread.id, {
         requestId: `create_${randomUUID()}`,
         content: options.firstInstruction,
+        ...(options.metadata !== undefined ? { metadata: options.metadata } : {}),
         ...(options.modelId !== undefined ? { modelId: options.modelId } : {}),
         ...(options.reasoningEffort !== undefined ? { reasoningEffort: options.reasoningEffort } : {}),
       });
@@ -440,7 +961,15 @@ export class CodexAdapter implements AgentProviderAdapter {
   }
 
   public async branchSession(providerSessionId: string): Promise<RemoteSession> {
-    const response = await (await this.peer()).request<ThreadForkResponse>("thread/fork", { threadId: providerSessionId });
+    const params = { threadId: providerSessionId };
+    let response: ThreadForkResponse;
+    try {
+      response = await this.request<ThreadForkResponse>("thread/fork", params);
+    } catch (error) {
+      if (!isCodexThreadNotFound(error)) throw error;
+      await this.resumeSession(providerSessionId);
+      response = await this.request<ThreadForkResponse>("thread/fork", params);
+    }
     this.#ownedThreads.add(response.thread.id);
     let session = (await this.normalizeThreads([response.thread]))[0] ?? normalizeCodexThread(this.#hostId, response.thread);
     const modelId = response.model ?? this.#sessionMetadata.get(providerSessionId)?.modelId;
@@ -460,22 +989,196 @@ export class CodexAdapter implements AgentProviderAdapter {
   }
 
   public async resumeSession(providerSessionId: string): Promise<void> {
-    const response = await (await this.peer()).request<ThreadResponse>("thread/resume", { threadId: providerSessionId });
+    const dynamicTools = this.#threadsWithoutClientTools.has(providerSessionId) ? undefined : this.dynamicTools();
+    const response = await this.request<ThreadResponse>("thread/resume", {
+      threadId: providerSessionId,
+      ...(dynamicTools === undefined ? {} : { dynamicTools }),
+    });
     if (response.thread.id !== providerSessionId) throw new ProviderAdapterError(this.providerId, "RESUME_ID_MISMATCH", "Codex resumed a different thread ID", false);
     this.#ownedThreads.add(providerSessionId);
+    if (dynamicTools !== undefined) this.#threadsWithClientTools.add(providerSessionId);
   }
 
   public async sendMessage(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
-    if ((request.attachments?.length ?? 0) > 0 && this.#desktopQueue !== null) {
-      const desktopResult = await this.#desktopQueue.tryStartTurn(providerSessionId, request);
-      if (desktopResult !== null) return desktopResult;
+    const child = this.#visionChildren.get(providerSessionId);
+    if (child !== undefined) return await child.adapter.sendMessage(providerSessionId, request);
+    const key = `${providerSessionId}\u0000${request.requestId}`;
+    const existing = this.#inFlightMessageSends.get(key);
+    if (existing !== undefined) return await existing;
+    const send = this.sendMessageOnce(providerSessionId, request);
+    this.#inFlightMessageSends.set(key, send);
+    try {
+      return await send;
+    } finally {
+      if (this.#inFlightMessageSends.get(key) === send) this.#inFlightMessageSends.delete(key);
     }
-    return await this.sendMessageToAppServer(providerSessionId, request);
+  }
+
+  private async sendMessageOnce(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
+    const existing = await this.acceptedScheduledMessage(providerSessionId, request);
+    if (existing !== null) return existing;
+    if (this.#desktopQueue === null) {
+      try {
+        return await this.sendMessageToAppServer(providerSessionId, request);
+      } catch (error) {
+        if (error instanceof CodexPreTurnStartError) throw error.cause;
+        throw error;
+      }
+    }
+
+    let appServerFailure: "active_writer" | "pre_delivery";
+    try {
+      // App Server is the ordinary writer even when Codex Desktop's IPC pipe
+      // happens to exist. Desktop routing is justified only by App Server's
+      // explicit active-writer rejection or another failure proven to precede
+      // turn/start.
+      return await this.sendMessageToAppServer(providerSessionId, request);
+    } catch (error) {
+      if (isCodexActiveWriter(error)) appServerFailure = "active_writer";
+      else if (error instanceof CodexPreTurnStartError) appServerFailure = "pre_delivery";
+      else throw error;
+    }
+
+    this.assertExternalOwnerToolRoutingSafe(request, appServerFailure);
+
+    const deadline = Date.now() + this.#desktopQueue.ownerRecoveryWindowMs;
+    let retryDelayMs = this.#desktopQueue.ownerRetryDelayMs;
+    while (true) {
+      const desktopAttempt = await this.#desktopQueue.tryStartTurn(
+        providerSessionId,
+        request,
+        this.dynamicToolsForRequest(request),
+      );
+      if (desktopAttempt.outcome === "accepted") return desktopAttempt.result;
+      if (desktopAttempt.outcome === "delivery_unknown") throw desktopAttempt.error;
+
+      if (appServerFailure === "active_writer") {
+        // Discovery failures and NoClientFound prove that Desktop did not start
+        // the turn. Retry App Server with the identical request identity: its
+        // writer lock may have been released while Desktop ownership converged.
+        try {
+          return await this.sendMessageToAppServer(providerSessionId, request);
+        } catch (error) {
+          if (isCodexActiveWriter(error)) {
+            appServerFailure = "active_writer";
+          } else if (error instanceof CodexPreTurnStartError) {
+            // The retry still did not reach turn/start. Desktop remains safe,
+            // but another App Server attempt would only repeat the preflight.
+            appServerFailure = "pre_delivery";
+          } else {
+            throw error;
+          }
+        }
+      }
+
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
+      await delay(Math.min(retryDelayMs, remainingMs));
+      retryDelayMs = Math.min(400, Math.ceil(retryDelayMs * 1.5));
+    }
+
+    throw new ProviderAdapterError(
+      this.providerId,
+      appServerFailure === "active_writer" ? "EXTERNAL_WRITER_UNAVAILABLE" : "SAFE_DELIVERY_UNAVAILABLE",
+      appServerFailure === "active_writer"
+        ? "Codex still has another writer for this task, but it did not become reachable during safe delivery. Your draft and attachments are unchanged."
+        : "Codex could not complete its pre-delivery task setup and no Desktop owner accepted the turn. Your draft and attachments are unchanged.",
+      true,
+    );
+  }
+
+  private async acceptedScheduledMessage(
+    providerSessionId: string,
+    request: SendMessageRequest,
+  ): Promise<SendMessageResult | null> {
+    if (!isScheduledMessageRequest(request)) return null;
+    const params = { threadId: providerSessionId, includeTurns: true };
+    let response: ThreadResponse;
+    try {
+      response = await this.readScheduledHistory(params);
+    } catch (error) {
+      // A thread/start response can precede Codex materializing its first-turn
+      // history. That state proves there is no persisted scheduled turn to
+      // adopt yet, so the original request identity may proceed to turn/start.
+      if (isCodexThreadHistoryUnavailableBeforeFirstMessage(error)) return null;
+      if (!isCodexThreadNotFound(error)) throw error;
+      await this.resumeSession(providerSessionId);
+      try {
+        response = await this.readScheduledHistory(params);
+      } catch (resumedReadError) {
+        if (isCodexThreadHistoryUnavailableBeforeFirstMessage(resumedReadError)) return null;
+        throw resumedReadError;
+      }
+    }
+    const persisted = persistedCodexUserTurn(
+      response.thread,
+      request.requestId,
+      normalizedScheduledPrompt(providerPromptContent(request)),
+    );
+    if (persisted === null) return null;
+    return {
+      accepted: true,
+      ...(persisted.turnId !== undefined ? { providerTurnId: persisted.turnId } : {}),
+      details: ["Codex already accepted this scheduled prompt."],
+    };
+  }
+
+  /**
+   * Scheduled delivery checks are read-only and protect an exact-once write.
+   * A long-lived App Server can survive a Desktop update while becoming unable
+   * to traverse the newer rollout lineage. Replace that stale process once and
+   * repeat only the safe history read; turn/start remains outside this retry.
+   */
+  private async readScheduledHistory(params: { readonly threadId: string; readonly includeTurns: boolean }): Promise<ThreadResponse> {
+    try {
+      return await this.request<ThreadResponse>("thread/read", params);
+    } catch (error) {
+      if (!isRecoverableScheduledHistoryRead(error) || !await this.recyclePeerAfterSafeRead()) throw error;
+      return await this.request<ThreadResponse>("thread/read", params);
+    }
+  }
+
+  private async recyclePeerAfterSafeRead(): Promise<boolean> {
+    if (this.#disposed) return false;
+    const peer = this.#peer;
+    if (peer === null) return true;
+    if (this.#activePeerRequests > 0 || this.#pendingServerRequests.size > 0 || this.hasOwnedActiveTurn()) return false;
+    this.#resourceGeneration += 1;
+    this.cancelIdleRelease();
+    this.#peer = null;
+    this.#commandResolver.invalidate();
+    const closing = peer.close().catch(() => undefined);
+    this.#closing = closing;
+    try {
+      await closing;
+    } finally {
+      this.#ownedThreads.clear();
+      this.#currentTurns.clear();
+      if (this.#closing === closing) this.#closing = null;
+    }
+    return !this.#disposed;
   }
 
   private async sendMessageToAppServer(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
+    const internalPurpose = request.metadata?.internalPurpose;
+    if (internalPurpose === "vision_proxy" || internalPurpose === "ears") {
+      // Restored helpers were created by an earlier adapter instance, so the
+      // createSession(clientTools: "none") policy is no longer in memory. The
+      // hidden helper marker on every internal turn restores that isolation
+      // before ensureClientTools can resume the task with recursive tools.
+      this.#threadsWithoutClientTools.add(providerSessionId);
+      this.#threadsWithClientTools.delete(providerSessionId);
+    }
+    try {
+      await this.ensureClientTools(providerSessionId);
+      // Separating process initialization from the turn/start request gives the
+      // caller a truthful exact-once boundary: a discovery or initialization
+      // failure here cannot have submitted the user's instruction.
+      await this.peer();
+    } catch (error) {
+      throw new CodexPreTurnStartError(error);
+    }
     const input = codexTurnInput(request);
-    const peer = await this.peer();
     const params = {
       threadId: providerSessionId,
       clientUserMessageId: request.requestId,
@@ -485,15 +1188,26 @@ export class CodexAdapter implements AgentProviderAdapter {
     };
     let response: TurnResponse;
     try {
-      response = await peer.request<TurnResponse>("turn/start", params);
+      response = await this.requestWithDeliveryBoundary<TurnResponse>("turn/start", params);
     } catch (error) {
       if (!isCodexThreadNotFound(error)) throw error;
-      const resumed = await peer.request<ThreadResponse>("thread/resume", { threadId: providerSessionId });
+      const dynamicTools = this.#threadsWithoutClientTools.has(providerSessionId) ? undefined : this.dynamicTools();
+      let resumed: ThreadResponse;
+      try {
+        resumed = await this.request<ThreadResponse>("thread/resume", {
+          threadId: providerSessionId,
+          ...(dynamicTools === undefined ? {} : { dynamicTools }),
+        });
+      } catch (resumeError) {
+        // The preceding turn/start was explicitly rejected as missing, so this
+        // resume is still provably pre-delivery.
+        throw new CodexPreTurnStartError(resumeError);
+      }
       if (resumed.thread.id !== providerSessionId) {
         throw new ProviderAdapterError(this.providerId, "RESUME_ID_MISMATCH", "Codex resumed a different thread ID", false);
       }
       this.#ownedThreads.add(providerSessionId);
-      response = await peer.request<TurnResponse>("turn/start", params);
+      response = await this.requestWithDeliveryBoundary<TurnResponse>("turn/start", params);
     }
     this.#ownedThreads.add(providerSessionId);
     const turnId = response.turn?.id;
@@ -508,7 +1222,30 @@ export class CodexAdapter implements AgentProviderAdapter {
   }
 
   public hasActiveTurn(providerSessionId: string): boolean {
-    return this.#sessionStates.get(providerSessionId) === "working";
+    // A cached status label is presentation state, not proof that a turn still
+    // exists. App Server work owns a concrete turn id; Desktop-owned work is
+    // authoritative only while the rollout reconciler still observes it.
+    return this.#currentTurns.has(providerSessionId)
+      || this.#activity?.hasActiveTurn(providerSessionId) === true;
+  }
+
+  public ownsActiveTurn(providerSessionId: string): boolean {
+    // Desktop-started turns also have a real turn id, but they never enter this
+    // adapter's current-turn map. This map is populated only after App Server
+    // accepts turn/start and is cleared by its matching turn/completed event.
+    return this.#currentTurns.has(providerSessionId);
+  }
+
+  /** The rollout reconciler reads only newly appended bytes on each live tick. */
+  public async watchSession(providerSessionId: string): Promise<boolean> {
+    if (this.#activity === null) return false;
+    await this.#activity.watchSession(providerSessionId);
+    await this.releaseIdleResources();
+    return true;
+  }
+
+  public unwatchSession(providerSessionId: string): void {
+    this.#activity?.unwatchSession(providerSessionId);
   }
 
   public async steerMessage(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
@@ -517,7 +1254,7 @@ export class CodexAdapter implements AgentProviderAdapter {
       throw new ProviderAdapterError(this.providerId, "NO_ACTIVE_TURN", "No active Codex turn is available to steer", false);
     }
     const input = codexTurnInput(request);
-    const response = await (await this.peer()).request<{ readonly turnId: string }>("turn/steer", {
+    const response = await this.requestWithDeliveryBoundary<{ readonly turnId: string }>("turn/steer", {
       threadId: providerSessionId,
       clientUserMessageId: request.requestId,
       input,
@@ -527,7 +1264,7 @@ export class CodexAdapter implements AgentProviderAdapter {
   }
 
   public async editMessage(providerSessionId: string, request: EditMessageRequest): Promise<SendMessageResult> {
-    const response = await (await this.peer()).request<ThreadResponse>("thread/read", {
+    const response = await this.request<ThreadResponse>("thread/read", {
       threadId: providerSessionId,
       includeTurns: true,
     });
@@ -556,7 +1293,7 @@ export class CodexAdapter implements AgentProviderAdapter {
     if (activeTurn) {
       throw new ProviderAdapterError(this.providerId, "TURN_ACTIVE", "Stop the active Codex turn before editing a message", false);
     }
-    await (await this.peer()).request("thread/rollback", {
+    await this.request("thread/rollback", {
       threadId: providerSessionId,
       numTurns: turns.length - targetIndex,
     });
@@ -569,13 +1306,16 @@ export class CodexAdapter implements AgentProviderAdapter {
   }
 
   public async interrupt(providerSessionId: string): Promise<void> {
+    const child = this.#visionChildren.get(providerSessionId);
+    if (child !== undefined) return await child.adapter.interrupt(providerSessionId);
     const turnId = this.#currentTurns.get(providerSessionId);
     if (turnId === undefined) throw new ProviderAdapterError(this.providerId, "NO_ACTIVE_TURN", "No active Codex turn is known for this thread", false);
-    await (await this.peer()).request("turn/interrupt", { threadId: providerSessionId, turnId });
+    await this.request("turn/interrupt", { threadId: providerSessionId, turnId });
   }
 
   public async subscribe(providerSessionId: string | null, sink: ProviderEventSink): Promise<Subscription> {
     await this.peer();
+    await this.releaseIdleResources();
     return this.#events.subscribe(providerSessionId, sink);
   }
 
@@ -624,13 +1364,26 @@ export class CodexAdapter implements AgentProviderAdapter {
   public async dispose(): Promise<void> {
     if (this.#disposed) return;
     this.#disposed = true;
+    for (const pending of this.#compactions.values()) pending.reject(new Error("Codex adapter disposed during compaction"));
+    this.#compactionTurns.clear();
+    const children = [...this.#visionChildren.values()];
+    this.#visionChildren.clear();
+    await Promise.all(children.map(async ({ adapter, catalog }) => {
+      await adapter.dispose();
+      await catalog.dispose();
+    }));
     this.#resourceGeneration += 1;
     this.cancelIdleRelease();
     this.#desktopQueue?.dispose();
-    this.#activity?.dispose();
+    await this.#activity?.dispose();
     for (const pending of this.#pendingServerRequests.values()) pending.reject(new Error("Codex adapter disposed"));
     this.#pendingServerRequests.clear();
     this.#ownedThreads.clear();
+    this.#threadsWithClientTools.clear();
+    this.#threadsWithoutClientTools.clear();
+    this.#visionThreads.clear();
+    this.#visionMessages.clear();
+    this.#clientToolResumes.clear();
     this.#events.clear();
     const startingPeer = this.#startingPeer;
     if (startingPeer !== null) await startingPeer.close().catch(() => undefined);
@@ -661,13 +1414,106 @@ export class CodexAdapter implements AgentProviderAdapter {
     }
   }
 
+  public async releaseSession(providerSessionId: string): Promise<void> {
+    const child = this.#visionChildren.get(providerSessionId);
+    if (child !== undefined) {
+      await child.adapter.dispose();
+      await child.catalog.dispose();
+      this.#visionChildren.delete(providerSessionId);
+      return;
+    }
+    if (!this.#visionThreads.has(providerSessionId)) return;
+    if (this.#peer !== null && this.#ownedThreads.has(providerSessionId)) {
+      await this.request("thread/unsubscribe", { threadId: providerSessionId });
+    }
+    this.#ownedThreads.delete(providerSessionId);
+    this.#threadsWithoutClientTools.delete(providerSessionId);
+    this.#visionThreads.delete(providerSessionId);
+    this.#visionMessages.delete(providerSessionId);
+  }
+
+  private async request<T>(method: string, params: unknown = {}): Promise<T> {
+    const peer = await this.peer();
+    this.#activePeerRequests += 1;
+    try {
+      return await peer.request<T>(method, params);
+    } finally {
+      this.#activePeerRequests -= 1;
+      await this.releaseIdleResources();
+    }
+  }
+
+  private async requestWithDeliveryBoundary<T>(method: string, params: unknown): Promise<T> {
+    const peer = await this.peer();
+    this.#activePeerRequests += 1;
+    try {
+      const started = peer.startRequest<T>(method, params);
+      // Own the result rejection immediately while the transport acceptance
+      // boundary is awaited separately.
+      void started.result.catch(() => undefined);
+      await started.sent;
+      try {
+        return await started.result;
+      } catch (error) {
+        // A JSON-RPC error is an explicit provider rejection, not an ambiguous
+        // lost acknowledgement. Transport failure or timeout after the frame
+        // was accepted must never be retried blindly.
+        if (error instanceof JsonRpcRemoteError) throw error;
+        throw new ProviderAdapterError(
+          this.providerId,
+          "DELIVERY_UNKNOWN",
+          "Codex received the instruction frame, but Tethoq could not confirm whether the provider accepted it. Delivery will be reconciled before another attempt.",
+          false,
+          { cause: error },
+        );
+      }
+    } finally {
+      this.#activePeerRequests -= 1;
+      await this.releaseIdleResources();
+    }
+  }
+
   private async initialize(): Promise<JsonRpcPeer> {
-    const transport = this.#transportFactory?.() ?? new JsonLineProcessTransport({
-      command: this.#command,
-      args: this.#args,
-      ...(this.#cwd !== undefined ? { cwd: this.#cwd } : {}),
-    });
-    const peer = new JsonRpcPeer(transport, {
+    try {
+      return await this.initializeOnce();
+    } catch (error) {
+      if (!this.#automaticCommand || this.#transportFactory !== undefined) throw error;
+      // Codex Desktop updates replace the hashed executable directory. If that
+      // happens between a cached version probe and process spawn, discovery is
+      // still pre-turn and may be repeated once without duplicate-delivery risk.
+      this.#commandResolver.invalidate();
+      try {
+        return await this.initializeOnce();
+      } catch (retryError) {
+        this.#commandResolver.invalidate();
+        throw retryError;
+      }
+    }
+  }
+
+  private async initializeOnce(): Promise<JsonRpcPeer> {
+    let transport: JsonRpcTransport;
+    try {
+      if (this.#transportFactory !== undefined) {
+        transport = this.#transportFactory(this.#args);
+      } else {
+        // Re-scan on every new process. Codex Desktop can update while Tethoq
+        // stays open, and an older executable may still launch successfully
+        // while being unable to read the newer rollout lineage.
+        if (this.#automaticCommand) this.#commandResolver.invalidate();
+        const selection = await this.#commandResolver.resolve();
+        transport = new JsonLineProcessTransport({
+          command: selection.command,
+          args: this.#args,
+          ...(this.#cwd !== undefined ? { cwd: this.#cwd } : {}),
+          env: this.#environment,
+        });
+      }
+    } catch (error) {
+      throw new ProviderAdapterError(this.providerId, "INITIALIZE_FAILED", `Codex App Server initialization failed: ${error instanceof Error ? error.message : String(error)}`, true, { cause: error });
+    }
+    let peer!: JsonRpcPeer;
+    peer = new JsonRpcPeer(transport, {
       includeJsonRpc: false,
       timeoutMs: this.#requestTimeoutMs,
       idPrefix: "codex",
@@ -675,10 +1521,19 @@ export class CodexAdapter implements AgentProviderAdapter {
         type: "provider.disconnected",
         payload: { message: error.message, source: "json_rpc_callback" },
       }),
+      onTransportClosed: (error) => this.handlePeerTransportClosed(peer, error),
     });
     this.#startingPeer = peer;
     peer.onNotification((method, params) => this.handleNotification(method, params));
-    peer.onRequest((method, params, id) => this.handleServerRequest(method, params, id));
+    peer.onRequest(async (method, params, id) => {
+      this.#activePeerRequests += 1;
+      try {
+        return await this.handleServerRequest(method, params, id);
+      } finally {
+        this.#activePeerRequests -= 1;
+        await this.releaseIdleResources();
+      }
+    });
     try {
       await peer.request("initialize", {
         clientInfo: { name: "tethoq", title: "Tethoq", version: "0.1.0" },
@@ -696,6 +1551,31 @@ export class CodexAdapter implements AgentProviderAdapter {
     }
   }
 
+  private async handlePeerTransportClosed(peer: JsonRpcPeer, error: Error): Promise<void> {
+    const current = this.#peer === peer;
+    const starting = this.#startingPeer === peer;
+    if (!current && !starting) return;
+    for (const pending of this.#compactions.values()) pending.reject(error);
+    this.#compactionTurns.clear();
+    const interruptedSessionIds = current ? [...this.#currentTurns.keys()] : [];
+    if (current) this.#peer = null;
+    if (starting) this.#startingPeer = null;
+    this.#resourceGeneration += 1;
+    this.cancelIdleRelease();
+    this.#ownedThreads.clear();
+    this.#currentTurns.clear();
+    for (const pending of this.#pendingServerRequests.values()) pending.reject(error);
+    this.#pendingServerRequests.clear();
+    for (const providerSessionId of interruptedSessionIds) {
+      const reconciled = await this.#activity?.reconcile([{ providerSessionId, nativeState: "unknown" }]);
+      await this.emitSessionState(providerSessionId, reconciled?.get(providerSessionId) ?? "unknown");
+    }
+    await this.emit({
+      type: "provider.disconnected",
+      payload: { message: error.message, source: "transport_closed" },
+    });
+  }
+
   private cancelIdleRelease(): void {
     if (this.#idleReleaseTimer === null) return;
     clearTimeout(this.#idleReleaseTimer);
@@ -709,6 +1589,10 @@ export class CodexAdapter implements AgentProviderAdapter {
     if (this.#disposed || generation !== this.#resourceGeneration) return;
     const peer = this.#peer;
     if (peer === null) return;
+    if (this.#activePeerRequests > 0 || this.#pendingServerRequests.size > 0 || this.hasOwnedActiveTurn()) {
+      await this.releaseIdleResources();
+      return;
+    }
     this.#peer = null;
     const closing = peer.close();
     this.#closing = closing;
@@ -720,17 +1604,29 @@ export class CodexAdapter implements AgentProviderAdapter {
     }
   }
 
+  private hasOwnedActiveTurn(): boolean {
+    return this.#compactions.size > 0 || [...this.#ownedThreads].some((providerSessionId) =>
+      this.#currentTurns.has(providerSessionId)
+      || [...this.#pendingServerRequests.values()].some((pending) => pending.providerSessionId === providerSessionId));
+  }
+
   private async handleServerRequest(method: string, params: unknown, id: RpcId): Promise<unknown> {
     const requestId = String(id);
     const source = isRecord(params) ? params : {};
     const providerSessionId = [source.threadId, source.conversationId, source.sessionId].find((value): value is string => typeof value === "string") ?? "unknown";
     if (method === "item/tool/call") {
+      if (this.#threadsWithoutClientTools.has(providerSessionId)) {
+        return { contentItems: [{ type: "inputText", text: "Tools are disabled for this private helper." }], success: false };
+      }
       if (this.#clientTooling === undefined) throw new ProviderAdapterError(this.providerId, "CLIENT_TOOLS_UNAVAILABLE", "Client tools are not configured", false);
       const tool = typeof source.tool === "string" ? source.tool : undefined;
       const input = isRecord(source.arguments) ? jsonObject(source.arguments) : {};
       if (tool === undefined) throw new ProviderAdapterError(this.providerId, "CLIENT_TOOL_INVALID", "Codex requested an unnamed client tool", false);
       try {
-        const output = await this.#clientTooling.execute(this.providerId, providerSessionId, tool, input);
+        const output = await this.#clientTooling.execute(this.providerId, providerSessionId, tool, input, {
+          callId: requestId,
+          lifecycleOwner: "provider",
+        });
         return { contentItems: [{ type: "inputText", text: JSON.stringify(output) }], success: true };
       } catch (error) {
         return { contentItems: [{ type: "inputText", text: error instanceof Error ? error.message : String(error) }], success: false };
@@ -778,8 +1674,71 @@ export class CodexAdapter implements AgentProviderAdapter {
     const source = isRecord(params) ? params : {};
     const providerSessionId = [source.threadId, isRecord(source.thread) ? source.thread.id : undefined].find((value): value is string => typeof value === "string");
     const turnId = [source.turnId, isRecord(source.turn) ? source.turn.id : undefined].find((value): value is string => typeof value === "string");
+    const compaction = providerSessionId === undefined ? undefined : this.#compactions.get(providerSessionId);
+    if (providerSessionId !== undefined && compaction !== undefined && turnId !== undefined
+      && turnId !== compaction.previousTurnId) {
+      if (method === "turn/started" && compaction.turnId === undefined) {
+        compaction.turnId = turnId;
+        this.#compactionTurns.delete(providerSessionId);
+        this.#compactionTurns.set(providerSessionId, turnId);
+        if (this.#compactionTurns.size > 128) this.#compactionTurns.delete(this.#compactionTurns.keys().next().value!);
+      }
+      if (compaction.turnId === turnId) {
+        const item = isRecord(source.item) ? source.item : {};
+        if (method === "item/started" && item.type === "contextCompaction" && typeof item.id === "string") {
+          compaction.itemId = item.id;
+        }
+        if (method === "item/completed" && item.type === "contextCompaction" && item.id === compaction.itemId
+          && compaction.itemId !== undefined) compaction.itemCompleted = true;
+        if (method === "turn/completed") {
+          const status = isRecord(source.turn) ? source.turn.status : undefined;
+          if (status === "completed" && compaction.itemCompleted) compaction.resolve();
+          else if (status !== "completed") compaction.reject(new ProviderAdapterError(
+            this.providerId, "COMPACTION_FAILED", "Codex compaction failed or was interrupted", true,
+          ));
+        }
+        if (method === "error" && source.willRetry !== true) compaction.reject(new ProviderAdapterError(
+          this.providerId, "COMPACTION_FAILED", "Codex compaction failed", true,
+        ));
+      }
+    }
+    if (providerSessionId !== undefined && this.#visionThreads.has(providerSessionId)
+      && turnId !== undefined && method === "item/completed" && isRecord(source.item)
+      && source.item.type === "agentMessage" && typeof source.item.id === "string") {
+      const text = assistantItemText(source.item);
+      const currentTurnId = this.#currentTurns.get(providerSessionId);
+      if (text && (currentTurnId === undefined || currentTurnId === turnId)) {
+        const now = this.#now().toISOString();
+        this.#visionMessages.set(providerSessionId, {
+          id: `codex/${source.item.id}`,
+          sessionId: makeGlobalSessionId(this.#hostId, this.providerId, providerSessionId),
+          providerMessageId: source.item.id,
+          role: "assistant",
+          createdAt: now,
+          completedAt: now,
+          parts: [{ type: "text", text }],
+          status: "completed",
+          nativeMetadata: { turnId },
+        });
+      }
+    }
     if (providerSessionId !== undefined && turnId !== undefined && method === "turn/started") this.#currentTurns.set(providerSessionId, turnId);
-    if (providerSessionId !== undefined && method === "turn/completed") this.#currentTurns.delete(providerSessionId);
+    if (providerSessionId !== undefined && method === "turn/completed") {
+      const currentTurnId = this.#currentTurns.get(providerSessionId);
+      // A delayed terminal event for turn A cannot retire a newer owned turn B.
+      // Missing identity is likewise insufficient once a concrete turn is live.
+      if (currentTurnId !== undefined && turnId !== currentTurnId) return;
+      this.#currentTurns.delete(providerSessionId);
+    }
+
+    // Manual compaction has its own bridge lifecycle. Its native turn must not
+    // look like another user turn (or trigger automatic compaction recursively).
+    if (providerSessionId !== undefined && (
+      (turnId !== undefined && this.#compactionTurns.get(providerSessionId) === turnId
+        && (method === "turn/started" || method === "turn/completed" || method === "error"
+          || (isRecord(source.item) && source.item.type === "contextCompaction")))
+      || (compaction !== undefined && method === "thread/status/changed")
+    )) return;
 
     if (providerSessionId !== undefined && method === "thread/tokenUsage/updated") {
       const tokenUsage = isRecord(source.tokenUsage) ? source.tokenUsage : source;
@@ -815,8 +1774,46 @@ export class CodexAdapter implements AgentProviderAdapter {
 
     if (providerSessionId !== undefined && method === "thread/status/changed") {
       const nativeState = normalizeCodexStatus(source.status);
-      const reconciled = await this.#activity?.reconcile([{ providerSessionId, nativeState }]);
-      await this.emitSessionState(providerSessionId, reconciled?.get(providerSessionId) ?? nativeState, source);
+      const lifecycleState = this.ownsActiveTurn(providerSessionId)
+        && (nativeState === "idle" || nativeState === "unknown")
+        ? "working"
+        : nativeState;
+      const externalWriter = !this.#ownedThreads.has(providerSessionId)
+        && await this.#activity?.hasWriterLock(providerSessionId) === true;
+      const coldNotLoaded = isColdNotLoadedStatus(source.status, externalWriter, this.ownsActiveTurn(providerSessionId));
+      const reconciled = await this.#activity?.reconcile([{
+        providerSessionId,
+        nativeState: coldNotLoaded ? "idle" : externalWriter ? "unknown" : lifecycleState,
+        ...(coldNotLoaded ? { observeUnknown: false } : {}),
+      }]);
+      await this.emitSessionState(providerSessionId, reconciled?.get(providerSessionId) ?? (coldNotLoaded ? "idle" : lifecycleState), source);
+      return;
+    }
+
+    if (providerSessionId !== undefined && method === "thread/name/updated") {
+      const title = normalizeCodexThreadName(source.threadName);
+      if (title !== undefined) await this.emit({ type: "session.updated", providerSessionId, payload: { title } });
+      return;
+    }
+
+    if (method === "thread/goal/updated") {
+      const goalThreadId = requireGoalNotificationThread(source, method);
+      const goal = requireNativeGoal(source.goal, method, goalThreadId);
+      await this.emit({ type: "session.goal_updated", providerSessionId: goalThreadId, payload: { goal: goal as unknown as JsonObject } });
+      return;
+    }
+    if (method === "thread/goal/cleared") {
+      const goalThreadId = requireGoalNotificationThread(source, method);
+      validateGoalOrderingFields(source, method);
+      const payload: JsonObject = {
+        ...(hasOwn(source, "revision") ? { revision: source.revision as number } : {}),
+        ...(hasOwn(source, "updatedAt") ? { updatedAt: source.updatedAt as number | string } : {}),
+      };
+      await this.emit({
+        type: "session.goal_cleared",
+        providerSessionId: goalThreadId,
+        payload,
+      });
       return;
     }
 
@@ -847,11 +1844,33 @@ export class CodexAdapter implements AgentProviderAdapter {
     const sessions = threads.map((thread) => normalizeCodexThread(this.#hostId, thread));
     const externalWriters = await Promise.all(sessions.map(async (session) =>
       !this.#ownedThreads.has(session.providerSessionId) && await this.#activity?.hasWriterLock(session.providerSessionId) === true));
-    const states = await this.#activity?.reconcile(threads.map((thread, index) => ({
-      providerSessionId: thread.id,
-      ...(thread.path !== undefined ? { path: thread.path } : {}),
-      nativeState: sessions[index]?.state ?? "unknown",
-    }))) ?? new Map<string, SessionState>();
+    const states = await this.#activity?.reconcile(threads.map((thread, index) => {
+      const listedState = sessions[index]?.state ?? "unknown";
+      const lifecycleState = this.ownsActiveTurn(thread.id) && (listedState === "idle" || listedState === "unknown")
+        ? "working"
+        : listedState;
+      return {
+        providerSessionId: thread.id,
+        ...(thread.path !== undefined ? { path: thread.path } : {}),
+      // App Server's `notLoaded` is a cold catalogue state, not an active or
+      // unknown turn. Once the external writer lock is gone (and Tethoq has
+      // no owned turn), expose it as idle without asking the reconciler to
+      // reopen the historical rollout.
+        nativeState: isColdNotLoadedStatus(thread.status, externalWriters[index] === true, this.ownsActiveTurn(thread.id))
+          ? "idle"
+          : externalWriters[index] === true ? "unknown" : lifecycleState,
+      // A separate Codex client can report its thread idle before its rollout
+      // writer has persisted the terminal event. While that external writer is
+      // present, the rollout's start/terminal marker is the authoritative turn
+      // state; a terminal marker still keeps a merely open idle task idle.
+      // App Server's cold `notLoaded` rows also normalize to unknown. They are
+      // historical catalogue entries, not a reason to scan every rollout. A
+      // real external writer (or a Tethoq-owned turn) still opts into the
+      // rollout observer, and opening a task does so through watchSession().
+        observeUnknown: !isColdNotLoadedStatus(thread.status, externalWriters[index] === true, this.ownsActiveTurn(thread.id))
+          && (externalWriters[index] === true || this.#ownedThreads.has(thread.id)),
+      };
+    })) ?? new Map<string, SessionState>();
     return sessions.map((session, index) => {
       const state = states.get(session.providerSessionId) ?? session.state;
       const observedMetadata = this.#activity?.turnMetadata(session.providerSessionId);
@@ -874,26 +1893,6 @@ export class CodexAdapter implements AgentProviderAdapter {
         ...(metadata.reasoningEffort !== undefined ? { reasoningEffort: metadata.reasoningEffort } : {}),
       };
     });
-  }
-
-  private async withRecentActivityPreview(session: RemoteSession): Promise<RemoteSession> {
-    const observed = await this.#activity?.recentMessages(session.providerSessionId) ?? [];
-    let latest: CodexObservedMessage | undefined;
-    for (let index = observed.length - 1; index >= 0; index -= 1) {
-      const candidate = observed[index];
-      if (candidate?.partType === "text" && candidate.text.trim().length > 0) {
-        latest = candidate;
-        break;
-      }
-    }
-    if (latest === undefined) return session;
-    const preview = latest.text.trim().replace(/\s+/gu, " ").slice(0, 240);
-    const observedAt = validIsoTimestamp(latest.createdAt);
-    return {
-      ...session,
-      preview,
-      ...(observedAt !== undefined && observedAt > session.lastActivityAt ? { lastActivityAt: observedAt } : {}),
-    };
   }
 
   private async applySessionMetadata(providerSessionId: string, update: CodexTurnMetadata, emitChange: boolean): Promise<void> {
@@ -970,6 +1969,7 @@ export class CodexAdapter implements AgentProviderAdapter {
       }
       return;
     }
+
     const activity = activities[0];
     if (activity?.type === "tool") {
       await this.emit({
@@ -991,12 +1991,49 @@ export class CodexAdapter implements AgentProviderAdapter {
       partType: message.partType,
       source: "codex-local-rollout",
       ...(message.phase !== undefined ? { phase: message.phase } : {}),
+      ...(message.turnId !== undefined ? { turnId: message.turnId } : {}),
+      ...(message.canonicalUserMessage ? { canonicalUserMessage: true } : {}),
     };
+    const imageAttachments = message.role === "user" ? observedImageAttachments(activities) : [];
     // A rollout response_item is already a complete persisted record. Replaying
     // it as started/delta/completed made the renderer briefly mark finished work
     // as live and the text-free completion could erase the answer until history
     // catch-up restored it. One completed event is both faster and truthful.
-    await this.emit({ type: "message.completed", providerSessionId, payload: { ...base, text: message.text } });
+    await this.emit({
+      type: "message.completed",
+      providerSessionId,
+      payload: {
+        ...base,
+        text: message.text,
+        ...(imageAttachments.length > 0 ? { requiresHistoryRefresh: true, imageAttachments } : {}),
+      },
+    });
+  }
+
+  private async publishDiscoveredActiveThread(providerSessionId: string): Promise<void> {
+    if (this.#disposed) return;
+    const response = await this.request<ThreadResponse>("thread/read", {
+      threadId: providerSessionId,
+      includeTurns: false,
+    });
+    if (this.#disposed || response.thread.id !== providerSessionId) return;
+    const session = (await this.normalizeThreads([response.thread]))[0];
+    if (session === undefined || this.#disposed) return;
+    // The lock filename only tells us which task may have a writer. The rollout
+    // marker reconciler above decides whether that writer has a live turn. Send
+    // the resulting state through the normal provider event path so Bridge can
+    // update an existing row or materialize a genuinely active unknown task.
+    await this.emit({
+      type: "session.updated",
+      providerSessionId,
+      payload: {
+        state: session.state,
+        activityDiscovered: true,
+        ...(normalizeCodexThreadName(response.thread.name) !== undefined ? { title: session.title } : {}),
+        ...(session.modelId !== undefined ? { modelId: session.modelId } : {}),
+        ...(session.reasoningEffort !== undefined ? { reasoningEffort: session.reasoningEffort } : {}),
+      },
+    });
   }
 
   public async getExternalSessionLaunches(providerSessionId: string, since: string) {
@@ -1014,16 +2051,30 @@ function inputModalities(value: unknown): readonly ("text" | "image" | "audio")[
   return modalities.length > 0 ? modalities : undefined;
 }
 
-/** GPT-5.6 Sol accepts native MP3 input even when an older app-server omits it. */
-function codexModelInputModalities(id: string, value: unknown): readonly ("text" | "image" | "audio")[] | undefined {
-  const reported = inputModalities(value);
-  if (id.trim().toLowerCase() !== "gpt-5.6-sol") return reported;
-  return [...new Set([...(reported ?? ["text", "image"]), "audio" as const])];
-}
-
 function isCodexThreadNotFound(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /\bthread not found\b/iu.test(message);
+  return /\bthread\b[^\r\n]{0,160}\b(?:not found|not loaded)\b/iu.test(message);
+}
+
+function isCodexThreadHistoryUnavailableBeforeFirstMessage(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /\bthread\b[^\r\n]{0,160}\bis not materialized yet;\s*includeTurns is unavailable before first user message\b/iu.test(message);
+}
+
+function isRecoverableScheduledHistoryRead(error: unknown): boolean {
+  if (error instanceof JsonRpcRemoteError) {
+    return /\binvalid paginated history lineage\b|\bhistory lineage\b[^\r\n]{0,160}\bcycle detected\b/iu.test(error.rpcError.message);
+  }
+  return !(error instanceof ProviderAdapterError) || error.code === "INITIALIZE_FAILED" && error.retryable;
+}
+
+function isCodexActiveWriter(error: unknown): boolean {
+  return error instanceof JsonRpcRemoteError
+    && /\balready has an active writer\b/iu.test(error.rpcError.message);
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function validIsoTimestamp(value: string | undefined): string | undefined {
@@ -1132,8 +2183,17 @@ function normalizeNotification(
   };
   if (method === "thread/started") return { ...base, type: "session.created", payload: { thread: jsonObject(source.thread) } };
   if (method === "turn/started") return { ...base, type: "message.started", payload: { ...(turnId !== undefined ? { turnId } : {}) } };
-  if (method === "turn/completed") return { ...base, type: "agent.completed", payload: { ...(turnId !== undefined ? { turnId } : {}), turn: jsonObject(source.turn) } };
-  if (method === "item/agentMessage/delta") return { ...base, type: "message.delta", payload: { text: typeof source.delta === "string" ? source.delta : "", ...(typeof source.itemId === "string" ? { itemId: source.itemId } : {}) } };
+  if (method === "turn/completed") {
+    const turn = jsonObject(source.turn);
+    const status = typeof turn.status === "string" ? turn.status.trim().toLowerCase() : undefined;
+    const type = status === "interrupted" || status === "cancelled" || status === "canceled" || status === "aborted" || status === "stopped"
+      ? "agent.interrupted"
+      : status === "failed" || status === "error"
+        ? "agent.error"
+        : "agent.completed";
+    return { ...base, type, payload: { ...(turnId !== undefined ? { turnId } : {}), turn } };
+  }
+  if (method === "item/agentMessage/delta") return { ...base, type: "message.delta", payload: { text: typeof source.delta === "string" ? visibleCodexAssistantDelta(source.delta) : "", ...(typeof source.itemId === "string" ? { itemId: source.itemId } : {}) } };
   if (method === "item/started") {
     const item = isRecord(source.item) ? source.item : {};
     const type = typeof item.type === "string" ? item.type : "unknown";
@@ -1150,7 +2210,10 @@ function normalizeNotification(
     if (type === "fileChange") return { ...base, type: "file.changed", payload: { files: [...extractFiles(item)], item: jsonObject(item) } };
     if (type.includes("Tool") || type === "webSearch") return { ...base, type: "tool.completed", payload: { item: jsonObject(item) } };
     if (type === "reasoning") return { ...base, type: "message.completed", payload: { partType: "reasoning", item: jsonObject(item) } };
-    if (type === "agentMessage" || type === "plan") return { ...base, type: "message.completed", payload: { item: jsonObject(item) } };
+    if (type === "agentMessage" || type === "plan") {
+      const text = assistantItemText(item);
+      return { ...base, type: "message.completed", payload: { item: jsonObject(item), ...(text ? { text } : {}) } };
+    }
     if (type === "contextCompaction") return { ...base, type: "message.completed", payload: { text: "Session compacted", ...(typeof item.id === "string" ? { itemId: item.id } : {}) } };
     return null;
   }
@@ -1165,4 +2228,108 @@ function normalizeNotification(
   // genuine App Server `error` notifications still flow above unchanged.
   if (method === "warning" || method === "guardianWarning" || method === "configWarning") return null;
   return null;
+}
+
+function assistantItemText(item: Record<string, unknown>): string {
+  const content = Array.isArray(item.content) ? item.content : [item.content ?? item.text];
+  return visibleCodexAssistantText(content.flatMap((part) => {
+    if (typeof part === "string") return [part];
+    return isRecord(part) && typeof part.text === "string" ? [part.text] : [];
+  }).join(""));
+}
+
+function isColdNotLoadedStatus(status: unknown, externalWriter: boolean, ownedActiveTurn: boolean): boolean {
+  const type = typeof status === "string"
+    ? status
+    : isRecord(status) && typeof status.type === "string" ? status.type : undefined;
+  return type === "notLoaded" && !externalWriter && !ownedActiveTurn;
+}
+
+const nativeGoalStatuses = new Set<SessionGoalStatus>(["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]);
+
+function hasOwn(source: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(source, key);
+}
+
+function isThreadId(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return isNonNegativeSafeInteger(value) && value > 0;
+}
+
+function isNativeTimestamp(value: unknown): value is number {
+  return isPositiveSafeInteger(value);
+}
+
+function isGoalOrderingTimestamp(value: unknown): value is number | string {
+  if (isNativeTimestamp(value)) return true;
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+function validateGoalOrderingFields(source: Record<string, unknown>, method: string): void {
+  if (hasOwn(source, "revision") && !isNonNegativeSafeInteger(source.revision)) {
+    throw invalidGoalResponse(method);
+  }
+  if (hasOwn(source, "updatedAt") && !isGoalOrderingTimestamp(source.updatedAt)) {
+    throw invalidGoalResponse(method);
+  }
+}
+
+function validateGoalEnvelope(source: Record<string, unknown>, expectedThreadId: string, method: string): void {
+  if (hasOwn(source, "threadId") && (!isThreadId(source.threadId) || source.threadId !== expectedThreadId)) {
+    throw invalidGoalResponse(method);
+  }
+  validateGoalOrderingFields(source, method);
+}
+
+function requireGoalNotificationThread(source: Record<string, unknown>, method: string): string {
+  if (!isThreadId(source.threadId)) throw invalidGoalResponse(method);
+  return source.threadId;
+}
+
+function normalizeNativeGoal(value: unknown, expectedThreadId?: string): ProviderSessionGoal | undefined {
+  if (!isRecord(value)
+    || !isThreadId(value.threadId)
+    || (expectedThreadId !== undefined && value.threadId !== expectedThreadId)
+    || typeof value.objective !== "string"
+    || value.objective.trim().length === 0
+    || value.objective.length > sessionGoalObjectiveMaxLength
+    || !nativeGoalStatuses.has(value.status as SessionGoalStatus)
+    || !hasOwn(value, "tokenBudget")
+    || (value.tokenBudget !== null && !isPositiveSafeInteger(value.tokenBudget))
+    || !isNonNegativeSafeInteger(value.tokensUsed)
+    || !isNonNegativeSafeInteger(value.timeUsedSeconds)
+    || !isNativeTimestamp(value.createdAt)
+    || !isNativeTimestamp(value.updatedAt)
+    || (hasOwn(value, "revision") && !isNonNegativeSafeInteger(value.revision))) return undefined;
+  return {
+    objective: value.objective,
+    status: value.status as SessionGoalStatus,
+    tokenBudget: value.tokenBudget as number | null,
+    tokensUsed: value.tokensUsed,
+    timeUsedSeconds: value.timeUsedSeconds,
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+    ...(hasOwn(value, "revision") ? { revision: value.revision as number } : {}),
+  };
+}
+
+function invalidGoalResponse(method: string): ProviderAdapterError {
+  return new ProviderAdapterError("codex", "GOAL_RESPONSE_INVALID", `Codex returned an invalid ${method} response`, false);
+}
+
+function requireNativeGoal(value: unknown, method: string, expectedThreadId?: string): ProviderSessionGoal {
+  const goal = normalizeNativeGoal(value, expectedThreadId);
+  if (goal === undefined) throw invalidGoalResponse(method);
+  return goal;
+}
+
+function isUnsupportedGoalError(error: unknown): boolean {
+  return error instanceof JsonRpcRemoteError && error.rpcError.code === -32601;
 }

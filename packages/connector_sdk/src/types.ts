@@ -198,6 +198,15 @@ export interface ConnectorCreateSessionParams {
   readonly firstInstruction?: string;
   readonly parentSessionId?: string;
   readonly metadata?: JsonObject;
+  /** Internal helpers must not inherit host tools or harness MCP configuration. */
+  readonly clientTools?: "all" | "none";
+  readonly mcpServers?: "inherit" | "none";
+}
+
+export interface ConnectorClientToolDefinition {
+  readonly name: string;
+  readonly description: string;
+  readonly inputSchema: JsonObject;
 }
 
 export interface ConnectorAttachment {
@@ -211,6 +220,13 @@ export interface ConnectorSendMessageParams {
   readonly sessionId: string;
   readonly requestId: string;
   readonly content: string;
+  /** Replace the previous turn's host tools with this list; [] disables them. */
+  readonly clientTools?: readonly ConnectorClientToolDefinition[];
+  /**
+   * Private per-turn guidance for the connector's provider.
+   * Connectors must not persist or render this alongside visible message text.
+   */
+  readonly developerInstructions?: string;
   readonly modelId?: string;
   readonly reasoningEffort?: string;
   readonly attachments?: readonly ConnectorAttachment[];

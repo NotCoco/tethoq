@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   Menu,
   WebContentsView,
+  clipboard,
   session,
   type BrowserWindow,
   type ContextMenuParams,
@@ -16,6 +17,7 @@ import {
   type WebContents,
 } from "electron";
 import { BrowserIdleLifecycle } from "./browser_idle_lifecycle.js";
+import { contextMenuTemplate } from "./context_menu.js";
 
 /**
  * The browser deliberately uses only this named partition. It is owned by Tethoq
@@ -35,6 +37,12 @@ const MAX_AGENT_LABEL = 500;
 const MAX_AGENT_TYPE_TEXT = 20_000;
 const MAX_AGENT_SCROLL_DELTA = 4_000;
 const MAX_AGENT_CAPTURE_BYTES = 900_000;
+const MAX_AGENT_ALL_TEXT = 60_000;
+const DEFAULT_AGENT_ALL_TEXT_PER_TAB = 2_500;
+const MAX_AGENT_ALL_ELEMENTS_PER_TAB = 60;
+const BROWSER_NAVIGATION_TIMEOUT_MS = 45_000;
+const BROWSER_AGENT_ACTION_TIMEOUT_MS = 15_000;
+const BROWSER_AGENT_INSPECT_ALL_TIMEOUT_MS = 30_000;
 const AGENT_VIEWPORT: Rectangle = { x: 0, y: 0, width: 1_280, height: 800 };
 const SEARCH_ENDPOINT = "https://www.google.com/search?q=";
 
@@ -74,6 +82,8 @@ export interface BrowserTabState {
   readonly canGoForward: boolean;
   readonly crashed: boolean;
   readonly error: string | null;
+  readonly muted: boolean;
+  readonly audible: boolean;
 }
 
 export interface BrowserDownloadStateEntry {
@@ -140,10 +150,18 @@ export interface BrowserAgentPageSnapshot {
   readonly tabId: string;
   readonly title: string;
   readonly url: string;
+  readonly pageError?: string;
   readonly text: string;
   readonly textTruncated: boolean;
   readonly elements: readonly BrowserAgentElement[];
   readonly elementsTruncated: boolean;
+}
+
+export interface BrowserAgentWorkspaceSnapshot {
+  readonly activeTabId: string | null;
+  readonly tabs: readonly BrowserAgentPageSnapshot[];
+  readonly textTruncated: boolean;
+  readonly tabsTruncated: boolean;
 }
 
 export interface BrowserAgentActionResult {
@@ -176,6 +194,7 @@ export interface BrowserAgentScreenshot {
 export type BrowserWorkspaceNotice =
   | { readonly type: "blocked-navigation"; readonly tabId: string; readonly url: string }
   | { readonly type: "blocked-popup"; readonly tabId: string; readonly url: string }
+  | { readonly type: "tab-limit" }
   | { readonly type: "focus-address"; readonly tabId: string }
   | { readonly type: "permission-blocked"; readonly tabId: string; readonly permission: string; readonly origin: string }
   | { readonly type: "permission-expired"; readonly requestId: string }
@@ -199,6 +218,8 @@ interface TabRecord {
   loading: boolean;
   crashed: boolean;
   error: string | null;
+  muted: boolean;
+  audible: boolean;
   agentInspectionId: string | null;
   readonly agentRefs: Set<string>;
 }
@@ -221,7 +242,12 @@ interface DownloadRecord {
 }
 
 interface BrowserSessionSnapshot {
-  readonly tabs: readonly { readonly url: string; readonly title: string; readonly faviconUrl: string | null }[];
+  readonly tabs: readonly {
+    readonly url: string;
+    readonly title: string;
+    readonly faviconUrl: string | null;
+    readonly muted: boolean;
+  }[];
   readonly activeIndex: number;
 }
 
@@ -255,12 +281,14 @@ export class BrowserWorkspaceManager {
   #overlayOpen = false;
   #overlayGeneration = 0;
   #overlayCaptureTabId: string | null = null;
+  #overlayCaptureBounds: Rectangle | null = null;
   #clearing = false;
   #initialized = false;
   #disposed = false;
   #emitQueued = false;
   #agentActive = false;
   #suspendPromise: Promise<void> | undefined;
+  #restorePromise: Promise<void> | undefined;
 
   public constructor(options: BrowserWorkspaceManagerOptions) {
     this.#window = options.window;
@@ -315,9 +343,14 @@ export class BrowserWorkspaceManager {
 
     const url = normalizeNavigationInput(input?.url ?? this.#initialUrl);
     try {
-      await tab.view.webContents.loadURL(url);
+      await withBrowserDeadline(
+        tab.view.webContents.loadURL(url),
+        BROWSER_NAVIGATION_TIMEOUT_MS,
+        "The browser page took too long to load",
+        () => tab.view.webContents.stop(),
+      );
     } catch (error: unknown) {
-      if (!tab.view.webContents.isDestroyed()) {
+      if (!tab.view.webContents.isDestroyed() && !isAbortedNavigationError(error)) {
         tab.loading = false;
         tab.error = errorMessage(error);
         this.#emitSoon();
@@ -330,6 +363,17 @@ export class BrowserWorkspaceManager {
     this.#assertAvailable();
     const tab = this.#tab(tabId);
     this.#activate(tab);
+    this.#emitSoon();
+    return this.#tabState(tab);
+  }
+
+  public setMuted(tabId: string, muted: boolean): BrowserTabState {
+    this.#assertAvailable();
+    const tab = this.#tab(tabId);
+    if (!tab.view.webContents.isDestroyed()) {
+      tab.view.webContents.setAudioMuted(muted);
+      this.#syncAudioState(tab);
+    }
     this.#emitSoon();
     return this.#tabState(tab);
   }
@@ -356,10 +400,20 @@ export class BrowserWorkspaceManager {
 
   public async navigate(tabId: string, input: string): Promise<BrowserTabState> {
     const tab = this.#tab(tabId);
+    if (tab.view.webContents.isDestroyed()) throw new Error("The browser tab is no longer available");
     const url = normalizeNavigationInput(input);
     tab.error = null;
     this.#clearAgentRefs(tab);
-    await tab.view.webContents.loadURL(url);
+    try {
+      await withBrowserDeadline(
+        tab.view.webContents.loadURL(url),
+        BROWSER_NAVIGATION_TIMEOUT_MS,
+        "The browser page took too long to load",
+        () => tab.view.webContents.stop(),
+      );
+    } catch (error: unknown) {
+      if (!isAbortedNavigationError(error)) throw error;
+    }
     return this.#tabState(tab);
   }
 
@@ -376,9 +430,15 @@ export class BrowserWorkspaceManager {
       throw new Error("The visible browser belongs to another session; close it before using this browser tool");
     }
     await this.initialize();
+    await this.#suspendPromise;
+    await this.#restorePromise;
+    if (this.#visible && this.#activeSessionId !== null && boundedSessionId !== this.#activeSessionId) {
+      throw new Error("The visible browser belongs to another session; close it before using this browser tool");
+    }
     this.#agentActive = true;
     this.#idleLifecycle.setInactive(false);
     if (boundedSessionId !== this.#activeSessionId) {
+      this.#touchSessionSnapshot(boundedSessionId);
       this.#snapshotActiveSession();
       this.#closeAllTabs();
       this.#activeSessionId = boundedSessionId;
@@ -386,9 +446,8 @@ export class BrowserWorkspaceManager {
       this.#touchSessionSnapshot(boundedSessionId);
     }
     if (this.#tabs.size === 0) {
-      await this.#suspendPromise;
       const hasSnapshot = this.#sessionSnapshots.has(boundedSessionId);
-      if (this.#tabs.size === 0 && (materializeTab || hasSnapshot)) await this.#restoreSession(boundedSessionId);
+      if (materializeTab || hasSnapshot) await this.#restoreSessionCoordinated(boundedSessionId);
     }
     for (const tab of this.#tabs.values()) tab.view.setBounds(this.#effectiveViewBounds());
     this.#emitSoon();
@@ -403,12 +462,20 @@ export class BrowserWorkspaceManager {
   }
 
   public async inspectForAgent(tabId?: string): Promise<BrowserAgentPageSnapshot> {
-    const tab = this.#agentTab(tabId);
+    return await this.#inspectAgentPage(this.#agentTab(tabId), MAX_AGENT_TEXT, MAX_AGENT_ELEMENTS);
+  }
+
+  async #inspectAgentPage(tab: TabRecord, maximumText: number, maximumElements: number, timeoutMs = BROWSER_AGENT_ACTION_TIMEOUT_MS): Promise<BrowserAgentPageSnapshot> {
     const inspectionId = randomUUID();
-    const value = await tab.view.webContents.executeJavaScript(
-      scriptCall(inspectPageForAgent, inspectionId, MAX_AGENT_ELEMENTS, MAX_AGENT_TEXT, MAX_AGENT_LABEL),
-      false,
-    ) as AgentInspectionPayload;
+    if (tab.view.webContents.isDestroyed()) throw new Error("The browser tab is no longer available");
+    const value = await withBrowserDeadline(
+      tab.view.webContents.executeJavaScript(
+        scriptCall(inspectPageForAgent, inspectionId, maximumElements, maximumText, MAX_AGENT_LABEL),
+        false,
+      ) as Promise<AgentInspectionPayload>,
+      timeoutMs,
+      "The browser page did not respond to inspection",
+    );
     const refs = new Set(value.elements.map((element) => element.ref));
     tab.agentInspectionId = inspectionId;
     tab.agentRefs.clear();
@@ -417,16 +484,65 @@ export class BrowserWorkspaceManager {
       tabId: tab.id,
       title: boundedText(value.title, 240) || tab.title,
       url: isAllowedWebUrl(value.url) ? value.url : tab.url,
-      text: boundedText(value.text, MAX_AGENT_TEXT),
+      text: boundedText(value.text, maximumText),
       textTruncated: value.textTruncated === true,
-      elements: value.elements.slice(0, MAX_AGENT_ELEMENTS).map((element) => normalizeAgentElement(element)),
+      elements: value.elements.slice(0, maximumElements).map((element) => normalizeAgentElement(element)),
       elementsTruncated: value.elementsTruncated === true,
     };
   }
 
+  public async inspectAllForAgent(options: { readonly maxTextPerTab?: number } = {}): Promise<BrowserAgentWorkspaceSnapshot> {
+    if (this.#tabs.size === 0) return { activeTabId: this.#activeTabId, tabs: [], textTruncated: false, tabsTruncated: false };
+    const requested = options.maxTextPerTab ?? DEFAULT_AGENT_ALL_TEXT_PER_TAB;
+    if (!Number.isInteger(requested) || requested < 250 || requested > MAX_AGENT_TEXT) {
+      throw new Error(`max_text_per_tab must be an integer from 250 to ${MAX_AGENT_TEXT}`);
+    }
+    const tabs: BrowserAgentPageSnapshot[] = [];
+    let remainingText = MAX_AGENT_ALL_TEXT;
+    let textTruncated = false;
+    let tabsTruncated = false;
+    const deadline = Date.now() + BROWSER_AGENT_INSPECT_ALL_TIMEOUT_MS;
+    for (const tab of this.#tabs.values()) {
+      const remainingTime = deadline - Date.now();
+      if (remainingText <= 250 || remainingTime <= 0) {
+        tabsTruncated = true;
+        break;
+      }
+      let snapshot: BrowserAgentPageSnapshot;
+      try {
+        snapshot = await this.#inspectAgentPage(
+          tab,
+          Math.min(requested, remainingText),
+          MAX_AGENT_ALL_ELEMENTS_PER_TAB,
+          Math.min(BROWSER_AGENT_ACTION_TIMEOUT_MS, remainingTime),
+        );
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        snapshot = {
+          tabId: tab.id,
+          title: tab.title,
+          url: tab.url,
+          pageError: boundedText(message, 500) || "This page could not be inspected",
+          text: "",
+          textTruncated: false,
+          elements: [],
+          elementsTruncated: false,
+        };
+      }
+      tabs.push(snapshot);
+      remainingText -= snapshot.text.length;
+      textTruncated ||= snapshot.textTruncated;
+    }
+    return { activeTabId: this.#activeTabId, tabs, textTruncated, tabsTruncated };
+  }
+
   public async clickForAgent(ref: string, tabId?: string): Promise<BrowserAgentActionResult> {
     const tab = this.#agentTabForRef(ref, tabId);
-    const value = await tab.view.webContents.executeJavaScript(scriptCall(clickElementForAgent, ref), true) as AgentActionPayload;
+    const value = await withBrowserDeadline(
+      tab.view.webContents.executeJavaScript(scriptCall(clickElementForAgent, ref), true) as Promise<AgentActionPayload>,
+      BROWSER_AGENT_ACTION_TIMEOUT_MS,
+      "The browser page did not respond to the click",
+    );
     if (value.ok !== true) throw new Error(agentActionError(value.error));
     return { tabId: tab.id, url: currentAgentUrl(tab, value.url), ref };
   }
@@ -435,7 +551,11 @@ export class BrowserWorkspaceManager {
     const tab = this.#agentTabForRef(ref, tabId);
     const boundedValue = text.slice(0, MAX_AGENT_TYPE_TEXT);
     if (boundedValue.length !== text.length) throw new Error(`Browser text is limited to ${MAX_AGENT_TYPE_TEXT} characters`);
-    const value = await tab.view.webContents.executeJavaScript(scriptCall(typeIntoElementForAgent, ref, boundedValue, submit), true) as AgentActionPayload;
+    const value = await withBrowserDeadline(
+      tab.view.webContents.executeJavaScript(scriptCall(typeIntoElementForAgent, ref, boundedValue, submit), true) as Promise<AgentActionPayload>,
+      BROWSER_AGENT_ACTION_TIMEOUT_MS,
+      "The browser page did not respond to text entry",
+    );
     if (value.ok !== true) throw new Error(agentActionError(value.error));
     return {
       tabId: tab.id,
@@ -450,7 +570,11 @@ export class BrowserWorkspaceManager {
     const x = boundedAgentScrollDelta(deltaX);
     const y = boundedAgentScrollDelta(deltaY);
     if (x === 0 && y === 0) throw new Error("Browser scroll needs a non-zero delta");
-    const value = await tab.view.webContents.executeJavaScript(scriptCall(scrollPageForAgent, x, y), true) as AgentScrollPayload;
+    const value = await withBrowserDeadline(
+      tab.view.webContents.executeJavaScript(scriptCall(scrollPageForAgent, x, y), true) as Promise<AgentScrollPayload>,
+      BROWSER_AGENT_ACTION_TIMEOUT_MS,
+      "The browser page did not respond to scrolling",
+    );
     return {
       tabId: tab.id,
       url: currentAgentUrl(tab, value.url),
@@ -466,7 +590,11 @@ export class BrowserWorkspaceManager {
     if (this.#overlayBusy()) throw new Error("Close the browser overlay before capturing the page");
     const viewBounds = this.#effectiveViewBounds();
     tab.view.setBounds(viewBounds);
-    let image = await tab.view.webContents.capturePage({ x: 0, y: 0, width: viewBounds.width, height: viewBounds.height }, { stayHidden: true });
+    let image = await withBrowserDeadline(
+      tab.view.webContents.capturePage({ x: 0, y: 0, width: viewBounds.width, height: viewBounds.height }, { stayHidden: true }),
+      BROWSER_AGENT_ACTION_TIMEOUT_MS,
+      "The browser page did not respond to capture",
+    );
     let size = image.getSize();
     const scale = Math.min(1, 1_280 / Math.max(1, size.width), 960 / Math.max(1, size.height));
     if (scale < 1) {
@@ -533,7 +661,13 @@ export class BrowserWorkspaceManager {
     this.#assertAvailable();
     this.#requestedVisible = visible;
     this.#visible = visible && this.#hostVisible;
-    if (!this.#visible) this.#rejectPendingPermissions();
+    if (!this.#visible) {
+      this.#rejectPendingPermissions();
+      ++this.#overlayGeneration;
+      this.#overlayOpen = false;
+      this.#overlayCaptureTabId = null;
+      this.#overlayCaptureBounds = null;
+    }
     this.#enableBrowserThrottling();
     this.#syncTabVisibility();
     this.#idleLifecycle.setInactive(!this.#visible && this.#tabs.size > 0);
@@ -548,9 +682,16 @@ export class BrowserWorkspaceManager {
     this.#visible = this.#requestedVisible && visible;
     if (this.#visible && this.#tabs.size === 0) {
       await this.#suspendPromise;
-      if (this.#visible && this.#tabs.size === 0) await this.#restoreSession(this.#activeSessionId ?? undefined);
+      await this.#restorePromise;
+      if (this.#visible && this.#tabs.size === 0) await this.#restoreSessionCoordinated(this.#activeSessionId ?? undefined);
     }
-    if (!this.#visible) this.#rejectPendingPermissions();
+    if (!this.#visible) {
+      this.#rejectPendingPermissions();
+      ++this.#overlayGeneration;
+      this.#overlayOpen = false;
+      this.#overlayCaptureTabId = null;
+      this.#overlayCaptureBounds = null;
+    }
     this.#enableBrowserThrottling();
     this.#syncTabVisibility();
     this.#idleLifecycle.setInactive(!this.#visible && this.#tabs.size > 0);
@@ -563,9 +704,12 @@ export class BrowserWorkspaceManager {
    * State reads, app startup, and unrelated coding sessions remain view/process-free.
    */
   public async setVisibleForSession(visible: boolean, sessionId?: string): Promise<BrowserWorkspaceState> {
-    if (!visible && !this.#initialized) return this.setVisible(false);
+    if (!visible) return this.setVisible(false);
     await this.initialize();
+    await this.#suspendPromise;
+    await this.#restorePromise;
     if (visible && sessionId !== undefined && sessionId !== this.#activeSessionId) {
+      this.#touchSessionSnapshot(sessionId);
       this.#snapshotActiveSession();
       this.#closeAllTabs();
       this.#activeSessionId = sessionId;
@@ -573,8 +717,7 @@ export class BrowserWorkspaceManager {
       this.#touchSessionSnapshot(sessionId);
     }
     if (visible && this.#hostVisible && this.#tabs.size === 0) {
-      await this.#suspendPromise;
-      if (this.#tabs.size === 0) await this.#restoreSession(sessionId);
+      await this.#restoreSessionCoordinated(sessionId);
     }
     return this.setVisible(visible);
   }
@@ -596,7 +739,7 @@ export class BrowserWorkspaceManager {
     if (tab !== undefined && this.#visible && !this.#overlayBusy()) tab.view.webContents.focus();
   }
 
-  public async openOverlay(bounds: Rectangle): Promise<string> {
+  public async prepareOverlay(bounds: Rectangle): Promise<{ readonly snapshot: string; readonly token: number }> {
     this.#assertAvailable();
     if (this.#overlayBusy()) throw new Error("The browser overlay is already open");
     const tab = this.#activeTabId === null ? undefined : this.#tabs.get(this.#activeTabId);
@@ -612,28 +755,54 @@ export class BrowserWorkspaceManager {
     };
     const generation = ++this.#overlayGeneration;
     this.#overlayCaptureTabId = tab.id;
+    this.#overlayCaptureBounds = { ...viewBounds };
     try {
       const image = await tab.view.webContents.capturePage(captureBounds, { stayHidden: true });
       const snapshot = `data:image/png;base64,${image.toPNG().toString("base64")}`;
-      if (this.#disposed || generation !== this.#overlayGeneration || this.#overlayCaptureTabId !== tab.id || !this.#visible || !this.#tabs.has(tab.id) || tab.view.webContents.isDestroyed()) {
+      if (this.#disposed || generation !== this.#overlayGeneration || this.#overlayCaptureTabId !== tab.id || this.#activeTabId !== tab.id || !this.#visible || !this.#tabs.has(tab.id) || tab.view.webContents.isDestroyed()) {
         if (!this.#disposed && generation === this.#overlayGeneration && this.#overlayCaptureTabId === tab.id) {
           this.#overlayCaptureTabId = null;
+          this.#overlayCaptureBounds = null;
           this.#restoreActiveTab();
         }
         throw new Error("The browser overlay request was cancelled");
       }
-      this.#overlayCaptureTabId = null;
-      this.#overlayOpen = true;
-      this.#syncTabVisibility();
-      this.#window.webContents.focus();
-      return snapshot;
+      // Keep the native page visible until the renderer confirms this decoded
+      // frame has actually painted. Otherwise the BrowserWindow background is
+      // exposed between hiding the WebContentsView and mounting the image.
+      return { snapshot, token: generation };
     } catch (error) {
       if (generation === this.#overlayGeneration && this.#overlayCaptureTabId === tab.id) {
         this.#overlayCaptureTabId = null;
+        this.#overlayCaptureBounds = null;
         this.#restoreActiveTab();
       }
       throw error;
     }
+  }
+
+  public openOverlay(token: number): void {
+    this.#assertAvailable();
+    const tabId = this.#overlayCaptureTabId;
+    const tab = tabId === null ? undefined : this.#tabs.get(tabId);
+    const capturedBounds = this.#overlayCaptureBounds;
+    const currentBounds = tab?.view.getBounds();
+    const boundsChanged = capturedBounds === null || currentBounds === undefined
+      || capturedBounds.x !== currentBounds.x || capturedBounds.y !== currentBounds.y
+      || capturedBounds.width !== currentBounds.width || capturedBounds.height !== currentBounds.height;
+    if (this.#overlayOpen || token !== this.#overlayGeneration || tab === undefined || tab.id !== this.#activeTabId || !this.#visible || tab.view.webContents.isDestroyed() || boundsChanged) {
+      if (!this.#overlayOpen) {
+        this.#overlayCaptureTabId = null;
+        this.#overlayCaptureBounds = null;
+        this.#restoreActiveTab();
+      }
+      throw new Error("The browser overlay request was cancelled");
+    }
+    this.#overlayCaptureTabId = null;
+    this.#overlayCaptureBounds = null;
+    this.#overlayOpen = true;
+    this.#syncTabVisibility();
+    this.#window.webContents.focus();
   }
 
   public closeOverlay(): void {
@@ -644,6 +813,7 @@ export class BrowserWorkspaceManager {
     if (!wasOpen && !wasCapturing) return;
     this.#overlayOpen = false;
     this.#overlayCaptureTabId = null;
+    this.#overlayCaptureBounds = null;
     this.#restoreActiveTab();
   }
 
@@ -741,6 +911,7 @@ export class BrowserWorkspaceManager {
     ++this.#overlayGeneration;
     this.#overlayOpen = false;
     this.#overlayCaptureTabId = null;
+    this.#overlayCaptureBounds = null;
     this.#rejectPendingPermissions();
     this.#session.setPermissionCheckHandler(null);
     this.#session.setPermissionRequestHandler(null);
@@ -796,6 +967,8 @@ export class BrowserWorkspaceManager {
       loading: false,
       crashed: false,
       error: null,
+      muted: false,
+      audible: false,
       agentInspectionId: null,
       agentRefs: new Set<string>(),
     };
@@ -805,7 +978,10 @@ export class BrowserWorkspaceManager {
     this.#window.contentView.addChildView(view);
     view.setBounds(this.#effectiveViewBounds());
     view.setVisible(false);
-    if (activate) this.#activate(tab);
+    // A background-created first tab must still become the logical active tab,
+    // otherwise later state/inspect calls have no page to address. Passing false
+    // keeps the native browser and host-window focus exactly where the user left it.
+    if (activate || this.#activeTabId === null) this.#activate(tab, activate);
     this.#emitSoon();
     return tab;
   }
@@ -868,6 +1044,10 @@ export class BrowserWorkspaceManager {
         this.#onNotice?.({ type: "blocked-popup", tabId: tab.id, url: details.url });
         return { action: "deny" };
       }
+      if (this.#tabs.size >= MAX_TABS) {
+        this.#onNotice?.({ type: "tab-limit" });
+        return { action: "deny" };
+      }
       return {
         action: "allow",
         outlivesOpener: true,
@@ -924,6 +1104,11 @@ export class BrowserWorkspaceManager {
       tab.error = `Browser tab stopped (${details.reason})`;
       this.#emitSoon();
     });
+    contents.on("audio-state-changed", (event) => {
+      tab.audible = event.audible;
+      tab.muted = contents.isAudioMuted();
+      this.#emitSoon();
+    });
     contents.on("certificate-error", (event, _url, _error, _certificate, callback) => {
       event.preventDefault();
       callback(false);
@@ -957,7 +1142,7 @@ export class BrowserWorkspaceManager {
     }
     if (accelerator && input.key.toLowerCase() === "t") {
       event.preventDefault();
-      void this.createTab({}, true);
+      this.#createTabDetached();
       return;
     }
     if (accelerator && input.key.toLowerCase() === "r") {
@@ -967,7 +1152,7 @@ export class BrowserWorkspaceManager {
     }
     if (accelerator && input.key.toLowerCase() === "w") {
       event.preventDefault();
-      void this.closeTab(tab.id);
+      void this.closeTab(tab.id).catch(() => undefined);
       return;
     }
     if (input.alt && input.key === "ArrowLeft") {
@@ -985,26 +1170,31 @@ export class BrowserWorkspaceManager {
     const contents = tab.view.webContents;
     const template: Electron.MenuItemConstructorOptions[] = [];
     if (params.linkURL !== "" && isAllowedWebUrl(params.linkURL)) {
-      template.push({ label: "Open link in new tab", click: () => { void this.createTab({ url: params.linkURL }, true); } });
+      template.push({ label: "Open link in new tab", click: () => this.#createTabDetached(params.linkURL) });
       template.push({ type: "separator" });
     }
-    if (params.isEditable) {
-      template.push(
-        { role: "undo", enabled: params.editFlags.canUndo },
-        { role: "redo", enabled: params.editFlags.canRedo },
-        { type: "separator" },
-        { role: "cut", enabled: params.editFlags.canCut },
-        { role: "copy", enabled: params.editFlags.canCopy },
-        { role: "paste", enabled: params.editFlags.canPaste },
-      );
-    } else if (params.selectionText !== "") {
-      template.push({ role: "copy", enabled: params.editFlags.canCopy });
-    }
+    // One editing menu for the whole app: a page here offers the same cut,
+    // copy, paste, select all, and spelling corrections as the workspace.
+    template.push(...contextMenuTemplate(params, {
+      replaceMisspelling: (word) => contents.replaceMisspelling(word),
+      learnSpelling: (word) => contents.session.addWordToSpellCheckerDictionary(word),
+      copyText: (text) => clipboard.writeText(text),
+      copyImage: (x, y) => contents.copyImageAt(x, y),
+      allowWebUrl: isAllowedWebUrl,
+    }));
     if (template.length > 0 && template.at(-1)?.type !== "separator") template.push({ type: "separator" });
     template.push({ label: "Back", enabled: contents.navigationHistory.canGoBack(), click: () => this.goBack(tab.id) });
     template.push({ label: "Forward", enabled: contents.navigationHistory.canGoForward(), click: () => this.goForward(tab.id) });
     template.push({ label: "Reload", click: () => this.reload(tab.id) });
     Menu.buildFromTemplate(template).popup({ window: this.#window });
+  }
+
+  #createTabDetached(url?: string): void {
+    if (this.#tabs.size >= MAX_TABS) {
+      this.#onNotice?.({ type: "tab-limit" });
+      return;
+    }
+    void this.createTab(url === undefined ? {} : { url }, true).catch(() => undefined);
   }
 
   #onDownload(item: DownloadItem, webContents: WebContents): void {
@@ -1066,14 +1256,14 @@ export class BrowserWorkspaceManager {
     this.#emitSoon();
   }
 
-  #activate(tab: TabRecord): void {
+  #activate(tab: TabRecord, focus = true): void {
     this.#activeTabId = tab.id;
     this.#enableBrowserThrottling();
     this.#syncTabVisibility();
     tab.view.setBounds(this.#effectiveViewBounds());
     if (!this.#overlayBusy()) {
       this.#window.contentView.addChildView(tab.view);
-      if (this.#visible) tab.view.webContents.focus();
+      if (focus && this.#visible) tab.view.webContents.focus();
     }
   }
 
@@ -1093,6 +1283,7 @@ export class BrowserWorkspaceManager {
   }
 
   #tabState(tab: TabRecord): BrowserTabState {
+    this.#syncAudioState(tab);
     const history = tab.view.webContents.navigationHistory;
     return {
       id: tab.id,
@@ -1104,7 +1295,15 @@ export class BrowserWorkspaceManager {
       canGoForward: history.canGoForward(),
       crashed: tab.crashed,
       error: tab.error,
+      muted: tab.muted,
+      audible: tab.audible,
     };
+  }
+
+  #syncAudioState(tab: TabRecord): void {
+    if (tab.view.webContents.isDestroyed()) return;
+    tab.muted = tab.view.webContents.isAudioMuted();
+    tab.audible = tab.view.webContents.isCurrentlyAudible();
   }
 
   #tab(tabId: string): TabRecord {
@@ -1162,27 +1361,67 @@ export class BrowserWorkspaceManager {
     }
   }
 
+  async #restoreSessionCoordinated(sessionId: string | undefined): Promise<void> {
+    const inFlight = this.#restorePromise;
+    if (inFlight !== undefined) {
+      await inFlight;
+      return;
+    }
+    const restore = this.#restoreSession(sessionId);
+    this.#restorePromise = restore;
+    try {
+      await restore;
+    } finally {
+      if (this.#restorePromise === restore) this.#restorePromise = undefined;
+    }
+  }
+
   async #restoreSession(sessionId: string | undefined): Promise<void> {
     const snapshot = sessionId === undefined ? undefined : this.#takeSessionSnapshot(sessionId);
     if (snapshot === undefined || snapshot.tabs.length === 0) {
       await this.createTab({ url: this.#initialUrl }, true);
       return;
     }
+    const restored: { readonly tab: TabRecord; readonly url: string }[] = [];
     for (let index = 0; index < snapshot.tabs.length; index += 1) {
       const source = snapshot.tabs[index]!;
       const tab = this.#addTab(index === snapshot.activeIndex);
       tab.title = source.title;
       tab.faviconUrl = source.faviconUrl;
+      tab.url = normalizeRestorableUrl(source.url, this.#initialUrl);
+      tab.loading = true;
+      if (!tab.view.webContents.isDestroyed()) {
+        tab.view.webContents.setAudioMuted(source.muted);
+        this.#syncAudioState(tab);
+      }
+      restored.push({ tab, url: tab.url });
+    }
+    if (this.#activeTabId === null && this.#tabs.size > 0) this.#activate(this.#tabs.values().next().value!);
+    const activeIndex = restored.findIndex(({ tab }) => tab.id === this.#activeTabId);
+    if (activeIndex > 0) restored.unshift(...restored.splice(activeIndex, 1));
+    // The complete tab topology is available immediately. Pages then hydrate
+    // one at a time (active first), avoiding both a partial tab list and a burst
+    // of 24 simultaneous Chromium loads after a long session is restored.
+    void this.#loadRestoredTabs(restored).catch(() => undefined);
+  }
+
+  async #loadRestoredTabs(restored: readonly { readonly tab: TabRecord; readonly url: string }[]): Promise<void> {
+    for (const { tab, url } of restored) {
+      if (!this.#tabs.has(tab.id) || tab.view.webContents.isDestroyed()) continue;
       try {
-        await tab.view.webContents.loadURL(normalizeRestorableUrl(source.url, this.#initialUrl));
+        await withBrowserDeadline(
+          tab.view.webContents.loadURL(url),
+          BROWSER_NAVIGATION_TIMEOUT_MS,
+          "The browser page took too long to restore",
+          () => tab.view.webContents.stop(),
+        );
       } catch (error: unknown) {
-        if (!tab.view.webContents.isDestroyed()) {
+        if (!tab.view.webContents.isDestroyed() && !isAbortedNavigationError(error)) {
           tab.loading = false;
           tab.error = errorMessage(error);
         }
       }
     }
-    if (this.#activeTabId === null && this.#tabs.size > 0) this.#activate(this.#tabs.values().next().value!);
   }
 
   #snapshotActiveSession(): void {
@@ -1191,7 +1430,12 @@ export class BrowserWorkspaceManager {
     const activeIndex = Math.max(0, tabs.findIndex((tab) => tab.id === this.#activeTabId));
     this.#sessionSnapshots.delete(this.#activeSessionId);
     this.#sessionSnapshots.set(this.#activeSessionId, {
-      tabs: tabs.map((tab) => ({ url: normalizeRestorableUrl(tab.url, this.#initialUrl), title: tab.title, faviconUrl: tab.faviconUrl })),
+      tabs: tabs.map((tab) => ({
+        url: normalizeRestorableUrl(tab.url, this.#initialUrl),
+        title: tab.title,
+        faviconUrl: tab.faviconUrl,
+        muted: tab.view.webContents.isDestroyed() ? tab.muted : tab.view.webContents.isAudioMuted(),
+      })),
       activeIndex,
     });
     while (this.#sessionSnapshots.size > MAX_SESSION_SNAPSHOTS) {
@@ -1255,6 +1499,7 @@ export class BrowserWorkspaceManager {
     ++this.#overlayGeneration;
     this.#overlayOpen = false;
     this.#overlayCaptureTabId = null;
+    this.#overlayCaptureBounds = null;
     for (const tab of this.#tabs.values()) {
       this.#window.contentView.removeChildView(tab.view);
       if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close({ waitForBeforeUnload: false });
@@ -1651,6 +1896,34 @@ function isAllowedPopupUrl(value: string): boolean {
 
 function normalizeRestorableUrl(value: string, fallback: string): string {
   return isAllowedWebUrl(value) ? value : fallback;
+}
+
+async function withBrowserDeadline<T>(operation: Promise<T>, timeoutMs: number, message: string, onTimeout?: () => void): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      try {
+        onTimeout?.();
+      } catch {
+        // The renderer may already have disappeared; the timeout still owns the
+        // failure and must release the serialized browser tool queue.
+      }
+      reject(new Error(message));
+    }, timeoutMs);
+    timer.unref();
+  });
+  try {
+    return await Promise.race([operation, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+export function isAbortedNavigationError(error: unknown): boolean {
+  const code = typeof error === "object" && error !== null && "code" in error
+    ? (error as { readonly code?: unknown }).code
+    : undefined;
+  return code === -3 || code === "ERR_ABORTED" || /\bERR_ABORTED\b/i.test(error instanceof Error ? error.message : String(error));
 }
 
 function errorMessage(error: unknown): string {

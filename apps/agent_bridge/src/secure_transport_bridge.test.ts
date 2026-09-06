@@ -181,6 +181,48 @@ test("a revoked device cannot agree a key even with a valid signature", async (c
   assert.equal(session.encrypted, false);
 });
 
+test("a phone receives its self-revoke acknowledgement before disconnection", async (context) => {
+  const { bridge, config, device, credential, session, sent, hello } = await pairedSession(context);
+  const offer = parseSecureHandshakeOffer((hello as Record<string, unknown>).encryption);
+  assert.ok(offer !== null);
+  const { accept, keys } = acceptSecureHandshake({
+    offer,
+    hostId: config.hostId,
+    hostPublicKeyPem: config.identity.publicKeyPem,
+    deviceId: device.deviceId,
+    devicePrivateKeyPem: device.privateKeyPem,
+    credential,
+  });
+  await session.handle(JSON.stringify(accept));
+  const phone = new SecureChannel(keys, "device");
+  sent.length = 0;
+
+  let disconnectNotified = false;
+  const stopListening = bridge.onDeviceRevoked(() => { disconnectNotified = true; });
+  context.after(stopListening);
+  const credentialId = bridge.pairedDevices()[0]!.credentialId;
+  const envelope = deviceRequest(config.hostId, "device.revoke", { credentialId });
+  const signed = signDeviceAction({
+    credential,
+    action: envelope as unknown as JsonObject,
+    devicePrivateKeyPem: device.privateKeyPem,
+  });
+
+  await session.handle(JSON.stringify(phone.seal(JSON.stringify({ kind: "signed_action", signed }))));
+
+  assert.equal(disconnectNotified, false, "the response continuation must run before the disconnect notification");
+  assert.deepEqual(bridge.pairedDevices(), []);
+  const responseFrame = parseSecureFrame(sent.shift());
+  assert.ok(responseFrame !== null, "self-revoke must return an encrypted response");
+  const response = JSON.parse(phone.open(responseFrame)) as Record<string, unknown>;
+  assert.equal(response.requestId, envelope.requestId);
+  assert.equal(response.ok, true);
+  assert.deepEqual(response.payload, { revoked: true });
+
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(disconnectNotified, true);
+});
+
 test("ciphertext before a handshake is refused", async (context) => {
   const { session } = await pairedSession(context);
   const stranger = new SecureChannel({ hostToDevice: Buffer.alloc(32, 1), deviceToHost: Buffer.alloc(32, 2) } as SecureTransportKeys, "device");

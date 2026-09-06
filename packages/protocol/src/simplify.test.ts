@@ -19,7 +19,15 @@ test("simplify command distinguishes previous and upcoming answers", () => {
     target: "upcoming",
     content: "Please explain the result",
   });
+  assert.deepEqual(parseSimplifyCommand("/simplify, explain the result"), {
+    active: true,
+    target: "upcoming",
+    content: "explain the result",
+  });
   assert.equal(parseSimplifyCommand("/simplified is not a command").active, false);
+  assert.equal(parseSimplifyCommand("/simplify-extra is not a command").active, false);
+  assert.equal(parseSimplifyCommand("/simplify.exe is not a command").active, false);
+  assert.equal(parseSimplifyCommand("/simplify,explain is not a command").active, false);
 });
 
 test("simplify settings are bounded and guidance stays concise", () => {

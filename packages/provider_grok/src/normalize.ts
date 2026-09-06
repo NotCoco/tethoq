@@ -48,6 +48,7 @@ function sessionState(value: Record<string, unknown>): SessionState {
   const type = typeof status === "string" ? status : isRecord(status) && typeof status.type === "string" ? status.type : "unknown";
   if (type === "idle") return "idle";
   if (type === "active" || type === "busy" || type === "retry") return "working";
+  if (type === "completed" || type === "complete" || type === "success" || type === "succeeded") return "completed";
   if (type === "systemError" || type === "error" || type === "failed") return "failed";
   return "unknown";
 }

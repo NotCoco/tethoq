@@ -42,12 +42,28 @@ app.commandLine.appendSwitch('use-fake-device-for-media-stream');
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function createOneShotGate() {
+  let releaseWait;
+  let released = false;
+  const wait = new Promise((resolve) => { releaseWait = resolve; });
+  return {
+    used: false,
+    wait,
+    release() {
+      if (released) return;
+      released = true;
+      releaseWait();
+    },
+  };
+}
+
 const ONE_PIXEL_PNG_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
 
 const defaultPreferences = {
   version: 1,
   experimentalFeatures: false,
   reasoningDisplay: 'compact',
+  taskListMode: 'recent',
   localOpenHandlerId: 'system',
   closeAction: 'tray',
   launchAtLogin: 'off',
@@ -130,26 +146,46 @@ function scenarioOutcome(scenario, outcome, observations) {
   };
 }
 
-function registerFakeModelIpc(window, host) {
+function registerFakeModelIpc(window, host, options = {}) {
   const handles = new Map();
   let preferences = JSON.parse(JSON.stringify(defaultPreferences));
+  let mobileConnection = { state: 'idle', devices: [] };
+  const directorySelections = Array.isArray(options.directorySelections) ? [...options.directorySelections] : null;
   const handle = (channel, listener) => {
     handles.set(channel, listener);
     ipcMain.handle(channel, listener);
   };
   handle('tethoq:bootstrap', () => host.bootstrap());
-  handle('tethoq:request', (_event, input) => {
+  handle('tethoq:request', async (_event, input) => {
     const record = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
-    return host.handleRequest(typeof record.type === 'string' ? record.type : '', record.payload ?? {}, record.requestId);
+    const requestType = typeof record.type === 'string' ? record.type : '';
+    const firstSessionsListGate = options.firstSessionsListGate;
+    if (requestType === 'sessions.list' && firstSessionsListGate && firstSessionsListGate.used !== true) {
+      firstSessionsListGate.used = true;
+      await firstSessionsListGate.wait;
+    }
+    const firstInterruptGate = options.firstInterruptGate;
+    if (requestType === 'session.interrupt' && firstInterruptGate && firstInterruptGate.used !== true) {
+      firstInterruptGate.used = true;
+      await firstInterruptGate.wait;
+    }
+    return host.handleRequest(requestType, record.payload ?? {}, record.requestId);
   });
-  handle('tethoq:select-directory', () => null);
-  handle('tethoq:select-images', () => [{
-    name: 'fake-attachment.png',
-    path: 'C:\\FakeModel\\fake-attachment.png',
-    mimeType: 'image/png',
-    byteLength: 68,
-    dataBase64: ONE_PIXEL_PNG_BASE64,
-  }]);
+  handle('tethoq:select-directory', () => directorySelections ? (directorySelections.shift() ?? null) : (options.directorySelection ?? null));
+  handle('tethoq:select-images', async () => {
+    const firstSelectImagesGate = options.firstSelectImagesGate;
+    if (firstSelectImagesGate && firstSelectImagesGate.used !== true) {
+      firstSelectImagesGate.used = true;
+      await firstSelectImagesGate.wait;
+    }
+    return [{
+      name: 'fake-attachment.png',
+      path: 'C:\\FakeModel\\fake-attachment.png',
+      mimeType: 'image/png',
+      byteLength: 68,
+      dataBase64: ONE_PIXEL_PNG_BASE64,
+    }];
+  });
   handle('tethoq:select-files', () => []);
   handle('tethoq:capture-screens', () => []);
   handle('tethoq:reveal-path', () => true);
@@ -157,7 +193,11 @@ function registerFakeModelIpc(window, host) {
   handle('tethoq:local-open-handlers', () => localOpenState);
   handle('tethoq:open-local-target', () => ({ opened: true, handlerId: 'system', state: localOpenState }));
   handle('tethoq:open-dictation-setup-page', () => undefined);
-  handle('tethoq:show-window', () => { if (!window.isDestroyed()) window.show(); });
+  handle('tethoq:open-harness-setup-page', () => undefined);
+  handle('tethoq:show-window', () => {
+    if (options.keepWindowHidden === true) return;
+    if (!window.isDestroyed()) window.show();
+  });
   handle('tethoq:hide-window', () => undefined);
   handle('tethoq:opencode-status', () => ({ state: 'unavailable', url: '', managed: false }));
   handle('tethoq:restart-opencode', () => ({ state: 'unavailable', url: '', managed: false }));
@@ -187,12 +227,28 @@ function registerFakeModelIpc(window, host) {
     if (action?.type === 'set-alerts') preferences = { ...preferences, alerts: ['all', 'attention', 'off'].includes(action.value) ? action.value : 'all' };
     if (action?.type === 'set-launch-at-login') preferences = { ...preferences, launchAtLogin: ['off', 'window', 'tray'].includes(action.value) ? action.value : 'off' };
     if (action?.type === 'set-reasoning-display') preferences = { ...preferences, reasoningDisplay: action.value === 'expanded' ? 'expanded' : 'compact' };
+    if (action?.type === 'set-task-list-mode') preferences = { ...preferences, taskListMode: action.value === 'project' ? 'project' : 'recent' };
     if (action?.type === 'set-experimental-features') preferences = { ...preferences, experimentalFeatures: action.enabled === true };
     if (action?.type === 'set-allow-foreign-subagents') preferences = { ...preferences, allowForeignSubagents: action.enabled === true };
     return preferences;
   });
   handle('tethoq:live-session-get-state', () => liveSessionIdleState);
   handle('tethoq:live-session-action', () => liveSessionIdleState);
+  handle('tethoq:mobile-connection-get-state', () => mobileConnection);
+  handle('tethoq:mobile-connection-action', (_event, action) => {
+    if (action?.type === 'start') {
+      mobileConnection = {
+        state: 'ready',
+        devices: mobileConnection.devices,
+        qrDataUrl: `data:image/svg+xml;base64,${Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2 2"><path d="M0 0h1v1H0zm1 1h1v1H1z"/></svg>').toString('base64')}`,
+        expiresAt: new Date(Date.now() + 300_000).toISOString(),
+      };
+    } else if (action?.type === 'revoke') {
+      mobileConnection = { ...mobileConnection, devices: mobileConnection.devices.filter((device) => device.id !== action.connectionId) };
+    }
+    if (!window.isDestroyed()) window.webContents.send('tethoq:mobile-connection-state', mobileConnection);
+    return mobileConnection;
+  });
   ipcMain.on('tethoq:renderer-ready', () => undefined);
   return () => {
     for (const channel of handles.keys()) ipcMain.removeHandler(channel);
@@ -329,6 +385,12 @@ function analyzeCapture(filePath) {
 }
 
 async function clickSelector(window, selector) {
+  await evaluate(window, `(() => {
+    const element = document.querySelector(${JSON.stringify(selector)});
+    if (!(element instanceof HTMLElement)) throw new Error('Element not found: ' + ${JSON.stringify(selector)});
+    element.scrollIntoView({ block: 'center', inline: 'nearest' });
+  })()`);
+  await evaluate(window, `new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
   const point = await evaluate(window, `(() => {
     const element = document.querySelector(${JSON.stringify(selector)});
     if (!(element instanceof HTMLElement)) throw new Error('Element not found: ' + ${JSON.stringify(selector)});
@@ -336,7 +398,8 @@ async function clickSelector(window, selector) {
     if (bounds.width <= 0 || bounds.height <= 0 || bounds.right < 0 || bounds.left > window.innerWidth || bounds.bottom < 0 || bounds.top > window.innerHeight) throw new Error('Element is outside the viewport or has no painted hit area: ' + ${JSON.stringify(selector)});
     const x = Math.round(bounds.left + bounds.width / 2);
     const y = Math.round(bounds.top + bounds.height / 2);
-    if (!element.contains(document.elementFromPoint(x, y))) throw new Error('Element is occluded at its click point: ' + ${JSON.stringify(selector)});
+    const hit = document.elementFromPoint(x, y);
+    if (!element.contains(hit)) throw new Error('Element is occluded at its click point: ' + ${JSON.stringify(selector)} + ' bounds=' + JSON.stringify({ left: bounds.left, top: bounds.top, width: bounds.width, height: bounds.height }) + ' hit=' + (hit?.outerHTML?.slice(0, 240) ?? 'none'));
     return { x, y };
   })()`);
   window.webContents.sendInputEvent({ type: 'mouseMove', x: point.x, y: point.y });
@@ -391,12 +454,17 @@ async function bringIntoView(window, selector) {
 }
 
 async function contextClickSelector(window, selector) {
+  await evaluate(window, `(() => { const element = document.querySelector(${JSON.stringify(selector)}); if (!(element instanceof HTMLElement)) throw new Error('Element not found: ' + ${JSON.stringify(selector)}); element.scrollIntoView({ block: 'center' }); })()`);
+  await evaluate(window, `new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
   const point = await evaluate(window, `(() => {
     const element = document.querySelector(${JSON.stringify(selector)});
     if (!(element instanceof HTMLElement)) throw new Error('Element not found: ' + ${JSON.stringify(selector)});
     const bounds = element.getBoundingClientRect();
     if (bounds.width <= 0 || bounds.height <= 0 || bounds.right < 0 || bounds.left > window.innerWidth || bounds.bottom < 0 || bounds.top > window.innerHeight) throw new Error('Element is outside the viewport or has no painted hit area: ' + ${JSON.stringify(selector)});
-    return { x: Math.round(bounds.left + bounds.width / 2), y: Math.round(bounds.top + bounds.height / 2) };
+    const x = Math.round(bounds.left + bounds.width / 2);
+    const y = Math.round(bounds.top + bounds.height / 2);
+    if (!element.contains(document.elementFromPoint(x, y))) throw new Error('Element is occluded at its context-click point: ' + ${JSON.stringify(selector)});
+    return { x, y };
   })()`);
   window.webContents.sendInputEvent({ type: 'mouseMove', x: point.x, y: point.y });
   window.webContents.sendInputEvent({ type: 'mouseDown', x: point.x, y: point.y, button: 'right', clickCount: 1 });
@@ -410,7 +478,10 @@ async function clickTaskByTitle(window, title) {
     const button = [...document.querySelectorAll('button')].find((candidate) => candidate.textContent?.includes(title));
     if (!button) throw new Error('Task button not found: ' + title);
     button.dataset.fakeModelQaTask = 'target';
-    button.scrollIntoView({ block: 'nearest' });
+    // Center the row inside the scrollport. The nearest alignment can leave a row exactly
+    // under the fixed filter header after a popover has just closed, making a
+    // legitimate task click look occluded to the deterministic hit-test.
+    button.scrollIntoView({ block: 'center' });
     return 'button[data-fake-model-qa-task="target"]';
   })()`);
   await evaluate(window, `new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
@@ -520,6 +591,89 @@ async function stopSubmissionIdentityTrace(window) {
   })()`);
 }
 
+async function attachFakeImage(window) {
+  await clickSelector(window, 'button[aria-label="Add attachment"]');
+  await waitFor(window, `Boolean(document.querySelector('.composer-attachment-menu .composer-popover'))`, 'Attachment menu did not open');
+  await clickMatchingButton(window, '.composer-attachment-menu .composer-popover', 'Attach image');
+  await waitFor(window, `Boolean(document.querySelector('.image-attachment-chip img'))`, 'Selected image did not become a composer widget');
+}
+
+async function startImageSendTrace(window, text) {
+  await evaluate(window, `(() => {
+    const target = ${JSON.stringify(text)};
+    const trace = { target, samples: [], startedAt: performance.now(), raf: 0, imageNode: null, cardNode: null, imageDetachments: 0 };
+    const matchingRows = () => [...document.querySelectorAll('.conversation .message-user')]
+      .filter((node) => node.querySelector('.message-body')?.textContent?.trim() === target);
+    const sample = () => {
+      const rows = matchingRows();
+      const row = rows.at(-1) ?? null;
+      const image = row?.querySelector('.message-images img') ?? null;
+      if (image && trace.imageNode === null) {
+        trace.imageNode = image;
+        trace.cardNode = row;
+      }
+      const bounds = image?.getBoundingClientRect();
+      const scroller = document.querySelector('.conversation-scroll');
+      trace.samples.push({
+        frame: trace.samples.length,
+        at: Number((performance.now() - trace.startedAt).toFixed(1)),
+        userRows: rows.length,
+        imageVisible: Boolean(image),
+        sameImageNode: image ? image === trace.imageNode : null,
+        sameCardNode: row ? row === trace.cardNode : null,
+        anchor: row?.getAttribute('data-scroll-anchor') ?? null,
+        left: bounds ? Number(bounds.left.toFixed(3)) : null,
+        right: bounds ? Number(bounds.right.toFixed(3)) : null,
+        width: bounds ? Number(bounds.width.toFixed(3)) : null,
+        scrollTop: scroller ? Number(scroller.scrollTop.toFixed(3)) : null,
+        bottomGap: scroller ? Number((scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight).toFixed(3)) : null,
+        assistantRows: document.querySelectorAll('.message-assistant').length,
+        assistantRunning: document.querySelectorAll('.message-assistant[aria-busy="true"], .reasoning-group[aria-busy="true"]').length,
+      });
+      trace.raf = requestAnimationFrame(sample);
+    };
+    trace.observer = new MutationObserver(() => {
+      if (trace.imageNode && !trace.imageNode.isConnected) trace.imageDetachments += 1;
+    });
+    trace.observer.observe(document.querySelector('.conversation') ?? document.body, { subtree: true, childList: true });
+    trace.raf = requestAnimationFrame(sample);
+    window.__tethoqImageSendTrace = trace;
+  })()`);
+}
+
+async function stopImageSendTrace(window) {
+  return evaluate(window, `(() => {
+    const trace = window.__tethoqImageSendTrace;
+    if (!trace) return { target: null, samples: [], imageDetachments: -1 };
+    cancelAnimationFrame(trace.raf);
+    trace.observer.disconnect();
+    delete window.__tethoqImageSendTrace;
+    return { target: trace.target, samples: trace.samples, imageDetachments: trace.imageDetachments };
+  })()`);
+}
+
+function assertStableImagePresentation(trace, text) {
+  assert.equal(trace.target, text, 'Image trace targeted a different message');
+  const firstImageIndex = trace.samples.findIndex((sample) => sample.imageVisible);
+  assert.ok(firstImageIndex >= 0, 'Submitted image never appeared in the transcript');
+  const painted = trace.samples.slice(firstImageIndex);
+  assert.ok(painted.length >= 2, 'Submitted image was not sampled across multiple painted frames');
+  assert.equal(trace.imageDetachments, 0, 'The submitted image DOM node was detached during canonical reconciliation');
+  assert.equal(painted.every((sample) => sample.imageVisible), true, 'The submitted image disappeared after first paint');
+  assert.equal(painted.every((sample) => sample.sameImageNode === true), true, 'The submitted image was remounted under a new DOM node');
+  assert.equal(painted.every((sample) => sample.sameCardNode === true), true, 'The submitted user card was remounted under a new DOM node');
+  assert.equal(Math.max(...painted.map((sample) => sample.userRows)), 1, 'Canonical reconciliation painted a duplicate user row');
+  const baseline = painted[0];
+  const maximumHorizontalDrift = Math.max(...painted.flatMap((sample) => [
+    Math.abs(sample.left - baseline.left),
+    Math.abs(sample.right - baseline.right),
+    Math.abs(sample.width - baseline.width),
+  ]));
+  assert.ok(maximumHorizontalDrift <= 0.5, `Submitted image moved horizontally by ${maximumHorizontalDrift}px`);
+  assert.equal(new Set(painted.map((sample) => sample.anchor)).size, 1, 'Submitted image changed its visible scroll identity');
+  return { firstImageIndex, paintedFrames: painted.length, maximumHorizontalDrift, anchor: baseline.anchor };
+}
+
 function assertQueuedIdentityTrace(trace, text) {
   assert.equal(trace.target, text, 'Queue identity trace targeted a different instruction');
   assert.ok(trace.samples.length > 0, 'Queue identity trace captured no painted frames');
@@ -550,6 +704,7 @@ async function replaceComposerText(window, text) {
 }
 
 async function chooseSlashCommand(window, command) {
+  await replaceComposerText(window, '');
   await replaceComposerText(window, '/');
   await waitFor(window, `Boolean(document.querySelector('.slash-command-palette'))`, 'Slash command palette did not open');
   await clickMatchingButton(window, '.slash-command-palette', command);
@@ -562,25 +717,24 @@ async function pressComposerEnter(window) {
 }
 
 async function ensureBottom(window) {
-  await evaluate(window, `new Promise((resolve) => {
-    const started = performance.now();
-    let stableFrames = 0;
-    let previousHeight = -1;
-    const settle = () => {
+  // Use the same wheel path as a reader. A direct scrollTop write is deliberately
+  // rejected by the renderer when a task owns a saved reading anchor, because an
+  // unowned browser/layout move must never silently replace that user choice.
+  await wheelToBottom(window);
+  try {
+    await waitFor(window, `(() => { const s = document.querySelector('.conversation-scroll'); return s && s.scrollHeight - s.scrollTop - s.clientHeight <= 2; })()`, 'Could not reach the physical bottom');
+  } catch (error) {
+    const state = await evaluate(window, `(() => {
       const scroller = document.querySelector('.conversation-scroll');
-      if (!scroller) return resolve(false);
-      scroller.scrollTop = scroller.scrollHeight;
-      scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
-      const gap = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
-      if (gap <= 2 && scroller.scrollHeight === previousHeight) stableFrames += 1;
-      else stableFrames = 0;
-      previousHeight = scroller.scrollHeight;
-      if (stableFrames >= 4 || performance.now() - started >= 2_000) return resolve(true);
-      requestAnimationFrame(settle);
-    };
-    settle();
-  })`);
-  await waitFor(window, `(() => { const s = document.querySelector('.conversation-scroll'); return s && s.scrollHeight - s.scrollTop - s.clientHeight <= 2; })()`, 'Could not reach the physical bottom');
+      const spacer = document.querySelector('.conversation-tail-spacer');
+      const composer = document.querySelector('.composer-wrap');
+      const viewport = scroller?.getBoundingClientRect();
+      const composerBounds = composer?.getBoundingClientRect();
+      const writes = window.__tethoqScrollTrace?.accesses?.filter((entry) => entry.type === 'write').slice(-8).map((entry) => ({ value: entry.value, before: entry.before, height: entry.height, client: entry.client, cause: entry.cause, stack: entry.stack?.split('\\n').slice(0, 8).join(' | ') }));
+      return { scrollTop: scroller?.scrollTop, scrollHeight: scroller?.scrollHeight, clientHeight: scroller?.clientHeight, gap: scroller ? scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight : null, spacerHeight: spacer?.getBoundingClientRect().height, viewportBottom: viewport?.bottom, composerTop: composerBounds?.top, writes };
+    })()`);
+    throw new Error(`${error instanceof Error ? error.message : String(error)}; ${JSON.stringify(state)}`);
+  }
 }
 
 async function wheelBy(window, pixels) {
@@ -591,6 +745,89 @@ async function wheelBy(window, pixels) {
     window.webContents.sendInputEvent({ type: 'mouseWheel', x: point.x, y: point.y, deltaY: step, deltaX: 0, canScroll: true });
     await delay(18);
   }
+}
+
+async function wheelConversationGutterBy(window, pixels) {
+  const point = await evaluate(window, `(() => {
+    const bounds = document.querySelector('.conversation-scroll')?.getBoundingClientRect();
+    if (!bounds) throw new Error('Conversation scroller not found');
+    return { x: Math.round(bounds.right - 18), y: Math.round(bounds.top + bounds.height / 2) };
+  })()`);
+  window.webContents.sendInputEvent({ type: 'mouseMove', x: point.x, y: point.y });
+  const step = pixels >= 0 ? 100 : -100;
+  for (let sent = 0; Math.abs(sent) < Math.abs(pixels); sent += step) {
+    window.webContents.sendInputEvent({ type: 'mouseWheel', x: point.x, y: point.y, deltaY: step, deltaX: 0, canScroll: true });
+    await delay(18);
+  }
+}
+
+async function wheelConversationGutterToBottom(window, attempts = 20) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const gap = await evaluate(window, `(() => { const scroller = document.querySelector('.conversation-scroll'); return scroller ? scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight : null; })()`);
+    if (typeof gap === 'number' && gap <= 2) return;
+    await wheelConversationGutterBy(window, -600);
+    await delay(35);
+  }
+  throw new Error('Wheel input in the transcript gutter could not reach the conversation tail');
+}
+
+async function wheelConversationGutterUntilVisible(window, selector, attempts = 20) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const position = await evaluate(window, `(() => {
+      const element = document.querySelector(${JSON.stringify(selector)});
+      const viewport = document.querySelector('.conversation-scroll')?.getBoundingClientRect();
+      const bounds = element?.getBoundingClientRect();
+      if (!bounds || !viewport) return null;
+      if (bounds.top >= viewport.top && bounds.bottom <= viewport.bottom) return { visible: true };
+      return { visible: false, direction: bounds.top < viewport.top ? 'up' : 'down' };
+    })()`);
+    if (!position) break;
+    if (position.visible) return;
+    await wheelConversationGutterBy(window, position.direction === 'up' ? 200 : -200);
+    await delay(35);
+  }
+  throw new Error(`Element did not enter the conversation through gutter wheel input: ${selector}`);
+}
+
+async function wheelInside(window, selector, pixels) {
+  const point = await evaluate(window, `(() => {
+    const element = document.querySelector(${JSON.stringify(selector)});
+    if (!(element instanceof HTMLElement)) throw new Error('Nested scroller not found: ' + ${JSON.stringify(selector)});
+    const bounds = element.getBoundingClientRect();
+    const x = Math.round(bounds.left + bounds.width / 2);
+    const y = Math.round(bounds.top + bounds.height / 2);
+    const hit = document.elementFromPoint(x, y);
+    if (hit !== element && !element.contains(hit)) throw new Error('Nested scroller is not reachable at its centre: ' + ${JSON.stringify(selector)});
+    return { x, y };
+  })()`);
+  window.webContents.sendInputEvent({ type: 'mouseMove', x: point.x, y: point.y });
+  const step = pixels >= 0 ? 100 : -100;
+  for (let sent = 0; Math.abs(sent) < Math.abs(pixels); sent += step) {
+    window.webContents.sendInputEvent({ type: 'mouseWheel', x: point.x, y: point.y, deltaY: step, deltaX: 0, canScroll: true });
+    await delay(18);
+  }
+}
+
+async function wheelNestedToBottom(window, selector, attempts = 12) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const gap = await evaluate(window, `(() => { const flow = document.querySelector(${JSON.stringify(selector)}); return flow ? flow.scrollHeight - flow.scrollTop - flow.clientHeight : null; })()`);
+    if (typeof gap === 'number' && gap <= 1) return;
+    await wheelInside(window, selector, -600);
+    await delay(35);
+  }
+  const state = await evaluate(window, `(() => { const flow = document.querySelector(${JSON.stringify(selector)}); return { scrollTop: flow?.scrollTop, maximum: flow ? flow.scrollHeight - flow.clientHeight : null }; })()`);
+  throw new Error(`Wheel input could not reach the nested scroller tail: ${JSON.stringify(state)}`);
+}
+
+async function wheelToBottom(window, attempts = 20) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const gap = await evaluate(window, `(() => { const scroller = document.querySelector('.conversation-scroll'); return scroller ? scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight : null; })()`);
+    if (typeof gap === 'number' && gap <= 2) return;
+    await wheelBy(window, -600);
+    await delay(35);
+  }
+  const state = await evaluate(window, `(() => { const scroller = document.querySelector('.conversation-scroll'); return { scrollTop: scroller?.scrollTop, maximum: scroller ? scroller.scrollHeight - scroller.clientHeight : null }; })()`);
+  throw new Error(`Wheel input could not reach the conversation tail: ${JSON.stringify(state)}`);
 }
 
 async function wheelAwayFromBottom(window, pixels) {
@@ -793,6 +1030,243 @@ async function scenarioBoot(window, captures) {
   });
 }
 
+async function scenarioGoalLifecycle(window, captures, host) {
+  await ensureRendererReady(window);
+  await waitFor(window, `document.querySelector('.workspace h1')?.textContent?.includes('Fake model main task')`, 'Goal: main fixture task did not open', 10_000);
+  const before = host.stateForTests();
+  assert.equal(await evaluate(window, `Boolean(document.querySelector('.goal-trigger'))`), false, 'Goal: permanent header control is still painted');
+  await openPopover(window, `button[aria-label="More message actions"]`, '.composer-actions-menu .composer-popover', 'Goal overflow menu');
+  await clickMatchingButton(window, '.composer-actions-menu .composer-popover', 'Goal');
+  await waitFor(window, `Boolean(document.querySelector('.goal-popover'))`, 'Goal: controls did not open');
+  await assertOverlayWithinViewport(window, '.goal-popover', 'goal controls');
+  await capture(window, '23-goal-empty', captures);
+  await clickSelector(window, '.goal-popover textarea');
+  await window.webContents.insertText('Ship the reliable goal UI');
+  await clickSelector(window, '.goal-popover input[type="number"]');
+  await window.webContents.insertText('12000');
+  await clickMatchingButton(window, '.goal-popover', 'Start goal');
+  await waitFor(window, `!document.querySelector('.goal-popover')`, 'Goal: successful start did not close controls');
+  assert.equal(host.stateForTests().modelTurnCount, before.modelTurnCount, 'Goal: creating a goal started an automatic model turn');
+  await chooseSlashCommand(window, '/goal');
+  await waitFor(window, `document.querySelector('.goal-popover')?.textContent?.includes('Active')`, 'Goal: active state did not reopen through /goal');
+  await capture(window, '24-goal-active', captures);
+
+  const lifecycle = [
+    ['Pause', 'Paused'],
+    ['Resume', 'Active'],
+    ['Mark stalled', 'Stalled'],
+    ['Resume', 'Active'],
+    ['Complete', 'Complete'],
+    ['Reopen', 'Active'],
+  ];
+  for (const [action, label] of lifecycle) {
+    if (!await evaluate(window, `Boolean(document.querySelector('.goal-popover'))`)) {
+      await chooseSlashCommand(window, '/goal');
+    }
+    await waitFor(window, `Boolean(document.querySelector('.goal-popover'))`, `Goal: controls did not reopen for ${action}`);
+    await clickMatchingButton(window, '.goal-popover', action);
+    await waitFor(window, `document.querySelector('.goal-popover')?.textContent?.includes(${JSON.stringify(label)})`, `Goal: state ${label} did not appear`);
+  }
+  const activeRequests = host.stateForTests().requests.filter((request) => request.type === 'session.goal.set');
+  assert.ok(activeRequests.length >= lifecycle.length + 1, 'Goal: lifecycle mutations did not reach the fake provider');
+  assert.equal(activeRequests[0].payload.tokenBudget, 12000, 'Goal: token budget did not reach the fake provider');
+  await submitComposer(window, 'Continue toward the goal');
+  await waitForFakeHostIdle(host);
+  const send = host.stateForTests().requests.findLast((request) => request.type === 'session.send_message');
+  assert.match(send.payload.developerInstructions ?? '', /private control context/iu, 'Goal: private guidance was not attached to the turn metadata');
+  assert.match(send.payload.developerInstructions ?? '', /Token budget: 12000 tokens/iu, 'Goal: token budget was not attached to private turn metadata');
+  assert.equal(await evaluate(window, `![...document.querySelectorAll('.message-user, .message-assistant')].some((node) => node.textContent?.includes('private control context'))`), true, 'Goal: private guidance leaked into a visible message');
+
+  await clickTaskByTitle(window, 'Fake model attachments task');
+  await waitFor(window, `document.querySelector('.workspace h1')?.textContent?.includes('Fake model attachments task')`, 'Goal: could not switch away before reopen check');
+  await clickTaskByTitle(window, 'Fake model main task');
+  await waitFor(window, `document.querySelector('.workspace h1')?.textContent?.includes('Fake model main task')`, 'Goal: task did not survive reopen');
+
+  await chooseSlashCommand(window, '/goal');
+  await waitFor(window, `Boolean(document.querySelector('.goal-popover'))`, 'Goal: controls did not reopen for clear');
+  await waitFor(window, `document.querySelector('.goal-popover')?.textContent?.includes('Active')`, 'Goal: active goal did not survive task reopen');
+  await clickMatchingButton(window, '.goal-popover', 'Clear');
+  await waitFor(window, `!document.querySelector('.goal-popover')`, 'Goal: clear did not close controls');
+
+  await window.setSize(760, 480);
+  await delay(350);
+  await clickTaskByTitle(window, 'Fake model main task');
+  await waitFor(window, `document.querySelector('.workspace h1')?.textContent?.includes('Fake model main task')`, 'Goal: compact task navigation did not open the workspace');
+  await assertResponsiveLayout(window, 'Goal 760x480');
+  await chooseSlashCommand(window, '/goal');
+  await waitFor(window, `Boolean(document.querySelector('.goal-popover'))`, 'Goal: compact controls did not open');
+  await assertOverlayWithinViewport(window, '.goal-popover', 'compact goal controls');
+  await capture(window, '25-goal-compact-760x480', captures);
+  return scenarioOutcome('goal-lifecycle', {
+    revisionedLifecycle: true,
+    guidanceMetadata: true,
+    automaticTurns: host.stateForTests().modelTurnCount - before.modelTurnCount,
+    compact: true,
+  }, {
+    'goal.command-and-overflow-entry': true,
+    'goal.lifecycle-controls': lifecycle.map(([action, label]) => `${action}:${label}`),
+    'goal.private-guidance-no-transcript': true,
+    'goal.zero-token-and-reopen': { noAutomaticTurnBeforeSend: true, reopened: true, clear: true },
+    'goal.compact-painted-popover': true,
+  });
+}
+
+async function scenarioLunaPanelSequences(window, captures, host) {
+  await ensureRendererReady(window);
+  await waitFor(window, `document.querySelector('.workspace h1')?.textContent?.includes('Fake model main task')`, 'Luna: main fixture task did not open', 10_000);
+
+  // A task switch remounts Composer. The delegate prompt belongs to its parent
+  // task, so moving away and back must restore it just like the main draft.
+  const delegationDraft = `Luna delegation draft ${Date.now()}`;
+  await openPopover(window, `button[aria-label="More message actions"]`, '.composer-actions-menu .composer-popover', 'Luna delegation actions');
+  await clickMatchingButton(window, '.composer-actions-menu .composer-popover', 'Delegate task');
+  await waitFor(window, `Boolean(document.querySelector('.delegation-chat-picker textarea'))`, 'Luna: delegation panel did not open');
+  await clickSelector(window, '.delegation-chat-picker textarea');
+  await window.webContents.insertText(delegationDraft);
+  await waitFor(window, `document.querySelector('.delegation-chat-picker textarea')?.value === ${JSON.stringify(delegationDraft)}`, 'Luna: delegation draft was not entered');
+  await clickTaskByTitle(window, 'Fake model attachments task');
+  await waitFor(window, `document.querySelector('.workspace h1')?.textContent?.includes('Fake model attachments task')`, 'Luna: could not switch away from the delegation draft');
+  await clickTaskByTitle(window, 'Fake model main task');
+  await waitFor(window, `document.querySelector('.workspace h1')?.textContent?.includes('Fake model main task')`, 'Luna: could not return to the delegation parent');
+  await openPopover(window, `button[aria-label="More message actions"]`, '.composer-actions-menu .composer-popover', 'Luna restored delegation actions');
+  await clickMatchingButton(window, '.composer-actions-menu .composer-popover', 'Delegate task');
+  await waitFor(window, `document.querySelector('.delegation-chat-picker textarea')?.value === ${JSON.stringify(delegationDraft)}`, 'Luna: task switching discarded the delegation draft');
+  await clickMatchingButton(window, '.delegation-chat-picker', 'Cancel');
+
+  // A compact panel should submit on Enter and return focus to the composer.
+  await chooseSlashCommand(window, '/goal');
+  await waitFor(window, `Boolean(document.querySelector('.goal-popover'))`, 'Luna: goal panel did not open');
+  await clickSelector(window, '.goal-popover textarea');
+  await window.webContents.insertText('Luna keyboard goal');
+  host.failNextRequestForTests('session.goal.set', 'Injected goal save failure.');
+  window.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Enter' });
+  window.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Enter' });
+  await waitFor(window, `Boolean(document.querySelector('.goal-popover')) && document.querySelector('.toast-error')?.textContent?.includes('Injected goal save failure.')`, 'Luna: failed Enter submission dismissed the goal panel or hid its error');
+  assert.equal(await evaluate(window, `document.querySelector('.goal-popover textarea')?.value`), 'Luna keyboard goal', 'Luna: failed goal save discarded the objective');
+  window.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Enter' });
+  window.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Enter' });
+  await waitFor(window, `!document.querySelector('.goal-popover')`, 'Luna: Enter did not save and close goal panel');
+  const goalFocus = await evaluate(window, `document.activeElement?.matches('textarea[aria-label="Message"]')`);
+  assert.equal(goalFocus, true, 'Luna: closing the goal panel did not restore composer focus');
+
+  // Partial command deletion must remain in the one palette instead of opening
+  // a chain of unrelated surfaces; Escape preserves the user's draft.
+  await replaceComposerText(window, '/ea');
+  await waitFor(window, `Boolean(document.querySelector('.slash-command-palette')) && document.querySelector('.slash-command-palette')?.textContent?.includes('/ears')`, 'Luna: partial command did not filter');
+  window.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Backspace' });
+  window.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Backspace' });
+  window.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Backspace' });
+  window.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Backspace' });
+  await waitFor(window, `document.querySelector('textarea[aria-label="Message"]')?.value === '/' && Boolean(document.querySelector('.slash-command-palette'))`, 'Luna: deleting a partial command did not restore the catalogue');
+  window.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
+  window.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
+  await waitFor(window, `!document.querySelector('.slash-command-palette') && document.querySelector('textarea[aria-label="Message"]')?.value === '/'`, 'Luna: command Escape did not preserve the draft');
+
+  // Mesh and EARS each open as one panel and can be dismissed without a
+  // second confirmation or a stale panel surviving the next command.
+  await replaceComposerText(window, '');
+  await replaceComposerText(window, '/');
+  await waitFor(window, `Boolean(document.querySelector('.slash-command-palette'))`, 'Luna: command palette did not reopen for Mesh');
+  await clickMatchingButton(window, '.slash-command-palette', '/mesh');
+  await waitFor(window, `Boolean(document.querySelector('.mesh-panel'))`, 'Luna: mesh panel did not open');
+  await clickSelector(window, '.workspace h1');
+  await waitFor(window, `!document.querySelector('.mesh-panel')`, 'Luna: outside click did not close Mesh');
+  await replaceComposerText(window, '');
+  await replaceComposerText(window, '/mesh');
+  await waitFor(window, `Boolean(document.querySelector('.mesh-panel'))`, 'Luna: Mesh did not reopen after outside dismissal');
+  window.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
+  window.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
+  await waitFor(window, `!document.querySelector('.mesh-panel') && document.activeElement?.matches('textarea[aria-label="Message"]')`, 'Luna: Escape did not close Mesh and restore composer focus');
+  await replaceComposerText(window, '');
+  await replaceComposerText(window, '/');
+  await waitFor(window, `Boolean(document.querySelector('.slash-command-palette'))`, 'Luna: command palette did not reopen for EARS');
+  await clickMatchingButton(window, '.slash-command-palette', '/ears');
+  await waitFor(window, `Boolean(document.querySelector('.ears-settings'))`, 'Luna: EARS panel did not open');
+  window.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
+  window.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
+  await waitFor(window, `!document.querySelector('.ears-settings') && document.activeElement?.matches('textarea[aria-label="Message"]')`, 'Luna: Escape did not close EARS and restore composer focus');
+  await replaceComposerText(window, '/');
+  await waitFor(window, `Boolean(document.querySelector('.slash-command-palette'))`, 'Luna: command palette did not reopen for the second EARS pass');
+  await clickMatchingButton(window, '.slash-command-palette', '/ears');
+  await waitFor(window, `Boolean(document.querySelector('.ears-settings'))`, 'Luna: EARS did not reopen after Escape');
+  await clickSelector(window, '.workspace h1');
+  await waitFor(window, `!document.querySelector('.ears-settings')`, 'Luna: outside click did not close EARS');
+
+  // Project mode keeps same-named folders separate, groups after filtering,
+  // and supports a folder-picked draft through first materialization.
+  await clickSelector(window, 'button[aria-label="Arrange tasks by project"]');
+  await waitFor(window, `document.querySelectorAll('.session-project-group').length >= 4`, 'Luna: project groups did not appear');
+  const groups = await evaluate(window, `[...document.querySelectorAll('.session-project-group')].map((group) => ({ name: group.querySelector('.session-project-header strong')?.textContent?.trim(), path: group.querySelector('.session-project-header')?.getAttribute('title') }))`);
+  assert.equal(groups.filter((group) => group.name === 'payments').length, 2, 'Luna: duplicate folder basenames were merged');
+  assert.ok(groups.some((group) => group.name === 'C:\\'), 'Luna: drive root group was lost');
+  assert.ok(groups.some((group) => group.name === 'No project folder'), 'Luna: empty directory group was lost');
+  await evaluate(window, `document.querySelector('.session-project-group .session-project-header')?.click()`);
+  await waitFor(window, `document.querySelector('.session-project-group .session-project-header')?.getAttribute('aria-expanded') === 'false'`, 'Luna: project collapse did not hide tasks');
+  await evaluate(window, `document.querySelector('.session-project-group .session-project-header')?.click()`);
+  await waitFor(window, `document.querySelector('.session-project-group .session-project-header')?.getAttribute('aria-expanded') === 'true'`, 'Luna: project expand did not restore tasks');
+
+  const titleBeforeCancelledPicker = await evaluate(window, `document.querySelector('.workspace h1')?.textContent?.trim()`);
+  await clickSelector(window, 'button[aria-label="New project"]');
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(await evaluate(window, `document.querySelector('.workspace h1')?.textContent?.trim()`), titleBeforeCancelledPicker, 'Luna: cancelling the project folder picker created a draft');
+  await clickSelector(window, 'button[aria-label="New project"]');
+  await waitFor(window, `document.querySelector('.workspace h1')?.textContent?.trim() === 'New task'`, 'Luna: New project did not open a draft');
+  assert.equal(await evaluate(window, `document.querySelector('.workspace-location')?.textContent?.trim()`), 'C:\\FakeModel\\qa-project', 'Luna: chosen folder did not reach the draft');
+  const instruction = 'Luna project materialization';
+  await replaceComposerText(window, instruction);
+  await pressComposerEnter(window);
+  await waitFor(window, `document.querySelector('.workspace h1')?.textContent?.includes(${JSON.stringify(instruction)})`, 'Luna: project draft did not materialize');
+  const create = host.stateForTests().requests.filter((request) => request.type === 'session.create').at(-1);
+  assert.equal(create?.payload?.workingDirectory, 'C:\\FakeModel\\qa-project', 'Luna: materialization lost the selected folder');
+
+  await clickSelector(window, 'button[aria-label="Arrange tasks by recency"]');
+  await waitFor(window, `!document.querySelector('.session-project-group') && document.querySelector('button[aria-label="Arrange tasks by project"]')`, 'Luna: recency toggle did not restore the flat task list');
+  return scenarioOutcome('luna-panel-sequences', { goalFocus, groups, materializedDirectory: create?.payload?.workingDirectory }, {
+    'luna.goal-enter-closes-and-focuses': { failedSaveStayedOpen: true, focused: goalFocus },
+    'luna.partial-command-deletion': { restoredCatalogue: true, draftPreserved: true },
+    'luna.mesh-and-ears-single-panel': { meshEscape: true, meshOutside: true, earsEscape: true, earsOutside: true },
+    'luna.delegation-draft-survives-task-switch': delegationDraft,
+    'luna.project-groups-keep-path-identity': groups,
+    'luna.project-collapse-expand': { collapsed: true, expanded: true },
+    'luna.project-draft-materializes-folder': { cancelledWithoutDraft: true, create: create?.payload },
+    'luna.recency-project-toggle': { project: true, recency: true },
+  });
+}
+
+async function scenarioProjectContextMenuBounds(window, captures) {
+  await ensureRendererReady(window);
+  await window.setSize(760, 480);
+  await clickSelector(window, 'button[aria-label="Arrange tasks by project"]');
+  await waitFor(window, `document.querySelectorAll('.session-project-group').length >= 4`, 'Project menu: grouped tasks did not appear');
+  await contextClickSelector(window, '[data-session-id="fake-project-alpha"]');
+  await waitFor(window, `Boolean(document.querySelector('.session-context-menu'))`, 'Project menu: task actions did not open');
+  await assertOverlayWithinViewport(window, '.session-context-menu', 'project task context menu');
+  await clickMatchingButton(window, '.session-context-menu', 'Archive');
+  await waitFor(window, `!document.querySelector('[data-session-id="fake-project-alpha"]')`, 'Project menu: Archive was not reachable');
+  await capture(window, '26-project-context-menu-760x480', captures);
+  return scenarioOutcome('project-context-menu-bounds', { compact: true, archiveReachable: true }, {
+    'projects.context-menu-actions-stay-in-viewport': true,
+  });
+}
+
+async function scenarioQueueNewTaskEscape(window, captures, host) {
+  await ensureRendererReady(window);
+  const queued = host.handleRequest('message_queue.enqueue', { sessionId: 'fake-main', content: 'Escape must preserve this queued instruction' }).payload.message;
+  await waitFor(window, `Boolean(document.querySelector('.queued-message-row'))`, 'Queue Escape: queued instruction did not render');
+  await openPopover(window, 'button[aria-label="Queued instruction actions"]', '.queued-message-menu .composer-popover', 'Queue Escape actions');
+  await clickMatchingButton(window, '.queued-message-menu .composer-popover', 'Send to new task');
+  await waitFor(window, `Boolean(document.querySelector('.queue-new-task-picker'))`, 'Queue Escape: new-task picker did not open');
+  window.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
+  window.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
+  await waitFor(window, `!document.querySelector('.queue-new-task-picker')`, 'Queue Escape: new-task picker ignored Escape');
+  assert.equal(host.stateForTests().requests.some((request) => request.type === 'message_queue.move_to_new_task' && request.payload.messageId === queued.id), false, 'Queue Escape: dismissing the picker moved the instruction');
+  await waitFor(window, `Boolean(document.querySelector('.queued-message-row'))`, 'Queue Escape: dismissing the picker consumed the instruction');
+  await capture(window, '27-queue-new-task-escape', captures);
+  return scenarioOutcome('queue-new-task-escape', { dismissed: true, queuePreserved: true }, {
+    'queue.new-task-picker-escape-preserves-item': true,
+  });
+}
+
 async function scenarioContextThresholdLifecycle(window, captures, host) {
   const requestCount = () => host.stateForTests().requests.filter((entry) => entry.type === 'session.context.set_threshold').length;
   const initialRequests = requestCount();
@@ -801,8 +1275,9 @@ async function scenarioContextThresholdLifecycle(window, captures, host) {
     slider: Number(document.querySelector('input[aria-label="Automatic compaction threshold"]')?.value),
     heading: document.querySelector('.context-usage-heading b')?.textContent?.trim(),
     percent: document.querySelector('.context-usage-percent')?.textContent?.trim(),
+    fill: document.querySelector('.context-expanded-track i')?.style.width,
   }))()`);
-  assert.deepEqual(initial, { slider: 96_000, heading: '96.0k', percent: '4%' }, 'Context control did not open on the applied provider threshold');
+  assert.deepEqual(initial, { slider: 96_000, heading: '96.0k', percent: '4%', fill: '3.28125%' }, 'Context control did not open with independent usage and threshold values');
 
   await evaluate(window, `(() => {
     const slider = document.querySelector('input[aria-label="Automatic compaction threshold"]');
@@ -811,14 +1286,18 @@ async function scenarioContextThresholdLifecycle(window, captures, host) {
     slider.dispatchEvent(new Event('input', { bubbles: true }));
     slider.dispatchEvent(new Event('change', { bubbles: true }));
   })()`);
-  await waitFor(window, `document.querySelector('.context-usage-heading b')?.textContent?.trim() === '40.0k' && document.querySelector('.context-usage-percent')?.textContent?.trim() === '11%'`, 'Context draft did not preview its percentage');
+  await waitFor(window, `document.querySelector('.context-usage-heading b')?.textContent?.trim() === '40.0k'`, 'Context draft threshold did not follow the slider');
+  assert.deepEqual(await evaluate(window, `(() => ({
+    fill: document.querySelector('.context-expanded-track i')?.style.width,
+  }))()`), { fill: initial.fill }, 'Dragging the compaction threshold moved the context usage fill');
+  assert.equal(await evaluate(window, `document.querySelector('.context-usage-percent')?.textContent?.trim()`), '11%', 'Compact header did not preview distance to the draft compaction threshold');
   assert.equal(requestCount(), initialRequests, 'Dragging the context threshold applied before the user clicked Apply');
   await capture(window, '01-context-draft-preview', captures);
 
   window.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
   window.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
   await waitFor(window, `!document.querySelector('.context-usage-popover')`, 'Escape did not dismiss context settings');
-  assert.equal(await evaluate(window, `document.querySelector('.context-usage-percent')?.textContent?.trim()`), '4%', 'Escape left the unsaved context percentage painted as active');
+  assert.equal(await evaluate(window, `document.querySelector('.context-usage-percent')?.textContent?.trim()`), initial.percent, 'Escape left the unsaved threshold percentage painted as active');
   await openPopover(window, '.context-usage-trigger', '.context-usage-popover', 'context threshold reopen after Escape');
   assert.equal(await evaluate(window, `Number(document.querySelector('input[aria-label="Automatic compaction threshold"]')?.value)`), 96_000, 'Escape did not reset the draft threshold');
 
@@ -842,7 +1321,7 @@ async function scenarioContextThresholdLifecycle(window, captures, host) {
     slider.dispatchEvent(new Event('change', { bubbles: true }));
   })()`);
   await clickMatchingButton(window, '.context-usage-popover', 'Apply');
-  await waitFor(window, `!document.querySelector('.context-usage-popover') && document.querySelector('.context-usage-percent')?.textContent?.trim() === '11%'`, 'Applied context threshold did not update the compact meter');
+  await waitFor(window, `!document.querySelector('.context-usage-popover') && document.querySelector('.context-usage-percent')?.textContent?.trim() === '11%'`, 'Applied context threshold did not update the compact header meter');
   assert.equal(requestCount(), initialRequests + 1, 'Apply did not issue exactly one threshold update');
   const applied = host.stateForTests().requests.filter((entry) => entry.type === 'session.context.set_threshold').at(-1);
   assert.deepEqual(applied?.payload, { sessionId: 'fake-main', thresholdTokens: 40_000, compactNow: true });
@@ -855,7 +1334,7 @@ async function scenarioContextThresholdLifecycle(window, captures, host) {
   window.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
   await waitFor(window, `!document.querySelector('.context-usage-popover')`, 'Final context settings dismissal failed');
   return scenarioOutcome('context-threshold-lifecycle', { initial, applied: applied.payload, persistedPercent: '11%' }, {
-    'context.draft-live-percentage': initial,
+    'context.draft-keeps-usage-stable': initial,
     'context.escape-discards-draft': true,
     'context.outside-click-discards-draft': true,
     'context.apply-once': applied.payload,
@@ -864,20 +1343,57 @@ async function scenarioContextThresholdLifecycle(window, captures, host) {
   });
 }
 
+/**
+ * The EYES model control is a searchable listbox, so its catalogue is read from the
+ * open dropdown rather than from static option nodes. Returns each visible row's
+ * model name plus the dimmer upstream-provider label beside it.
+ */
+async function readVisionModels(window, query = '') {
+  return await evaluate(window, `(async () => {
+    const trigger = document.querySelector('.vision-model-trigger');
+    if (!(trigger instanceof HTMLButtonElement)) throw new Error('The EYES model trigger is missing');
+    const settle = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    if (!document.querySelector('.vision-model-dropdown')) { trigger.click(); await settle(); }
+    const field = document.querySelector('.vision-model-search input');
+    if (!field) throw new Error('The EYES model search field is missing');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(field, ${JSON.stringify(query)});
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    const rows = [...document.querySelectorAll('.vision-model-option')].map((node) => ({
+      name: node.querySelector('strong')?.textContent?.trim(),
+      source: node.querySelector('small')?.textContent?.trim() ?? null,
+    }));
+    trigger.click();
+    await settle();
+    return rows;
+  })()`);
+}
+
 async function scenarioCommandContracts(window, captures, host) {
   await replaceComposerText(window, '/');
   const catalogue = await evaluate(window, `[...document.querySelectorAll('.slash-command-palette button strong')].map((node) => node.textContent?.trim())`);
-  assert.deepEqual(catalogue, ['/simplify', '/mesh', '/ears', '/eyes'], 'The real composer command catalogue drifted');
+  assert.deepEqual(catalogue, ['/simplify', '/mesh', '/goal', '/ears', '/eyes'], 'The real composer command catalogue drifted');
   await capture(window, '01-command-catalogue', captures);
 
   await chooseSlashCommand(window, '/eyes');
   await waitFor(window, `Boolean(document.querySelector('.vision-eyes-picker'))`, '/eyes did not open the vision picker');
-  const visionOptions = await evaluate(window, `(() => ({
-    providers: [...document.querySelectorAll('select[aria-label="Vision provider"] option')].map((node) => node.textContent?.trim()),
-    models: [...document.querySelectorAll('select[aria-label="Vision model"] option')].map((node) => node.textContent?.trim()),
-  }))()`);
-  assert.deepEqual(visionOptions.providers, ['Direct API', 'Codex', 'OpenCode', 'Grok']);
-  assert.deepEqual(visionOptions.models, ['Direct Vision + Audio']);
+  // EYES is off until the user chooses: the provider list carries its
+  // placeholder, no model is pre-selected, and the panel says so plainly.
+  await waitFor(window, `(() => {
+    const picker = document.querySelector('.vision-eyes-picker');
+    const providers = [...document.querySelectorAll('select[aria-label="Vision provider"] option')].map((node) => node.textContent?.trim());
+    return picker?.textContent?.includes('Off for this task') && providers.length === 5 && document.querySelector('.vision-model-trigger')?.dataset.modelId === '';
+  })()`, '/eyes capability options did not finish loading');
+  const visionProviders = await evaluate(window, `[...document.querySelectorAll('select[aria-label="Vision provider"] option')].map((node) => node.textContent?.trim())`);
+  assert.deepEqual(visionProviders, ['Choose provider', 'Direct API', 'Codex', 'OpenCode', 'Grok']);
+  await evaluate(window, `(() => {
+    const select = document.querySelector('select[aria-label="Vision provider"]');
+    if (!(select instanceof HTMLSelectElement)) throw new Error('Vision provider select is missing');
+    select.value = 'direct';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+  })()`);
+  await waitFor(window, `document.querySelector('select[aria-label="Vision provider"]')?.value === 'direct'`, '/eyes did not select Direct through keyboard input');
+  assert.deepEqual(await readVisionModels(window), [{ name: 'Direct Vision + Audio', source: null }]);
   await evaluate(window, `(() => {
     const select = document.querySelector('select[aria-label="Vision provider"]');
     if (!(select instanceof HTMLSelectElement)) throw new Error('Vision provider select is missing');
@@ -885,7 +1401,10 @@ async function scenarioCommandContracts(window, captures, host) {
     select.dispatchEvent(new Event('change', { bubbles: true }));
   })()`);
   await waitFor(window, `document.querySelector('select[aria-label="Vision provider"]')?.value === 'opencode'`, '/eyes did not select OpenCode through keyboard input');
-  assert.deepEqual(await evaluate(window, `[...document.querySelectorAll('select[aria-label="Vision model"] option')].map((node) => node.textContent?.trim())`), ['DeepSeek V4 Flash']);
+  assert.deepEqual(await readVisionModels(window), [{ name: 'DeepSeek V4 Flash', source: null }]);
+  // Typing narrows the same catalogue, and a query matching nothing empties it.
+  assert.deepEqual(await readVisionModels(window, 'flash'), [{ name: 'DeepSeek V4 Flash', source: null }]);
+  assert.deepEqual(await readVisionModels(window, 'no-such-model'), []);
   await clickMatchingButton(window, '.vision-eyes-picker', 'Use as eyes');
   await waitFor(window, `!document.querySelector('.vision-eyes-picker')`, '/eyes picker did not close after configuration');
   const visionRequest = host.stateForTests().requests.filter((entry) => entry.type === 'session.vision.configure').at(-1);
@@ -923,7 +1442,7 @@ async function scenarioCommandContracts(window, captures, host) {
 
   await chooseSlashCommand(window, '/mesh');
   await waitFor(window, `Boolean(document.querySelector('.mesh-panel'))`, '/mesh did not open the target picker');
-  await clickMatchingButton(window, '.mesh-panel', 'OpenCode');
+  await clickSelector(window, 'button[aria-label="Choose model and reasoning for OpenCode"]');
   await waitFor(window, `Boolean(document.querySelector('.mesh-model-picker'))`, '/mesh did not open OpenCode model selection');
   await clickSelector(window, '.mesh-model-picker-scroll section:nth-of-type(2) button:last-child');
   await clickMatchingButton(window, '.mesh-model-picker', 'Add to mesh');
@@ -931,19 +1450,27 @@ async function scenarioCommandContracts(window, captures, host) {
   await delay(50);
   await chooseSlashCommand(window, '/mesh');
   await waitFor(window, `Boolean(document.querySelector('.mesh-panel'))`, '/mesh did not reopen the target picker');
-  await clickMatchingButton(window, '.mesh-panel', 'Grok');
+  await clickSelector(window, 'button[aria-label="Choose model and reasoning for Grok"]');
   await waitFor(window, `Boolean(document.querySelector('.mesh-model-picker'))`, '/mesh did not open Grok model selection');
   await clickSelector(window, '.mesh-model-picker-scroll section:nth-of-type(2) button:last-child');
   await clickMatchingButton(window, '.mesh-model-picker', 'Add to mesh');
   await replaceComposerText(window, 'Compare both harness implementations');
   await pressComposerEnter(window);
   await waitFor(window, `document.querySelector('textarea[aria-label="Message"]')?.value === ''`, '/mesh did not consume the submitted instruction');
-  const meshRequest = host.stateForTests().requests.filter((entry) => entry.type === 'delegation.start').at(-1);
+  const meshRequest = host.stateForTests().requests.filter((entry) => entry.type === 'delegation.prepare').at(-1);
   assert.equal(meshRequest?.payload?.prompt, 'Compare both harness implementations');
   assert.deepEqual(meshRequest?.payload?.targets, [
     { providerId: 'opencode', modelId: 'deepseek/deepseek-v4-flash', reasoningEffort: 'max' },
     { providerId: 'grok', modelId: 'grok/vision', reasoningEffort: 'high' },
   ]);
+  assert.deepEqual(meshRequest?.payload?.presentationSegments, [
+    { type: 'mesh', targetIndex: 0 },
+    { type: 'mesh', targetIndex: 1 },
+    { type: 'text', text: 'Compare both harness implementations' },
+  ]);
+  assert.equal(meshRequest?.payload?.modelId, 'fake/deterministic-v1');
+  assert.equal(meshRequest?.payload?.reasoningEffort, 'Medium');
+  assert.equal(host.stateForTests().requests.some((entry) => entry.type === 'delegation.start'), false, 'The command journey used the legacy raw-prompt child route');
   await capture(window, '04-mesh-mixed-models', captures);
 
   await chooseSlashCommand(window, '/simplify');
@@ -976,6 +1503,59 @@ async function scenarioCommandContracts(window, captures, host) {
     'mesh.mixed-provider-model-effort-payload': meshRequest.payload.targets,
     'simplify.hidden-metadata-payload': simplifyRequest.payload,
   });
+}
+
+async function scenarioMeshParentOrchestration(window, host) {
+  const initialDelegationRequests = host.stateForTests().requests.filter((entry) =>
+    entry.type === 'delegation.prepare' || entry.type === 'delegation.start');
+  assert.deepEqual(initialDelegationRequests, [], 'Mesh orchestration scenario did not start with a clean delegation request log');
+
+  await chooseSlashCommand(window, '/mesh');
+  await waitFor(window, `Boolean(document.querySelector('.mesh-panel'))`, 'Mesh orchestration: target picker did not open');
+  await clickSelector(window, 'button[aria-label="Choose model and reasoning for OpenCode"]');
+  await waitFor(window, `Boolean(document.querySelector('.mesh-model-picker'))`, 'Mesh orchestration: OpenCode model picker did not open');
+  await waitFor(window, `[...document.querySelectorAll('.mesh-model-picker-reasoning-options button')].some((button) => button.textContent?.includes('Max')) && !document.querySelector('.mesh-model-picker footer button.primary')?.disabled`, 'Mesh orchestration: OpenCode choices did not finish loading');
+  await clickMatchingButton(window, '.mesh-model-picker-reasoning-options', 'Max');
+  await clickMatchingButton(window, '.mesh-model-picker', 'Add to mesh');
+  await waitFor(window, `document.querySelector('textarea[aria-label="Message"]')?.value === '' && !document.querySelector('.mesh-model-picker')`, 'Mesh orchestration: OpenCode target did not settle in the composer');
+
+  await chooseSlashCommand(window, '/mesh');
+  await waitFor(window, `Boolean(document.querySelector('.mesh-panel'))`, 'Mesh orchestration: target picker did not reopen');
+  await clickSelector(window, 'button[aria-label="Choose model and reasoning for Grok"]');
+  await waitFor(window, `Boolean(document.querySelector('.mesh-model-picker'))`, 'Mesh orchestration: Grok model picker did not open');
+  await waitFor(window, `[...document.querySelectorAll('.mesh-model-picker-reasoning-options button')].some((button) => button.textContent?.includes('High')) && !document.querySelector('.mesh-model-picker footer button.primary')?.disabled`, 'Mesh orchestration: Grok choices did not finish loading');
+  await clickMatchingButton(window, '.mesh-model-picker-reasoning-options', 'High');
+  await clickMatchingButton(window, '.mesh-model-picker', 'Add to mesh');
+  const prompt = 'Compare both harness implementations';
+  await replaceComposerText(window, prompt);
+  await pressComposerEnter(window);
+  await waitFor(window, `document.querySelector('textarea[aria-label="Message"]')?.value === ''`, 'Mesh orchestration: submitted instruction remained in the composer');
+
+  const delegationRequests = host.stateForTests().requests.filter((entry) =>
+    entry.type === 'delegation.prepare' || entry.type === 'delegation.start');
+  assert.deepEqual(delegationRequests.map((entry) => entry.type), ['delegation.prepare'],
+    'Mesh orchestration must issue exactly one prepared parent turn and never use delegation.start');
+  const meshRequest = delegationRequests[0];
+  assert.equal(meshRequest.payload?.parentSessionId, 'fake-main');
+  assert.equal(meshRequest.payload?.prompt, prompt);
+  assert.deepEqual(meshRequest.payload?.targets, [
+    { providerId: 'opencode', modelId: 'deepseek/deepseek-v4-flash', reasoningEffort: 'max' },
+    { providerId: 'grok', modelId: 'grok/vision', reasoningEffort: 'high' },
+  ]);
+  assert.deepEqual(meshRequest.payload?.presentationSegments, [
+    { type: 'mesh', targetIndex: 0 },
+    { type: 'mesh', targetIndex: 1 },
+    { type: 'text', text: prompt },
+  ]);
+  assert.equal(meshRequest.payload?.modelId, 'fake/deterministic-v1');
+  assert.equal(meshRequest.payload?.reasoningEffort, 'Medium');
+
+  return scenarioOutcome('mesh-parent-orchestration', {
+    requestType: meshRequest.type,
+    targets: meshRequest.payload.targets,
+    presentationSegments: meshRequest.payload.presentationSegments,
+    parentSelection: { modelId: meshRequest.payload.modelId, reasoningEffort: meshRequest.payload.reasoningEffort },
+  }, {});
 }
 
 async function scenarioEarsTranscriptionSend(window, captures, host) {
@@ -1021,7 +1601,7 @@ async function scenarioEarsTranscriptionSend(window, captures, host) {
   // PCM callbacks. Later recordings are already warm, but this cold-start path
   // is the one a real first-use EARS journey takes.
   await delay(1_600);
-  await clickSelector(window, 'button[aria-label="Stop recording"]');
+  await clickSelector(window, 'button[aria-label="Stop dictation"]');
   try {
     await waitFor(window, `document.querySelector('.audio-playback-chip button[aria-label^="Play "]')`, 'EARS recording did not become an editable composer attachment', 8_000);
   } catch (error) {
@@ -1065,7 +1645,139 @@ async function scenarioEarsTranscriptionSend(window, captures, host) {
 }
 
 async function ensureRendererReady(window) {
-  await waitFor(window, `document.querySelector('.desktop-app') && document.querySelector('.conversation-scroll') && document.querySelector('textarea[aria-label="Message"]')`, 'Renderer did not become ready', 15_000);
+  await waitFor(window, `document.querySelector('.desktop-app') && (document.querySelector('textarea[aria-label="Message"]') || document.querySelector('[data-session-id="fake-main"] .session-row'))`, 'Renderer did not become ready', 15_000);
+  if (!await evaluate(window, `Boolean(document.querySelector('textarea[aria-label="Message"]'))`)) {
+    await evaluate(window, `document.querySelector('[data-session-id="fake-main"] .session-row')?.click()`);
+  }
+  await waitFor(window, `document.querySelector('.conversation-scroll') && document.querySelector('textarea[aria-label="Message"]')`, 'Fixture task did not open', 8_000);
+}
+
+async function scenarioRuntimeStartupStatus(window, captures, _host, sessionsListGate) {
+  const gateDeadline = Date.now() + 5_000;
+  while (sessionsListGate?.used !== true && Date.now() < gateDeadline) await delay(10);
+  assert.equal(sessionsListGate?.used, true, 'Runtime startup status did not pause the first sessions.list request');
+  try {
+    await waitFor(window, `document.querySelector('.desktop-app') && document.querySelector('.sidebar-runtime-indicator.starting')`, 'Neutral runtime startup status did not paint', 8_000);
+    const starting = await evaluate(window, `(() => ({
+      offlineBanner: [...document.querySelectorAll('.error-banner')].some((node) => node.textContent?.includes('Local runtime is offline')),
+      statusLabel: document.querySelector('.sidebar-runtime-indicator')?.getAttribute('aria-label') ?? null,
+      startingClass: Boolean(document.querySelector('.sidebar-runtime-indicator.starting')),
+      offlineClass: Boolean(document.querySelector('.sidebar-runtime-indicator.offline')),
+    }))()`);
+    assert.equal(starting.offlineBanner, false, 'Ordinary runtime startup painted the offline error banner');
+    assert.match(starting.statusLabel ?? '', /Runtime starting/u, 'Startup status did not name the neutral state truthfully');
+    assert.equal(starting.startingClass, true, 'Startup status did not use its neutral painted class');
+    assert.equal(starting.offlineClass, false, 'Startup status used the red offline class');
+    await capture(window, 'startup-runtime-01-neutral', captures);
+
+    sessionsListGate.release();
+    await waitFor(window, `document.querySelector('.sidebar-runtime-indicator.connected[aria-label*="Runtime online"]')`, 'Runtime status did not settle online after hydration', 10_000);
+    const hydrated = await evaluate(window, `({
+      offlineBanner: [...document.querySelectorAll('.error-banner')].some((node) => node.textContent?.includes('Local runtime is offline')),
+      statusLabel: document.querySelector('.sidebar-runtime-indicator')?.getAttribute('aria-label') ?? null,
+    })`);
+    assert.equal(hydrated.offlineBanner, false, 'Healthy hydrated runtime painted the offline error banner');
+    assert.match(hydrated.statusLabel ?? '', /Runtime online/u, 'Hydrated runtime did not settle online');
+    await capture(window, 'startup-runtime-02-online', captures);
+
+    if (!window.isDestroyed()) window.webContents.send('tethoq:runtime-state', { state: 'failed', message: 'Injected runtime failure' });
+    await waitFor(window, `document.querySelector('.sidebar-runtime-indicator.offline[aria-label*="Runtime offline"]') && [...document.querySelectorAll('.error-banner')].some((node) => node.textContent?.includes('Local runtime is offline'))`, 'Authoritative runtime failure did not paint offline', 5_000);
+    const failed = await evaluate(window, `({
+      offlineBanner: [...document.querySelectorAll('.error-banner')].some((node) => node.textContent?.includes('Local runtime is offline')),
+      statusLabel: document.querySelector('.sidebar-runtime-indicator')?.getAttribute('aria-label') ?? null,
+    })`);
+    assert.equal(failed.offlineBanner, true, 'Authoritative runtime failure did not show its recovery banner');
+    assert.match(failed.statusLabel ?? '', /Runtime offline/u, 'Authoritative runtime failure did not settle offline');
+    await capture(window, 'startup-runtime-03-failed', captures);
+    return scenarioOutcome('runtime-startup-status', { starting, hydrated, failed }, {});
+  } finally {
+    sessionsListGate?.release();
+  }
+}
+
+async function scenarioProgressiveStartup(window, captures, _host, sessionsListGate) {
+  assert.equal(sessionsListGate?.used, true, 'Progressive startup did not pause the first sessions.list request');
+  const draft = `Typed before startup hydration ${Date.now()}`;
+  try {
+    const shell = await evaluate(window, `(() => ({
+      progressiveWorkspace: Boolean(document.querySelector('.workspace-progressive-loading')),
+      taskSkeleton: Boolean(document.querySelector('.session-list-skeleton')),
+      headerSkeleton: Boolean(document.querySelector('.workspace-header-skeleton')),
+      transcriptSkeleton: Boolean(document.querySelector('.transcript-skeleton')),
+      textarea: Boolean(document.querySelector('textarea[aria-label="Message"]')),
+      spinnerCount: document.querySelectorAll('.spinner').length,
+      visibleLoadingCopy: /loading (?:your )?coding tools|loading task history/iu.test(document.body.innerText),
+      offlineBanner: [...document.querySelectorAll('.error-banner')].some((node) => node.textContent?.includes('Local runtime is offline')),
+      runtimeStarting: Boolean(document.querySelector('.sidebar-runtime-indicator.starting[aria-label*="Runtime starting"]')),
+    }))()`);
+    assert.deepEqual(shell, {
+      progressiveWorkspace: true,
+      taskSkeleton: true,
+      headerSkeleton: true,
+      transcriptSkeleton: true,
+      textarea: true,
+      spinnerCount: 0,
+      visibleLoadingCopy: false,
+      offlineBanner: false,
+      runtimeStarting: true,
+    }, 'Progressive startup did not paint the independently hydrating shell');
+
+    await replaceComposerText(window, draft);
+    await attachFakeImage(window);
+    const before = await evaluate(window, `(() => {
+      const image = document.querySelector('.image-attachment-chip img');
+      if (!(image instanceof HTMLImageElement)) throw new Error('Startup image widget is missing');
+      window.__tethoqProgressiveStartupImageNode = image;
+      return {
+        draft: document.querySelector('textarea[aria-label="Message"]')?.value,
+        attachmentCount: document.querySelectorAll('.image-attachment-chip img').length,
+        attachmentName: document.querySelector('.image-attachment-chip')?.textContent?.trim(),
+        imageSource: image.currentSrc || image.src,
+      };
+    })()`);
+    assert.equal(before.draft, draft, 'The startup composer did not accept typed text');
+    assert.equal(before.attachmentCount, 1, 'The startup composer did not accept exactly one image');
+    assert.match(before.attachmentName ?? '', /fake-attachment\.png/u, 'The startup image widget lost its filename');
+    assert.ok(before.imageSource, 'The startup image widget has no painted source');
+    await capture(window, 'startup-01-progressive-shell-usable', captures);
+
+    sessionsListGate.release();
+    await waitFor(window, `!document.querySelector('.workspace-progressive-loading') && Boolean(document.querySelector('[data-session-id="fake-main"]'))`, 'Progressive startup did not hydrate the real task list', 10_000);
+    await waitFor(window, `document.querySelector('textarea[aria-label="Message"]')?.value === ${JSON.stringify(draft)} && document.querySelectorAll('.image-attachment-chip img').length === 1`, 'Startup draft did not survive hydration', 5_000);
+    await evaluate(window, `new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
+    const hydrated = await evaluate(window, `(() => {
+      const image = document.querySelector('.image-attachment-chip img');
+      return {
+        draft: document.querySelector('textarea[aria-label="Message"]')?.value,
+        attachmentCount: document.querySelectorAll('.image-attachment-chip img').length,
+        sameImageNode: image === window.__tethoqProgressiveStartupImageNode,
+        imageSource: image instanceof HTMLImageElement ? image.currentSrc || image.src : null,
+        startupDraftPresent: Boolean(document.querySelector('[data-session-id="draft-startup"]')),
+        realSessionsPresent: Boolean(document.querySelector('[data-session-id="fake-main"]')),
+        skeletonsRemaining: document.querySelectorAll('.session-list-skeleton, .workspace-header-skeleton, .transcript-skeleton').length,
+        offlineBanner: [...document.querySelectorAll('.error-banner')].some((node) => node.textContent?.includes('Local runtime is offline')),
+        runtimeOnline: Boolean(document.querySelector('.sidebar-runtime-indicator.connected[aria-label*="Runtime online"]')),
+      };
+    })()`);
+    assert.equal(hydrated.draft, draft, 'Hydration replaced the text typed during startup');
+    assert.equal(hydrated.attachmentCount, 1, 'Hydration replaced or duplicated the startup image');
+    assert.equal(hydrated.sameImageNode, true, 'Hydration remounted the startup image widget');
+    assert.equal(hydrated.imageSource, before.imageSource, 'Hydration changed the startup image source');
+    assert.equal(hydrated.startupDraftPresent, true, 'Hydration discarded the usable startup draft task');
+    assert.equal(hydrated.realSessionsPresent, true, 'Hydration did not add the real task list');
+    assert.equal(hydrated.skeletonsRemaining, 0, 'Hydrated content left startup skeletons mounted');
+    assert.equal(hydrated.offlineBanner, false, 'A healthy hydrated runtime showed the offline banner');
+    assert.equal(hydrated.runtimeOnline, true, 'The runtime indicator did not become online after hydration');
+    await capture(window, 'startup-02-hydrated-draft-preserved', captures);
+
+    return scenarioOutcome('progressive-startup', { shell, before, hydrated }, {
+      'startup.progressive-shell-no-blocking-copy': shell,
+      'startup.composer-usable-before-hydration': { draftAccepted: before.draft === draft, attachmentCount: before.attachmentCount },
+      'startup.draft-survives-hydration': { sameText: hydrated.draft === draft, sameImageNode: hydrated.sameImageNode, attachmentCount: hydrated.attachmentCount },
+    });
+  } finally {
+    sessionsListGate?.release();
+  }
 }
 
 /**
@@ -1217,6 +1929,77 @@ async function scenarioMasterStream(window, captures, host) {
   await waitFor(window, `document.querySelector('.reasoning-group[aria-busy="true"]')`, 'Fake reasoning did not start');
   await waitFor(window, `Boolean(document.querySelector(${JSON.stringify(`[data-scroll-members*="${runId}-fake-stream-tool"]`)}))`, 'Tool activity did not reach the timeline', 6_000);
   await waitFor(window, `Boolean(document.querySelector(${JSON.stringify(`[data-scroll-members*="${runId}-fake-stream-command"]`)}))`, 'Command activity did not reach the timeline', 6_000);
+  const liveReasoningFlowSelector = `[data-scroll-members*="${runId}-fake-stream-reasoning"] .reasoning-flow-running`;
+  await waitFor(window, `(() => {
+    const flow = document.querySelector(${JSON.stringify(liveReasoningFlowSelector)});
+    return flow && flow.scrollHeight > flow.clientHeight + 80 && flow.textContent?.includes('enough deterministic detail to overflow');
+  })()`, 'Live reasoning did not produce a bounded nested scroll surface', 6_000);
+  const defaultReasoningFollow = await evaluate(window, `(() => {
+    const flow = document.querySelector(${JSON.stringify(liveReasoningFlowSelector)});
+    const transcript = document.querySelector('.conversation-scroll');
+    return {
+      scrollTop: flow?.scrollTop ?? null,
+      maximum: flow ? flow.scrollHeight - flow.clientHeight : null,
+      bottomGap: flow ? flow.scrollHeight - flow.scrollTop - flow.clientHeight : null,
+      transcriptScrollTop: transcript?.scrollTop ?? null,
+      transcriptBottomGap: transcript ? transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight : null,
+      alreadyReceivedPauseCheckpoint: flow?.textContent?.includes('Reader-owned position checkpoint') ?? null,
+    };
+  })()`);
+  assert.ok(defaultReasoningFollow.maximum > 80, `Live reasoning did not overflow enough to exercise nested follow: ${JSON.stringify(defaultReasoningFollow)}`);
+  assert.ok(defaultReasoningFollow.bottomGap <= 1, `Live reasoning did not follow its physical bottom by default: ${JSON.stringify(defaultReasoningFollow)}`);
+  assert.ok(defaultReasoningFollow.transcriptBottomGap <= 2, `Master stream did not begin with the transcript following its own bottom: ${JSON.stringify(defaultReasoningFollow)}`);
+  assert.equal(defaultReasoningFollow.alreadyReceivedPauseCheckpoint, false, 'Reasoning pause checkpoint arrived before the reader interaction could be exercised');
+
+  await wheelInside(window, liveReasoningFlowSelector, 300);
+  await waitFor(window, `(() => {
+    const flow = document.querySelector(${JSON.stringify(liveReasoningFlowSelector)});
+    return flow && flow.scrollHeight - flow.scrollTop - flow.clientHeight > 120;
+  })()`, 'Wheel-up input did not move the nested reasoning reader away from its tail');
+  await delay(500);
+  const pausedReasoningBaseline = await evaluate(window, `(() => {
+    const flow = document.querySelector(${JSON.stringify(liveReasoningFlowSelector)});
+    const transcript = document.querySelector('.conversation-scroll');
+    window.__fakeModelQaReasoningFlowNode = flow;
+    return {
+      scrollTop: flow?.scrollTop ?? null,
+      maximum: flow ? flow.scrollHeight - flow.clientHeight : null,
+      transcriptScrollTop: transcript?.scrollTop ?? null,
+    };
+  })()`);
+  await waitFor(window, `document.querySelector(${JSON.stringify(liveReasoningFlowSelector)})?.textContent?.includes('Reader-owned position checkpoint')`, 'Later reasoning did not arrive while the nested reader was scrolled up', 6_000);
+  const pausedReasoningAfterChunk = await evaluate(window, `(() => {
+    const flow = document.querySelector(${JSON.stringify(liveReasoningFlowSelector)});
+    const transcript = document.querySelector('.conversation-scroll');
+    return {
+      scrollTop: flow?.scrollTop ?? null,
+      maximum: flow ? flow.scrollHeight - flow.clientHeight : null,
+      bottomGap: flow ? flow.scrollHeight - flow.scrollTop - flow.clientHeight : null,
+      transcriptScrollTop: transcript?.scrollTop ?? null,
+      sameNode: flow === window.__fakeModelQaReasoningFlowNode,
+      transcriptBottomGap: transcript ? transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight : null,
+    };
+  })()`);
+  assert.ok(pausedReasoningAfterChunk.maximum > pausedReasoningBaseline.maximum + 20, `Later reasoning did not grow the nested surface: ${JSON.stringify({ pausedReasoningBaseline, pausedReasoningAfterChunk })}`);
+  assert.ok(Math.abs(pausedReasoningAfterChunk.scrollTop - pausedReasoningBaseline.scrollTop) <= 1, `Reasoning growth moved the reader-owned nested position: ${JSON.stringify({ pausedReasoningBaseline, pausedReasoningAfterChunk })}`);
+  assert.ok(pausedReasoningAfterChunk.bottomGap > 120, `Scrolled-up reasoning silently resumed following: ${JSON.stringify(pausedReasoningAfterChunk)}`);
+  assert.ok(Math.abs(pausedReasoningAfterChunk.transcriptScrollTop - pausedReasoningBaseline.transcriptScrollTop) <= 1, `Nested reasoning wheel input moved the main transcript: ${JSON.stringify({ pausedReasoningBaseline, pausedReasoningAfterChunk })}`);
+  assert.ok(pausedReasoningAfterChunk.transcriptBottomGap <= 2, `Nested reasoning input revoked the main transcript's independent follow state: ${JSON.stringify(pausedReasoningAfterChunk)}`);
+
+  await wheelNestedToBottom(window, liveReasoningFlowSelector);
+  const restoredReasoningBaseline = await evaluate(window, `(() => {
+    const flow = document.querySelector(${JSON.stringify(liveReasoningFlowSelector)});
+    return { maximum: flow ? flow.scrollHeight - flow.clientHeight : null, bottomGap: flow ? flow.scrollHeight - flow.scrollTop - flow.clientHeight : null };
+  })()`);
+  assert.ok(restoredReasoningBaseline.bottomGap <= 1, `Reader could not return reasoning to its exact physical bottom: ${JSON.stringify(restoredReasoningBaseline)}`);
+  await waitFor(window, `document.querySelector(${JSON.stringify(liveReasoningFlowSelector)})?.textContent?.includes('Bottom-follow restoration checkpoint')`, 'Reasoning did not continue after nested follow was restored', 6_000);
+  const resumedReasoningAfterChunk = await evaluate(window, `(() => {
+    const flow = document.querySelector(${JSON.stringify(liveReasoningFlowSelector)});
+    return { maximum: flow ? flow.scrollHeight - flow.clientHeight : null, bottomGap: flow ? flow.scrollHeight - flow.scrollTop - flow.clientHeight : null };
+  })()`);
+  assert.ok(resumedReasoningAfterChunk.maximum > restoredReasoningBaseline.maximum + 20, `Restored reasoning did not receive later growth: ${JSON.stringify({ restoredReasoningBaseline, resumedReasoningAfterChunk })}`);
+  assert.ok(resumedReasoningAfterChunk.bottomGap <= 1, `Reasoning did not resume following after the reader returned to bottom: ${JSON.stringify(resumedReasoningAfterChunk)}`);
+  const reasoningScrollFollow = { defaultReasoningFollow, pausedReasoningBaseline, pausedReasoningAfterChunk, restoredReasoningBaseline, resumedReasoningAfterChunk };
   const activeReasoning = await evaluate(window, `(() => {
     const groups = [...document.querySelectorAll(${JSON.stringify(`[data-scroll-members*="${runId}-fake-stream-reasoning"]`)})];
     const group = groups[0];
@@ -1253,6 +2036,8 @@ async function scenarioMasterStream(window, captures, host) {
     assert.equal(activeReasoning.flowPlayState, 'running', `Live reasoning text animation was paused: ${JSON.stringify(activeReasoning)}`);
   }
   await capture(window, '01-stream-active', captures);
+  await waitFor(window, `[...document.querySelectorAll('.message-assistant')].some((node) => node.textContent?.includes('The fake model completed its deterministic pass.'))`, 'Final answer did not begin after nested reasoning interaction', 6_000);
+  await waitFor(window, `(() => { const transcript = document.querySelector('.conversation-scroll'); return transcript && transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight <= 2; })()`, 'Main transcript stopped following after nested reasoning wheel input', 6_000);
   try {
     await waitFor(window, `(() => { const reasoning = document.querySelector(${JSON.stringify(`[data-scroll-members*="${runId}-fake-stream-reasoning"]`)}); const busy = reasoning?.matches('[aria-busy="true"]') || reasoning?.querySelector('[aria-busy="true"]'); const answer = document.querySelector(${JSON.stringify(`[data-scroll-anchor*="${runId}-fake-stream-answer"]`)}); return !busy && answer; })()`, 'Stream did not complete', 12_000);
   } catch (error) {
@@ -1260,18 +2045,75 @@ async function scenarioMasterStream(window, captures, host) {
     throw new Error(`${error instanceof Error ? error.message : String(error)}; stream state: ${JSON.stringify(state)}`);
   }
   await waitForSessionIdle(window);
-  const settledCommandSelector = await evaluate(window, `(() => {
-    const button = [...document.querySelectorAll('.activity-row')].find((candidate) => candidate.textContent?.includes('npm run fake-check'));
-    if (!(button instanceof HTMLElement)) throw new Error('Settled command disclosure is missing');
-    button.dataset.fakeModelQaCommand = 'settled';
-    return 'button[data-fake-model-qa-command="settled"]';
+  const settledCommandGroupSelector = `[data-scroll-members*="${runId}-fake-stream-command"]`;
+  const settledCommandPainted = `(() => {
+    const group = document.querySelector(${JSON.stringify(`[data-scroll-members*="${runId}-fake-stream-command"]`)});
+    const command = [...(group?.querySelectorAll('.activity-row') ?? [])].find((candidate) => candidate.textContent?.includes('npm run fake-check'));
+    return Boolean(command && command.getClientRects().length > 0);
+  })()`;
+  const settledReasoningSelector = `[data-scroll-members*="${runId}-fake-stream-reasoning"] button.reasoning-disclosure`;
+  assert.equal(await evaluate(window, settledCommandPainted), true, 'Settled command disclosure is missing');
+  assert.equal(await evaluate(window, `Boolean(document.querySelector(${JSON.stringify(settledReasoningSelector)}))`), true, 'Settled Reasoning disclosure is missing');
+  await wheelConversationGutterToBottom(window);
+  const collapsedTailGeometry = await evaluate(window, `(() => {
+    const reasoning = document.querySelector(${JSON.stringify(settledReasoningSelector)});
+    const composer = document.querySelector('.composer-wrap');
+    const spacer = document.querySelector('.conversation-tail-spacer');
+    const scroller = document.querySelector('.conversation-scroll');
+    const bounds = reasoning?.getBoundingClientRect();
+    const composerBounds = composer?.getBoundingClientRect();
+    return { reasoningBottom: bounds?.bottom, composerTop: composerBounds?.top, spacerHeight: spacer?.getBoundingClientRect().height, scrollTop: scroller?.scrollTop, scrollHeight: scroller?.scrollHeight, clientHeight: scroller?.clientHeight };
   })()`);
-  await clickSelector(window, settledCommandSelector);
+  assert.ok(collapsedTailGeometry.reasoningBottom <= collapsedTailGeometry.composerTop, `Collapsed tail Reasoning is hidden behind the composer: ${JSON.stringify(collapsedTailGeometry)}`);
+  await wheelConversationGutterUntilVisible(window, settledReasoningSelector);
+  await delay(500);
+  await wheelConversationGutterUntilVisible(window, settledReasoningSelector);
+  await delay(120);
+  const beforeDisclosureClick = await evaluate(window, `(() => {
+    const reasoning = document.querySelector(${JSON.stringify(settledReasoningSelector)});
+    return {
+      expanded: reasoning?.getAttribute('aria-expanded') ?? null,
+      members: reasoning?.closest('.reasoning-group')?.getAttribute('data-scroll-members') ?? null,
+      groupText: reasoning?.closest('.reasoning-group')?.textContent?.replace(/\\s+/gu, ' ').trim() ?? null,
+    };
+  })()`);
+  assert.equal(beforeDisclosureClick.expanded, 'true', `Live-open Reasoning closed during settlement: ${JSON.stringify(beforeDisclosureClick)}`);
+  await evaluate(window, `(() => {
+    const reasoning = document.querySelector(${JSON.stringify(settledReasoningSelector)});
+    window.__fakeModelQaReasoningClicks = 0;
+    reasoning?.addEventListener('click', () => { window.__fakeModelQaReasoningClicks += 1; });
+  })()`);
+  await clickVerifiedVisibleSelector(window, settledReasoningSelector);
+  await waitFor(window, `document.querySelector(${JSON.stringify(settledReasoningSelector)})?.getAttribute('aria-expanded') === 'false'`, 'Physical click did not close settled Reasoning');
+  assert.equal(await evaluate(window, `window.__fakeModelQaReasoningClicks`), 1, 'Settled Reasoning did not receive its physical close click exactly once');
+  assert.equal(await evaluate(window, settledCommandPainted), false, 'Closing settled Reasoning left its command painted');
+  await clickVerifiedVisibleSelector(window, settledReasoningSelector);
+  await waitFor(window, `document.querySelector(${JSON.stringify(settledReasoningSelector)})?.getAttribute('aria-expanded') === 'true'`, 'Physical click did not reopen settled Reasoning');
+  await waitFor(window, settledCommandPainted, 'Settled command did not become painted when Reasoning reopened');
+  const disclosureState = await evaluate(window, `(() => {
+    const reasoning = document.querySelector(${JSON.stringify(settledReasoningSelector)});
+    const group = document.querySelector(${JSON.stringify(settledCommandGroupSelector)});
+    const command = [...(group?.querySelectorAll('.activity-row') ?? [])].find((candidate) => candidate.textContent?.includes('npm run fake-check'));
+    return { expanded: reasoning?.getAttribute('aria-expanded'), physicalClicks: window.__fakeModelQaReasoningClicks, commandRects: command?.getClientRects().length, commandDisplay: command ? getComputedStyle(command).display : null, members: reasoning?.closest('.reasoning-group')?.getAttribute('data-scroll-members') ?? null, groupText: reasoning?.closest('.reasoning-group')?.textContent?.replace(/\\s+/gu, ' ').trim() };
+  })()`);
+  assert.equal(disclosureState.physicalClicks, 2, `Settled Reasoning did not receive one close and one reopen click: ${JSON.stringify(disclosureState)}`);
+  assert.equal(disclosureState.members, beforeDisclosureClick.members, `Settled Reasoning changed grouped identity while toggling: ${JSON.stringify({ beforeDisclosureClick, disclosureState })}`);
+  await wheelConversationGutterToBottom(window);
+  const expandedTailGeometry = await evaluate(window, `(() => {
+    const group = document.querySelector(${JSON.stringify(settledCommandGroupSelector)});
+    const command = [...(group?.querySelectorAll('.activity-row') ?? [])].find((candidate) => candidate.textContent?.includes('npm run fake-check'));
+    const composer = document.querySelector('.composer-wrap');
+    const bounds = command?.getBoundingClientRect();
+    const composerBounds = composer?.getBoundingClientRect();
+    return { commandBottom: bounds?.bottom, composerTop: composerBounds?.top };
+  })()`);
+  assert.ok(expandedTailGeometry.commandBottom <= expandedTailGeometry.composerTop, `Expanded tail command is hidden behind the composer: ${JSON.stringify(expandedTailGeometry)}`);
+  await clickMatchingButton(window, settledCommandGroupSelector, 'npm run fake-check');
   await waitFor(window, `[...document.querySelectorAll('.activity-snippet')].some((node) => node.textContent?.includes('fake check passed'))`, 'Settled command disclosure did not reveal its concrete output');
   const identity = await evaluate(window, `(() => {
     const text = ${JSON.stringify(message)};
     const userRows = [...document.querySelectorAll('.message-user')].filter((node) => node.textContent?.includes(text));
-    const localEchoes = [...document.querySelectorAll('[data-scroll-anchor]')].filter((node) => String(node.dataset.scrollAnchor).startsWith('local-') && node.textContent?.includes(text));
+    const localPresentationAnchors = [...document.querySelectorAll('[data-scroll-anchor]')].filter((node) => String(node.dataset.scrollAnchor).startsWith('local-') && node.textContent?.includes(text));
     return {
       userRows: userRows.length,
       userRowDetails: userRows.map((node) => ({
@@ -1279,7 +2121,7 @@ async function scenarioMasterStream(window, captures, host) {
         anchor: node.closest('[data-scroll-anchor]')?.getAttribute('data-scroll-anchor') ?? null,
         members: node.closest('[data-scroll-members]')?.getAttribute('data-scroll-members') ?? null,
       })),
-      localEchoes: localEchoes.length,
+      localPresentationAnchors: localPresentationAnchors.length,
       reasoningGroups: document.querySelectorAll(${JSON.stringify(`[data-scroll-members*="${runId}-fake-stream-reasoning"]`)}).length,
       toolMembers: document.querySelectorAll(${JSON.stringify(`[data-scroll-members*="${runId}-fake-stream-tool"]`)}).length,
       commandMembers: document.querySelectorAll(${JSON.stringify(`[data-scroll-members*="${runId}-fake-stream-command"]`)}).length,
@@ -1289,8 +2131,12 @@ async function scenarioMasterStream(window, captures, host) {
       runningReasoningText: document.querySelectorAll('.reasoning-flow-running').length,
     };
   })()`);
+  const canonicalUserMessages = (host.stateForTests().messagesBySession.get('fake-main') ?? [])
+    .filter((entry) => entry.role === 'user' && entry.parts?.some((part) => part.type === 'text' && part.text === message));
   assert.equal(identity.userRows, 1, `Optimistic identity: expected one canonical user row, found ${identity.userRows}: ${JSON.stringify(identity.userRowDetails)}`);
-  assert.equal(identity.localEchoes, 0, `Optimistic identity: the local-* echo row survived history insertion (${identity.localEchoes})`);
+  assert.equal(identity.localPresentationAnchors, 1, `Optimistic identity: the accepted row lost its stable presentation anchor (${identity.localPresentationAnchors})`);
+  assert.equal(canonicalUserMessages.length, 1, `Optimistic identity: provider history did not contain exactly one canonical user message (${canonicalUserMessages.length})`);
+  assert.doesNotMatch(canonicalUserMessages[0].providerMessageId, /^local-/u, 'Optimistic identity: provider history retained the renderer-only local identity');
   assert.equal(identity.reasoningGroups, 1, `History insertion: reasoning group duplicated (${identity.reasoningGroups})`);
   assert.equal(identity.toolMembers, 1, `History insertion: tool activity duplicated (${identity.toolMembers})`);
   assert.equal(identity.commandMembers, 1, `History insertion: command activity duplicated (${identity.commandMembers})`);
@@ -1298,13 +2144,12 @@ async function scenarioMasterStream(window, captures, host) {
   assert.match(identity.commandText, /npm run fake-check[\s\S]*fake check passed/u, `Settled command lost its command or output: ${identity.commandText}`);
   assert.equal(identity.runningReasoningGroups, 0, 'Settled reasoning kept an aria-busy shimmer owner');
   assert.equal(identity.runningReasoningText, 0, 'Settled reasoning text kept its running shimmer class');
-  await evaluate(window, `document.querySelector(${JSON.stringify('button[data-fake-model-qa-command="settled"]')})?.removeAttribute('data-fake-model-qa-command')`);
   await capture(window, '02-stream-settled', captures);
-  return scenarioOutcome('master-stream-identity', { activeReasoning, identity }, {
-    'stream.reasoning-live-single-clickable': activeReasoning,
+  return scenarioOutcome('master-stream-identity', { activeReasoning, reasoningScrollFollow, identity }, {
+    'stream.reasoning-live-single-clickable': { ...activeReasoning, reasoningScrollFollow },
     'stream.reasoning-shimmer': { labelAnimation: activeReasoning.labelAnimation, flowAnimation: activeReasoning.flowAnimation },
     'stream.tool-command-details': { toolText: activeReasoning.toolText, commandText: identity.commandText },
-    'stream.optimistic-user-reconciles-once': { userRows: identity.userRows, localEchoes: identity.localEchoes },
+    'stream.optimistic-user-reconciles-once': { userRows: identity.userRows, localPresentationAnchors: identity.localPresentationAnchors, canonicalProviderRows: canonicalUserMessages.length },
     'stream.history-insertion-no-duplicates': { reasoningGroups: identity.reasoningGroups, toolMembers: identity.toolMembers, commandMembers: identity.commandMembers, answerRows: identity.answerRows },
   });
 }
@@ -1314,7 +2159,20 @@ async function scenarioTerminalHistoryRace(window, captures, host) {
   await clickTaskByTitle(window, 'Fake model main task');
   await submitComposer(window, 'restart mid-turn terminal history race');
   await waitFor(window, `[...document.querySelectorAll('.reasoning-group')].some((node) => node.textContent?.includes('Checking the persisted transcript'))`, 'Terminal history race did not show its running Reasoning row');
+  await waitForFakeHostIdle(host);
+  await delay(50);
+  const terminalObservedAt = performance.now();
+  const deferred = await evaluate(window, `({
+    answers: [...document.querySelectorAll('.message-assistant')].filter((node) => node.textContent?.includes('The final reply arrived through persisted history')).length,
+    busy: document.querySelectorAll('.reasoning-group[aria-busy="true"]').length,
+    stoppable: Boolean(document.querySelector('button[aria-label="Stop task"]')),
+    taskSpinner: Boolean(document.querySelector('[data-session-id="fake-main"] .session-row-working-spinner')),
+  })`);
+  assert.deepEqual(deferred, { answers: 0, busy: 1, stoppable: true, taskSpinner: true }, 'An early terminal signal settled the visible turn before the quiet boundary');
+  await capture(window, '02-terminal-history-race-deferred', captures);
   await waitFor(window, `!document.querySelector('button[aria-label="Stop task"]')`, 'Terminal history race kept Stop visible after completion', 6_000);
+  const quietSettlementMs = performance.now() - terminalObservedAt;
+  assert.ok(quietSettlementMs < 4_000, `Terminal history race waited ${quietSettlementMs.toFixed(1)}ms instead of settling after the quiet boundary`);
   assert.equal(await evaluate(window, `[...document.querySelectorAll('.message-assistant')].filter((node) => node.textContent?.includes('The final reply arrived through persisted history')).length`), 0, 'Terminal history answer arrived before persisted history released it');
 
   await new Promise((resolve, reject) => {
@@ -1325,6 +2183,7 @@ async function scenarioTerminalHistoryRace(window, captures, host) {
   window.webContents.send('tethoq:runtime-state', { state: 'ready' });
   await ensureRendererReady(window);
   await clickTaskByTitle(window, 'Fake model main task');
+  await evaluate(window, `new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
   await waitFor(window, `document.querySelectorAll('.reasoning-group').length > 0`, 'Reloaded renderer did not restore the incomplete Reasoning row');
   assert.equal(await evaluate(window, `[...document.querySelectorAll('.message-assistant')].filter((node) => node.textContent?.includes('The final reply arrived through persisted history')).length`), 0, 'Reloaded renderer already contained the delayed final reply');
   assert.equal(await evaluate(window, `document.querySelectorAll('.reasoning-group[aria-busy="true"]').length`), 0, 'Completed task kept a live Reasoning shimmer after reload');
@@ -1352,9 +2211,51 @@ async function scenarioTerminalHistoryRace(window, captures, host) {
   })`);
   assert.deepEqual(settled, { answers: 1, busy: 0, incomplete: 0, stoppable: false }, 'Terminal history race did not settle to one calm final answer');
   await capture(window, '02-terminal-history-race-settled', captures);
-  return scenarioOutcome('terminal-history-race', { reloadedMidTurn: true, ...settled }, {
+  return scenarioOutcome('terminal-history-race', { reloadedMidTurn: true, deferred, quietSettlementMs, ...settled }, {
     'history.terminal-before-final-recovers-after-reload': settled,
     'history.terminal-race-no-duplicate-or-stale-shimmer': settled,
+  });
+}
+
+async function scenarioTerminalLiveCancellation(window, captures, host) {
+  await ensureRendererReady(window);
+  await clickTaskByTitle(window, 'Fake model main task');
+  await submitComposer(window, 'restart mid-turn terminal history race');
+  await waitFor(window, `[...document.querySelectorAll('.reasoning-group')].some((node) => node.textContent?.includes('Checking the persisted transcript'))`, 'Terminal cancellation journey did not show its running Reasoning row');
+  await waitForFakeHostIdle(host);
+  await delay(50);
+
+  const resumed = host.emitDeferredLiveActivityForTests();
+  assert.equal(resumed.emitted, true, 'Fake provider could not emit newer work after its early terminal signal');
+  await waitFor(window, `Boolean(document.querySelector('button[aria-label="Stop task"]')) && Boolean(document.querySelector('[data-session-id="fake-main"] .session-row-working-spinner'))`, 'Newer provider work did not keep the task visibly active');
+
+  // Cross the original two-second settlement deadline. If that stale timer was
+  // not cancelled, Stop/spinner/shimmer disappear here even though newer work won.
+  await delay(2_250);
+  const afterStaleDeadline = await evaluate(window, `({
+    answers: [...document.querySelectorAll('.message-assistant')].filter((node) => node.textContent?.includes('The final reply arrived through persisted history')).length,
+    busy: document.querySelectorAll('.reasoning-group[aria-busy="true"]').length,
+    stoppable: Boolean(document.querySelector('button[aria-label="Stop task"]')),
+    taskSpinner: Boolean(document.querySelector('[data-session-id="fake-main"] .session-row-working-spinner')),
+  })`);
+  assert.deepEqual(afterStaleDeadline, { answers: 0, busy: 1, stoppable: true, taskSpinner: true }, 'An obsolete terminal timer overruled newer live activity');
+  await capture(window, '03-terminal-cancelled-by-live-activity', captures);
+
+  const released = host.releaseDeferredFinalHistoryForTests();
+  assert.equal(released.released, true, 'Fake provider did not publish its later canonical final answer');
+  await waitFor(window, `[...document.querySelectorAll('.message-assistant')].filter((node) => node.textContent?.includes('The final reply arrived through persisted history after the terminal event.')).length === 1`, 'Canonical final answer did not appear after the replacement terminal signal', 8_000);
+  await waitFor(window, `!document.querySelector('button[aria-label="Stop task"]') && !document.querySelector('[data-session-id="fake-main"] .session-row-working-spinner')`, 'Replacement terminal signal did not settle the resumed turn', 6_000);
+  const settled = await evaluate(window, `({
+    answers: [...document.querySelectorAll('.message-assistant')].filter((node) => node.textContent?.includes('The final reply arrived through persisted history after the terminal event.')).length,
+    busy: document.querySelectorAll('.reasoning-group[aria-busy="true"]').length,
+    stoppable: Boolean(document.querySelector('button[aria-label="Stop task"]')),
+    taskSpinner: Boolean(document.querySelector('[data-session-id="fake-main"] .session-row-working-spinner')),
+  })`);
+  assert.deepEqual(settled, { answers: 1, busy: 0, stoppable: false, taskSpinner: false }, 'Resumed turn did not settle cleanly from canonical history');
+  await wheelToBottom(window);
+  await capture(window, '04-terminal-replacement-settled', captures);
+  return scenarioOutcome('terminal-live-cancellation', { afterStaleDeadline, settled }, {
+    'history.later-live-activity-cancels-stale-terminal': { afterStaleDeadline, settled },
   });
 }
 
@@ -1405,6 +2306,73 @@ async function scenarioError(window, captures) {
   return scenarioOutcome('error', { role: 'alert', recoveryFocusedComposer: true }, {
     'failure.visible-error-row': { role: 'alert', recoveryFocusedComposer: true },
   });
+}
+
+async function scenarioStopPresentationBoundary(window, captures, host, interruptGate) {
+  await ensureRendererReady(window);
+  await clickTaskByTitle(window, 'Fake model main task');
+  await submitComposer(window, 'run the queue scenario');
+  await waitFor(window, `document.querySelector('.reasoning-group[aria-busy="true"]') && document.querySelector('button[aria-label="Stop task"]')`, 'Stop boundary fixture did not enter live reasoning');
+
+  const interruptsBefore = host.stateForTests().requests.filter((entry) => entry.type === 'session.interrupt').length;
+  await clickSelector(window, 'button[aria-label="Stop task"]');
+  const gateDeadline = Date.now() + 2_000;
+  while (interruptGate?.used !== true && Date.now() < gateDeadline) await delay(10);
+  assert.equal(interruptGate?.used, true, 'Stop did not reach the delayed interrupt gate');
+  assert.notEqual(host.stateForTests().playing, null, 'Delayed interrupt settled the provider before the UI boundary could be inspected');
+  await evaluate(window, `new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
+
+  const presentationState = () => evaluate(window, `({
+    runningReasoningGroups: document.querySelectorAll('.reasoning-group[aria-busy="true"]').length,
+    runningReasoningText: document.querySelectorAll('.reasoning-flow-running').length,
+    workingPulses: document.querySelectorAll('.working-pulse').length,
+    taskSpinners: document.querySelectorAll('[data-session-id="fake-main"] .session-row-working-spinner').length,
+    workspaceSpinners: document.querySelectorAll('.workspace-title .status .spinner').length,
+    primarySpinners: document.querySelectorAll('.composer-primary-actions .send-button .spinner').length,
+    stopButtons: document.querySelectorAll('button[aria-label="Stop task"]').length,
+    primaryLabel: document.querySelector('.composer-primary-actions .send-button')?.getAttribute('aria-label') ?? null,
+  })`);
+  const expectedQuiet = {
+    runningReasoningGroups: 0,
+    runningReasoningText: 0,
+    workingPulses: 0,
+    taskSpinners: 0,
+    workspaceSpinners: 0,
+    primarySpinners: 0,
+    stopButtons: 0,
+    primaryLabel: 'Send instruction',
+  };
+  const afterTwoFrames = await presentationState();
+  assert.deepEqual(afterTwoFrames, expectedQuiet, 'Stop did not become a quiet visual terminal boundary within two frames');
+
+  // The next provider delta lands while the interrupt RPC is still waiting.
+  // It must update canonical history without reacquiring any live animation.
+  await delay(650);
+  assert.notEqual(host.stateForTests().playing, null, 'The delayed fake turn ended before stale live output was exercised');
+  const afterLateOutput = await presentationState();
+  assert.deepEqual(afterLateOutput, expectedQuiet, 'Late same-turn output reacquired live presentation after Stop');
+  await capture(window, 'stop-boundary-pending', captures);
+
+  interruptGate.release();
+  await waitForFakeHostIdle(host);
+  await waitFor(window, `!document.querySelector('.reasoning-group[aria-busy="true"], .message-assistant[aria-busy="true"], .working-pulse, [data-session-id="fake-main"] .session-row-working-spinner, .workspace-title .status .spinner, .composer-primary-actions .send-button .spinner')`, 'Successful interrupt did not settle quietly');
+  const interruptsAfter = host.stateForTests().requests.filter((entry) => entry.type === 'session.interrupt').length;
+  assert.equal(interruptsAfter, interruptsBefore + 1, 'Stop issued anything other than one interrupt request');
+
+  await submitComposer(window, 'run the queue scenario again');
+  await waitFor(window, `document.querySelector('.reasoning-group[aria-busy="true"]') && document.querySelector('button[aria-label="Stop task"]')`, 'Interrupt failure fixture did not enter live reasoning');
+  host.failNextRequestForTests('session.interrupt', 'Injected interrupt rejection.');
+  const failureInterruptsBefore = host.stateForTests().requests.filter((entry) => entry.type === 'session.interrupt').length;
+  await clickSelector(window, 'button[aria-label="Stop task"]');
+  await waitFor(window, `document.querySelector('.toast-error')?.textContent?.includes('Injected interrupt rejection.')`, 'Interrupt failure did not surface its truthful error');
+  await waitFor(window, `document.querySelector('button[aria-label="Stop task"]') && document.querySelector('[data-session-id="fake-main"] .session-row-working-spinner') && document.querySelector('.workspace-title .status .spinner') && document.querySelector('.reasoning-group[aria-busy="true"], .message-assistant[aria-busy="true"]')`, 'Interrupt failure did not restore live presentation');
+  const failureInterruptsAfter = host.stateForTests().requests.filter((entry) => entry.type === 'session.interrupt').length;
+  assert.equal(failureInterruptsAfter, failureInterruptsBefore + 1, 'Failed Stop issued anything other than one interrupt request');
+  await capture(window, 'stop-boundary-failure-resumed', captures);
+
+  host.handleRequest('session.interrupt', { sessionId: 'fake-main' }, 'stop-boundary-cleanup');
+  await waitForFakeHostIdle(host);
+  return { afterTwoFrames, afterLateOutput, interruptRequests: 1, failureRestoredLivePresentation: true };
 }
 
 async function scenarioKeyboardCoreActions(window, captures, host) {
@@ -1468,7 +2436,7 @@ async function scenarioNativeAudioSending(window, captures, host) {
   // Stop so this validates the widget rather than scheduler luck.
   await delay(1_500);
   await capture(window, '17-audio-recording-active', captures);
-  await clickSelector(window, 'button[aria-label="Stop recording"]');
+  await clickSelector(window, 'button[aria-label="Stop dictation"]');
   await waitFor(window, `document.querySelector('.attachment-chips .audio-playback-chip button[aria-label^="Play "]')`, 'Stopped MP3 did not become a playable composer widget', 8_000);
   assert.equal(await evaluate(window, `document.querySelectorAll('.toast').length`), 0, 'Attaching a recording showed a redundant success toast');
   await capture(window, '18-audio-attached-before-send', captures);
@@ -1516,6 +2484,88 @@ async function scenarioNativeAudioSending(window, captures, host) {
   });
 }
 
+async function scenarioImageSendScrollStability(window, captures, host) {
+  await clickTaskByTitle(window, 'Fake model main task');
+  await waitFor(window, `document.querySelector('.workspace h1')?.textContent?.includes('Fake model main task')`, 'Image-send fixture task did not open');
+  await waitForSessionIdle(window);
+  await installScrollTrace(window);
+
+  const bottomText = `Image send pinned at bottom ${Date.now()}`;
+  await attachFakeImage(window);
+  await replaceComposerText(window, bottomText);
+  await ensureBottom(window);
+  await startImageSendTrace(window, bottomText);
+  await pressComposerEnter(window);
+  await waitFor(window, `(() => {
+    const row = [...document.querySelectorAll('.message-user')].find((node) => node.querySelector('.message-body')?.textContent?.trim() === ${JSON.stringify(bottomText)});
+    return Boolean(row?.querySelector('.message-images img'));
+  })()`, 'Accepted image send did not appear as a transcript widget');
+  await capture(window, '20-image-send-accepted-at-bottom', captures);
+  await waitFor(window, `Boolean(document.querySelector('.reasoning-group[aria-busy="true"], .message-assistant[aria-busy="true"]'))`, 'Image-send assistant response never entered a live state');
+  await capture(window, '21-image-send-response-live', captures);
+  await waitForFakeHostIdle(host);
+  await waitForSessionIdle(window);
+  await waitFor(window, `(() => [...document.querySelectorAll('.message-assistant')].some((node) => node.textContent?.includes('Fresh fake audio response')))()`, 'Image-send assistant response did not finish');
+  await evaluate(window, `new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
+  const bottomTrace = await stopImageSendTrace(window);
+  const bottomPresentation = assertStableImagePresentation(bottomTrace, bottomText);
+  const bottomPainted = bottomTrace.samples.slice(bottomPresentation.firstImageIndex);
+  const maximumBottomGap = Math.max(...bottomPainted.map((sample) => sample.bottomGap));
+  assert.ok(maximumBottomGap <= 1.5, `Bottom-following image send drifted ${maximumBottomGap}px from the physical end`);
+  await capture(window, '22-image-send-finished-at-bottom', captures);
+
+  await wheelAwayFromBottom(window, 900);
+  await waitFor(window, `(() => {
+    const scroller = document.querySelector('.conversation-scroll');
+    return scroller && scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight > 400;
+  })()`, 'Image-send fixture could not establish a manually scrolled reading position');
+  await attachFakeImage(window);
+  const preservedText = `Image send preserves reader position ${Date.now()}`;
+  await replaceComposerText(window, preservedText);
+  await evaluate(window, `new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
+  const preservedBaseline = await evaluate(window, `document.querySelector('.conversation-scroll')?.scrollTop ?? null`);
+  assert.equal(typeof preservedBaseline, 'number', 'Manual-scroll baseline is unavailable');
+  await startImageSendTrace(window, preservedText);
+  await pressComposerEnter(window);
+  await waitFor(window, `(() => {
+    const row = [...document.querySelectorAll('.message-user')].find((node) => node.querySelector('.message-body')?.textContent?.trim() === ${JSON.stringify(preservedText)});
+    return Boolean(row?.querySelector('.message-images img'));
+  })()`, 'Scrolled-up image send did not become a transcript widget');
+  await waitForFakeHostIdle(host);
+  await waitForSessionIdle(window);
+  await evaluate(window, `new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
+  const preservedTrace = await stopImageSendTrace(window);
+  const preservedPresentation = assertStableImagePresentation(preservedTrace, preservedText);
+  const maximumPreservedScrollDrift = Math.max(...preservedTrace.samples.map((sample) => Math.abs(sample.scrollTop - preservedBaseline)));
+  assert.ok(maximumPreservedScrollDrift <= 0.5, `Scrolled-up image send moved the reader by ${maximumPreservedScrollDrift}px`);
+  await capture(window, '23-image-send-finished-reader-preserved', captures);
+
+  const outcome = {
+    bottom: {
+      ...bottomPresentation,
+      maximumBottomGap,
+      frames: bottomTrace.samples.length,
+      imageDetachments: bottomTrace.imageDetachments,
+    },
+    preserved: {
+      ...preservedPresentation,
+      baselineScrollTop: preservedBaseline,
+      maximumScrollDrift: maximumPreservedScrollDrift,
+      frames: preservedTrace.samples.length,
+      imageDetachments: preservedTrace.imageDetachments,
+    },
+  };
+  return scenarioOutcome('image-send-scroll-stability', outcome, {
+    'attachments.image-send-stable-presentation': {
+      bottom: bottomPresentation,
+      preserved: preservedPresentation,
+      detachments: bottomTrace.imageDetachments + preservedTrace.imageDetachments,
+    },
+    'scroll.image-send-follows-physical-bottom': { maximumBottomGap },
+    'scroll.image-send-preserves-reader-position': { baselineScrollTop: preservedBaseline, maximumScrollDrift: maximumPreservedScrollDrift },
+  });
+}
+
 async function scenarioQueueSteerAndViewportStability(window, captures, host) {
   await clickTaskByTitle(window, 'Fake model main task');
   await waitFor(window, `document.querySelector('.workspace h1')?.textContent?.includes('Fake model main task')`, 'Queue fixture task did not open');
@@ -1547,7 +2597,10 @@ async function scenarioQueueSteerAndViewportStability(window, captures, host) {
   await waitFor(window, `(() => { const button = document.querySelector(${JSON.stringify(settledReasoningSelector)}); const bounds = button?.getBoundingClientRect(); return button && button.getAttribute('aria-expanded') === 'false' && bounds && bounds.top >= 0 && bounds.bottom <= innerHeight; })()`, 'Settled Reasoning control was not visible while scrolled up');
   await delay(220);
   const beforeExpansion = await viewportState(window, true);
-  await clickSelector(window, settledReasoningSelector);
+  // This control is deliberately already visible: use the non-scrolling click
+  // so the product's own anchor preservation, rather than the QA helper's
+  // scrollIntoView, is what the assertion measures.
+  await clickVerifiedVisibleSelector(window, settledReasoningSelector);
   await waitFor(window, `document.querySelector(${JSON.stringify(settledReasoningSelector)})?.getAttribute('aria-expanded') === 'true'`, 'Reasoning did not open', 6_000);
   await delay(220);
   const afterExpansion = await viewportState(window, false);
@@ -1583,7 +2636,7 @@ async function scenarioQueueSteerAndViewportStability(window, captures, host) {
   await waitFor(window, `document.querySelector('.workspace h1')?.textContent?.includes('Fake model attachments task')`, 'Did not switch to the attachments task');
   assert.ok(await evaluate(window, `Boolean(document.querySelector('.message-images-before img'))`), 'Attachments: the history image did not render');
   assert.ok(await evaluate(window, `Boolean(document.querySelector('.message-audio-before'))`), 'Attachments: the history audio did not render');
-  assert.ok(await evaluate(window, `Boolean(document.querySelector('[data-scroll-members*="fake-attach-user-3"]'))`), 'Attachments: the file attachment row did not render');
+  assert.ok(await evaluate(window, `[...document.querySelectorAll('.message-files .message-file-attachment strong')].some((node) => node.textContent?.trim() === 'fixture-notes.md')`), 'Attachments: the named file widget did not render');
   assert.ok(await evaluate(window, `Boolean(document.querySelector('[data-scroll-members*="fake-attach-file-change-0"]'))`), 'Attachments: the file-change row did not render');
   await capture(window, '10-attachments-task', captures);
   await clickTaskByTitle(window, 'Fake model main task');
@@ -1645,7 +2698,10 @@ async function scenarioQueueManagementJourneys(window, captures, host) {
   window.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'A', modifiers: ['control'] });
   await window.webContents.insertText('Queue management sibling B edited');
   await clickMatchingButton(window, `${row} .queued-message-edit`, 'Save');
-  await waitFor(window, `[...document.querySelectorAll('.queued-message-row .queued-message-content > strong')].some((node) => node.textContent?.trim() === 'Queue management sibling B edited')`, 'Edited queue content did not render');
+  await waitFor(window, `(() => {
+    const painted = [...document.querySelectorAll('.queued-message-row .queued-message-content > strong')].filter((node) => node.textContent?.trim() === 'Queue management sibling B edited').length;
+    return painted === 1;
+  })()`, 'Edited queue content did not render exactly once', 15_000);
   assert.deepEqual(host.stateForTests().queue.map((message) => [message.id, message.content]), [
     [siblingA.id, siblingA.content],
     [siblingB.id, 'Queue management sibling B edited'],
@@ -1661,7 +2717,23 @@ async function scenarioQueueManagementJourneys(window, captures, host) {
   assert.deepEqual(await queuedRowContents(window), [siblingA.content, siblingC.content]);
   assert.equal(await evaluate(window, `document.querySelectorAll('.toast').length`), 0, 'Queue removal showed a redundant success toast');
 
-  const siblingD = enqueue('Queue management sibling D');
+  const moveImageBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
+  const moveImageUpload = host.handleRequest('attachment.upload.begin', {
+    name: 'queue-handoff.png',
+    mimeType: 'image/png',
+    byteLength: moveImageBytes.length,
+  }).payload;
+  host.handleRequest('attachment.upload.chunk', {
+    uploadId: moveImageUpload.uploadId,
+    offset: 0,
+    dataBase64: moveImageBytes.toString('base64'),
+  });
+  const moveImageId = host.handleRequest('attachment.upload.complete', { uploadId: moveImageUpload.uploadId }).payload.attachmentId;
+  const siblingD = host.handleRequest('message_queue.enqueue', {
+    sessionId: 'fake-main',
+    content: 'Queue management sibling D',
+    attachmentIds: [moveImageId],
+  }).payload.message;
   await waitFor(window, `document.querySelectorAll('.queued-message-row').length === 3`, 'Third queue sibling did not return');
   host.failNextRequestForTests('message_queue.deliver', 'Injected queue delivery failure.');
   row = await markQueuedRow(window, siblingC.content, 'failed-middle');
@@ -1700,15 +2772,27 @@ async function scenarioQueueManagementJourneys(window, captures, host) {
     model: document.querySelector('.queue-new-task-selection > span strong')?.textContent?.trim(),
     effort: document.querySelector('select[aria-label="Reasoning for new task"]')?.value ?? null,
   })`);
+  host.failNextRequestForTests('message_queue.deliver_new_task', 'Injected new-task delivery failure.');
   await clickMatchingButton(window, '.queue-new-task-picker', 'Start task');
   await waitFor(window, `document.querySelector('.workspace h1')?.textContent?.includes(${JSON.stringify(siblingD.content)})`, 'Moved queue item did not open its new task', 8_000);
+  await waitFor(window, `[...document.querySelectorAll('.message-user')].filter((node) => node.textContent?.includes(${JSON.stringify(siblingD.content)})).length === 1`, 'Moved task did not paint its optimistic user row immediately', 8_000);
+  assert.equal(await evaluate(window, `document.querySelectorAll('.message-user .message-images-before img[alt="queue-handoff.png"]').length`), 1, 'Moved task did not paint its queued image widget before provider history');
   const moveRequest = host.stateForTests().requests.filter((entry) => entry.type === 'message_queue.move_to_new_task').at(-1);
   assert.equal(moveRequest.payload.messageId, siblingD.id);
   assert.equal(moveRequest.payload.providerId, 'fake');
   assert.equal(moveRequest.payload.modelId, 'fake/deterministic-v1');
   assert.equal(moveRequest.payload.reasoningEffort, chosenSelection.effort);
   assert.deepEqual(host.stateForTests().queue.map((message) => message.id), [siblingA.id, siblingE.id], 'Move-to-task consumed or reordered a sibling');
+  await waitFor(window, `document.querySelector('.message-delivery-error')?.textContent?.includes("Message wasn't sent.")`, 'Failed new-task delivery did not stay inline with the optimistic message', 8_000);
+  assert.match(await evaluate(window, `document.querySelector('.message-delivery-error')?.getAttribute('title') ?? ''`), /Injected new-task delivery failure/u);
+  await clickSelector(window, '#composer-message');
+  await window.webContents.insertText('Keep this newer draft intact');
+  await clickSelector(window, '.message-delivery-error button');
+  await waitFor(window, `!document.querySelector('.message-delivery-error')`, 'Retry did not settle the same moved message', 8_000);
+  assert.equal(await evaluate(window, `document.querySelector('#composer-message')?.value`), 'Keep this newer draft intact', 'Retry overwrote the destination composer draft');
   await waitFor(window, `[...document.querySelectorAll('.message-user')].filter((node) => node.textContent?.includes(${JSON.stringify(siblingD.content)})).length === 1`, 'Moved task did not receive the selected queued content', 8_000);
+  assert.equal(host.stateForTests().sessions.filter((session) => session.title === siblingD.content).length, 1, 'Retry created a duplicate target task');
+  assert.equal(await evaluate(window, `document.querySelectorAll('.message-user .message-images-before img[alt="queue-handoff.png"]').length`), 1, 'Canonical adoption lost or duplicated the queued image widget');
   assert.equal(await evaluate(window, `document.querySelectorAll('.toast').length`), 0, 'Move-to-task showed a redundant success toast');
   await capture(window, '21-queue-moved-to-task', captures);
   await waitForFakeHostIdle(host);
@@ -1753,6 +2837,8 @@ async function scenarioQueueManagementJourneys(window, captures, host) {
     failedDeliveryRestoredIndex: 1,
     steerIdentityFrames: identityTrace.samples.length,
     movedSelection: { model: chosenSelection.model, effort: chosenSelection.effort },
+    movedOptimisticAttachmentPainted: true,
+    movedRetryPreservedDraft: true,
     sideChatId: sideChat.id,
     finalParentQueue: [siblingA.id, siblingF.id],
   }, {
@@ -1814,6 +2900,189 @@ async function scenarioOverlaysAndResponsive(window, captures, host) {
   });
 }
 
+async function createScheduledDraftFromComposer(window, host, content, options = {}) {
+  const beforeIds = new Set(host.stateForTests().scheduledTasks.map((task) => task.requestId));
+  await clickSelector(window, 'button.new-task-button');
+  await waitFor(window, `document.querySelector('.workspace h1')?.textContent?.trim() === 'New task' && document.querySelector('textarea[aria-label="Message"]')?.placeholder === 'Describe the task…'`, 'Schedule: New task did not open a local draft');
+  await replaceComposerText(window, content);
+  await openPopover(window, `button[aria-label="More message actions"]`, '.composer-actions-menu .composer-popover', 'Schedule actions');
+  await clickMatchingButton(window, '.composer-actions-menu .composer-popover', 'Schedule task');
+  await waitFor(window, `Boolean(document.querySelector('.composer-schedule-panel input[type="datetime-local"]'))`, 'Schedule: scheduling panel did not open');
+  if (options.capturePanel) {
+    await assertOverlayWithinViewport(window, '.composer-schedule-panel', 'task scheduling panel');
+    await assertOverlayPaintedOnTop(window, '.composer-schedule-panel', 'task scheduling panel');
+    await capture(window, 'schedule-00-create-panel', options.captures ?? []);
+  }
+  const localValue = await evaluate(window, `document.querySelector('.composer-schedule-panel input[type="datetime-local"]')?.value`);
+  assert.equal(typeof localValue, 'string', 'Schedule: local run time was not populated');
+  assert.ok(localValue.length > 0, 'Schedule: local run time was empty');
+  await clickSelector(window, '.composer-schedule-panel button[type="submit"]');
+  await waitFor(window, `document.querySelector('.scheduled-task-notice')?.getAttribute('data-status') === 'pending' && document.querySelector('.workspace h1')?.textContent?.includes(${JSON.stringify(content)})`, 'Schedule: pending task did not replace the local draft', 8_000);
+  const state = host.stateForTests();
+  const task = state.scheduledTasks.find((candidate) => !beforeIds.has(candidate.requestId));
+  assert.ok(task, 'Schedule: fake host did not retain the newly scheduled task');
+  const createRequest = state.requests.filter((request) => request.type === 'scheduled_task.create' && request.payload.content === content).at(-1);
+  assert.ok(createRequest, 'Schedule: renderer did not issue scheduled_task.create');
+  assert.equal(createRequest.requestId, task.requestId, 'Schedule: renderer did not preserve the stable schedule request ID at the IPC boundary');
+  assert.match(task.requestId, /^schedule_[0-9a-f-]+$/iu, 'Schedule: renderer did not supply its stable schedule request ID');
+  assert.equal(task.status, 'pending', 'Schedule: newly created task was not pending');
+  assert.equal(task.content, content, 'Schedule: submitted content changed across the renderer boundary');
+  assert.equal(task.targetSessionId, `scheduled-task:${task.requestId}`, 'Schedule: pending task did not use its stable local placeholder identity');
+  assert.equal(state.sessions.some((session) => session.id === task.targetSessionId), false, 'Schedule: a future task eagerly created a provider session');
+  assert.equal(state.requests.filter((request) => request.type === 'session.open' && request.payload.sessionId === task.targetSessionId).length, 0, 'Schedule: renderer requested provider history for a local placeholder');
+  assert.equal(await evaluate(window, `document.querySelectorAll('[data-session-id=${JSON.stringify(task.targetSessionId)}]').length`), 1, 'Schedule: pending placeholder did not paint exactly one task row');
+  assert.equal(await evaluate(window, `Boolean(document.querySelector('textarea[aria-label="Message"]'))`), false, 'Schedule: composer remained available before the scheduled task started');
+  return { task, localValue, requestId: createRequest.requestId };
+}
+
+async function assertScheduledMaterialization(window, host, journey, startedTask, label) {
+  const placeholderId = journey.task.targetSessionId;
+  const sessionId = startedTask.targetSessionId;
+  assert.notEqual(sessionId, placeholderId, `${label}: dispatch did not replace the local placeholder identity`);
+  await waitFor(window, `Boolean(document.querySelector('[data-session-id=${JSON.stringify(sessionId)}] [aria-current="page"]')) && !document.querySelector('[data-session-id=${JSON.stringify(placeholderId)}]') && document.querySelector('.workspace h1')?.textContent?.includes(${JSON.stringify(journey.task.content)}) && document.querySelectorAll('.message-user').length === 1 && document.querySelector('.message-user')?.textContent?.includes(${JSON.stringify(journey.task.content)}) && Boolean(document.querySelector('.workspace-header .status-working'))`, `${label}: selection, timeline, and working state did not migrate to the provider task`, 8_000);
+  await delay(350);
+  const rendered = await evaluate(window, `({
+    selectedSessionId: document.querySelector('[data-session-id] [aria-current="page"]')?.closest('[data-session-id]')?.getAttribute('data-session-id'),
+    placeholderRows: document.querySelectorAll('[data-session-id=${JSON.stringify(placeholderId)}]').length,
+    realRows: document.querySelectorAll('[data-session-id=${JSON.stringify(sessionId)}]').length,
+    userRows: [...document.querySelectorAll('.message-user')].map((row) => ({ text: row.textContent?.trim(), anchor: row.getAttribute('data-scroll-anchor') })),
+    working: Boolean(document.querySelector('.workspace-header .status-working')),
+  })`);
+  assert.equal(rendered.selectedSessionId, sessionId, `${label}: selected task reverted after refresh`);
+  assert.equal(rendered.placeholderRows, 0, `${label}: stale placeholder returned after refresh`);
+  assert.equal(rendered.realRows, 1, `${label}: provider task did not retain exactly one task row`);
+  assert.equal(rendered.userRows.length, 1, `${label}: optimistic instruction was duplicated or lost`);
+  assert.equal(rendered.userRows[0].text?.includes(journey.task.content), true, `${label}: migrated optimistic instruction changed`);
+  assert.match(rendered.userRows[0].anchor ?? '', /^local-/u, `${label}: migrated instruction lost its stable presentation identity`);
+  assert.equal(rendered.working, true, `${label}: provider task no longer painted working state`);
+  const hostState = host.stateForTests();
+  assert.equal(hostState.sessions.filter((session) => session.id === sessionId).length, 1, `${label}: fake host did not materialize exactly one provider session`);
+  assert.equal(hostState.sessions.some((session) => session.id === placeholderId), false, `${label}: fake host leaked the placeholder into provider sessions`);
+  return { placeholderId, sessionId, rendered };
+}
+
+async function scenarioScheduledTaskLifecycle(window, captures, host) {
+  assert.equal(window.isVisible(), false, 'Schedule QA window became visible');
+  assert.ok(window.getBounds().x < 0 && window.getBounds().y < 0, `Schedule QA window moved on-screen: ${JSON.stringify(window.getBounds())}`);
+
+  const retryContent = 'Scheduled retry lifecycle fixture';
+  const retryJourney = await createScheduledDraftFromComposer(window, host, retryContent, { capturePanel: true, captures });
+  await window.setSize(620, 520);
+  await delay(250);
+  assert.equal(window.isVisible(), false, 'Compact schedule QA window became visible');
+  await clickTaskByTitle(window, retryContent);
+  await waitFor(window, `document.querySelector('.workspace h1')?.textContent?.includes(${JSON.stringify(retryContent)})`, 'Schedule: compact task navigation did not open the scheduled workspace');
+  await delay(400);
+  const compact = await evaluate(window, `(() => {
+    const rect = (selector) => { const element = document.querySelector(selector); if (!(element instanceof HTMLElement)) return null; const bounds = element.getBoundingClientRect(); return { left: bounds.left, top: bounds.top, right: bounds.right, bottom: bounds.bottom, width: bounds.width, height: bounds.height }; };
+    return {
+      notice: rect('.scheduled-task-notice'),
+      copy: rect('.scheduled-task-notice > div:not(.scheduled-task-actions)'),
+      actions: rect('.scheduled-task-actions'),
+      buttons: [...document.querySelectorAll('.scheduled-task-actions button')].map((button) => { const bounds = button.getBoundingClientRect(); return { left: bounds.left, top: bounds.top, right: bounds.right, bottom: bounds.bottom }; }),
+      workspace: rect('.workspace'),
+      conversation: rect('.conversation-scroll'),
+      viewport: { width: innerWidth, height: innerHeight },
+      scrollWidth: document.documentElement.scrollWidth,
+      ownedPoints: (() => {
+        const notice = document.querySelector('.scheduled-task-notice');
+        if (!(notice instanceof HTMLElement)) return [];
+        return [...notice.querySelectorAll('strong, .scheduled-task-actions button')].map((element) => {
+          const bounds = element.getBoundingClientRect();
+          const x = Math.round(bounds.left + bounds.width / 2);
+          const y = Math.round(bounds.top + bounds.height / 2);
+          const owner = document.elementFromPoint(x, y);
+          return { x, y, owned: owner instanceof Node && notice.contains(owner), owner: owner instanceof HTMLElement ? owner.tagName + '.' + owner.className : null };
+        });
+      })(),
+    };
+  })()`);
+  assert.ok(compact.notice && compact.workspace && compact.conversation && compact.actions && compact.copy, `Schedule: compact surface is incomplete (${JSON.stringify(compact)})`);
+  assert.ok(compact.notice.width > 0 && compact.notice.height > 0 && compact.workspace.width > 0 && compact.workspace.height > 0, `Schedule: compact geometry was not painted (${JSON.stringify(compact)})`);
+  assert.ok(compact.notice.left >= compact.workspace.left - 0.5 && compact.notice.right <= compact.workspace.right + 0.5, `Schedule: compact notice escaped the workspace (${JSON.stringify(compact)})`);
+  assert.ok(compact.notice.top >= -0.5 && compact.notice.bottom <= compact.viewport.height + 0.5, `Schedule: compact notice escaped the viewport (${JSON.stringify(compact)})`);
+  assert.ok(compact.notice.top >= compact.conversation.top - 0.5 && compact.notice.bottom <= compact.conversation.bottom + 0.5, `Schedule: compact notice was clipped by the conversation viewport (${JSON.stringify(compact)})`);
+  assert.ok(compact.actions.top >= compact.copy.bottom - 1, `Schedule: compact actions overlapped the task copy (${JSON.stringify(compact)})`);
+  assert.ok(compact.buttons.every((button) => button.left >= compact.notice.left - 0.5 && button.right <= compact.notice.right + 0.5), `Schedule: compact action escaped the notice (${JSON.stringify(compact.buttons)})`);
+  assert.ok(compact.ownedPoints.length >= 3 && compact.ownedPoints.every((point) => point.owned), `Schedule: compact notice did not own its painted hit-test points (${JSON.stringify(compact.ownedPoints)})`);
+  assert.ok(compact.scrollWidth <= compact.viewport.width + 1, `Schedule: compact lifecycle caused horizontal overflow (${compact.scrollWidth} > ${compact.viewport.width})`);
+  await capture(window, 'schedule-01-pending-compact-620x520', captures);
+  await window.setSize(1100, 760);
+  await delay(200);
+
+  host.setScheduledTaskStatusForTests(retryJourney.task.requestId, 'dispatching');
+  await waitFor(window, `document.querySelector('.scheduled-task-notice')?.getAttribute('data-status') === 'dispatching' && document.querySelector('.scheduled-task-notice strong')?.textContent?.includes('Starting scheduled task')`, 'Schedule: dispatching state was not painted');
+  assert.equal(await evaluate(window, `document.querySelectorAll('.scheduled-task-actions button').length`), 0, 'Schedule: pending actions remained available during dispatch');
+  assert.equal(await evaluate(window, `document.querySelectorAll('.message-user').length`), 1, 'Schedule: dispatch did not paint exactly one optimistic instruction');
+  await capture(window, 'schedule-02-dispatching', captures);
+
+  host.setScheduledTaskStatusForTests(retryJourney.task.requestId, 'failed', { failureMessage: 'Injected scheduled lifecycle failure.' });
+  await waitFor(window, `document.querySelector('.scheduled-task-notice')?.getAttribute('data-status') === 'failed' && document.querySelector('.scheduled-task-notice [role="alert"]')?.textContent?.includes('Injected scheduled lifecycle failure.')`, 'Schedule: failed state and reason were not painted');
+  await waitFor(window, `[...document.querySelectorAll('.scheduled-task-actions button')].some((button) => button.textContent?.includes('Retry now'))`, 'Schedule: failed task did not expose Retry now');
+  assert.equal(await evaluate(window, `document.querySelectorAll('.message-user').length`), 0, 'Schedule: failed dispatch did not retract its optimistic instruction');
+  await capture(window, 'schedule-03-failed-retry', captures);
+
+  await clickMatchingButton(window, '.scheduled-task-actions', 'Retry now');
+  await waitFor(window, `document.querySelector('.scheduled-task-notice')?.getAttribute('data-status') === 'pending' && !document.querySelector('.scheduled-task-notice [role="alert"]')`, 'Schedule: retry did not restore a clean pending state');
+  assert.equal(host.stateForTests().requests.filter((request) => request.type === 'scheduled_task.retry' && request.payload.scheduledTaskId === retryJourney.task.requestId).length, 1, 'Schedule: Retry now did not issue exactly one retry request');
+  host.setScheduledTaskStatusForTests(retryJourney.task.requestId, 'dispatching');
+  await waitFor(window, `document.querySelector('.scheduled-task-notice')?.getAttribute('data-status') === 'dispatching'`, 'Schedule: retried task did not re-enter dispatching');
+  const retryStarted = host.setScheduledTaskStatusForTests(retryJourney.task.requestId, 'started');
+  await waitFor(window, `!document.querySelector('.scheduled-task-notice') && Boolean(document.querySelector('textarea[aria-label="Message"]'))`, 'Schedule: started retry did not clear the schedule notice and restore the composer');
+  assert.equal(host.stateForTests().scheduledTasks.find((task) => task.requestId === retryJourney.task.requestId)?.status, 'started', 'Schedule: retry lifecycle did not reach started');
+  const retryRemap = await assertScheduledMaterialization(window, host, retryJourney, retryStarted, 'Schedule retry remap');
+
+  const runNowContent = 'Scheduled run-now lifecycle fixture';
+  const runNowJourney = await createScheduledDraftFromComposer(window, host, runNowContent);
+  await clickMatchingButton(window, '.scheduled-task-actions', 'Run now');
+  await waitFor(window, `document.querySelector('.scheduled-task-notice')?.getAttribute('data-status') === 'dispatching'`, 'Schedule: Run now did not enter dispatching');
+  assert.equal(host.stateForTests().requests.filter((request) => request.type === 'scheduled_task.run_now' && request.payload.scheduledTaskId === runNowJourney.task.requestId).length, 1, 'Schedule: Run now did not issue exactly one request');
+  const runNowStarted = host.setScheduledTaskStatusForTests(runNowJourney.task.requestId, 'started');
+  await waitFor(window, `!document.querySelector('.scheduled-task-notice') && Boolean(document.querySelector('textarea[aria-label="Message"]'))`, 'Schedule: Run now did not reach the started surface');
+  const runNowRemap = await assertScheduledMaterialization(window, host, runNowJourney, runNowStarted, 'Schedule run-now remap');
+  await capture(window, 'schedule-04-run-now-started', captures);
+
+  const cancelContent = 'Scheduled cancel lifecycle fixture';
+  const cancelJourney = await createScheduledDraftFromComposer(window, host, cancelContent);
+  await clickMatchingButton(window, '.scheduled-task-actions', 'Cancel');
+  await waitFor(window, `!document.querySelector('.scheduled-task-notice') && !document.querySelector('[data-session-id=${JSON.stringify(cancelJourney.task.targetSessionId)}]') && document.querySelector('.page-heading h1')?.textContent?.trim() === 'Dashboard'`, 'Schedule: Cancel did not remove the local placeholder');
+  assert.equal(host.stateForTests().scheduledTasks.some((task) => task.requestId === cancelJourney.task.requestId), false, 'Schedule: cancelled task remained active in the fake host');
+  assert.equal(host.stateForTests().sessions.some((session) => session.id === cancelJourney.task.targetSessionId), false, 'Schedule: cancelled placeholder leaked into provider sessions');
+  assert.equal(host.stateForTests().requests.filter((request) => request.type === 'scheduled_task.cancel' && request.payload.scheduledTaskId === cancelJourney.task.requestId).length, 1, 'Schedule: Cancel did not issue exactly one request');
+  await capture(window, 'schedule-05-cancelled', captures);
+
+  const dismissContent = 'Scheduled failed-dismiss lifecycle fixture';
+  const dismissJourney = await createScheduledDraftFromComposer(window, host, dismissContent);
+  host.setScheduledTaskStatusForTests(dismissJourney.task.requestId, 'dispatching');
+  await waitFor(window, `document.querySelector('.scheduled-task-notice')?.getAttribute('data-status') === 'dispatching'`, 'Schedule: failed-dismiss fixture did not enter dispatching');
+  host.setScheduledTaskStatusForTests(dismissJourney.task.requestId, 'failed', { failureMessage: 'Dismissable scheduled lifecycle failure.' });
+  await waitFor(window, `document.querySelector('.scheduled-task-notice')?.getAttribute('data-status') === 'failed' && [...document.querySelectorAll('.scheduled-task-actions button')].some((button) => button.textContent?.includes('Dismiss'))`, 'Schedule: failed task did not expose Dismiss');
+  await clickMatchingButton(window, '.scheduled-task-actions', 'Dismiss');
+  await waitFor(window, `!document.querySelector('.scheduled-task-notice') && !document.querySelector('[data-session-id=${JSON.stringify(dismissJourney.task.targetSessionId)}]') && document.querySelector('.page-heading h1')?.textContent?.trim() === 'Dashboard'`, 'Schedule: Dismiss did not remove the failed placeholder');
+  assert.equal(host.stateForTests().scheduledTasks.some((task) => task.requestId === dismissJourney.task.requestId), false, 'Schedule: dismissed failed task remained active in the fake host');
+  assert.equal(host.stateForTests().requests.filter((request) => request.type === 'scheduled_task.cancel' && request.payload.scheduledTaskId === dismissJourney.task.requestId).length, 1, 'Schedule: Dismiss did not issue exactly one cancel request');
+  await capture(window, 'schedule-06-failed-dismissed', captures);
+
+  assert.equal(window.isVisible(), false, 'Schedule QA window became visible before completion');
+  return scenarioOutcome('scheduled-task-lifecycle', {
+    retryTaskId: retryJourney.task.requestId,
+    runNowTaskId: runNowJourney.task.requestId,
+    cancelledTaskId: cancelJourney.task.requestId,
+    dismissedTaskId: dismissJourney.task.requestId,
+    retryRemap,
+    runNowRemap,
+    compact,
+  }, {
+    'schedule.create-pending': { taskId: retryJourney.task.requestId, requestId: retryJourney.requestId, localValue: retryJourney.localValue },
+    'schedule.dispatching-failed-retry': ['pending', 'dispatching', 'failed', 'pending'],
+    'schedule.retry-starts-task': { taskId: retryJourney.task.requestId, remap: retryRemap },
+    'schedule.run-now-starts-task': { taskId: runNowJourney.task.requestId, remap: runNowRemap },
+    'schedule.cancel-clears-active-schedule': cancelJourney.task.requestId,
+    'schedule.failed-dismiss-clears-active-schedule': dismissJourney.task.requestId,
+    'schedule.compact-layout-contained': compact,
+  });
+}
+
 async function scenarioDraftRestoreAndMaterialize(window, captures, host) {
   await clickSelector(window, 'button.new-task-button');
   await waitFor(window, `document.querySelector('.workspace h1')?.textContent?.trim() === 'New task' && document.querySelector('textarea[aria-label="Message"]')?.placeholder === 'Describe the task…'`, 'New task did not open a local draft');
@@ -1860,6 +3129,47 @@ async function scenarioDraftRestoreAndMaterialize(window, captures, host) {
     'draft.materialize-once-no-duplicate': { createRequests: creates.length - createsBefore, firstInstructionRows: 1, taskRows: 1 },
     'draft.clear-after-materialize': '',
   });
+}
+
+async function scenarioDraftLatePickerRebind(window, captures, host, selectImagesGate) {
+  assert.ok(selectImagesGate, 'Late-picker scenario did not receive its image gate');
+  const instruction = `Draft materializes before image picker ${Date.now()}`;
+  try {
+    await clickTaskByTitle(window, 'Fake Codex audio task');
+    await waitFor(window, `document.querySelector('.workspace h1')?.textContent?.includes('Fake Codex audio task')`, 'Late picker: image-capable source task did not open');
+    await clickSelector(window, 'button.new-task-button');
+    await waitFor(window, `document.querySelector('.workspace h1')?.textContent?.trim() === 'New task'`, 'Late picker: local draft did not open');
+    const draftId = await evaluate(window, `document.querySelector('[data-session-id^="draft-"]')?.getAttribute('data-session-id')`);
+    assert.match(draftId ?? '', /^draft-/u, 'Late picker: local draft has no stable id');
+    await replaceComposerText(window, instruction);
+    await clickSelector(window, 'button[aria-label="Add attachment"]');
+    await waitFor(window, `Boolean(document.querySelector('.composer-attachment-menu .composer-popover'))`, 'Late picker: attachment menu did not open');
+    await clickMatchingButton(window, '.composer-attachment-menu .composer-popover', 'Attach image');
+    await delay(25);
+    assert.equal(selectImagesGate.used, true, 'Late picker: image selection was not paused');
+
+    await pressComposerEnter(window);
+    await waitFor(window, `document.querySelector('.workspace h1')?.textContent?.includes(${JSON.stringify(instruction)}) && !document.querySelector('[data-session-id=${JSON.stringify(draftId)}]')`, 'Late picker: draft did not materialize while image selection was pending', 8_000);
+    assert.equal(await evaluate(window, `document.querySelectorAll('.image-attachment-chip img').length`), 0, 'Late picker: gated image appeared before selection resolved');
+
+    selectImagesGate.release();
+    await waitFor(window, `document.querySelectorAll('.image-attachment-chip img').length === 1`, 'Late picker: resolved image did not follow the materialized task', 5_000);
+    const rebound = await evaluate(window, `(() => ({
+      title: document.querySelector('.workspace h1')?.textContent?.trim(),
+      draftIdPresent: Boolean(document.querySelector('[data-session-id=${JSON.stringify(draftId)}]')),
+      attachmentName: document.querySelector('.image-attachment-chip')?.textContent?.trim(),
+      attachmentCount: document.querySelectorAll('.image-attachment-chip img').length,
+    }))()`);
+    assert.equal(rebound.draftIdPresent, false, 'Late picker resurrected the replaced local draft');
+    assert.equal(rebound.attachmentCount, 1, 'Late picker duplicated the selected image');
+    assert.match(rebound.attachmentName ?? '', /fake-attachment\.png/u, 'Late picker lost the selected image name');
+    await capture(window, 'draft-23-late-image-picker-rebound', captures);
+    return scenarioOutcome('draft-late-picker-rebind', { draftId, rebound, createRequests: host.stateForTests().requests.filter((entry) => entry.type === 'session.create').length }, {
+      'draft.late-image-picker-follows-materialized-task': rebound,
+    });
+  } finally {
+    selectImagesGate.release();
+  }
 }
 
 async function scenarioSettingsRoundTrip(window, captures) {
@@ -2155,22 +3465,34 @@ async function runFakeModelQa() {
   const results = {};
   const failures = [];
   const scenarioDefinitions = [
+    ['runtime-startup-status', (window, host, context) => scenarioRuntimeStartupStatus(window, captures, host, context.sessionsListGate)],
+    ['progressive-startup', (window, host, context) => scenarioProgressiveStartup(window, captures, host, context.sessionsListGate)],
     ['boot-and-state-signals', (window, host) => scenarioBoot(window, captures, host)],
+    ['goal-lifecycle', (window, host) => scenarioGoalLifecycle(window, captures, host)],
+    ['luna-panel-sequences', (window, host) => scenarioLunaPanelSequences(window, captures, host)],
+    ['project-context-menu-bounds', (window) => scenarioProjectContextMenuBounds(window, captures)],
+    ['queue-new-task-escape', (window, host) => scenarioQueueNewTaskEscape(window, captures, host)],
     ['context-threshold-lifecycle', (window, host) => scenarioContextThresholdLifecycle(window, captures, host)],
+    ['mesh-parent-orchestration', (window, host) => scenarioMeshParentOrchestration(window, host)],
     ['command-contracts', (window, host) => scenarioCommandContracts(window, captures, host)],
     ['ears-transcription-send', (window, host) => scenarioEarsTranscriptionSend(window, captures, host)],
     ['response-annotation-journey', (window, host) => scenarioResponseAnnotationJourney(window, captures, host)],
     ['master-stream-identity', (window, host) => scenarioMasterStream(window, captures, host)],
     ['terminal-history-race', (window, host) => scenarioTerminalHistoryRace(window, captures, host)],
+    ['terminal-live-cancellation', (window, host) => scenarioTerminalLiveCancellation(window, captures, host)],
     ['compaction-once', (window, host) => scenarioCompaction(window, captures, host)],
     ['error', (window, host) => scenarioError(window, captures, host)],
+    ['stop-presentation-boundary', (window, host, context) => scenarioStopPresentationBoundary(window, captures, host, context.interruptGate)],
     ['keyboard-core-actions', (window, host) => scenarioKeyboardCoreActions(window, captures, host)],
     ['approval', (window, host) => scenarioApproval(window, captures, host)],
     ['native-audio-sending', (window, host) => scenarioNativeAudioSending(window, captures, host)],
+    ['image-send-scroll-stability', (window, host) => scenarioImageSendScrollStability(window, captures, host)],
     ['queue-steer-and-viewport-stability', (window, host) => scenarioQueueSteerAndViewportStability(window, captures, host)],
     ['queue-management-journeys', (window, host) => scenarioQueueManagementJourneys(window, captures, host)],
     ['overlays-and-responsive', (window, host) => scenarioOverlaysAndResponsive(window, captures, host)],
+    ['scheduled-task-lifecycle', (window, host) => scenarioScheduledTaskLifecycle(window, captures, host)],
     ['draft-restore-and-materialize', (window, host) => scenarioDraftRestoreAndMaterialize(window, captures, host)],
+    ['draft-late-picker-rebind', (window, host, context) => scenarioDraftLatePickerRebind(window, captures, host, context.selectImagesGate)],
     ['settings-round-trip', (window, host) => scenarioSettingsRoundTrip(window, captures, host)],
     ['archive-selected-task', (window, host) => scenarioArchiveSelectedTask(window, captures, host)],
     ['microphone-selection-fallback', (window, host) => scenarioMicrophoneSelectionFallback(window, captures, host)],
@@ -2200,7 +3522,12 @@ async function runFakeModelQa() {
     for (const [index, [name, scenario]] of scenarios.entries()) {
       console.log(`fake-model-qa: ${name} started`);
       let qaWindow;
+      const sessionsListGate = ['runtime-startup-status', 'progressive-startup'].includes(name) ? createOneShotGate() : null;
+      const selectImagesGate = name === 'draft-late-picker-rebind' ? createOneShotGate() : null;
+      const interruptGate = name === 'stop-presentation-boundary' ? createOneShotGate() : null;
       const host = createFakeModelHost({
+        ...(['luna-panel-sequences', 'project-context-menu-bounds'].includes(name) ? { projectGroupingFixture: true } : {}),
+        ...(name === 'image-send-scroll-stability' ? { imageSendFixture: true } : {}),
         dictationSources: [{ id: 'fake-stt', label: 'Fake local transcription', status: 'ready', setupEnvironmentVariable: '', capabilities: { batch: true, maxAudioBytes: 4 * 1024 * 1024 } }],
         onBatch: (batch) => { if (qaWindow && !qaWindow.isDestroyed()) qaWindow.webContents.send('tethoq:event-batch', batch); },
       });
@@ -2210,6 +3537,7 @@ async function runFakeModelQa() {
         width: 1100,
         height: 760,
         show: false,
+        skipTaskbar: true,
         backgroundColor: '#0b0b0a',
         autoHideMenuBar: true,
         webPreferences: {
@@ -2217,23 +3545,35 @@ async function runFakeModelQa() {
           nodeIntegration: false,
           sandbox: true,
           backgroundThrottling: false,
+          ...(['mesh-parent-orchestration', 'scheduled-task-lifecycle', 'stop-presentation-boundary'].includes(name) ? { offscreen: true } : {}),
+          partition: `tethoq-fake-model-${process.pid}-${index}`,
           preload: preloadPath,
         },
       });
-      const cleanupIpc = registerFakeModelIpc(qaWindow, host);
+      qaWindow.webContents.session.setPermissionRequestHandler((_webContents, permission, callback) => callback(permission === 'media'));
+      const cleanupIpc = registerFakeModelIpc(qaWindow, host, {
+        ...(name === 'luna-panel-sequences' ? { directorySelections: [null, 'C:\\FakeModel\\qa-project'] } : {}),
+        ...(sessionsListGate ? { firstSessionsListGate: sessionsListGate } : {}),
+        ...(selectImagesGate ? { firstSelectImagesGate: selectImagesGate } : {}),
+        ...(interruptGate ? { firstInterruptGate: interruptGate } : {}),
+        keepWindowHidden: ['mesh-parent-orchestration', 'scheduled-task-lifecycle', 'stop-presentation-boundary'].includes(name),
+      });
       const keepAliveForReport = index === scenarios.length - 1;
       try {
         await qaWindow.loadFile(rendererPath);
-        qaWindow.showInactive();
+        if (!['mesh-parent-orchestration', 'scheduled-task-lifecycle', 'stop-presentation-boundary'].includes(name)) qaWindow.showInactive();
         if (!qaWindow.isDestroyed()) qaWindow.webContents.send('tethoq:runtime-state', { state: 'ready' });
-        await ensureRendererReady(qaWindow);
-        const outcome = await scenario(qaWindow, host);
+        if (name !== 'runtime-startup-status') await ensureRendererReady(qaWindow);
+        const outcome = await scenario(qaWindow, host, { sessionsListGate, selectImagesGate, interruptGate });
         results[name] = { ...(outcome && typeof outcome === 'object' ? outcome : {}), passed: true };
         console.log(`fake-model-qa: ${name} passed`);
       } catch (error) {
         failures.push({ name, message: error instanceof Error ? error.message : String(error), stack: error instanceof Error ? error.stack : undefined });
         console.error(`fake-model-qa: ${name} failed`, error);
       } finally {
+        sessionsListGate?.release();
+        selectImagesGate?.release();
+        interruptGate?.release();
         if (keepAliveForReport) retained = { qaWindow, host, cleanupIpc };
         else {
           cleanupIpc();

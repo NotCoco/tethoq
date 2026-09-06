@@ -1,63 +1,155 @@
 import { Type } from "typebox"
 import { createConnection } from "node:net"
-import { readFile, readdir } from "node:fs/promises"
+import { readFile, readdir, unlink } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
 const configuredRuntimePath = process.env.UAR_MESH_RUNTIME
 const legacyRuntimePath = join(homedir(), ".tethoq", "mesh-tool-runtime.json")
 const runtimeDirectory = join(homedir(), ".tethoq", "mesh-runtimes")
+const runtimeResponseTimeoutMs = 2_000
+// The only EYES sentence a provider model may see when the visual-support pipe
+// itself is unreachable. Real usage, auth, and model failures keep their own
+// terminal errors; transport noise must never leak a raw pipe diagnostic.
+const eyesTransportFailure = "EYES could not inspect the image. Try again or choose another EYES model."
 
-async function call(sessionID, name, input) {
+class RuntimeConnectError extends Error {
+  constructor(error) {
+    super(error instanceof Error ? error.message : String(error), { cause: error })
+    this.name = "RuntimeConnectError"
+  }
+}
+
+class RuntimeTaskNotOwnedError extends Error {
+  constructor(message) {
+    super(message || "This Tethoq runtime does not own the task")
+    this.name = "RuntimeTaskNotOwnedError"
+  }
+}
+
+async function call(sessionID, name, input, callId) {
   const runtimes = await matchingRuntimes(name)
   let lastError
+  let taskNotOwnedError
   for (const runtime of runtimes) {
     try {
-      return await callRuntime(runtime, sessionID, name, input)
+      return await callRuntime(runtime, sessionID, name, input, callId)
     } catch (error) {
+      if (error instanceof RuntimeTaskNotOwnedError) {
+        // A later dead descriptor's connect failure must not mask the
+        // meaningful ownership miss once every runtime has been tried.
+        if (!taskNotOwnedError) taskNotOwnedError = error
+        continue
+      }
+      if (!(error instanceof RuntimeConnectError)) throw error
       lastError = error
+      await forgetDeadRuntime(runtime)
     }
   }
-  throw lastError || new Error("No active Tethoq tool runtime supports this command")
+  throw taskNotOwnedError || lastError || new Error("No active Tethoq tool runtime supports this command")
+}
+
+async function forgetDeadRuntime(runtime) {
+  // Crashed bridges leak descriptors that would otherwise be retried on every
+  // later tool call. Remove the file that still names this exact unreachable
+  // runtime; identity is rechecked so a recycled path is never deleted.
+  try {
+    const files = await readdir(runtimeDirectory)
+    for (const file of files) {
+      if (!file.endsWith(".json")) continue
+      const path = join(runtimeDirectory, file)
+      try {
+        const candidate = JSON.parse(await readFile(path, "utf8"))
+        if (candidate.hostId === runtime.hostId && candidate.pipePath === runtime.pipePath && candidate.token === runtime.token) {
+          await unlink(path)
+        }
+      } catch {}
+    }
+  } catch {}
 }
 
 async function matchingRuntimes(name) {
-  if (configuredRuntimePath) return [JSON.parse(await readFile(configuredRuntimePath, "utf8"))]
   let paths = [legacyRuntimePath]
   try {
     paths.push(...(await readdir(runtimeDirectory)).filter((file) => file.endsWith(".json")).map((file) => join(runtimeDirectory, file)))
   } catch {}
-  const runtimes = []
+  const discoveredRuntimes = []
   for (const path of paths) {
     try {
       const runtime = JSON.parse(await readFile(path, "utf8"))
-      if (!Array.isArray(runtime.tools) || runtime.tools.includes(name)) runtimes.push(runtime)
+      if (!Array.isArray(runtime.tools) || runtime.tools.includes(name)) discoveredRuntimes.push(runtime)
     } catch {}
   }
-  return runtimes.sort((left, right) => String(right.startedAt || "").localeCompare(String(left.startedAt || "")))
+  discoveredRuntimes.sort((left, right) => String(right.startedAt || "").localeCompare(String(left.startedAt || "")))
+
+  const runtimes = []
+  if (configuredRuntimePath) {
+    try {
+      const runtime = JSON.parse(await readFile(configuredRuntimePath, "utf8"))
+      if (!Array.isArray(runtime.tools) || runtime.tools.includes(name)) runtimes.push(runtime)
+    } catch (error) {
+      if (!isMissingFile(error)) throw error
+    }
+  }
+  runtimes.push(...discoveredRuntimes)
+  return dedupeRuntimes(runtimes)
 }
 
-async function callRuntime(runtime, sessionID, name, input) {
+function isMissingFile(error) {
+  return error && typeof error === "object" && error.code === "ENOENT"
+}
+
+function dedupeRuntimes(runtimes) {
+  const seen = new Set()
+  return runtimes.filter((runtime) => {
+    const key = [runtime.hostId, runtime.pipePath, runtime.token].map((value) => String(value || "")).join("\u0000")
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+async function callRuntime(runtime, sessionID, name, input, callId) {
   const parentSessionId = [runtime.hostId, "pi", sessionID].map(encodeURIComponent).join("/")
   return await new Promise((resolve, reject) => {
-    const socket = createConnection(runtime.pipePath)
+    let socket
+    try {
+      socket = createConnection(runtime.pipePath)
+    } catch (error) {
+      reject(new RuntimeConnectError(error))
+      return
+    }
     let buffer = ""
     socket.setEncoding("utf8")
-    socket.once("error", reject)
+    socket.setTimeout(runtimeResponseTimeoutMs, () => {
+      socket.destroy()
+      reject(new RuntimeConnectError(new Error("Tethoq runtime response timed out")))
+    })
+    socket.once("error", (error) => reject(new RuntimeConnectError(error)))
     socket.on("data", (chunk) => {
       buffer += chunk
       const newline = buffer.indexOf("\n")
       if (newline < 0) return
+      socket.setTimeout(0)
       socket.destroy()
       try {
         const response = JSON.parse(buffer.slice(0, newline))
-        if (!response.ok) throw new Error(response.error || "Tethoq tool failed")
+        if (!response.ok) {
+          if (response.code === "TASK_NOT_OWNED_HERE") throw new RuntimeTaskNotOwnedError(response.error)
+          throw new Error(response.error || "Tethoq tool failed")
+        }
         resolve(response.result)
       } catch (error) {
         reject(error)
       }
     })
-    socket.once("connect", () => socket.write(`${JSON.stringify({ token: runtime.token, parentSessionId, tool: name, input })}\n`))
+    socket.once("connect", () => socket.write(`${JSON.stringify({
+      token: runtime.token,
+      parentSessionId,
+      tool: name,
+      input,
+      context: { callId, lifecycleOwner: "provider" },
+    })}\n`))
   })
 }
 
@@ -65,19 +157,28 @@ export default function tethoqTools(pi) {
   const tools = [
     ["mesh_list_sessions", "Find Tethoq tasks", "Find other indexed Tethoq tasks without scanning local session data.", Type.Object({ query: Type.Optional(Type.String({ maxLength: 200 })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 25 })) })],
     ["mesh_message_session", "Message Tethoq task", "Send an isolated, queue-safe message to another indexed Tethoq task.", Type.Object({ target_session_id: Type.String(), message: Type.String({ maxLength: 32000 }), request_id: Type.String({ maxLength: 256 }) })],
+    ["mesh_dispatch_delegation", "Dispatch prepared Mesh delegation", "Dispatch every pre-authorized target for this turn using parent-authored instructions.", Type.Object({ delegation_id: Type.String({ maxLength: 256, description: "Copy the exact delegation_id from this turn's private Mesh guidance. This is an existing prepared ID; never invent a new one." }), assignments: Type.Array(Type.Object({ target_index: Type.Integer({ minimum: 0, maximum: 3 }), instruction: Type.String({ minLength: 1, maxLength: 32000 }) }, { additionalProperties: false }), { minItems: 1, maxItems: 4 }) }, { additionalProperties: false })],
     ["mesh_list_children", "List delegated children", "List cross-harness child sessions delegated by this parent.", Type.Object({})],
     ["mesh_message_child", "Message delegated child", "Send a follow-up instruction to a delegated child.", Type.Object({ child_session_id: Type.String(), message: Type.String() })],
     ["mesh_wait", "Wait for delegated children", "Wait for selected delegated children when their result is needed.", Type.Object({ child_session_ids: Type.Optional(Type.Array(Type.String())), timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 300 })) })],
     ["mesh_read_result", "Read delegated result", "Read the latest result and transcript tail from a delegated child.", Type.Object({ child_session_id: Type.String() })],
-    ["ask_eyes", "Ask visual support", "Ask the configured visual-support model about the most recently attached image.", Type.Object({ question: Type.String({ maxLength: 8000 }) })],
-    ["browser_get_state", "Get browser state", "List this session's isolated Tethoq browser tabs.", Type.Object({})],
-    ["browser_open", "Open browser tab", "Open an HTTP(S) address or web search in the Tethoq browser.", Type.Object({ url_or_search: Type.String({ maxLength: 8192 }) })],
+    ["tethoq_turn_support", "Tethoq turn support", "Use only when private turn-scoped Tethoq guidance explicitly instructs you to call this tool. Do not infer a purpose or call it without that guidance.", Type.Object({ request: Type.String({ maxLength: 8000 }) })],
+    ["browser_get_state", "Get browser state", "Read tab, loading, navigation and audio state plus bounded visible text and semantic controls from the active page.", Type.Object({})],
+    ["browser_open", "Open browser tab", "Open an HTTP(S) address or web search in a new background tab.", Type.Object({ url_or_search: Type.String({ maxLength: 8192 }), activate: Type.Optional(Type.Boolean()) })],
     ["browser_navigate", "Navigate browser tab", "Navigate a Tethoq browser tab.", Type.Object({ tab_id: Type.Optional(Type.String()), url_or_search: Type.String({ maxLength: 8192 }) })],
     ["browser_inspect", "Inspect browser page", "Read bounded visible page text and semantic control references.", Type.Object({ tab_id: Type.Optional(Type.String()) })],
+    ["browser_inspect_all", "Inspect all browser pages", "Read bounded visible text and semantic controls from every browser tab.", Type.Object({ max_text_per_tab: Type.Optional(Type.Integer({ minimum: 250, maximum: 20000 })) })],
     ["browser_click", "Click browser control", "Click one control reference returned by browser_inspect.", Type.Object({ tab_id: Type.Optional(Type.String()), ref: Type.String() })],
     ["browser_type", "Type in browser field", "Replace the contents of a safe browser text field.", Type.Object({ tab_id: Type.Optional(Type.String()), ref: Type.String(), text: Type.String({ maxLength: 20000 }), submit: Type.Optional(Type.Boolean()) })],
     ["browser_scroll", "Scroll browser page", "Scroll a browser page by bounded pixel deltas.", Type.Object({ tab_id: Type.Optional(Type.String()), delta_x: Type.Optional(Type.Integer({ minimum: -4000, maximum: 4000 })), delta_y: Type.Optional(Type.Integer({ minimum: -4000, maximum: 4000 })) })],
     ["browser_capture", "Inspect browser visually", "Capture the page and ask the configured visual-support model a focused question.", Type.Object({ tab_id: Type.Optional(Type.String()), question: Type.Optional(Type.String({ maxLength: 2000 })) })],
+    ["browser_activate", "Activate browser tab", "Make a browser tab active.", Type.Object({ tab_id: Type.String() })],
+    ["browser_close", "Close browser tab", "Close a browser tab.", Type.Object({ tab_id: Type.String() })],
+    ["browser_back", "Browser back", "Go back in a browser tab's history.", Type.Object({ tab_id: Type.Optional(Type.String()) })],
+    ["browser_forward", "Browser forward", "Go forward in a browser tab's history.", Type.Object({ tab_id: Type.Optional(Type.String()) })],
+    ["browser_reload", "Reload browser tab", "Reload a browser tab.", Type.Object({ tab_id: Type.Optional(Type.String()) })],
+    ["browser_stop", "Stop browser loading", "Stop loading a browser tab.", Type.Object({ tab_id: Type.Optional(Type.String()) })],
+    ["browser_set_muted", "Mute browser tab", "Mute or unmute audio in a browser tab.", Type.Object({ tab_id: Type.Optional(Type.String()), muted: Type.Optional(Type.Boolean()) })],
   ]
   for (const [name, label, description, parameters] of tools) {
     pi.registerTool({
@@ -85,10 +186,19 @@ export default function tethoqTools(pi) {
       label,
       description,
       parameters,
-      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      async execute(toolCallId, params, signal, _onUpdate, ctx) {
         if (signal?.aborted) return { content: [{ type: "text", text: "Cancelled" }], details: {} }
-        const value = await call(ctx.sessionManager.getSessionId(), name, params)
-        return { content: [{ type: "text", text: JSON.stringify(value) }], details: value }
+        try {
+          const value = await call(ctx.sessionManager.getSessionId(), name, params, toolCallId)
+          return { content: [{ type: "text", text: JSON.stringify(value) }], details: value }
+        } catch (error) {
+          if (name === "tethoq_turn_support"
+            && (error instanceof RuntimeConnectError || error instanceof RuntimeTaskNotOwnedError
+              || (error instanceof Error && /No active Tethoq tool runtime supports this command/.test(error.message)))) {
+            throw new Error(eyesTransportFailure)
+          }
+          throw error
+        }
       },
     })
   }

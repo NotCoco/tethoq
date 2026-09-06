@@ -13,6 +13,7 @@ import { defaultMeshRuntimePath, MeshToolGateway } from "./mesh_tools.js";
 import { installOpenCodeMeshTools } from "./opencode_tools.js";
 import { installPiTools } from "./pi_tools.js";
 import { installCodexMeshTools } from "./codex_tools.js";
+import { resolveCodexCommand } from "../../../packages/provider_codex/src/index.js";
 import { pairingQrText, validatePublicBridgeUrl } from "./pairing_qr.js";
 import { openDefaultBrowser, startPairingPage, type PairingPage } from "./pairing_page.js";
 import { startPhonePairTunnel, type PhonePairTunnel } from "./phone_pair_tunnel.js";
@@ -21,6 +22,16 @@ import { CompanionControlServer } from "./companion_control.js";
 import { tethoqEnvironmentFlag, tethoqEnvironmentValue } from "./environment.js";
 import { defaultTranscriptionSourceRegistry } from "./dictation.js";
 import { DictationCredentialStore, defaultDictationCredentialStatePath } from "./dictation_credentials.js";
+import { GoalStore, defaultGoalStatePath } from "./goal_store.js";
+import { ScheduledTaskStore, defaultScheduledTaskStatePath } from "./scheduled_task_store.js";
+import { ScheduledTaskScheduler } from "./scheduled_tasks.js";
+import { SessionCatalogueStore, defaultSessionCatalogueStatePath } from "./session_catalogue_store.js";
+import { VisionProxyStore, defaultVisionProxyStatePath } from "./vision_proxy_store.js";
+import {
+  BridgeOwnedClientToolFailureStore,
+  defaultBridgeOwnedClientToolFailureStatePath,
+} from "./client_tool_failure_store.js";
+import { QueueDeliveryStore, defaultQueueDeliveryStatePath } from "./queue_delivery_store.js";
 
 interface CliOptions {
   readonly configPath: string;
@@ -124,6 +135,19 @@ const sessionTransferStore = new SessionTransferStateStore(defaultSessionTransfe
 const sessionTransferState = await sessionTransferStore.read();
 const crossSessionStore = new CrossSessionInboxStore(defaultCrossSessionInboxStatePath(options.configPath));
 const crossSessionState = await crossSessionStore.read();
+const queueDeliveryStore = new QueueDeliveryStore(defaultQueueDeliveryStatePath(options.configPath), config.hostId);
+const queueDeliveryState = await queueDeliveryStore.read();
+const goalStore = new GoalStore(defaultGoalStatePath(options.configPath));
+const goalState = await goalStore.read();
+const sessionCatalogueStore = new SessionCatalogueStore(defaultSessionCatalogueStatePath(options.configPath), config.hostId);
+const sessionCatalogue = await sessionCatalogueStore.read();
+const visionProxyStore = new VisionProxyStore(defaultVisionProxyStatePath(options.configPath), config.hostId);
+const visionProxyState = await visionProxyStore.read();
+const clientToolFailureStore = new BridgeOwnedClientToolFailureStore(
+  defaultBridgeOwnedClientToolFailureStatePath(options.configPath),
+  config.hostId,
+);
+const clientToolFailureState = await clientToolFailureStore.read();
 const dictationCredentialStore = new DictationCredentialStore(
   defaultDictationCredentialStatePath(options.configPath),
   config.identity.privateKeyPem,
@@ -151,16 +175,35 @@ const bridge = new AgentBridge(config, createConfiguredProviders(
   onSessionTransfersChange: (transfers) => sessionTransferStore.scheduleWrite(transfers),
   crossSessionMessages: crossSessionState.messages,
   onCrossSessionMessagesChange: (messages) => crossSessionStore.scheduleWrite(messages),
+  queueDeliveries: queueDeliveryState.deliveries,
+  onQueueDeliveriesChange: (deliveries) => queueDeliveryStore.scheduleWrite(deliveries),
+  goals: goalState.goals,
+  onGoalsChange: (goals) => goalStore.write(goals),
+  sessionCatalogue,
+  onSessionCatalogueChange: (sessions) => sessionCatalogueStore.scheduleWrite(sessions),
+  visionProxies: visionProxyState.proxies,
+  visionHelperSessionIds: visionProxyState.helperSessionIds,
+  onVisionProxiesChange: (proxies, helperSessionIds) => visionProxyStore.scheduleWrite(proxies, helperSessionIds),
+  bridgeOwnedClientToolFailures: clientToolFailureState.failures,
+  onBridgeOwnedClientToolFailuresChange: (failures) => clientToolFailureStore.scheduleWrite(failures),
   transcriptionSources,
   onTranscriptionCredentialChange: (sourceId, apiKey) => {
     if (sourceId !== "openai-stt" && sourceId !== "xai-stt") throw new Error("Dictation source is not configurable");
     return dictationCredentialStore.set(sourceId, apiKey);
   },
 });
+const scheduledTaskStore = new ScheduledTaskStore(defaultScheduledTaskStatePath(options.configPath));
+bridge.configureScheduledTasks(await ScheduledTaskScheduler.open({
+  store: scheduledTaskStore,
+  dispatch: async (task) => await bridge.dispatchScheduledTask(task),
+  onChange: async ({ reason, task, previousTargetSessionId }) =>
+    bridge.scheduledTaskChanged(task, reason, previousTargetSessionId),
+  onError: (error) => console.error("Scheduled task reconciliation failed", error),
+}));
 const desktopLifecycle = configuredDesktopLifecycle();
 const meshTools = new MeshToolGateway(
   config.hostId,
-  (parentSessionId, tool, input) => bridge.executeClientTool(parentSessionId, tool, input),
+  (parentSessionId, tool, input, context) => bridge.executeClientTool(parentSessionId, tool, input, context),
   { runtimePath: meshRuntimePath },
 );
 let meshToolsReady = false;
@@ -185,9 +228,14 @@ if (meshToolsReady) {
     }));
   }
   if (allowProviderConfigMutation && config.enabledProviders.includes("codex")) {
-    toolInstallers.push(installCodexMeshTools(meshTools.sharedMcpServer(), tethoqEnvironmentValue(process.env, "TETHOQ_CODEX_COMMAND") ?? "codex").catch((error: unknown) => {
-      console.warn(`Codex mesh tool installation failed; Codex remains usable without shared mesh commands: ${error instanceof Error ? error.message : String(error)}`);
-    }));
+    const configuredCodexCommand = tethoqEnvironmentValue(providerEnvironment, "TETHOQ_CODEX_COMMAND");
+    toolInstallers.push(resolveCodexCommand({
+      env: providerEnvironment,
+      ...(configuredCodexCommand !== undefined ? { configuredCommand: configuredCodexCommand } : {}),
+    }).then((selection) => installCodexMeshTools(meshTools.sharedMcpServer("provider"), selection.command))
+      .catch((error: unknown) => {
+        console.warn(`Codex mesh tool installation failed; Codex remains usable without shared mesh commands: ${error instanceof Error ? error.message : String(error)}`);
+      }));
   }
   await Promise.all(toolInstallers);
 }
@@ -287,10 +335,11 @@ const shutdown = async (signal: string) => {
   await relay?.dispose();
   await phoneTunnel?.dispose();
   await companionControl?.dispose();
+  await bridge.drainScheduledTasksForShutdown();
   await local.close();
   await meshTools.close();
   await bridge.dispose();
-  await Promise.all([pairingStore.flush(), delegationStore.flush(), sessionTransferStore.flush(), crossSessionStore.flush(), dictationCredentialStore.flush()]);
+  await Promise.all([pairingStore.flush(), delegationStore.flush(), sessionTransferStore.flush(), crossSessionStore.flush(), queueDeliveryStore.flush(), dictationCredentialStore.flush(), goalStore.flush(), sessionCatalogueStore.flush(), visionProxyStore.flush(), clientToolFailureStore.flush()]);
   process.exit(0);
 };
 process.once("SIGINT", () => void shutdown("SIGINT"));

@@ -5,9 +5,34 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark" />
     <title>Tethoq</title>
+    <style>
+      :root, html, body, #root { width: 100%; height: 100%; margin: 0; background: #0b0b0a; color-scheme: dark; }
+      body { overflow: hidden; color: #f0f2f0; font-family: Inter, "Segoe UI", system-ui, sans-serif; }
+      .pre-react-startup { width: 100%; height: 100%; display: grid; grid-template-rows: 46px 1fr; }
+      .pre-react-title { border-bottom: 1px solid #252523; -webkit-app-region: drag; }
+      .pre-react-body { min-height: 0; display: grid; grid-template-columns: 248px 1fr; }
+      .pre-react-rail { border-right: 1px solid #252523; background: #111110; }
+      .pre-react-rows { display: grid; gap: 3px; padding: 62px 16px 8px; }
+      .pre-react-row { height: 86px; display: grid; grid-template-columns: 36px 1fr; align-items: center; gap: 10px; }
+      .pre-react-row > i, .pre-react-message > i { width: 36px; height: 36px; border-radius: 50%; }
+      .pre-react-lines { display: grid; gap: 8px; }
+      .pre-react-lines i { width: 86%; height: 9px; border-radius: 5px; }
+      .pre-react-lines i:first-child { width: 58%; }
+      .pre-react-lines i:last-child { width: 42%; }
+      .pre-react-workspace { min-width: 0; min-height: 0; display: grid; grid-template-rows: 64px 1fr auto; background: #0f0f0e; }
+      .pre-react-header { border-bottom: 1px solid #252523; }
+      .pre-react-messages { width: min(780px, calc(100% - 38px)); margin: 0 auto; padding-top: 42px; display: grid; align-content: start; gap: 26px; }
+      .pre-react-message { width: 72%; display: grid; grid-template-columns: 36px 1fr; align-items: start; gap: 10px; }
+      .pre-react-message.user { width: 55%; grid-template-columns: 1fr; justify-self: end; padding: 14px 16px; border-radius: 14px 14px 4px 14px; background: #1b1b19; }
+      .pre-react-message.short { width: 48%; }
+      .pre-react-composer { width: min(780px, calc(100% - 38px)); height: 82px; margin: 0 auto 14px; border: 1px solid #343431; border-radius: 13px; background: #161615; }
+      .pre-react-row > i, .pre-react-lines i, .pre-react-message > i { background: #242421; background-image: linear-gradient(100deg, #22221f 12%, #2c2c28 46%, #22221f 80%); background-size: 220% 100%; animation: startup-sheen 1.8s ease-in-out infinite; }
+      @keyframes startup-sheen { 0%, 100% { background-position: 100% 0; opacity: .72; } 50% { background-position: 0 0; opacity: 1; } }
+      @media (prefers-reduced-motion: reduce) { .pre-react-row > i, .pre-react-lines i, .pre-react-message > i { animation: none; } }
+    </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root"><main class="pre-react-startup" role="status" aria-label="Tethoq is starting"><div class="pre-react-title"></div><div class="pre-react-body"><aside class="pre-react-rail"><div class="pre-react-rows"><div class="pre-react-row"><i></i><span class="pre-react-lines"><i></i><i></i><i></i></span></div><div class="pre-react-row"><i></i><span class="pre-react-lines"><i></i><i></i><i></i></span></div><div class="pre-react-row"><i></i><span class="pre-react-lines"><i></i><i></i><i></i></span></div><div class="pre-react-row"><i></i><span class="pre-react-lines"><i></i><i></i><i></i></span></div></div></aside><section class="pre-react-workspace"><header class="pre-react-header"></header><div class="pre-react-messages"><div class="pre-react-message"><i></i><span class="pre-react-lines"><i></i><i></i><i></i></span></div><div class="pre-react-message user"><span class="pre-react-lines"><i></i><i></i></span></div><div class="pre-react-message short"><i></i><span class="pre-react-lines"><i></i><i></i></span></div></div><div class="pre-react-composer"></div></section></div></main></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

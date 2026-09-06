@@ -1,9 +1,11 @@
 import 'dart:convert';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
+import 'draft_journal.dart';
 import 'ears.dart';
 import 'json.dart';
 import 'models.dart';
@@ -214,23 +216,87 @@ class SessionReadState {
       };
 }
 
-class DeviceSecurity {
+class RecentModelUse {
+  const RecentModelUse({required this.key, required this.usedAt});
+
+  final String key;
+  final DateTime usedAt;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+        'key': key,
+        'usedAt': usedAt.toUtc().toIso8601String(),
+      };
+}
+
+bool _validRecentModelKey(String? value) {
+  if (value == null || value.length > 300) return false;
+  final separator = value.indexOf('\u0000');
+  return separator > 0 && separator < value.length - 1;
+}
+
+class DeviceSecurity implements DraftJournalKeyProvider {
   DeviceSecurity({FlutterSecureStorage? storage})
       : _storage = storage ?? const FlutterSecureStorage();
 
   static const _hostIndexKey = 'uar.paired_host_ids.v1';
+  static const _lastActiveHostKey = 'uar.last_active_host_id.v1';
   static const _defaultDeliveryModeKey = 'uar.default_delivery_mode.v1';
   static const _reasoningDisplayModeKey = 'uar.reasoning_display_mode.v1';
+  static const _taskListModeKey = 'uar.task_list_mode.v1';
   static const _dictationDictionaryKey = 'uar.dictation_dictionary.v1';
   static const _dictationSourceKey = 'uar.dictation_source.v1';
   static const _dictationSourcePreferencesKey =
       'uar.dictation_source_preferences.v1';
   static const _delegationPreferencesKey = 'uar.delegation_preferences.v1';
   static const _agentDefaultsKey = 'uar.agent_defaults.v1';
-  static const _recentModelsKey = 'uar.recent_models.v1';
+  // This intentionally does not reuse `uar.recent_models.v1`: that key was
+  // populated by picker clicks, including choices that were never sent.
+  static const _recentUsedModelsKey = 'uar.recent_used_models.v1';
   static const _earsSettingsKey = 'uar.ears_settings.v1';
+  static const _draftJournalKey = 'uar.draft_journal_aes256_key.v1';
+  static const _secureTransportCapabilityKeyPrefix =
+      'uar.secure_transport_capability.v1.';
+  static const _secureTransportCapabilityRequired = 'required';
   final FlutterSecureStorage _storage;
   final Ed25519 _algorithm = Ed25519();
+  Future<List<int>>? _draftJournalKeyFuture;
+
+  @override
+  Future<List<int>> loadKey() =>
+      _draftJournalKeyFuture ??= _loadDraftJournalKey();
+
+  Future<List<int>> _loadDraftJournalKey() async {
+    try {
+      final stored = await _storage.read(key: _draftJournalKey);
+      if (stored != null) {
+        try {
+          final decoded = decodeBase64Url(stored);
+          if (decoded.length == 32 && base64UrlNoPadding(decoded) == stored) {
+            return List<int>.unmodifiable(decoded);
+          }
+        } on FormatException {
+          // Report the same validation failure below.
+        }
+        throw StateError('Stored draft journal key is invalid');
+      }
+
+      final random = Random.secure();
+      final generated = List<int>.generate(
+        32,
+        (_) => random.nextInt(256),
+        growable: false,
+      );
+      await _storage.write(
+        key: _draftJournalKey,
+        value: base64UrlNoPadding(generated),
+      );
+      return List<int>.unmodifiable(generated);
+    } catch (_) {
+      // Do not memoize failures; secure storage may recover or be repaired.
+      _draftJournalKeyFuture = null;
+      rethrow;
+    }
+  }
 
   Future<DeviceIdentity> createDeviceIdentity() async {
     final keyPair = await _algorithm.newKeyPair();
@@ -332,6 +398,59 @@ class DeviceSecurity {
     await _storage.write(key: _hostIndexKey, value: jsonEncode(ids));
   }
 
+  /// Returns whether this exact host/device pairing has previously completed a
+  /// verified secure-transport handshake. A missing marker deliberately keeps
+  /// the compatibility path for paired bridges that predate secure transport.
+  /// Storage and validation failures propagate so callers cannot reinterpret
+  /// an unknown capability state as permission to send plaintext.
+  Future<bool> readSecureTransportRequired(PairedHost host) async {
+    final value = await _storage.read(
+      key: await _secureTransportCapabilityKey(host),
+    );
+    if (value == null) return false;
+    if (value != _secureTransportCapabilityRequired) {
+      throw StateError('Stored secure transport capability is invalid');
+    }
+    return true;
+  }
+
+  /// Pins encryption only after the transport has verified this paired host's
+  /// signed ephemeral key. The marker contains no host or device secret.
+  Future<void> markSecureTransportRequired(PairedHost host) async {
+    await _storage.write(
+      key: await _secureTransportCapabilityKey(host),
+      value: _secureTransportCapabilityRequired,
+    );
+  }
+
+  Future<void> clearSecureTransportRequired(PairedHost host) async {
+    await _storage.delete(key: await _secureTransportCapabilityKey(host));
+  }
+
+  Future<String?> readLastActiveHostId() async {
+    final hostId = await _storage.read(key: _lastActiveHostKey);
+    return _validStoredHostId(hostId) ? hostId : null;
+  }
+
+  Future<void> saveLastActiveHostId(String hostId) async {
+    if (!_validStoredHostId(hostId)) {
+      throw ArgumentError.value(hostId, 'hostId', 'must be a valid host ID');
+    }
+    await _storage.write(key: _lastActiveHostKey, value: hostId);
+  }
+
+  Future<void> clearLastActiveHostId([String? expectedHostId]) async {
+    if (expectedHostId != null && !_validStoredHostId(expectedHostId)) {
+      throw ArgumentError.value(
+          expectedHostId, 'expectedHostId', 'must be a valid host ID');
+    }
+    if (expectedHostId != null &&
+        await _storage.read(key: _lastActiveHostKey) != expectedHostId) {
+      return;
+    }
+    await _storage.delete(key: _lastActiveHostKey);
+  }
+
   Future<void> removeHost(String hostId) async {
     final hosts = await readHosts();
     final removed = hosts.where((item) => item.hostId == hostId).firstOrNull;
@@ -340,11 +459,26 @@ class DeviceSecurity {
         .where((id) => id != hostId)
         .toList()
       ..sort();
+    if (removed != null) {
+      await clearSecureTransportRequired(removed);
+    }
+    await clearLastActiveHostId(hostId);
     await _storage.delete(key: 'uar.host.$hostId');
     if (removed != null) {
       await _storage.delete(key: _sessionReadStateKey(removed));
     }
     await _storage.write(key: _hostIndexKey, value: jsonEncode(ids));
+  }
+
+  Future<String> _secureTransportCapabilityKey(PairedHost host) async {
+    final digest = await Sha256().hash(utf8.encode(canonicalJson(
+      <String, Object?>{
+        'purpose': 'tethoq-secure-transport-capability',
+        'hostId': host.hostId,
+        'deviceId': host.deviceId,
+      },
+    )));
+    return '$_secureTransportCapabilityKeyPrefix${base64UrlNoPadding(digest.bytes)}';
   }
 
   Future<SessionReadState?> readSessionReadState(PairedHost host) async {
@@ -383,6 +517,18 @@ class DeviceSecurity {
       throw ArgumentError.value(value, 'value', 'must be compact or expanded');
     }
     await _storage.write(key: _reasoningDisplayModeKey, value: value);
+  }
+
+  Future<String> readTaskListMode() async {
+    final value = await _storage.read(key: _taskListModeKey);
+    return value == 'project' ? 'project' : 'recent';
+  }
+
+  Future<void> saveTaskListMode(String value) async {
+    if (value != 'recent' && value != 'project') {
+      throw ArgumentError.value(value, 'value', 'must be recent or project');
+    }
+    await _storage.write(key: _taskListModeKey, value: value);
   }
 
   Future<List<String>> readDictationDictionary() async {
@@ -556,16 +702,29 @@ class DeviceSecurity {
     );
   }
 
-  Future<List<String>> readRecentModelKeys() async {
-    final raw = await _storage.read(key: _recentModelsKey);
-    if (raw == null) return <String>[];
-    final decoded = jsonDecode(raw);
-    if (decoded is! List<Object?>) return <String>[];
-    return decoded
-        .whereType<String>()
-        .where((value) => value.length <= 300 && value.contains('\u0000'))
-        .take(5)
-        .toList(growable: false);
+  Future<List<RecentModelUse>> readRecentModelUses() async {
+    final raw = await _storage.read(key: _recentUsedModelsKey);
+    if (raw == null) return <RecentModelUse>[];
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! List<Object?>) return <RecentModelUse>[];
+      final result = <RecentModelUse>[];
+      final seen = <String>{};
+      for (final value in decoded) {
+        if (value is! Map<Object?, Object?>) continue;
+        final json = jsonMap(value, name: 'recent model use');
+        final key = optionalString(json, 'key');
+        final usedAt = DateTime.tryParse(optionalString(json, 'usedAt') ?? '');
+        if (!_validRecentModelKey(key) || usedAt == null || !seen.add(key!)) {
+          continue;
+        }
+        result.add(RecentModelUse(key: key, usedAt: usedAt.toUtc()));
+        if (result.length == 20) break;
+      }
+      return result;
+    } on Object {
+      return <RecentModelUse>[];
+    }
   }
 
   Future<EarsSettings> readEarsSettings() async {
@@ -585,12 +744,18 @@ class DeviceSecurity {
     );
   }
 
-  Future<void> saveRecentModelKeys(Iterable<String> keys) async {
-    final normalized = keys
-        .where((value) => value.length <= 300 && value.contains('\u0000'))
-        .take(5)
-        .toList(growable: false);
-    await _storage.write(key: _recentModelsKey, value: jsonEncode(normalized));
+  Future<void> saveRecentModelUses(Iterable<RecentModelUse> uses) async {
+    final normalized = <RecentModelUse>[];
+    final seen = <String>{};
+    for (final use in uses) {
+      if (!_validRecentModelKey(use.key) || !seen.add(use.key)) continue;
+      normalized.add(use);
+      if (normalized.length == 20) break;
+    }
+    await _storage.write(
+      key: _recentUsedModelsKey,
+      value: jsonEncode(normalized.map((use) => use.toJson()).toList()),
+    );
   }
 
   String _sessionReadStateKey(PairedHost host) =>
@@ -625,6 +790,12 @@ class DeviceSecurity {
 
   List<int> _pemToRawPublicKey(String pem) => ed25519RawPublicKeyFromPem(pem);
 }
+
+bool _validStoredHostId(String? value) =>
+    value != null &&
+    value.isNotEmpty &&
+    value.length <= 4096 &&
+    !value.contains('\u0000');
 
 /// Unwraps an Ed25519 SubjectPublicKeyInfo PEM into its raw 32 bytes. The
 /// secure transport needs the same conversion to check the computer's signed

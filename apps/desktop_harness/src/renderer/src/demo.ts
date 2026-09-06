@@ -146,6 +146,8 @@ export const demoBootstrap: DesktopBootstrap = {
   openCode: { state: "managed", url: "http://127.0.0.1:4096/", managed: true, message: "Managed local provider runtime" },
 };
 
+export const savedProjectDirectories = ["C:\\Projects\\sample-app", "C:\\Projects\\account-service", "C:\\Projects\\storefront"];
+
 export const sessions: Session[] = [
   {
     id: "desktop-harness",
@@ -300,6 +302,8 @@ const desktopTimeline: TimelineItem[] = [
 export const demoSnapshot: DesktopSnapshot = {
   connected: true,
   hostName: "This computer",
+  goals: {},
+  goalClearRevisions: {},
   providers,
   sessions,
   timelines: {

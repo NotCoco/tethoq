@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 const repositoryRoot = fileURLToPath(new URL('..', import.meta.url));
 const generatedSegments = new Set([
   '.dart_tool', '.example-dist', '.git', '.next', '.test-dist', 'artifacts',
-  'build', 'coverage', 'dist', 'node_modules', 'out', 'release', 'tmp',
+  'build', 'coverage', 'dist', 'local-artifacts', 'node_modules', 'out', 'release', 'tmp',
 ]);
 const sourcePathPrefixes = [
   'apps/agent_bridge/release/',
@@ -21,8 +21,8 @@ const sourceCodeExtensions = new Set([
   '.cjs', '.cts', '.dart', '.js', '.jsx', '.mjs', '.mts', '.ts', '.tsx',
 ]);
 const textExtensions = new Set([
-  '', '.bat', '.cjs', '.cmd', '.css', '.dart', '.env', '.html', '.js', '.json',
-  '.jsx', '.kt', '.kts', '.md', '.mjs', '.properties', '.ps1', '.sh', '.sql',
+  '', '.bat', '.c', '.cjs', '.cmd', '.cmake', '.cpp', '.css', '.cts', '.dart', '.env', '.h', '.html', '.in', '.js', '.json',
+  '.jsx', '.kt', '.kts', '.lock', '.md', '.mjs', '.mts', '.properties', '.ps1', '.py', '.sh', '.sql',
   '.svg', '.toml', '.ts', '.tsx', '.txt', '.xml', '.yaml', '.yml', '.gradle',
 ]);
 const allowedCredentialNames = new Set([
@@ -39,7 +39,7 @@ const allowedSecretFixtureLiterals = new Map([
     [desktopConfigPrivateKeyFixture],
   ],
 ]);
-const placeholderUsers = new Set(['deploy', 'example', 'person', 'public', 'test', 'user', 'username', 'you']);
+const placeholderUsers = new Set(['deploy', 'example', 'example user', 'person', 'public', 'test', 'user', 'username', 'you']);
 const secretPatterns = [
   { reason: 'private key material', pattern: /-----BEGIN (?:DSA |EC |OPENSSH |PGP |RSA )?PRIVATE KEY-----/u },
   { reason: 'AWS access key identifier', pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/u },
@@ -96,6 +96,8 @@ function packageLicenseReason(path, text) {
 }
 
 function generatedPathReason(path) {
+  if (path.split('/').some((segment) => segment.toLowerCase() === 'local-artifacts')
+    || /^TETHOQ_UI_(?:FEEDBACK_LEDGER|DOCTRINE).*\.(?:json|md)$/iu.test(basename(path))) return 'private local notes';
   if (allowedGeneratedPaths.has(path) || sourcePathPrefixes.some((prefix) => path.startsWith(prefix))) return undefined;
   const segment = path.split('/').find((candidate) => {
     const normalized = candidate.toLowerCase();
@@ -119,8 +121,7 @@ function credentialFilenameReason(path) {
 
 function personalPathReason(text) {
   const windowsPatterns = [
-    /[A-Za-z]:\\Users\\([^\\\r\n]+)\\/gu,
-    /[A-Za-z]:\\\\Users\\\\([^\\\r\n]+)\\\\/gu,
+    /[A-Za-z]:[\\/]+Users[\\/]+([^\\/\r\n"'`]+)[\\/]/giu,
   ];
   for (const pattern of windowsPatterns) {
     for (const match of text.matchAll(pattern)) {

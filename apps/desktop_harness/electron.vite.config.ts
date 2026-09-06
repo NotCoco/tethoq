@@ -1,10 +1,15 @@
 import { resolve } from "node:path";
+import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import react from "@vitejs/plugin-react";
 import { defineConfig, externalizeDepsPlugin } from "electron-vite";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const repositoryRoot = resolve(here, "../..");
+// Vite injects an inline React-refresh preamble in development. Give only
+// this launch's generated scripts a nonce accepted by Electron's dev CSP.
+const rendererNonce = randomBytes(18).toString("base64");
+process.env.TETHOQ_DEV_CSP_NONCE = rendererNonce;
 
 export default defineConfig({
   main: {
@@ -45,6 +50,7 @@ export default defineConfig({
     },
   },
   renderer: {
+    html: { cspNonce: rendererNonce },
     root: resolve(here, "src/renderer"),
     plugins: [react()],
     resolve: {
