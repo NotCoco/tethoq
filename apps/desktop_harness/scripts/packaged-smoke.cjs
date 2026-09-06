@@ -710,6 +710,15 @@ async function verifyPackagedResources() {
   const nativeModuleStat = await stat(nativeModulePath);
   assert.ok(nativeModuleStat.isFile() && nativeModuleStat.size > 0, 'The Windows uiohook native module is not unpacked beside app.asar.');
   assert.ok(path.relative(asarUnpackedRoot, nativeModulePath).split(path.sep)[0] !== '..', 'The uiohook native module escaped app.asar.unpacked.');
+  const nativeBuildRoot = path.join(asarUnpackedRoot, 'node_modules', 'uiohook-napi', 'build');
+  const nativeBuildEntries = await readdir(nativeBuildRoot, { recursive: true }).catch((error) => {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  });
+  for (const entry of nativeBuildEntries) {
+    if (!(await stat(path.join(nativeBuildRoot, entry))).isFile()) continue;
+    assert.match(entry, /^Release[\\/][^\\/]+\.node$/u, `Generated native build artifact leaked into the package: ${entry}`);
+  }
   for (const sourceFile of [
     path.join(asarUnpackedRoot, 'node_modules', 'uiohook-napi', 'binding.gyp'),
     path.join(asarUnpackedRoot, 'node_modules', 'uiohook-napi', 'src', 'lib', 'addon.c'),
@@ -1226,6 +1235,7 @@ async function main() {
     embeddedBridgeArchive: true,
     embeddedBridgeChecksum: true,
     unpackedUiohookNativeModule: true,
+    nativeBuildArtifactsExcluded: true,
     browserPreloadLifecycle: true,
     browserPrivateProfileReset: true,
     browserCompactDownloadPopover: true,

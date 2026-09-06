@@ -8,6 +8,9 @@ asarUnpack:
 files:
   - out/**/*
   - package.json
+  # Keep only release binaries from generated native build output.
+  - "!node_modules/uiohook-napi/build/!(Release)"
+  - "!node_modules/uiohook-napi/build/Release/!(*.node)"
 extraResources:
   - from: ../../LICENSE
     to: legal/TETHOQ-LICENSE.txt
