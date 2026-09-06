@@ -1610,7 +1610,7 @@ test("an unavailable lock directory preserves the last successful active snapsho
   assert.deepEqual(await reconciler.activeThreadIds(), [threadId], "a read failure is unknown, not an empty writer set");
 });
 
-test("writer-lock lookup is path-safe and ignores an orphaned lock file", async (t) => {
+test("writer-lock lookup is path-safe and ignores orphaned Windows lock files", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "uar-codex-writer-lock-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const lockDirectory = join(directory, "thread-writer-locks");
@@ -1621,8 +1621,10 @@ test("writer-lock lookup is path-safe and ignores an orphaned lock file", async 
   const reconciler = new CodexActivityReconciler({ codexHome: directory, onStateChanged: () => undefined });
   t.after(() => reconciler.dispose());
 
-  assert.equal(await reconciler.hasWriterLock(threadId), false);
+  // Only Windows probes the OS lock; other platforms use file presence.
+  if (process.platform === "win32") assert.equal(await reconciler.hasWriterLock(threadId), false);
   assert.equal(await reconciler.hasWriterLock("..\\outside"), false);
+  assert.equal(await reconciler.hasWriterLock("../outside"), false);
   await rm(lockPath);
   assert.equal(await reconciler.hasWriterLock(threadId), false);
 });

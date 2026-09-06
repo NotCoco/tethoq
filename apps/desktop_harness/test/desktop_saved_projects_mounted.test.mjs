@@ -68,12 +68,14 @@ test("saved project rail limits folders, stays stable, and separates harness, su
       const { app, BrowserWindow } = require("electron");
       const { writeFile } = require("node:fs/promises");
       const path = require("node:path");
+      app.commandLine.appendSwitch("disable-gpu");
+      app.commandLine.appendSwitch("force-device-scale-factor", "1");
       app.setPath("userData", path.join(__dirname, "profile"));
       app.on("window-all-closed", () => {});
       app.whenReady().then(async () => {
         const results = [];
         for (const [width, height, railWidth] of [[1100, 760, 248], [800, 560, 220]]) {
-          const window = new BrowserWindow({ width, height, x: -10000, y: -10000, show: false, webPreferences: { contextIsolation: true, sandbox: true, backgroundThrottling: false } });
+          const window = new BrowserWindow({ width, height, x: -10000, y: -10000, show: false, webPreferences: { contextIsolation: true, sandbox: true, backgroundThrottling: false, offscreen: true } });
           await window.loadFile(path.join(__dirname, "index.html"));
           await window.webContents.executeJavaScript('new Promise(resolve => { const check = () => window.projectQa?.ready && document.querySelector(".session-project-group") ? resolve() : setTimeout(check, 10); check(); })');
           await window.webContents.executeJavaScript('document.documentElement.style.setProperty("--navigation-panel", "' + railWidth + 'px")');
