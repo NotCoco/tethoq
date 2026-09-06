@@ -139,9 +139,15 @@ test("saved project rail limits folders, stays stable, and separates harness, su
             const target = await window.webContents.executeJavaScript('(() => { const shell = document.querySelector("[data-session-id=' + id + ']"); const button = shell.querySelector(".session-subagents-trigger").getBoundingClientRect(); const row = shell.getBoundingClientRect(); return { x: button.x + button.width / 2, y: button.y + button.height / 2, top: row.top }; })()');
             const { nodeId } = await window.webContents.debugger.sendCommand("DOM.querySelector", { nodeId: root.nodeId, selector: '[data-session-id="' + id + '"] .session-subagents-trigger' });
             await window.webContents.debugger.sendCommand("CSS.forcePseudoState", { nodeId, forcedPseudoClasses: ["hover"] });
-            await window.webContents.executeJavaScript('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
-            const hoverBackground = await window.webContents.executeJavaScript('getComputedStyle(document.querySelector("[data-session-id=' + id + '] .session-subagents-trigger")).backgroundColor');
-            if (hoverBackground !== "rgb(41, 41, 39)") throw new Error("Sub-agent hover styling did not apply");
+            // CDP's forced state can precede its painted style on a CI desktop.
+            // Wait for that state with a bound, then capture the actual hover.
+            const deadline = Date.now() + 2000;
+            let hoverBackground;
+            do {
+              await window.webContents.executeJavaScript('new Promise(resolve => setTimeout(() => requestAnimationFrame(resolve), 25))');
+              hoverBackground = await window.webContents.executeJavaScript('getComputedStyle(document.querySelector("[data-session-id=' + id + '] .session-subagents-trigger")).backgroundColor');
+            } while (hoverBackground !== "rgb(41, 41, 39)" && Date.now() < deadline);
+            if (hoverBackground !== "rgb(41, 41, 39)") throw new Error("Sub-agent hover styling did not apply at " + width + "px for " + id + ": " + hoverBackground);
             await writeFile(path.join(process.argv[2], "hover-" + id + "-" + width + ".png"), (await window.webContents.capturePage({ x: 0, y: Math.floor(target.top) - 4, width: railWidth, height: 40 })).toPNG());
             await window.webContents.debugger.sendCommand("CSS.forcePseudoState", { nodeId, forcedPseudoClasses: [] });
           }
