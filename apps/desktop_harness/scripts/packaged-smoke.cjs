@@ -1002,6 +1002,9 @@ async function gracefulQuit() {
   const available = await cdp.evaluate('typeof window.tethoqDesktop.quitForSmoke === "function"');
   assert.equal(available, true, 'The env-guarded packaged smoke quit hook was not exposed.');
   await cdp.evaluate('void window.tethoqDesktop.quitForSmoke()');
+  // An open debugging connection can retain Electron after its quit event.
+  cdp.close();
+  cdp = undefined;
   await waitFor(() => !processCommandLines().some((process) => process.ProcessId === appPid), 'graceful packaged app shutdown', 15_000);
 }
 
