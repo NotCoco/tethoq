@@ -181,7 +181,7 @@ test("mounted Composer preserves pending content and closes transient panels cle
             selectImages: async () => [],
           };
 
-          const [{ Composer, mergeFailedComposerDraft, defaultDraftScheduleLocalValue }, { mergeRefreshedSessions }, { loadProviderModelCatalogue, DesktopBridgeRequestError }, { mergeTimeline }] = await Promise.all([
+          const [{ Composer, mergeFailedComposerDraft, defaultDraftScheduleLocalValue, persistMeshRecentTargetsForSession, recentMeshModels }, { mergeRefreshedSessions }, { loadProviderModelCatalogue, DesktopBridgeRequestError }, { mergeTimeline }] = await Promise.all([
             import("./src/renderer/src/Composer.tsx"),
             import("./src/renderer/src/session_refresh.ts"),
             import("./src/renderer/src/bridge.ts"),
@@ -266,6 +266,7 @@ test("mounted Composer preserves pending content and closes transient panels cle
             const snapshot = { providers, models, sessions: [session], timelines: { [session.id]: [] } };
             const calls = [];
             const notifications = [];
+            let permission = "ask";
             const queue = [...initialQueue];
             let interrupted = 0;
             let upload = 0;
@@ -302,6 +303,10 @@ test("mounted Composer preserves pending content and closes transient panels cle
                  if (queuedSteerFailed && queuedSteerRecovery === "list-failure") throw new Error("simulated queue recovery read failure");
                  return { messages: [...queue] };
                }
+              if (type === "session.permissions.get" || type === "session.permissions.set") {
+                if (type.endsWith(".set")) permission = payload.value;
+                return { controls: [{ id: "tools", label: "Tool permissions", value: permission, options: [{ value: "ask", label: "Ask" }, { value: "deny", label: "Deny" }] }], note: "Applies to this task." };
+              }
               if (type === "attachment.upload.begin") return { uploadId: "upload-" + (++upload), chunkBytes: 32768 };
               if (type === "attachment.upload.complete") return { attachmentId: "attachment-" + upload };
               if (type === "message_queue.enqueue") {
@@ -495,7 +500,7 @@ test("mounted Composer preserves pending content and closes transient panels cle
              check(state.materializeActions().at(-1)?.action === "side_chat", "Draft side chat bypassed materialization");
              check(state.sideChatCreates().length === 0, "Draft side chat used the local draft id before materialization");
              await openAction("Goal");
-             check(state.materializeActions().at(-1)?.action === "goal", "Draft Goal bypassed materialization");
+             check(document.querySelector(".composer-goal-indicator.is-armed") && state.materializeActions().at(-1)?.action === "side_chat", "Draft Goal must arm the next message without materializing");
 
              progress("draft mesh opens locally");
              state = await mount({ draft: true, sessionState: "idle", initialDraft: "" });
@@ -1486,20 +1491,107 @@ test("mounted Composer preserves pending content and closes transient panels cle
             check(state.snapshot().timelines["mounted-session"].length === 1 && state.snapshot().timelines["mounted-session"][0].mesh?.targets.length === 1, "Uncertain delivery erased the submitted Mesh message");
             check(plainComposerValue() === "" && !document.querySelector('.composer-mesh-widget'), "Uncertain delivery restored a duplicate Mesh send into the composer");
 
+            progress("recent mesh mentions");
+            const mentionStorageKeys = ["tethoq:mesh-recent-targets:v1", "tethoq:mesh-recent-models:v1"];
+            const mentionStorageBackup = mentionStorageKeys.map((key) => localStorage.getItem(key));
+            for (const key of mentionStorageKeys) localStorage.removeItem(key);
+            state = await mount({ deferDelegation: true });
+            await setField(composer(), "@");
+            check(element('.mesh-mention-panel').textContent.includes("Use /mesh"), "First-use mentions did not explain how to populate recent models");
+            await pressKey(composer(), "Enter");
+            check(!state.calls.some((call) => ["delegation.prepare", "message_queue.enqueue", "session.send"].includes(call.type)), "Enter on an empty mention picker sent the draft");
+            await pressKey(composer(), "Escape");
+            check(!document.querySelector('.mesh-mention-panel') && composer().value === "@", "Escape changed the mention draft");
+            for (const prose of ["user@grok.com", "https://example.test/@grok"]) {
+              await setField(composer(), prose);
+              check(!document.querySelector('.mesh-mention-panel'), "An email or URL opened the mention picker");
+            }
+            await setField(composer(), "/mesh");
+            await click(buttonWithText(element('.mesh-panel'), "Mesh 1"));
+            check(recentMeshModels().length === 0, "Selecting without sending populated mesh history");
+            await click(send());
+            check(recentMeshModels().length === 0, "Pending delegation populated mesh history");
+            state.resolveDelegation();
+            await settle(5);
+            await setField(composer(), "@");
+            check(element('.mesh-mention-panel [role="option"]').textContent.includes("Mesh 1"), "Accepted mesh usage did not immediately enable mentions");
+
+            const mentionFixtures = [
+              { providerId: "mesh-1", modelId: "mesh-1-model", reasoningEffort: "medium" },
+              { providerId: "direct", modelId: "direct-audio", reasoningEffort: "low" },
+              { providerId: "codex", modelId: "codex-model", reasoningEffort: "medium" },
+              { providerId: "opencode", modelId: "opencode-go/deepseek-v4-pro", reasoningEffort: "high" },
+              { providerId: "opencode", modelId: "opencode-go/glm-5.3-flash", reasoningEffort: "max" },
+              { providerId: "grok", modelId: "grok-stale", reasoningEffort: "medium" },
+            ];
+            for (const target of mentionFixtures) persistMeshRecentTargetsForSession("another-parent", [target]);
+            state = await mount();
+            await setField(composer(), "@");
+            check(document.querySelectorAll('.mesh-mention-panel [role="option"]').length === 5, "Mentions did not retain exactly five models across tasks");
+            await pressKey(composer(), "ArrowUp");
+            check(element('.mesh-mention-row.selected').textContent.includes("Direct Audio"), "Mention ArrowUp did not wrap");
+            await pressKey(composer(), "ArrowDown");
+            check(element('.mesh-mention-row.selected').textContent.includes("Previously loaded Grok"), "Mention ArrowDown did not wrap");
+            await setField(composer(), "@g");
+            check(document.querySelectorAll('.mesh-mention-panel [role="option"]').length === 2, "@g did not narrow the recent models");
+            await setField(composer(), "@GL");
+            check(document.querySelectorAll('.mesh-mention-panel [role="option"]').length === 1, "Mention prefixes were not case insensitive");
+            await pressKey(composer(), "Enter", { isComposing: true });
+            check(!document.querySelector('.composer-mesh-widget'), "IME composition committed a model");
+            await pressKey(composer(), "Enter");
+            check(element('.composer-mesh-widget-body').title === "GLM 5.3 Flash · Max", "Mention selection lost the saved model or reasoning");
+            const mentionBadge = composer().value;
+            check(mentionBadge.length === 1 && !document.querySelector('.mesh-mention-panel'), "Mention text was not replaced by one badge");
+            check(composer().selectionStart === 1 && document.activeElement === composer(), "Mention selection lost the caret");
+
+            await setField(composer(), "Compare @grok suffix " + mentionBadge, false);
+            const mentionCaret = "Compare @g".length;
+            composer().setSelectionRange(mentionCaret, mentionCaret);
+            document.dispatchEvent(new Event("selectionchange"));
+            await settle();
+            await click(element('.mesh-mention-row .mesh-add-select'));
+            check(plainComposerValue() === "Compare  suffix ", "Completing at a middle caret left a partial mention or erased surrounding prose");
+            const mentionBadges = [...document.querySelectorAll('.composer-mesh-widget-body')].map((button) => button.title);
+            check(mentionBadges[0].includes("Grok") && mentionBadges[1].includes("GLM"), "Mention insertion reordered existing badges");
+            await setField(composer(), composer().value + " @doesnotexist", false);
+            check(element('.mesh-mention-panel').textContent.includes("No recent models match"), "Unmatched mentions did not explain the empty result");
+            await pressKey(composer(), "Enter");
+            check(document.querySelectorAll('.composer-mesh-widget').length === 2, "An unmatched mention selected a model");
+            await setField(composer(), composer().value.replace("@doesnotexist", "@gl"), false);
+            await pressKey(composer(), "Tab");
+            await setField(composer(), composer().value + " @gl", false);
+            await pressKey(composer(), "Enter");
+            await setField(composer(), composer().value + " @", false);
+            check(element('.mesh-mention-panel').textContent.includes("Four subagents"), "Mentions did not enforce the four-target limit");
+            await pressKey(composer(), "Enter");
+            check(document.querySelectorAll('.composer-mesh-widget').length === 4, "Mentions allowed a fifth target");
+            await pressKey(composer(), "Escape");
+            await setField(composer(), composer().value.slice(0, -1), false);
+            const mentionPrompt = plainComposerValue().trim();
+            await click(send());
+            const mentionedSend = state.calls.find((call) => call.type === "delegation.prepare");
+            check(mentionedSend?.payload.prompt === mentionPrompt, "Mention completion leaked search text into the sent prompt");
+            check(mentionedSend.payload.targets.map((target) => target.modelId).join(",") === "grok-stale,opencode-go/glm-5.3-flash,opencode-go/glm-5.3-flash,opencode-go/glm-5.3-flash", "Mention tags did not send their exact model routes in inline order");
+            check(mentionedSend.payload.targets.slice(1).every((target) => target.reasoningEffort === "max"), "Mention sends lost saved reasoning");
+            for (const [index, key] of mentionStorageKeys.entries()) {
+              if (mentionStorageBackup[index] === null) localStorage.removeItem(key);
+              else localStorage.setItem(key, mentionStorageBackup[index]);
+            }
+
             progress("goal clear focus");
             const existingGoal = {
               sessionId: "mounted-session", objective: "Clear this goal", status: "active", source: "native", tokenBudget: null,
               tokensUsed: 0, timeUsedSeconds: 0, createdAt: "2026-08-25T00:00:00.000Z", updatedAt: "2026-08-25T00:00:00.000Z", revision: 1,
             };
             await mount({ goal: existingGoal });
-            await openAction("Goal");
+            await click(element(".composer-current-goal"));
             await click(buttonWithText(element('.composer-goal-panel'), "Clear"));
             check(!document.querySelector('.composer-goal-panel'), "Successful Goal clear did not dismiss the panel");
             check(document.activeElement === composer(), "Successful Goal clear did not restore Composer focus");
 
             progress("goal delayed load");
-            await mount();
-            await openAction("Goal");
+            await mount({ goal: existingGoal });
+            await click(element(".composer-current-goal"));
             const objective = element('.composer-goal-panel textarea');
             const budget = element('.composer-goal-panel input[type="number"]');
             await setField(objective, "Keep my typed objective");
@@ -1513,6 +1605,27 @@ test("mounted Composer preserves pending content and closes transient panels cle
             check(objective.value === "Keep my typed objective", "Delayed goal load overwrote the edited objective");
             check(budget.value === "321", "Delayed goal load overwrote the edited budget");
 
+            progress("permissions slash and menu");
+            state = await mount({ sessionState: "idle", initialDraft: "Keep /permission this instruction" });
+            check(document.querySelector('.permission-settings'), "Complete /permission did not open its picker");
+            check(!plainComposerValue().includes("/permission") && plainComposerValue().includes("Keep") && plainComposerValue().includes("this instruction"), "Permission command erased surrounding draft text");
+            check(state.calls.some(call => call.type === "session.permissions.get" && call.payload.sessionId === "mounted-session"), "Picker did not read native task permissions");
+            check(!state.calls.some(call => call.type === "message.send"), "Permission command was sent to the model");
+            await pressKey(element('.permission-settings'), "Escape");
+            check(!document.querySelector('.permission-settings') && document.activeElement === composer(), "Escape did not restore composer focus");
+            await setField(composer(), "/perm");
+            check(document.querySelector('.slash-command-palette')?.textContent.includes('/permission'), "Permission prefix did not filter the palette");
+            await pressKey(composer(), "Enter");
+            check(document.querySelector('.permission-settings') && !plainComposerValue().includes('/perm'), "Keyboard command selection failed");
+            await pressKey(element('.permission-settings'), "Escape");
+            await openAction("Permissions");
+            check(document.querySelector('.permission-settings'), "Three-dot menu did not open permissions");
+            document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); await settle();
+            check(!document.querySelector('.permission-settings'), "Outside click did not dismiss permissions");
+            state = await mount({ draft: true, sessionState: "idle", initialDraft: "Keep new-task draft" });
+            await openAction("Permissions");
+            check(state.materializeActions().some(item => item.action === "permission"), "Draft permissions did not materialize the selected harness task");
+            check(plainComposerValue() === "Keep new-task draft", "Draft permissions erased the instruction");
             progress("complete");
             await unmount();
             window.__composerQaResult = { ok: true };

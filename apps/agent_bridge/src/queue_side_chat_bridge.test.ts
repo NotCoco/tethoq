@@ -662,7 +662,7 @@ test("side-chat RPCs move only the selected queued message, retain parentage, an
     .flatMap((message) => message.parts.flatMap((part) => part.type === "text" ? [part.text] : []))
     .join("\n");
   assert.match(sideUserText, /Inspect this without changing files/);
-  assert.match(sideUserText, /Side-chat role guidance/);
+  assert.doesNotMatch(sideUserText, /Side-chat role guidance|TETHOQ_BRANCH_TRANSCRIPT_BOOTSTRAP/);
 
   const promoted = await route(router, hostId, "side_chat.promote", { sessionId: sideChatId as string });
   assert.equal(promoted.ok, true);

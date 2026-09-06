@@ -10,8 +10,10 @@
 .harness-connection-card li + li { margin-top: 6px; }
 .harness-connection-card code { color: var(--text); font-size: 12px; }
 .harness-connection-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
-.harness-connection-actions button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--line); background: transparent; color: var(--text-soft); }
+.harness-connection-actions button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--line); background: transparent; color: var(--text-soft); transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease, box-shadow 120ms ease, transform 120ms ease; }
 .harness-connection-actions button:hover:not(:disabled), .harness-connection-actions button:focus-visible { background: var(--surface-2); border-color: var(--line-strong); }
+.harness-connection-actions button:active:not(:disabled) { background: var(--surface-3); border-color: var(--muted); color: var(--text); box-shadow: inset 0 1px 3px rgba(0, 0, 0, .35); transform: translateY(1px); transition-duration: 0s; }
+@media (prefers-reduced-motion: reduce) { .harness-connection-actions button { transition: none; } .harness-connection-actions button:active:not(:disabled) { transform: none; } }
 .harness-connection-actions svg { width: 14px; height: 14px; }
 .harness-setup-details { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 12px; }
 .harness-setup-details summary { cursor: pointer; font-size: 13px; }

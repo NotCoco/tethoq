@@ -52,13 +52,15 @@ export interface Session {
   /** Side chats are real provider sessions, but remain nested under their task. */
   sessionKind?: "task" | "side_chat" | "internal";
   parentSessionId?: string;
-  relationshipKind?: "handoff" | "branch" | "subagent" | "side_chat";
+  relationshipKind?: "handoff" | "branch" | "subagent" | "side_chat" | "model_switch";
   relationshipSourceSessionId?: string;
   agentNickname?: string;
   agentRole?: string;
   providerId: ProviderId;
   title: string;
   state: SessionState;
+  /** Provider-confirmed interruption; cleared when the task resumes. */
+  interruptedAt?: string;
   project: string;
   workingDirectory: string;
   preview: string;
@@ -175,6 +177,8 @@ export interface TimelineItem {
   childProviderId?: string;
   childModelId?: string;
   childReasoningEffort?: string;
+  childInterruptedAt?: string;
+  childStatusUpdatedAt?: string;
   timestamp: string;
   images?: TimelineImage[];
   audio?: TimelineAudio[];
@@ -251,6 +255,18 @@ export interface InputRequest {
   prompt: string;
   answerKey: string;
   options?: string[];
+  questions?: InputQuestion[];
+  elicitation?: Record<string, unknown>;
+}
+
+export interface InputQuestion {
+  id: string;
+  title: string;
+  prompt: string;
+  options: Array<{ value: string; label: string; description?: string; preview?: string }>;
+  multiple: boolean;
+  allowCustom: boolean;
+  secret: boolean;
 }
 
 export interface ModelOption {

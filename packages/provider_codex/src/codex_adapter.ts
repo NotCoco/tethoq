@@ -20,6 +20,7 @@ import {
   ProviderAdapterError,
   ProviderEventHub,
   providerPromptContent,
+  elicitationResponse,
   type AgentProviderAdapter,
   type AuthRequest,
   type AuthResult,
@@ -38,6 +39,7 @@ import {
   type ProviderQueuedMessage,
   type RecentProviderMessages,
   type ProviderSessionGoal,
+  type ProviderSessionPermissions,
   type ProviderSessionGoalUpdate,
   type ProviderUserInputResponse,
   type RestoreProviderMessageRequest,
@@ -57,6 +59,7 @@ import {
 import { CodexCommandResolver, probeCodexVersion } from "./codex_command.js";
 import { externalSessionLaunchesFromCommand } from "./external_launches.js";
 import { codexTurnInput } from "./codex_input.js";
+import { CodexSessionPermissions } from "./permissions.js";
 import { CodexDesktopQueue } from "./desktop_queue.js";
 import { codexVisionIsolationConfig, prepareCodexVisionCatalog, type CodexVisionCatalog } from "./vision_isolation.js";
 import { isRecord, jsonObject, messagesFromCodexThread, normalizeCodexStatus, normalizeCodexThread, normalizeCodexThreadName, visibleCodexAssistantDelta, visibleCodexAssistantText } from "./normalize.js";
@@ -91,6 +94,7 @@ class CodexPreTurnStartError extends Error {
 }
 
 export interface CodexAdapterOptions {
+  readonly permissionStatePath?: string;
   /** Internal EYES runtime; never enabled on the user's ordinary adapter. */
   readonly isolatedVisionRuntime?: boolean;
   readonly hostId: string;
@@ -339,6 +343,7 @@ export class CodexAdapter implements AgentProviderAdapter {
   public readonly steerQueuedMessage?: (providerSessionId: string, messageId: string, request: SendMessageRequest) => Promise<SendMessageResult>;
   readonly #events = new ProviderEventHub();
   readonly #pendingServerRequests = new Map<string, PendingServerRequest>();
+  readonly #sessionPermissions: CodexSessionPermissions;
   readonly #currentTurns = new Map<string, string>();
   readonly #compactions = new Map<string, PendingCompaction>();
   readonly #compactionTurns = new Map<string, string>();
@@ -384,6 +389,7 @@ export class CodexAdapter implements AgentProviderAdapter {
   #clientTooling: ProviderClientTooling | undefined;
 
   public constructor(options: CodexAdapterOptions) {
+    this.#sessionPermissions = new CodexSessionPermissions(options.permissionStatePath);
     this.#options = options;
     this.#hostId = options.hostId;
     this.#displayCommand = options.command ?? "codex";
@@ -738,6 +744,10 @@ export class CodexAdapter implements AgentProviderAdapter {
     // put that work in front of the visible history page; keep thread/read as the
     // fallback for sessions whose local rollout is unavailable.
     if (observedMessages.length > 0) return observedMessages;
+    // An existing, empty rollout is authoritative too. Do not ask App Server
+    // to reconstruct turns that do not exist (some versions reject list_turns).
+    const localWindow = await this.#activity?.recentMessageWindow(providerSessionId);
+    if (localWindow?.complete && localWindow.messages.length === 0) return observedMessages;
     try {
       const response = await this.request<ThreadResponse>("thread/read", { threadId: providerSessionId, includeTurns: true });
       return messagesFromCodexThread(this.#hostId, response.thread);
@@ -1161,6 +1171,7 @@ export class CodexAdapter implements AgentProviderAdapter {
 
   private async sendMessageToAppServer(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
     const internalPurpose = request.metadata?.internalPurpose;
+    let permissionOverrides: Record<string, unknown> = {};
     if (internalPurpose === "vision_proxy" || internalPurpose === "ears") {
       // Restored helpers were created by an earlier adapter instance, so the
       // createSession(clientTools: "none") policy is no longer in memory. The
@@ -1175,6 +1186,9 @@ export class CodexAdapter implements AgentProviderAdapter {
       // caller a truthful exact-once boundary: a discovery or initialization
       // failure here cannot have submitted the user's instruction.
       await this.peer();
+      if (internalPurpose !== "vision_proxy" && internalPurpose !== "ears" && !this.#visionThreads.has(providerSessionId)) {
+        permissionOverrides = await this.#sessionPermissions.turnOverrides(providerSessionId, () => this.request("configRequirements/read"));
+      }
     } catch (error) {
       throw new CodexPreTurnStartError(error);
     }
@@ -1183,6 +1197,7 @@ export class CodexAdapter implements AgentProviderAdapter {
       threadId: providerSessionId,
       clientUserMessageId: request.requestId,
       input,
+      ...permissionOverrides,
       ...(request.modelId !== undefined ? { model: request.modelId } : {}),
       ...(request.reasoningEffort !== undefined ? { effort: request.reasoningEffort } : {}),
     };
@@ -1308,9 +1323,32 @@ export class CodexAdapter implements AgentProviderAdapter {
   public async interrupt(providerSessionId: string): Promise<void> {
     const child = this.#visionChildren.get(providerSessionId);
     if (child !== undefined) return await child.adapter.interrupt(providerSessionId);
-    const turnId = this.#currentTurns.get(providerSessionId);
-    if (turnId === undefined) throw new ProviderAdapterError(this.providerId, "NO_ACTIVE_TURN", "No active Codex turn is known for this thread", false);
+    let turnId = this.#currentTurns.get(providerSessionId);
+    if (turnId === undefined) {
+      // Reconnected and externally started tasks need the actual live turn ID.
+      // Absence from this adapter's map is not evidence that the task stopped.
+      const { thread } = await this.request<ThreadResponse>("thread/read", { threadId: providerSessionId, includeTurns: true });
+      const active = [...(thread?.turns ?? [])].reverse().find((turn) => isRecord(turn)
+        && (turn.status === "inProgress" || turn.status === "in_progress" || turn.status === "running"));
+      if (isRecord(active) && typeof active.id === "string") turnId = active.id;
+      else if (thread !== undefined && normalizeCodexStatus(thread.status) === "idle") return;
+      else throw new ProviderAdapterError(this.providerId, "INTERRUPTION_UNCONFIRMED", "Codex could not identify the active turn to interrupt. Refresh the task and try Stop again.", true);
+    }
+    const locallyTracked = this.#currentTurns.get(providerSessionId) === turnId;
     await this.request("turn/interrupt", { threadId: providerSessionId, turnId });
+    const deadline = Date.now() + Math.min(this.#requestTimeoutMs, 15_000);
+    do {
+      if (locallyTracked && !this.#currentTurns.has(providerSessionId)) return;
+      const { thread } = await this.request<ThreadResponse>("thread/read", { threadId: providerSessionId, includeTurns: true });
+      const turn = thread?.turns?.find((entry) => isRecord(entry) && entry.id === turnId);
+      if (isRecord(turn) && (turn.status === "interrupted" || turn.status === "completed" || turn.status === "failed")
+        || !isRecord(turn) && thread !== undefined && normalizeCodexStatus(thread.status) === "idle") {
+        await this.handleNotification("turn/completed", { threadId: providerSessionId, turn: { id: turnId, status: "interrupted" } });
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } while (Date.now() < deadline);
+    throw new ProviderAdapterError(this.providerId, "INTERRUPTION_UNCONFIRMED", "Codex has not confirmed that the task stopped. Try Stop again.", true);
   }
 
   public async subscribe(providerSessionId: string | null, sink: ProviderEventSink): Promise<Subscription> {
@@ -1342,8 +1380,27 @@ export class CodexAdapter implements AgentProviderAdapter {
     }
   }
 
+  public async getSessionPermissions(providerSessionId: string): Promise<ProviderSessionPermissions> {
+    if (this.#visionThreads.has(providerSessionId)) return { controls: [], note: "Private helper permissions are fixed." };
+    const native = await this.request("thread/resume", { threadId: providerSessionId, excludeTurns: true });
+    const requirements = await this.request("configRequirements/read");
+    return await this.#sessionPermissions.describe(providerSessionId, native, requirements);
+  }
+
+  public async setSessionPermission(providerSessionId: string, controlId: string, value: string): Promise<ProviderSessionPermissions> {
+    const available = await this.getSessionPermissions(providerSessionId);
+    await this.#sessionPermissions.set(providerSessionId, controlId, value, available);
+    return await this.getSessionPermissions(providerSessionId);
+  }
+
   public async respondToUserInput(response: ProviderUserInputResponse): Promise<void> {
     const pending = this.#pendingServerRequests.get(response.providerRequestId);
+    if (pending?.method.includes("elicitation/request")) {
+      const result = elicitationResponse(pending.params ?? {}, response.answers);
+      this.#pendingServerRequests.delete(response.providerRequestId);
+      pending.resolve({ ...result, _meta: null });
+      return;
+    }
     if (pending === undefined || !pending.method.includes("requestUserInput")) throw new ProviderAdapterError(this.providerId, "INPUT_REQUEST_NOT_FOUND", "Codex input request is stale or unknown", false);
     this.#pendingServerRequests.delete(response.providerRequestId);
     pending.resolve({ answers: codexAnswersFromUserResponse(response.answers) });
@@ -1564,8 +1621,14 @@ export class CodexAdapter implements AgentProviderAdapter {
     this.cancelIdleRelease();
     this.#ownedThreads.clear();
     this.#currentTurns.clear();
-    for (const pending of this.#pendingServerRequests.values()) pending.reject(error);
+    const pendingRequests = [...this.#pendingServerRequests];
     this.#pendingServerRequests.clear();
+    for (const [, pending] of pendingRequests) pending.reject(error);
+    for (const [requestId, pending] of pendingRequests) {
+      if (!pending.method.includes("requestUserInput") && !pending.method.includes("elicitation/request")) continue;
+      await this.emit({ type: "user_input.resolved", providerSessionId: pending.providerSessionId,
+        payload: { providerRequestId: requestId, reason: "cancelled" } });
+    }
     for (const providerSessionId of interruptedSessionIds) {
       const reconciled = await this.#activity?.reconcile([{ providerSessionId, nativeState: "unknown" }]);
       await this.emitSessionState(providerSessionId, reconciled?.get(providerSessionId) ?? "unknown");
@@ -1663,7 +1726,9 @@ export class CodexAdapter implements AgentProviderAdapter {
     if (method.includes("requestUserInput") || method.includes("elicitation/request")) {
       return await new Promise<unknown>((resolve, reject) => {
         this.#pendingServerRequests.set(requestId, { method, providerSessionId, params: source, resolve, reject });
-        const enriched = userInputRequestPayload(source);
+        const enriched = method.includes("elicitation/request")
+          ? jsonObject({ ...source, kind: "elicitation", title: source.serverName ?? "Question", prompt: source.message })
+          : userInputRequestPayload(source);
         void this.emit({ type: "user_input.requested", providerSessionId, payload: { providerRequestId: requestId, request: enriched } });
       });
     }
@@ -1729,6 +1794,13 @@ export class CodexAdapter implements AgentProviderAdapter {
       // Missing identity is likewise insufficient once a concrete turn is live.
       if (currentTurnId !== undefined && turnId !== currentTurnId) return;
       this.#currentTurns.delete(providerSessionId);
+      for (const [requestId, pending] of this.#pendingServerRequests) {
+        if (pending.providerSessionId !== providerSessionId || (typeof pending.params?.turnId === "string" && pending.params.turnId !== turnId)) continue;
+        if (!pending.method.includes("requestUserInput") && !pending.method.includes("elicitation/request")) continue;
+        this.#pendingServerRequests.delete(requestId);
+        pending.resolve(pending.method.includes("elicitation/request") ? { action: "cancel", content: null, _meta: null } : { answers: {} });
+        await this.emit({ type: "user_input.resolved", providerSessionId, payload: { providerRequestId: requestId, reason: "cancelled" } });
+      }
     }
 
     // Manual compaction has its own bridge lifecycle. Its native turn must not

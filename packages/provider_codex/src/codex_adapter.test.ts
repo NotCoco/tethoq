@@ -90,6 +90,42 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+test("Codex Stop recovers an untracked active turn and verifies that it ended", async (t) => {
+  const transport = new FakeTransport();
+  transport.methodResponses.set("thread/read", [
+    { result: { thread: { id: "reconnected", status: { type: "active" }, turns: [{ id: "live-turn", status: "inProgress" }] } } },
+    { result: { thread: { id: "reconnected", status: { type: "idle" }, turns: [{ id: "live-turn", status: "interrupted" }] } } },
+  ]);
+  const adapter = new CodexAdapter({ hostId: "stop-reconnected", transportFactory: () => transport });
+  t.after(() => adapter.dispose());
+  await adapter.interrupt("reconnected");
+  const cancellation = transport.sent.find((value) => typeof value === "object" && value !== null && "method" in value && value.method === "turn/interrupt") as { params: unknown };
+  assert.deepEqual(cancellation.params, { threadId: "reconnected", turnId: "live-turn" });
+  assert.equal(adapter.hasActiveTurn("reconnected"), false);
+});
+
+test("Codex Stop accepts a verified idle task but does not mistake unknown activity for idle", async (t) => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("thread/read", { thread: { id: "idle", status: { type: "idle" }, turns: [] } });
+  const adapter = new CodexAdapter({ hostId: "stop-idle", transportFactory: () => transport });
+  t.after(() => adapter.dispose());
+  await adapter.interrupt("idle");
+  transport.methodResults.set("thread/read", { thread: { id: "unknown", status: { type: "active" }, turns: [] } });
+  await assert.rejects(adapter.interrupt("unknown"), /could not identify the active turn/);
+  assert.equal(transport.sent.some((value) => typeof value === "object" && value !== null && "method" in value && value.method === "turn/interrupt"), false);
+});
+
+test("Codex Stop does not report success when cancellation is accepted but the turn keeps running", async (t) => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("turn/start", { turn: { id: "still-live" } });
+  transport.methodResults.set("thread/read", { thread: { id: "thread", status: { type: "active" }, turns: [{ id: "still-live", status: "inProgress" }] } });
+  const adapter = new CodexAdapter({ hostId: "stop-unconfirmed", requestTimeoutMs: 20, transportFactory: () => transport });
+  t.after(() => adapter.dispose());
+  await adapter.sendMessage("thread", { requestId: "send", content: "Work" });
+  await assert.rejects(adapter.interrupt("thread"), /has not confirmed/);
+  assert.equal(adapter.hasActiveTurn("thread"), true);
+});
+
 async function fileExists(path: string): Promise<boolean> {
   try {
     return (await stat(path)).isFile();
@@ -115,6 +151,117 @@ async function adapterWithPeer(options: { readonly isolatedVisionRuntime?: boole
   await adapter.getAuthStatus();
   return { adapter, transport, events };
 }
+
+for (const mode of ["form", "openai/form", "openaiForm"] as const) {
+  test(`Codex ${mode} MCP elicitation returns typed native content and retains invalid submissions`, async (t) => {
+    const { adapter, transport, events } = await adapterWithPeer();
+    t.after(() => adapter.dispose());
+    const requestId = `elicitation-${mode}`;
+    transport.push({ id: requestId, method: "mcpServer/elicitation/request", params: {
+      threadId: "form-task", turnId: "form-turn", serverName: "Workspace", mode, _meta: null,
+      message: "Choose the validation settings",
+      requestedSchema: { type: "object", properties: {
+        name: { type: "string", title: "Name", minLength: 2 },
+        count: { type: "integer", minimum: 1, maximum: 5 },
+        enabled: { type: "boolean" },
+        checks: { type: "array", items: { type: "string", enum: ["tests", "build"] } },
+      }, required: ["name", "count", "enabled"] },
+    } });
+    await delay(10);
+    const requested = events.find((event) => event.type === "user_input.requested");
+    assert.equal(requested?.providerSessionId, "form-task");
+    assert.equal((requested?.payload.request as Record<string, unknown>).kind, "elicitation");
+    await assert.rejects(adapter.respondToUserInput({ providerRequestId: requestId, answers: { action: "accept", content: { name: "QA" } } }), /required/);
+    await assert.rejects(adapter.respondToUserInput({ providerRequestId: requestId, answers: { action: "accept", content: { name: "QA", count: 1.5, enabled: true } } }), /invalid/);
+    assert.equal(sentResult(transport, requestId), undefined);
+    await adapter.respondToUserInput({ providerRequestId: requestId, answers: { action: "accept", content: { name: "QA", count: 3, enabled: false, checks: ["build", "tests"], extra: "omitted" } } });
+    await delay(10);
+    assert.deepEqual(JSON.parse(JSON.stringify(sentResult(transport, requestId))), {
+      action: "accept", content: { name: "QA", count: 3, enabled: false, checks: ["build", "tests"] }, _meta: null,
+    });
+    await assert.rejects(adapter.respondToUserInput({ providerRequestId: requestId, answers: { action: "cancel" } }), /stale/);
+  });
+}
+
+test("Codex URL elicitation returns native accept, decline, and cancel without fabricated content", async (t) => {
+  const { adapter, transport } = await adapterWithPeer();
+  t.after(() => adapter.dispose());
+  for (const action of ["accept", "decline", "cancel"] as const) {
+    const requestId = `url-${action}`;
+    transport.push({ id: requestId, method: "mcpServer/elicitation/request", params: {
+      threadId: "url-task", turnId: null, serverName: "Workspace", mode: "url", _meta: null,
+      message: "Connect the service", url: "https://example.invalid/connect", elicitationId: "elicitation-native",
+    } });
+    await delay(10);
+    await adapter.respondToUserInput({ providerRequestId: requestId, answers: { action } });
+    await delay(10);
+    assert.deepEqual(sentResult(transport, requestId), { action, content: null, _meta: null });
+  }
+});
+
+test("Codex terminal events cancel only the completed task's turn-scoped elicitation", async (t) => {
+  const { adapter, transport, events } = await adapterWithPeer();
+  t.after(() => adapter.dispose());
+  for (const taskId of ["stopped-task", "other-task"]) {
+    transport.push({ method: "turn/started", params: { threadId: taskId, turn: { id: `${taskId}-turn` } } });
+    transport.push({ id: `${taskId}-input`, method: "mcpServer/elicitation/request", params: {
+      threadId: taskId, turnId: `${taskId}-turn`, serverName: "Workspace", mode: "form", _meta: null,
+      message: "Enter a label", requestedSchema: { type: "object", properties: { label: { type: "string" } }, required: ["label"] },
+    } });
+  }
+  await delay(10);
+  transport.push({ method: "turn/completed", params: { threadId: "stopped-task", turn: { id: "stopped-task-turn", status: "interrupted" } } });
+  await delay(15);
+  assert.deepEqual(sentResult(transport, "stopped-task-input"), { action: "cancel", content: null, _meta: null });
+  assert.equal(sentResult(transport, "other-task-input"), undefined);
+  assert.ok(events.some((event) => event.type === "user_input.resolved" && event.payload.providerRequestId === "stopped-task-input" && event.payload.reason === "cancelled"));
+  await assert.rejects(adapter.respondToUserInput({ providerRequestId: "stopped-task-input", answers: { action: "accept", content: { label: "late" } } }), /stale/);
+  await adapter.respondToUserInput({ providerRequestId: "other-task-input", answers: { action: "accept", content: { label: "still active" } } });
+  await delay(10);
+  assert.deepEqual(JSON.parse(JSON.stringify(sentResult(transport, "other-task-input"))), { action: "accept", content: { label: "still active" }, _meta: null });
+});
+
+test("Codex task permission overrides affect selected ordinary turns and preserve private helper isolation", async (t) => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("thread/resume", { approvalPolicy: "on-request", sandbox: { type: "workspaceWrite" } });
+  transport.methodResults.set("configRequirements/read", { requirements: null });
+  transport.methodResults.set("thread/start", { thread: { id: "no-client-tools", createdAt: 1, updatedAt: 1 } });
+  transport.methodResults.set("turn/start", { turn: { id: "test-turn" } });
+  const adapter = new CodexAdapter({ hostId: "permission-test", transportFactory: () => transport });
+  t.after(() => adapter.dispose());
+  await adapter.setSessionPermission("selected", "approvalPolicy", "never");
+  await adapter.setSessionPermission("selected", "sandbox", "read-only");
+  await adapter.createSession({ workingDirectory: "C:\\fixture", clientTools: "none" });
+  await adapter.setSessionPermission("no-client-tools", "sandbox", "workspace-write");
+  await adapter.sendMessage("selected", { requestId: "selected-user", content: "Inspect" });
+  await adapter.sendMessage("other", { requestId: "ordinary-user", content: "Inspect" });
+  await adapter.sendMessage("selected", { requestId: "helper-vision", content: "Inspect image", metadata: { internalPurpose: "vision_proxy" } });
+  await adapter.sendMessage("selected", { requestId: "helper-ears", content: "Listen", metadata: { internalPurpose: "ears" } });
+  await adapter.sendMessage("no-client-tools", { requestId: "without-client-tools", content: "Inspect" });
+  const starts = transport.sent.filter((value): value is { method: string; params: Record<string, unknown> } =>
+    typeof value === "object" && value !== null && "method" in value && value.method === "turn/start");
+  assert.equal(starts.length, 5);
+  assert.equal(starts[0]?.params.approvalPolicy, "never");
+  assert.deepEqual(starts[0]?.params.sandboxPolicy, { type: "readOnly", networkAccess: false });
+  for (const index of [1, 2, 3]) {
+    assert.equal("approvalPolicy" in starts[index]!.params, false);
+    assert.equal("sandboxPolicy" in starts[index]!.params, false);
+  }
+  assert.deepEqual(starts[4]?.params.sandboxPolicy, { type: "workspaceWrite", writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false });
+  assert.equal(transport.sent.some((value) => typeof value === "object" && value !== null && "method" in value && /config.*write/iu.test(String(value.method))), false);
+});
+
+test("Codex checks changed native requirements before a selected task reaches turn/start", async (t) => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("thread/resume", { approvalPolicy: "on-request", sandbox: { type: "workspaceWrite" } });
+  transport.methodResults.set("configRequirements/read", { requirements: null });
+  const adapter = new CodexAdapter({ hostId: "restricted-permission-test", transportFactory: () => transport });
+  t.after(() => adapter.dispose());
+  await adapter.setSessionPermission("selected", "sandbox", "danger-full-access");
+  transport.methodResults.set("configRequirements/read", { requirements: { allowedSandboxModes: ["read-only"] } });
+  await assert.rejects(adapter.sendMessage("selected", { requestId: "blocked-by-requirements", content: "Inspect" }), /no longer allow/);
+  assert.equal(transport.sent.some((value) => typeof value === "object" && value !== null && "method" in value && value.method === "turn/start"), false);
+});
 
 test("Codex advertises the native desktop queue only when synchronization is configured", () => {
   const standard = new CodexAdapter({ hostId: "host_queue_default", transportFactory: () => new FakeTransport() });
@@ -2447,6 +2594,25 @@ test("Codex pages older rollout history twice without starting a complete histor
   assert.equal(adapter.fullHistoryReads, 1);
 });
 
+test("Codex reads an empty local rollout without requesting unsupported native turns", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "tethoq-codex-empty-side-chat-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const rollout = join(directory, "rollout.jsonl");
+  await writeFile(rollout, `${JSON.stringify({ type: "session_meta", payload: { id: "empty-thread", cwd: directory } })}\n`, "utf8");
+  const transport = new FakeTransport();
+  transport.methodResults.set("thread/list", {
+    data: [{ id: "empty-thread", preview: "Empty task", cwd: directory, path: rollout, createdAt: 1, updatedAt: 1, status: { type: "idle" } }],
+    nextCursor: null,
+  });
+  transport.methodResponses.set("thread/read", [{ error: { code: -32603, message: "list_turns is not supported yet" } }]);
+  const adapter = new CodexAdapter({ hostId: "empty-codex", transportFactory: () => transport, localActivity: { codexHome: directory } });
+  t.after(() => adapter.dispose());
+  await adapter.listSessions();
+  assert.deepEqual(await adapter.getMessages("empty-thread"), []);
+  assert.equal(transport.sent.some((message) => typeof message === "object" && message !== null
+    && (message as Record<string, unknown>).method === "thread/read"), false);
+});
+
 test("Codex hydrates a persisted task path before considering complete App Server history", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "uar-codex-persisted-path-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -2932,6 +3098,25 @@ test("an unexpected App Server exit clears active task state instead of leaving 
     .map((event) => event.payload.state), ["working", "unknown"]);
   assert.equal(events.some((event) => event.type === "provider.disconnected"), true);
   await adapter.dispose();
+});
+
+test("Codex disconnect retires native questions and forms without a locally owned turn", async (t) => {
+  const { adapter, transport, events } = await adapterWithPeer();
+  t.after(() => adapter.dispose());
+  transport.push({ id: "external-question", method: "item/tool/requestUserInput", params: {
+    threadId: "external-task", turnId: "external-turn", questions: [{ id: "choice", header: "Storage", question: "Where?", options: [{ label: "Local", description: "This device" }] }],
+  } });
+  transport.push({ id: "external-form", method: "mcpServer/elicitation/request", params: {
+    threadId: "form-task", serverName: "Workspace", mode: "form", message: "Choose a name", requestedSchema: { type: "object", properties: { name: { type: "string" } } },
+  } });
+  await delay(15);
+  assert.equal(events.filter((event) => event.type === "user_input.requested").length, 2);
+  transport.crash(new Error("Native connection closed"));
+  await delay(15);
+  assert.deepEqual(events.filter((event) => event.type === "user_input.resolved").map((event) => event.payload.providerRequestId).sort(), ["external-form", "external-question"]);
+  assert.equal(events.some((event) => event.type === "agent.completed" || event.type === "agent.interrupted"), false);
+  await assert.rejects(adapter.respondToUserInput({ providerRequestId: "external-question", answers: { choice: ["Local"] } }), /stale/);
+  await assert.rejects(adapter.respondToUserInput({ providerRequestId: "external-form", answers: { action: "cancel" } }), /stale/);
 });
 
 test("a stale completion cannot retire a newer owned Codex turn", async () => {

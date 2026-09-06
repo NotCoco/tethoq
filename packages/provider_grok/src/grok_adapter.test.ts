@@ -13,14 +13,17 @@ import {
 
 class FakeTransport implements JsonRpcTransport {
   readonly listeners = new Set<(message: unknown) => void>();
+  readonly closeListeners = new Set<(error: Error) => void>();
   readonly methodResults = new Map<string, unknown>();
   readonly notificationsBeforeResult = new Map<string, readonly unknown[]>();
   readonly blockedMethods = new Set<string>();
   readonly rejectedMethods = new Map<string, Error>();
   readonly sent: unknown[] = [];
   public closeCalls = 0;
+  public transportError: Error | undefined;
 
   public async send(message: unknown): Promise<void> {
+    if (this.transportError !== undefined) throw this.transportError;
     this.sent.push(message);
     if (typeof message !== "object" || message === null) return;
     const record = message as Record<string, unknown>;
@@ -38,7 +41,17 @@ class FakeTransport implements JsonRpcTransport {
     return () => this.listeners.delete(listener);
   }
 
+  public onClose(listener: (error: Error) => void): () => void {
+    this.closeListeners.add(listener);
+    return () => this.closeListeners.delete(listener);
+  }
+
   public async close(): Promise<void> { this.closeCalls += 1; }
+
+  public crash(error = new Error("Grok transport disconnected")): void {
+    this.transportError = error;
+    for (const listener of [...this.closeListeners]) listener(error);
+  }
 
   public push(message: unknown): void {
     for (const listener of [...this.listeners]) listener(message);
@@ -62,6 +75,273 @@ async function waitForSentMethodCount(transport: FakeTransport, method: string, 
     await delay(1);
   }
 }
+
+function interactionResult(transport: FakeTransport, id: string): unknown {
+  const response = transport.sent.find((value): value is { id: string; result: unknown } =>
+    typeof value === "object" && value !== null && "id" in value && value.id === id && "result" in value);
+  return response === undefined ? undefined : JSON.parse(JSON.stringify(response.result));
+}
+
+for (const method of ["x.ai/ask_user_question", "_x.ai/ask_user_question"]) {
+  test(`Grok ${method} returns native question-keyed answers, multiSelect arrays, and Other annotations`, async (t) => {
+    const transport = new FakeTransport();
+    transport.methodResults.set("initialize", { protocolVersion: 1, agentCapabilities: {} });
+    const events: ProviderEvent[] = [];
+    const adapter = new GrokProviderAdapter({ hostId: "grok-question-test", transportFactory: () => transport });
+    t.after(() => adapter.dispose());
+    await adapter.subscribe(null, (event) => { events.push(event); });
+    const questions = [
+      { question: "Which database?", options: [{ label: "Redis", description: "Cache", preview: "Redis preview" }, { label: "Postgres", description: "Database" }] },
+      { question: "Which storage?", options: [{ label: "Local", description: "Local files" }] },
+      { question: "Which checks?", multiSelect: true, options: [{ label: "Tests", description: "Run tests" }, { label: "Build", description: "Compile" }] },
+      { question: "Which extra checks?", multiSelect: true, options: [{ label: "Lint", description: "Lint", preview: "must not be sent for multiSelect" }] },
+    ];
+    transport.push({ id: "question-rpc", method, params: { sessionId: "question-task", toolCallId: "question-tool", mode: "default", questions } });
+    await delay(10);
+    const request = events.find((event) => event.type === "user_input.requested");
+    assert.equal(request?.providerSessionId, "question-task");
+    const renderedQuestions = (request?.payload.request as Record<string, unknown>).questions as Record<string, unknown>[];
+    assert.deepEqual(renderedQuestions.map((entry) => entry.id), ["question_0", "question_1", "question_2", "question_3"]);
+    assert.equal(renderedQuestions[2]?.multiSelect, true);
+    await assert.rejects(adapter.respondToUserInput({ providerRequestId: "question-rpc", answers: { question_0: "Redis" } }), /every question/);
+    assert.equal(interactionResult(transport, "question-rpc"), undefined);
+    await adapter.respondToUserInput({ providerRequestId: "question-rpc", answers: {
+      question_3: ["Lint"], question_2: ["Build", "Tests"], question_1: "Use cloud storage", question_0: { answers: ["Redis"] },
+    } });
+    await delay(10);
+    assert.deepEqual(interactionResult(transport, "question-rpc"), {
+      outcome: "accepted",
+      answers: { "Which database?": ["Redis"], "Which storage?": ["Other"], "Which checks?": ["Build", "Tests"], "Which extra checks?": ["Lint"] },
+      annotations: { "Which database?": { preview: "Redis preview" }, "Which storage?": { notes: "Use cloud storage" } },
+    });
+    assert.ok(events.some((event) => event.type === "user_input.resolved" && event.payload.providerRequestId === "question-rpc"));
+    await assert.rejects(adapter.respondToUserInput({ providerRequestId: "question-rpc", answers: { question_0: "Redis" } }), /no longer/);
+  });
+}
+
+test("Grok interaction_resolved uses native snake_case identity and preserves another task's question", async (t) => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("initialize", { protocolVersion: 1, agentCapabilities: {} });
+  const events: ProviderEvent[] = [];
+  const adapter = new GrokProviderAdapter({ hostId: "grok-external-answer", transportFactory: () => transport });
+  t.after(() => adapter.dispose());
+  await adapter.subscribe(null, (event) => { events.push(event); });
+  for (const sessionId of ["resolved-task", "other-task"]) {
+    transport.push({ id: `${sessionId}-input`, method: "x.ai/ask_user_question", params: {
+      sessionId, toolCallId: "same-tool-id", mode: "default", questions: [{ question: "Which option?", options: [{ label: "Yes", description: "Proceed" }] }],
+    } });
+  }
+  await delay(10);
+  transport.push({ method: "x.ai/session_notification", params: { sessionId: "resolved-task", update: { sessionUpdate: "interaction_resolved", tool_call_id: "wrong-tool" } } });
+  await delay(10);
+  assert.equal(events.some((event) => event.type === "user_input.resolved"), false);
+  transport.push({ method: "_x.ai/session_notification", params: { sessionId: "resolved-task", update: { sessionUpdate: "interaction_resolved", tool_call_id: "same-tool-id" } } });
+  await delay(10);
+  assert.deepEqual(interactionResult(transport, "resolved-task-input"), { outcome: "cancelled" });
+  assert.equal(interactionResult(transport, "other-task-input"), undefined);
+  assert.deepEqual(events.filter((event) => event.type === "user_input.resolved").map((event) => event.payload), [{ providerRequestId: "resolved-task-input", reason: "cancelled" }]);
+  await assert.rejects(adapter.respondToUserInput({ providerRequestId: "resolved-task-input", answers: { question_0: "Yes" } }), /no longer/);
+  await adapter.respondToUserInput({ providerRequestId: "other-task-input", answers: { question_0: "Yes" } });
+});
+
+test("Grok transport disconnect retires native questions and forms without a local prompt", async (t) => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("initialize", { protocolVersion: 1, agentCapabilities: {} });
+  const events: ProviderEvent[] = [];
+  const adapter = new GrokProviderAdapter({ hostId: "question-disconnect-test", transportFactory: () => transport });
+  t.after(() => adapter.dispose());
+  await adapter.subscribe(null, (event) => { events.push(event); });
+  transport.push({ id: "native-question", method: "x.ai/ask_user_question", params: {
+    sessionId: "native-task", toolCallId: "question-tool", mode: "default", questions: [{ question: "Continue?", options: [{ label: "Yes", description: "Continue" }] }],
+  } });
+  transport.push({ id: "native-form", method: "x.ai/mcp/elicit", params: {
+    sessionId: "form-task", toolCallId: "form-tool", mode: "form", serverName: "Workspace", message: "Enter a label",
+    requestedSchema: { type: "object", properties: { label: { type: "string" } }, required: ["label"] },
+  } });
+  await delay(10);
+  assert.equal(events.filter((event) => event.type === "user_input.requested").length, 2);
+  transport.crash();
+  await delay(10);
+  assert.deepEqual(events.filter((event) => event.type === "user_input.resolved").map((event) => ({ sessionId: event.providerSessionId, ...event.payload })), [
+    { sessionId: "native-task", providerRequestId: "native-question", reason: "cancelled" },
+    { sessionId: "form-task", providerRequestId: "native-form", reason: "cancelled" },
+  ]);
+  await assert.rejects(adapter.respondToUserInput({ providerRequestId: "native-question", answers: { question_0: "Yes" } }), /no longer/);
+  await assert.rejects(adapter.respondToUserInput({ providerRequestId: "native-form", answers: { action: "accept", content: { label: "QA" } } }), /no longer/);
+  assert.ok(events.some((event) => event.type === "provider.disconnected" && event.payload.source === "transport_closed"));
+  assert.equal(events.some((event) => event.type === "agent.completed" || event.type === "agent.interrupted"), false);
+});
+
+test("Grok transport disconnect retires questions when an active tool defers the prompt terminal", async (t) => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("initialize", { protocolVersion: 1, agentCapabilities: {} });
+  transport.methodResults.set("session/new", { sessionId: "deferred-question" });
+  transport.blockedMethods.add("session/prompt");
+  const events: ProviderEvent[] = [];
+  const adapter = new GrokProviderAdapter({ hostId: "deferred-disconnect-test", transportFactory: () => transport });
+  t.after(() => adapter.dispose());
+  await adapter.subscribe(null, (event) => { events.push(event); });
+  await adapter.createSession({ workingDirectory: "C:\\fixture" });
+  await adapter.sendMessage("deferred-question", { requestId: "prompt", content: "Inspect" });
+  await waitForSentMethod(transport, "session/prompt");
+  transport.push({ method: "session/update", params: { sessionId: "deferred-question", update: {
+    sessionUpdate: "tool_call", toolCallId: "pending-tool", title: "Question", status: "in_progress",
+  } } });
+  transport.push({ id: "deferred-input", method: "x.ai/ask_user_question", params: {
+    sessionId: "deferred-question", toolCallId: "pending-tool", mode: "default", questions: [{ question: "Continue?", options: [{ label: "Yes", description: "Continue" }] }],
+  } });
+  await delay(10);
+  assert.ok(events.some((event) => event.type === "user_input.requested"));
+  transport.crash();
+  await delay(10);
+  assert.deepEqual(events.filter((event) => event.type === "user_input.resolved").map((event) => event.payload), [
+    { providerRequestId: "deferred-input", reason: "cancelled" },
+  ]);
+  await assert.rejects(adapter.respondToUserInput({ providerRequestId: "deferred-input", answers: { question_0: "Yes" } }), /no longer/);
+  assert.ok(events.some((event) => event.type === "provider.disconnected" && event.payload.source === "transport_closed"));
+  assert.equal(events.some((event) => event.type === "agent.completed" || event.type === "agent.interrupted" || event.type === "agent.error"), false,
+    "request cleanup must not invent a terminal event while native work owns the session");
+});
+
+test("Grok intentional idle release stays silent and late close callbacks preserve newer questions", async (t) => {
+  const transports: FakeTransport[] = [];
+  const events: ProviderEvent[] = [];
+  const adapter = new GrokProviderAdapter({
+    hostId: "question-idle-release-test", idleReleaseMs: 5,
+    transportFactory: () => {
+      const transport = new FakeTransport();
+      transport.methodResults.set("initialize", { protocolVersion: 1, agentCapabilities: {} });
+      transports.push(transport);
+      return transport;
+    },
+  });
+  t.after(() => adapter.dispose());
+  await adapter.subscribe(null, (event) => { events.push(event); });
+  const oldTransport = transports[0]!;
+  const lateCloseCallbacks = [...oldTransport.closeListeners];
+  await adapter.releaseIdleResources();
+  await delay(15);
+  assert.equal(oldTransport.closeCalls, 1);
+  assert.equal(events.some((event) => event.type === "provider.disconnected"), false);
+
+  await adapter.subscribe(null, () => undefined);
+  const newTransport = transports[1]!;
+  assert.ok(newTransport, "the next use must initialize a fresh peer");
+  newTransport.push({ id: "new-question", method: "x.ai/ask_user_question", params: {
+    sessionId: "new-task", toolCallId: "new-tool", mode: "default", questions: [{ question: "Continue?", options: [{ label: "Yes", description: "Continue" }] }],
+  } });
+  await delay(10);
+  assert.ok(events.some((event) => event.type === "user_input.requested"));
+  for (const callback of lateCloseCallbacks) callback(new Error("Old process closed after idle release"));
+  await delay(10);
+  assert.equal(events.some((event) => event.type === "provider.disconnected" || event.type === "user_input.resolved"), false);
+  await adapter.respondToUserInput({ providerRequestId: "new-question", answers: { question_0: "Yes" } });
+  await delay(10);
+  assert.deepEqual(interactionResult(newTransport, "new-question"), { outcome: "accepted", answers: { "Continue?": ["Yes"] }, annotations: {} });
+  await adapter.dispose();
+  assert.equal(newTransport.closeCalls, 1);
+  assert.equal(events.some((event) => event.type === "provider.disconnected"), false);
+});
+
+for (const stopReason of ["cancelled", "end_turn"] as const) {
+  test(`Grok ${stopReason} retires pending questions after confirmed native termination`, async (t) => {
+    const transport = new FakeTransport();
+    transport.methodResults.set("initialize", { protocolVersion: 1, agentCapabilities: {} });
+    transport.methodResults.set("session/new", { sessionId: "terminal-question" });
+    transport.blockedMethods.add("session/prompt");
+    const events: ProviderEvent[] = [];
+    const adapter = new GrokProviderAdapter({ hostId: "question-stop-test", transportFactory: () => transport });
+    t.after(() => adapter.dispose());
+    await adapter.subscribe(null, (event) => { events.push(event); });
+    await adapter.createSession({ workingDirectory: "C:\\fixture" });
+    await adapter.sendMessage("terminal-question", { requestId: "prompt", content: "Inspect" });
+    const prompt = await waitForSentMethod(transport, "session/prompt");
+    transport.push({ id: "pending-question", method: "x.ai/ask_user_question", params: {
+      sessionId: "terminal-question", toolCallId: "pending-tool", mode: "default", questions: [{ question: "Continue?", options: [{ label: "Yes", description: "Continue" }] }],
+    } });
+    await delay(10);
+    const stopping = stopReason === "cancelled" ? adapter.interrupt("terminal-question") : undefined;
+    if (stopping !== undefined) await waitForSentMethod(transport, "session/cancel");
+    assert.equal(interactionResult(transport, "pending-question"), undefined, "a visual Stop must not invent provider termination");
+    transport.push({ id: prompt.id, result: { stopReason } });
+    await stopping;
+    await delay(15);
+    assert.deepEqual(interactionResult(transport, "pending-question"), { outcome: "cancelled" });
+    assert.equal(adapter.hasActiveTurn("terminal-question"), false);
+    assert.ok(events.some((event) => event.type === "user_input.resolved" && event.payload.providerRequestId === "pending-question"));
+  });
+}
+
+for (const method of ["x.ai/mcp/elicit", "_x.ai/mcp/elicit"]) {
+  test(`Grok ${method} uses native outcome/content for structured MCP forms`, async (t) => {
+    const transport = new FakeTransport();
+    transport.methodResults.set("initialize", { protocolVersion: 1, agentCapabilities: {} });
+    const events: ProviderEvent[] = [];
+    const adapter = new GrokProviderAdapter({ hostId: "grok-mcp-test", transportFactory: () => transport });
+    t.after(() => adapter.dispose());
+    await adapter.subscribe(null, (event) => { events.push(event); });
+    transport.push({ id: "mcp-form", method, params: {
+      sessionId: "mcp-task", toolCallId: "mcp-tool", mode: "form", serverName: "Workspace", message: "Enter a label",
+      requestedSchema: { type: "object", properties: { label: { type: "string" }, enabled: { type: "boolean" } }, required: ["label", "enabled"] },
+    } });
+    await delay(10);
+    assert.equal((events.find((event) => event.type === "user_input.requested")?.payload.request as Record<string, unknown>).kind, "elicitation");
+    await assert.rejects(adapter.respondToUserInput({ providerRequestId: "mcp-form", answers: { action: "accept", content: { label: "QA" } } }), /required/);
+    assert.equal(interactionResult(transport, "mcp-form"), undefined);
+    await adapter.respondToUserInput({ providerRequestId: "mcp-form", answers: { action: "accept", content: { label: "QA", enabled: false } } });
+    await delay(10);
+    assert.deepEqual(interactionResult(transport, "mcp-form"), { outcome: "accept", content: { label: "QA", enabled: false } });
+    transport.push({ id: "mcp-decline", method, params: { sessionId: "mcp-task", toolCallId: "mcp-url", serverName: "Workspace", mode: "url", message: "Connect", url: "https://example.invalid", elicitationId: "native-elicit" } });
+    await delay(10);
+    await adapter.respondToUserInput({ providerRequestId: "mcp-decline", answers: { action: "decline" } });
+    await delay(10);
+    assert.deepEqual(interactionResult(transport, "mcp-decline"), { outcome: "decline" });
+  });
+}
+
+test("ACP permission controls expose only advertised choices and require native config confirmation", async (t) => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("initialize", { protocolVersion: 1, agentCapabilities: {} });
+  const config = (currentValue: string) => [{
+    id: "permissions", name: "Tool permissions", category: "permission", type: "select", currentValue,
+    options: [{ group: "Access", options: [{ value: "ask", name: "Ask each time", description: "Confirm tools" }, { value: "allow", name: "Allow tools" }] }],
+  }, { id: "model", name: "Model", category: "model", type: "select", currentValue: "model-a", options: [{ value: "model-a" }] }];
+  transport.methodResults.set("session/new", { sessionId: "config-task", configOptions: config("ask") });
+  const adapter = createPublicAcpProviderAdapter("qwen", { hostId: "permission-config-test", transportFactory: () => transport });
+  t.after(() => adapter.dispose());
+  await adapter.createSession({ workingDirectory: "C:\\fixture" });
+  const available = await adapter.getSessionPermissions("config-task");
+  assert.deepEqual(available.controls.map((control) => control.id), ["permissions"]);
+  assert.deepEqual(available.controls[0]?.options, [{ value: "ask", label: "Ask each time", description: "Confirm tools" }, { value: "allow", label: "Allow tools" }]);
+  await assert.rejects(adapter.setSessionPermission("config-task", "permissions", "unadvertised"), /did not offer/);
+  assert.equal(transport.sent.some((value) => typeof value === "object" && value !== null && "method" in value && value.method === "session/set_config_option"), false);
+  await assert.rejects(adapter.setSessionPermission("config-task", "permissions", "allow"), /did not confirm/);
+  assert.equal((await adapter.getSessionPermissions("config-task")).controls[0]?.value, "ask");
+  transport.methodResults.set("session/set_config_option", { configOptions: config("allow") });
+  assert.equal((await adapter.setSessionPermission("config-task", "permissions", "allow")).controls[0]?.value, "allow");
+  const write = transport.sent.find((value): value is { method: string; params: unknown } => typeof value === "object" && value !== null && "method" in value && value.method === "session/set_config_option");
+  assert.deepEqual(write?.params, { sessionId: "config-task", configId: "permissions", value: "allow" });
+  transport.methodResults.set("session/new", { sessionId: "other-config-task", configOptions: config("ask") });
+  await adapter.createSession({ workingDirectory: "C:\\fixture" });
+  assert.equal((await adapter.getSessionPermissions("other-config-task")).controls[0]?.value, "ask");
+});
+
+test("ACP legacy session modes remain selectable only from the harness's advertised mode list", async (t) => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("initialize", { protocolVersion: 1, agentCapabilities: {} });
+  transport.methodResults.set("session/new", { sessionId: "legacy-mode-task", modes: {
+    currentModeId: "default", availableModes: [{ id: "default", name: "Default" }, { id: "plan", name: "Plan", description: "Plan before acting" }],
+  } });
+  const adapter = createPublicAcpProviderAdapter("qwen", { hostId: "legacy-mode-test", transportFactory: () => transport });
+  t.after(() => adapter.dispose());
+  await adapter.createSession({ workingDirectory: "C:\\fixture" });
+  assert.deepEqual((await adapter.getSessionPermissions("legacy-mode-task")).controls[0]?.options, [{ value: "default", label: "Default" }, { value: "plan", label: "Plan", description: "Plan before acting" }]);
+  await assert.rejects(adapter.setSessionPermission("legacy-mode-task", "session_mode", "unsafe"), /did not offer/);
+  const updated = await adapter.setSessionPermission("legacy-mode-task", "session_mode", "plan");
+  assert.equal(updated.controls[0]?.value, "plan");
+  const write = transport.sent.find((value): value is { method: string; params: unknown } => typeof value === "object" && value !== null && "method" in value && value.method === "session/set_mode");
+  assert.deepEqual(write?.params, { sessionId: "legacy-mode-task", modeId: "plan" });
+});
 
 test("ACP releases an idle process, resumes cached sessions, and keeps event subscriptions", async () => {
   const transports: FakeTransport[] = [];
@@ -698,8 +978,12 @@ test("Grok ignores a cancelled prompt's late RPC result and keeps its successor 
 
   await adapter.sendMessage("grok-cancelled-late-result", { requestId: "cancelled", content: "Wait" });
   const firstPrompt = await waitForSentMethod(transport, "session/prompt");
-  await adapter.interrupt("grok-cancelled-late-result");
+  const stopping = adapter.interrupt("grok-cancelled-late-result");
+  await waitForSentMethod(transport, "session/cancel");
+  assert.equal(adapter.hasActiveTurn("grok-cancelled-late-result"), true);
+  assert.equal(events.some((event) => event.type === "agent.interrupted"), false);
   transport.push({ id: firstPrompt.id, result: { stopReason: "cancelled" } });
+  await stopping;
   await delay(20);
   assert.equal(events.filter((event) => event.type === "agent.interrupted").length, 1);
   assert.equal(events.some((event) => event.type === "agent.completed" || event.type === "agent.error"), false);
@@ -715,6 +999,64 @@ test("Grok ignores a cancelled prompt's late RPC result and keeps its successor 
   assert.equal(events.filter((event) => event.type === "agent.error").length, 0);
   assert.equal(adapter.hasActiveTurn("grok-cancelled-late-result"), false);
   await adapter.dispose();
+});
+
+test("Grok Stop waits for a native turn acknowledgement without a local prompt RPC", async (t) => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("initialize", { protocolVersion: 1, agentCapabilities: {} });
+  const events: ProviderEvent[] = [];
+  const adapter = new GrokProviderAdapter({ hostId: "stop-native", transportFactory: () => transport });
+  t.after(() => adapter.dispose());
+  await adapter.subscribe(null, (event) => { events.push(event); });
+  transport.push({ method: "_x.ai/queue/changed", params: { sessionId: "native-session", entries: [], runningPromptId: "native-turn" } });
+  await delay();
+  let settled = false;
+  const stopping = adapter.interrupt("native-session").then(() => { settled = true; });
+  await waitForSentMethod(transport, "session/cancel");
+  await delay();
+  assert.equal(settled, false);
+  assert.equal(adapter.hasActiveTurn("native-session"), true);
+  assert.equal(events.some((event) => event.type === "agent.interrupted"), false);
+  transport.push({ method: "session/update", params: { sessionId: "native-session", update: { sessionUpdate: "turn_completed", promptId: "native-turn", stopReason: "cancelled" } } });
+  await stopping;
+  assert.equal(adapter.hasActiveTurn("native-session"), false);
+  assert.equal(events.filter((event) => event.type === "agent.interrupted").length, 1);
+});
+
+test("Grok Stop does not treat a failed prompt RPC as cancellation confirmation", async (t) => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("initialize", { protocolVersion: 1, agentCapabilities: {} });
+  transport.methodResults.set("session/new", { sessionId: "grok-stop-error" });
+  transport.blockedMethods.add("session/prompt");
+  const events: ProviderEvent[] = [];
+  const adapter = new GrokProviderAdapter({ hostId: "stop-error", transportFactory: () => transport });
+  t.after(() => adapter.dispose());
+  await adapter.subscribe(null, (event) => { events.push(event); });
+  await adapter.createSession({ workingDirectory: "C:\\workspace" });
+  await adapter.sendMessage("grok-stop-error", { requestId: "send", content: "Work" });
+  const prompt = await waitForSentMethod(transport, "session/prompt");
+  const stopping = assert.rejects(adapter.interrupt("grok-stop-error"), /connection lost/);
+  await waitForSentMethod(transport, "session/cancel");
+  transport.push({ id: prompt.id, error: { code: -32000, message: "connection lost" } });
+  await stopping;
+  assert.equal(events.some((event) => event.type === "agent.interrupted"), false);
+  assert.equal(adapter.hasActiveTurn("grok-stop-error"), true);
+});
+
+test("Grok Stop does not report success before an unresponsive prompt confirms cancellation", async (t) => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("initialize", { protocolVersion: 1, agentCapabilities: {} });
+  transport.methodResults.set("session/new", { sessionId: "grok-stop-unconfirmed" });
+  transport.blockedMethods.add("session/prompt");
+  const events: ProviderEvent[] = [];
+  const adapter = new GrokProviderAdapter({ hostId: "stop-unconfirmed", requestTimeoutMs: 20, transportFactory: () => transport });
+  t.after(() => adapter.dispose());
+  await adapter.subscribe(null, (event) => { events.push(event); });
+  await adapter.createSession({ workingDirectory: "C:\\workspace" });
+  await adapter.sendMessage("grok-stop-unconfirmed", { requestId: "send", content: "Keep working" });
+  await assert.rejects(adapter.interrupt("grok-stop-unconfirmed"), /has not confirmed/);
+  assert.equal(adapter.hasActiveTurn("grok-stop-unconfirmed"), true);
+  assert.equal(events.some((event) => event.type === "agent.interrupted"), false);
 });
 
 test("Grok scheduled send fails closed when native history cannot be verified", async () => {
@@ -763,6 +1105,22 @@ test("Grok native queue/changed entries are listed and published to the bridge",
   assert.equal(Array.isArray(published?.payload.messages), true);
   assert.equal((published?.payload.messages as { id: string }[])[0]?.id, "native-q1");
   await adapter.dispose();
+});
+
+test("Grok Stop removes native follow-ups before cancellation so they cannot restart the task", async (t) => {
+  const transport = new FakeTransport();
+  transport.methodResults.set("initialize", { protocolVersion: 1, agentCapabilities: {} });
+  const adapter = new GrokProviderAdapter({ hostId: "stop-queue", transportFactory: () => transport });
+  t.after(() => adapter.dispose());
+  await adapter.subscribe(null, () => undefined);
+  transport.push({ method: "_x.ai/queue/changed", params: { sessionId: "queued-session", entries: [{ id: "follow-up", kind: "prompt", text: "Resume working" }] } });
+  await delay();
+  await adapter.interrupt("queued-session");
+  const methods = transport.sent.flatMap((entry) => typeof entry === "object" && entry !== null && "method" in entry ? [entry.method] : []);
+  assert.ok(methods.indexOf("_x.ai/queue/remove") >= 0);
+  assert.ok(methods.indexOf("_x.ai/queue/remove") < methods.indexOf("session/cancel"));
+  assert.deepEqual(await adapter.listQueuedMessages?.(), []);
+  assert.equal(adapter.hasActiveTurn("queued-session"), false);
 });
 
 test("Grok enqueue uses session/prompt so the CLI owns the follow-up", async () => {
@@ -1341,7 +1699,11 @@ test("Grok interrupt clears unresolved tool ownership without reviving its defer
   await delay(20);
   assert.equal(adapter.hasActiveTurn("grok-interrupted-tool"), true);
 
-  await adapter.interrupt("grok-interrupted-tool");
+  const stopping = adapter.interrupt("grok-interrupted-tool");
+  await waitForSentMethod(transport, "session/cancel");
+  assert.equal(events.some((event) => event.type === "agent.interrupted"), false);
+  transport.push({ method: "session/update", params: { sessionId: "grok-interrupted-tool", update: { sessionUpdate: "turn_completed", stopReason: "cancelled" } } });
+  await stopping;
   assert.equal(adapter.hasActiveTurn("grok-interrupted-tool"), false);
   assert.equal(events.filter((event) => event.type === "agent.completed").length, 0);
   assert.equal(events.filter((event) => event.type === "agent.interrupted").length, 1);

@@ -145,7 +145,7 @@ test("goal lives in the command and overflow flow without permanent header UI", 
   assert.doesNotMatch(app, /<GoalControl/u);
   assert.doesNotMatch(styles, /\.goal-trigger/u);
   assert.match(app, /goal=\{snapshot\.goals\[session\.id\] \?\? null\}/u);
-  assert.ok(composer.includes('if (draftSession || !hasSlashCommandToken(content, "/goal")) return;'));
+  assert.ok(composer.includes('if (!hasSlashCommandToken(content, "/goal")) return;'));
   assert.ok(composer.includes('const next = removeSlashCommandToken(content, "/goal");'));
   assert.match(composer, /<strong>Goal<\/strong>/u);
   assert.match(composer, /setGoalOpen\(true\)/u);

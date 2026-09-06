@@ -6,3 +6,4 @@ export * from "./process_transport.js";
 export * from "./pagination.js";
 export * from "./command.js";
 export * from "./guidance.js";
+export * from "./elicitation.js";

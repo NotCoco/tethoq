@@ -1,6 +1,6 @@
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { AgentIcon, AlertIcon, AnnotationIcon, BranchIcon, CheckIcon, ChevronDownIcon, ChevronRightIcon, CompactionIcon, ContextHandoffIcon, CopyIcon, FileIcon, ScreenshotIcon, SubagentsIcon, WorkflowIcon, XIcon } from "./icons";
+import { AgentIcon, AlertIcon, AnnotationIcon, BranchIcon, CheckIcon, ChevronDownIcon, ChevronRightIcon, CompactionIcon, ContextHandoffIcon, CopyIcon, FileIcon, ScreenshotIcon, StopIcon, SubagentsIcon, WorkflowIcon, XIcon } from "./icons";
 import { copyText as copyToClipboard } from "./clipboard";
 import { ProviderLogo, providerDisplayName } from "./components";
 import { RichText } from "./RichText";
@@ -8,6 +8,7 @@ import { AudioPlaybackChip } from "./audio_dictation";
 import type { Provider, ProviderId, ProviderStatus, TimelineItem, TimelineWorkflow } from "./types";
 import { responseAnnotationCopyText } from "./response_annotations";
 import { reasoningDisplayLabel } from "../../../../../packages/protocol/src/reasoning";
+import { visibleContextTransferText } from "../../../../../packages/protocol/src/context_visibility";
 
 const routineActivityKinds = new Set<TimelineItem["kind"]>(["tool", "command", "file"]);
 
@@ -56,10 +57,18 @@ function speaksForWork(item: TimelineItem): boolean {
   return item.kind === "reasoning" || isRoutineActivity(item);
 }
 
+/** Hide Codex presentation metadata, including unfinished streamed blocks, while preserving code examples. */
+export function visibleAssistantText(value: string): string {
+  return visibleContextTransferText(value).replace(
+    /(`{3,}|~{3,})[\s\S]*?(?:\1|$)|(`+)[^\n]*?\2|<(oai-mem-citation|citation_entries|rollout_ids)>[\s\S]*?(?:<\/\3>|$)|<\/(?:oai-mem-citation|citation_entries|rollout_ids)>/giu,
+    (match, fence: string | undefined, inlineCode: string | undefined) => fence || inlineCode ? match : "",
+  ).trimEnd();
+}
+
 /** Do not leave timestamp/copy-control shells for empty provider deltas. */
 export function hasVisibleTimelineContent(item: TimelineItem): boolean {
   if (item.kind !== "user" && item.kind !== "assistant") return true;
-  const body = item.body.trim();
+  const body = (item.kind === "assistant" ? visibleAssistantText(item.body) : visibleContextTransferText(item.body)).trim();
   if (item.mesh?.targets.length) return true;
   if (item.images?.length || item.audio?.length || item.files?.length || item.workflows?.length || item.annotations?.length) return true;
   if (!body || /^<!--[\s\S]*-->$/u.test(body)) return false;
@@ -82,12 +91,11 @@ const automaticCompactionNotice = /\b(?:automatically\s+compacted|automatic\s+co
 const compactionSummaryNotice = /^another language model started to solve this problem and produced a summary of its thinking process\./iu;
 const compactionTitle = /^(?:(?:context|conversation|session)\s+)?compaction(?:\s+summary)?$/iu;
 const systemTitle = /^(?:system|system message|system update|notice)$/iu;
-const compactionPresentationMetadata = /\s*<oai-mem-citation>[\s\S]*?<\/oai-mem-citation>\s*$/iu;
 const timelineBoundaryLabelCache = new WeakMap<TimelineItem, string | null>();
 const compactionContentKeyCache = new WeakMap<TimelineItem, { ordinary?: string; compaction?: string }>();
 
 function visibleCompactionDetail(value: string): string {
-  return value.replace(compactionPresentationMetadata, "").trim();
+  return visibleAssistantText(value).trim();
 }
 
 function isCompactionItem(item: TimelineItem): boolean {
@@ -273,7 +281,7 @@ export function finalAnswerCopyText(timeline: readonly TimelineItem[], index: nu
     candidate.kind === "assistant" && hasVisibleTimelineContent(candidate) && !timelineBoundaryLabel(candidate));
   const phaseAware = assistantItems.some((candidate) => candidate.phase !== undefined);
   const finalItems = phaseAware ? assistantItems.filter((candidate) => candidate.phase === "final_answer") : assistantItems;
-  return (finalItems.length ? finalItems : [item]).map((candidate) => candidate.body.trim()).filter(Boolean).join("\n\n");
+  return visibleAssistantText((finalItems.length ? finalItems : [item]).map((candidate) => candidate.body.trim()).filter(Boolean).join("\n\n"));
 }
 
 /** Preserve chronology while removing repeated outer Reasoning controls. */
@@ -493,10 +501,12 @@ const executionId = /\b(?:call|event|exec(?:ution)?|request|session|trace)[-_][a
 const uuid = /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/giu;
 
 function cleanTitle(value: string): string {
+  if (/(?:^|[.:/\s])(?:question|ask_user_question|request_user_input|requestUserInput)(?:$|[.:/\s])/iu.test(value)) return "Question";
   return value.replace(executionId, "").replace(uuid, "").replace(/\s{2,}/gu, " ").replace(/^[\s:.-]+|[\s:.-]+$/gu, "").trim();
 }
 
 export function activityLabel(item: TimelineItem): "Read" | "Write" | "Edit" | "Run" | "Delegate" | "Issue" | "Activity" {
+  if (item.kind === "tool" && cleanTitle(item.title ?? "") === "Question") return "Activity";
   if (item.kind === "command") return "Run";
   if (item.kind === "subagent") return "Delegate";
   if (item.kind === "error" || item.state === "failed") return "Issue";
@@ -1225,11 +1235,12 @@ const SpawnedSubagentRow = memo(function SpawnedSubagentRow({ item, onOpen }: {
   onOpen?: ((item: TimelineItem) => void) | undefined;
 }) {
   const state = item.state ?? "running";
-  const stateLabel = state === "completed" ? "finished" : state === "failed" ? "failed" : "running";
+  const stopped = state === "completed" && item.childInterruptedAt !== undefined;
+  const stateLabel = stopped ? "stopped" : state === "completed" ? "finished" : state === "failed" ? "failed" : "running";
   return <button
     type="button"
     className="spawned-subagent-row"
-    data-child-state={state}
+    data-child-state={stopped ? "stopped" : state}
     data-scroll-anchor={item.id}
     aria-label={`Open ${spawnedSubagentTarget(item)}, ${stateLabel}`}
     aria-busy={state === "running" || undefined}
@@ -1239,7 +1250,7 @@ const SpawnedSubagentRow = memo(function SpawnedSubagentRow({ item, onOpen }: {
     <span className="spawned-subagent-copy"><strong>Spawned sub-agent</strong><small>{spawnedSubagentTarget(item)}</small></span>
     <span className="spawned-subagent-state">{state === "running"
       ? <span className="spinner" aria-hidden="true" />
-      : state === "failed" ? <AlertIcon aria-hidden="true" /> : <CheckIcon aria-hidden="true" />}<span>{stateLabel}</span></span>
+      : stopped ? <StopIcon aria-hidden="true" /> : state === "failed" ? <AlertIcon aria-hidden="true" /> : <CheckIcon aria-hidden="true" />}<span>{stateLabel}</span></span>
     <ChevronRightIcon aria-hidden="true" />
   </button>;
 });
@@ -1616,6 +1627,7 @@ export const ChatTimelineCard = memo(function ChatTimelineCard({ item, providerI
   const time = new Date(item.timestamp).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
   if (isContextHandoffItem(item)) return <HandoffNotice item={item}/>;
   if (item.kind === "user" || item.kind === "assistant") {
+    const body = item.kind === "assistant" ? visibleAssistantText(item.body) : visibleContextTransferText(item.body);
     const assistantName = providerDisplayName(providerId, provider);
     const identity = item.kind === "assistant" && identityMode !== "none";
     const liveIdentity = identityMode === "live";
@@ -1623,7 +1635,7 @@ export const ChatTimelineCard = memo(function ChatTimelineCard({ item, providerI
     const progress = item.kind === "assistant" && (item.phase === "commentary" || item.state === "running");
     const footerCopyText = item.kind === "user" ? item.mesh
       ? item.mesh.segments.map((segment) => segment.type === "text" ? segment.text : `@${meshMessageLabel(item.mesh!.targets[segment.targetIndex]!)}`).join("")
-      : item.body.trim() : identityMode === "final" ? copyText : undefined;
+      : body.trim() : identityMode === "final" && copyText ? visibleAssistantText(copyText) : undefined;
     const visibleFooterCopyText = item.kind === "user" && item.annotations?.length
       ? responseAnnotationCopyText(item.body, item.annotations)
       : footerCopyText;
@@ -1659,7 +1671,7 @@ export const ChatTimelineCard = memo(function ChatTimelineCard({ item, providerI
         {/* Selecting an answer does nothing on its own; annotating is asked for
             by right-clicking the selection. A keyboard context menu reports no
             useful pointer position, so fall back to the answer's own corner. */}
-        {item.body || item.mesh ? <div className="message-body" onContextMenu={item.kind === "assistant" && onAnnotationSelection ? (event) => {
+        {body || item.mesh ? <div className="message-body" onContextMenu={item.kind === "assistant" && onAnnotationSelection ? (event) => {
           const text = selectedAssistantResponse(event.currentTarget);
           if (!text) return;
           event.preventDefault();
@@ -1668,7 +1680,7 @@ export const ChatTimelineCard = memo(function ChatTimelineCard({ item, providerI
             x: event.clientX > 0 ? event.clientX : bounds.left + 24,
             y: event.clientY > 0 ? event.clientY : bounds.top + 24,
           });
-        } : undefined}>{item.mesh ? <MeshMessageBody mesh={item.mesh} onLinkOpen={onLinkOpen}/> : <RichText onImageOpen={setLightbox} onLinkOpen={onLinkOpen}>{item.body}</RichText>}</div> : null}
+        } : undefined}>{item.mesh ? <MeshMessageBody mesh={item.mesh} onLinkOpen={onLinkOpen}/> : <RichText onImageOpen={setLightbox} onLinkOpen={onLinkOpen}>{body}</RichText>}</div> : null}
         {item.kind === "assistant" ? imageGallery : null}
         {item.kind === "assistant" ? audioGallery : null}
         {deliveryFailed ? <div className="message-delivery-error" role="status" title={item.queuedNewTaskDeliveryError}>

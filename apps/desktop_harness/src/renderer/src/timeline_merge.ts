@@ -1,4 +1,5 @@
 import type { TimelineItem } from "./types";
+import { visibleContextTransferText } from "../../../../../packages/protocol/src/context_visibility";
 
 /**
  * Folds one incoming row into the transcript.
@@ -52,6 +53,7 @@ export function mergeTimeline(existing: TimelineItem[], incoming: TimelineItem):
   if (found >= 0) return existing.map((item, index) => {
     if (index !== found) return item;
     if (item.kind === "user" && incoming.kind === "user"
+      && item.state !== "running" && item.streamDelta !== true
       && !composerEchoRow.test(item.id) && !composerEchoRow.test(incoming.id)) {
       const coalesced = coalescePersistedUserAction(item, incoming);
       return sameTimelineItem(item, coalesced) ? item : coalesced;
@@ -234,8 +236,8 @@ export function settleRunningTimeline(
   items: readonly TimelineItem[],
   terminalState: "completed" | "failed" = "completed",
 ): TimelineItem[] {
-  if (!items.some((item) => item.state === "running")) return items as TimelineItem[];
-  return items.map((item) => item.state === "running" ? { ...item, state: terminalState } : item);
+  if (!items.some((item) => item.state === "running" && item.kind !== "subagent")) return items as TimelineItem[];
+  return items.map((item) => item.state === "running" && item.kind !== "subagent" ? { ...item, state: terminalState } : item);
 }
 
 
@@ -261,7 +263,7 @@ function composerRowHasVisibleAttachments(item: TimelineItem): boolean {
 
 /** Attachment notes are added for the reader and are not part of what was sent. */
 function sentBody(item: TimelineItem): string {
-  const body = item.body.split(/\n\nAttached file:/u)[0]!.trim();
+  const body = visibleContextTransferText(item.body).split(/\n\nAttached file:/u)[0]!.trim();
   if (body) return body;
   return item.annotations?.length
     ? `annotations:${JSON.stringify(item.annotations.map(({ text, annotation }) => ({ text, annotation })))}`
@@ -617,6 +619,8 @@ function sameTimelineItem(left: TimelineItem, right: TimelineItem): boolean {
     && left.childProviderId === right.childProviderId
     && left.childModelId === right.childModelId
     && left.childReasoningEffort === right.childReasoningEffort
+    && left.childInterruptedAt === right.childInterruptedAt
+    && left.childStatusUpdatedAt === right.childStatusUpdatedAt
     && left.timestamp === right.timestamp
     && left.streamDelta === right.streamDelta
     && left.sourceEventId === right.sourceEventId

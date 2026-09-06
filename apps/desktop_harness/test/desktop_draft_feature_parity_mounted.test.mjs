@@ -343,20 +343,22 @@ test("OpenCode drafts expose and safely materialize the full provider-neutral ta
               check(labels.some((label) => label.includes(expected)), "Full OpenCode draft menu is missing: " + expected);
             }
             await click(action("Goal"));
+            check(document.querySelector(".composer-goal-indicator.is-armed") && createCalls.length === 0, "Goal must mark the next prompt without creating a task");
+            element(".send-button").click();
             await waitFor(() => createCalls.length === 1, "first session.create");
             element(".send-button").click();
             await settle();
             check(createCalls.length === 1, "An interleaved draft action and send created duplicate provider tasks");
             firstCreateGate.resolve();
-            await waitFor(() => document.querySelector(".composer-goal-panel"), "Goal after materialization remount");
             await waitFor(() => sendCalls.length === 1, "send after shared materialization");
+            check(sendCalls[0].goal?.objective === "Race-safe OpenCode draft", "Goal mode did not travel with the first real prompt");
+            check(!document.querySelector(".composer-goal-panel"), "Goal send opened a separate objective form");
             check(createCalls.length === 1, "Resolving the shared materialization created a second provider task");
             check(createCalls[0].payload.providerId === "opencode" && createCalls[0].payload.firstInstruction === undefined, "The app did not use the selected OpenCode route for action-led materialization: " + JSON.stringify(createCalls[0].payload));
             check(sendCalls[0].sessionId === "opencode-materialized-1" && sendCalls[0].content === "Race-safe OpenCode draft", "The interleaved send did not target the one real OpenCode task");
             check(document.querySelector('[data-session-id="opencode-materialized-1"] > .session-row.selected'), "The real OpenCode task was not selected after materialization");
             check(!document.querySelector('[data-session-id="' + racedDraftId + '"]'), "The local draft row survived provider materialization");
             check(document.querySelector('[data-session-id="opencode-materialized-1"] .provider-logo[data-provider-id="opencode"]'), "The stored session did not keep the harness that created it");
-            await click(element('button[aria-label="Close goal controls"]'));
 
             await click(element(".new-task-button"));
             const sideDraft = await waitFor(() => document.querySelector('[data-session-id^="draft-"] > .session-row.selected'), "side-chat draft");
@@ -386,17 +388,17 @@ test("OpenCode drafts expose and safely materialize the full provider-neutral ta
             await waitFor(() => document.querySelector('[data-session-id^="draft-"] > .session-row.selected'), "navigation draft");
             await selectOpenCode();
             await setField(element("#composer-message"), "Keep this draft without replaying its abandoned action");
-            await openAction("Goal");
+            await openAction("Open session browser");
             await waitFor(() => createCalls.length === 4, "navigation session.create");
             await click(element('[data-session-id="opencode-source"] > .session-row'));
             check(document.querySelector('[data-session-id="opencode-source"] > .session-row.selected'), "Navigation away from the materializing draft did not stick");
             navigationCreateGate.resolve();
             await waitFor(() => document.querySelector('[data-session-id="opencode-materialized-4"]'), "background materialization");
             check(document.querySelector('[data-session-id="opencode-source"] > .session-row.selected'), "Background materialization stole task selection");
-            check(!document.querySelector(".composer-goal-panel"), "The abandoned Goal action opened on another task");
+            check(!document.querySelector(".browser-page"), "The abandoned browser action opened on another task");
             await click(element('[data-session-id="opencode-materialized-4"] > .session-row'));
             await waitFor(() => document.querySelector("#composer-message")?.value === "Keep this draft without replaying its abandoned action", "background draft restoration");
-            check(!document.querySelector(".composer-goal-panel"), "The abandoned Goal action replayed after returning later");
+            check(!document.querySelector(".browser-page"), "The abandoned browser action replayed after returning later");
 
             await click(element(".new-task-button"));
             await waitFor(() => document.querySelector('[data-session-id^="draft-"] > .session-row.selected'), "delegation draft");

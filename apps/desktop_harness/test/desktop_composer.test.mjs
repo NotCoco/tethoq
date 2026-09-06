@@ -69,6 +69,30 @@ const timelineHelpers = await import(`file:///${timelineBundle.replaceAll("\\", 
 const composerUi = await import(`file:///${composerUiBundle.replaceAll("\\", "/")}`);
 const modelHydration = await import(`file:///${modelHydrationBundle.replaceAll("\\", "/")}`);
 
+test("assistant memory citations stay out of replies and copied answers", () => {
+  const answer = "The preview belongs to the footage.\n\nThe main sequence is visible.";
+  const entries = "<citation_entries>\nMEMORY.md:10-12|note=[Verified `preview` context]\n</citation_entries>\n<rollout_ids>\n00000000-0000-4000-8000-000000000001\n</rollout_ids>";
+  const citation = `<oai-mem-citation>\n${entries}\n</oai-mem-citation>`;
+  const row = (id, kind, body) => ({ id, kind, body, phase: "final_answer", state: "completed", timestamp: "2026-09-06T12:00:00Z" });
+  for (const suffix of [citation, entries, `<oai-mem-citation>\n${entries}`, "<citation_entries>\nMEMORY.md:10-12"]) {
+    const message = row("answer", "assistant", `${answer}\n\n${suffix}`);
+    assert.equal(timelineHelpers.visibleAssistantText(message.body), answer);
+    assert.equal(timelineHelpers.finalAnswerCopyText([row("user", "user", "Inspect this preview."), message], 1), answer);
+    assert.equal(timelineHelpers.hasVisibleTimelineContent(row("metadata", "assistant", suffix)), false);
+  }
+  assert.equal(timelineHelpers.visibleAssistantText(`${citation}\n\n${answer}`), `\n\n${answer}`);
+  assert.equal(timelineHelpers.hasVisibleTimelineContent(row("user", "user", `Explain this markup:\n${citation}`)), true);
+});
+
+test("assistant memory citation filtering preserves Markdown code examples", () => {
+  for (const fence of ["```", "~~~", "````"]) {
+    const example = `Markup example:\n\n${fence}xml\n<oai-mem-citation>\n<citation_entries>example</citation_entries>\n</oai-mem-citation>\n${fence}\n\nOrdinary text.`;
+    assert.equal(timelineHelpers.visibleAssistantText(example), example);
+  }
+  const inline = "Use `<citation_entries>` and `</citation_entries>` in the example.";
+  assert.equal(timelineHelpers.visibleAssistantText(inline), inline);
+});
+
 test("Continue belongs only to the latest unresolved interruption", () => {
   const issue = { id: "old-issue", kind: "error", body: "Task interrupted", state: "failed", timestamp: "2026-09-06T00:00:00Z" };
   const next = (kind, body = "New work") => ({ id: "next", kind, body, state: "completed", timestamp: "2026-09-06T00:01:00Z" });
@@ -540,9 +564,10 @@ test("terminal task state applies immediately while a superseded signal is ignor
 });
 
 test("slash commands open from a bare slash, filter without prefilling, and insert only on selection", () => {
-  assert.deepEqual(helpers.slashCommandSuggestions("/").map((item) => item.command), ["/simplify", "/mesh", "/goal", "/ears", "/eyes", "/schedule"]);
+  assert.deepEqual(helpers.slashCommandSuggestions("/").map((item) => item.command), ["/simplify", "/mesh", "/goal", "/permission", "/ears", "/eyes", "/schedule"]);
   assert.deepEqual(helpers.slashCommandSuggestions("/sim").map((item) => item.command), ["/simplify"]);
   assert.deepEqual(helpers.slashCommandSuggestions("/me").map((item) => item.command), ["/mesh"]);
+  assert.deepEqual(helpers.slashCommandSuggestions("/perm").map((item) => item.command), ["/permission"]);
   assert.deepEqual(helpers.slashCommandSuggestions("/g").map((item) => item.command), ["/goal"]);
   assert.deepEqual(helpers.slashCommandSuggestions("/ea").map((item) => item.command), ["/ears"]);
   // The two settings commands share a first letter, so /e has to offer both.
@@ -1790,8 +1815,8 @@ test("settled activity rows collapse behind the same Reasoning shell", async () 
   // behind one quiet Reasoning disclosure rather than staying in the user's face.
   assert.doesNotMatch(chat, /reasoning-group-settled/);
   assert.match(chat, /<span className="reasoning-label">\{running \? "Reasoning…" : "Reasoning"\}<\/span>/);
-  assert.match(composer, /\.message-assistant:has\(\.message-footer\) \+ \.reasoning-group,[\s\S]{0,120}margin-top:\s*36px/);
-  assert.match(composer, /\.final-answer-block:has\(\.message-footer\) \+ \.reasoning-group \{[^}]*margin-top:\s*36px/);
+  assert.match(composer, /\.message:has\(\.message-footer\) \+ \*,[\s\S]{0,200}margin-top:\s*36px/);
+  assert.match(composer, /\.final-answer-block:has\(\.message-footer\) \+ \*,[^{]*\{[^}]*margin-top:\s*36px/);
 
   assert.match(chat, /<ActivityDisclosure key=\{segment\.id\} item=\{segment\.items\[0\]!\}\/>/);
   assert.doesNotMatch(chat, /expandedSegments|toggleSegment|onSetSegments/);
@@ -2206,7 +2231,7 @@ test("composer and chat sources implement the reviewed compact interaction surfa
   assert.match(app, /initialDraft=\{composerDrafts/);
   assert.doesNotMatch(app, />CLI default</);
   assert.match(composer, /const draftSession = session\.draft === true/);
-  assert.match(composer, /allowProviderChange=\{draftSession\}/);
+  assert.match(composer, /allowProviderChange=\{draftSession \|\| onMaterializeDraft !== undefined\}/);
   assert.match(composer, /onDraftSelectionChange\?\.\(\{ providerId: nextProviderId, modelId: resolvedModelId, effort: nextEffort \}\)/);
   assert.match(composer, /await onCreateDraftSend\(\{/);
   assert.match(composer, /draftSessionId: session\.id/);
@@ -2215,7 +2240,7 @@ test("composer and chat sources implement the reviewed compact interaction surfa
   assert.match(composer, /if \(draftSession\) void requestDraftAction\("browser"\)/);
   assert.match(composer, /if \(draftSession\) void requestDraftAction\("side_chat"\)/);
   assert.match(composer, /if \(draftSession\) void requestDraftAction\("delegate"\)/);
-  assert.match(composer, /if \(draftSession\) void requestDraftAction\("goal"\)/);
+  assert.match(composer, /setMode\(goalArmed \? "queue" : "goal"\)/);
   assert.match(composer, /if \(draftSession\) void requestDraftAction\("eyes"\)/);
   assert.match(composer, /<DictationControl providerId=\{providerId\}/);
   assert.match(app, /request\("wallet\.get", \{ providerId: "direct", endpointId: nextEndpointId \}\)/);
@@ -2382,7 +2407,7 @@ test("composer and chat sources implement the reviewed compact interaction surfa
   assert.match(chat, /className="message-file-attachment"/);
   assert.match(chat, /function WorkflowMessageAttachment[\s\S]*?if \(restoreFocus\) trigger\.current\?\.focus\(\);[\s\S]*?setDetailsOpen\(false\);[\s\S]*?requestAnimationFrame\(\(\) => trigger\.current\?\.focus\(\)\)/u);
   assert.match(chat, /function WorkflowMessageAttachment[\s\S]*?event\.key !== "Escape"[\s\S]*?closeDetails\(\)/u);
-  assert.match(chat, /const footerCopyText = item\.kind === "user" \? item\.mesh[\s\S]*?: item\.body\.trim\(\) : identityMode === "final" \? copyText : undefined/);
+  assert.match(chat, /const footerCopyText = item\.kind === "user" \? item\.mesh[\s\S]*?: body\.trim\(\) : identityMode === "final" && copyText \? visibleAssistantText\(copyText\) : undefined/);
   assert.match(chat, /footerCopyText \? <div className="message-footer">/);
   assert.match(chat, /className="timeline-error-notice" role="alert" aria-live="assertive" aria-atomic="true"/);
   assert.match(chat, /className="timeline-error-recovery" onClick=\{onContinue\} disabled=\{continueDisabled\} aria-busy=\{continuePending\}/);
@@ -2450,9 +2475,9 @@ test("composer and chat sources implement the reviewed compact interaction surfa
   assert.match(styles, /\.timeline-compaction-detail/);
   assert.match(styles, /\.reasoning-thinking-segment \.timeline-item-meta[^{]*\{[^}]*position:\s*static[^}]*justify-content:\s*flex-end/);
   assert.match(styles, /\.timeline-compaction-footer[^{]*\{[^}]*justify-content:\s*flex-end/);
-  assert.match(css, /\.message-assistant:has\(\.message-footer\) \+ \.timeline-compaction-disclosure[\s\S]*margin-top:\s*36px/, "message copy controls reserve space before compaction disclosures");
+  assert.match(css, /\.message:has\(\.message-footer\) \+ \*,[\s\S]*margin-top:\s*36px/, "message copy controls reserve space before compaction disclosures");
   assert.match(css, /--turn-boundary-gap:\s*42px/);
-  assert.match(css, /\.message-assistant:has\(\.message-footer\) \+ \.reasoning-group,[\s\S]*margin-top:\s*36px/);
+  assert.match(css, /\.message:has\(\.message-footer\) \+ \*,[\s\S]*margin-top:\s*36px/);
   assert.match(css, /\.message-images-before[^{]*\{[^}]*margin:\s*0 0 8px/);
   assert.match(css, /\.send-button\.stop-button[^{]*\{[^}]*background:\s*#765150/);
   assert.match(css, /\.message-assistant \+ \.message-user,[\s\S]*\.message-user \+ \.reasoning-group,[\s\S]*margin-top:\s*var\(--turn-boundary-gap\)/);
@@ -2494,7 +2519,7 @@ test("composer and chat sources implement the reviewed compact interaction surfa
   assert.match(composer, /const interruptingRef = useRef\(false\)/);
   assert.match(composer, /if \(onInterrupt === undefined \|\| interruptingRef\.current\) return/);
   assert.match(composer, /interruptingRef\.current = true;[\s\S]*await onInterrupt\(\);[\s\S]*interruptingRef\.current = false;/);
-  assert.match(composer, /disabled=\{sending \|\| scheduleBusy \|\| interrupting \|\|/);
+  assert.match(composer, /disabled=\{sending \|\| materializingAction !== null \|\| scheduleBusy \|\| interrupting \|\|/);
   assert.match(chat, /function withCurrentActivity\(/);
   assert.match(chat, /candidateIndex === currentIndex[\s\S]*candidate\.state === "running" \? \{ \.\.\.candidate, state: "completed" \}/);
   assert.match(styles, /\.rich-table-scroll table[\s\S]*border-collapse:\s*collapse/);

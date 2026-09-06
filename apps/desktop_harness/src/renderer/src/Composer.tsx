@@ -1,7 +1,8 @@
 import { forwardRef, memo, useCallback, useEffect, useId, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import { ComposerMessageInput, type ComposerTextInput } from "./ComposerMessageInput";
-import { anchorMeshTargets, meshDraftParts, meshEditorValue, meshTargetRoute, moveMeshTargets, readMeshEditorValue } from "./mesh_composer";
+import { PermissionSettings } from "./PermissionSettings";
+import { anchorMeshTargets, meshDraftParts, meshEditorValue, meshMentionAtCaret, meshTargetRoute, moveMeshTargets, readMeshEditorValue } from "./mesh_composer";
 import {
   defaultSimplifyMaxWords,
   maximumSimplifyMaxWords,
@@ -106,8 +107,9 @@ import { mergeAcceptedComposerRow, rollbackOptimisticComposerRow } from "./timel
 type Request = (type: string, payload?: JsonObject, requestId?: string) => Promise<Record<string, unknown>>;
 
 export interface DraftSessionSendInput {
-  /** Local-only session id, used by App to replace the draft atomically. */
+  /** Draft or source task, replaced atomically after creating the destination. */
   draftSessionId: string;
+  requestId?: string;
   providerId: Session["providerId"];
   workingDirectory: string;
   content: string;
@@ -119,6 +121,7 @@ export interface DraftSessionSendInput {
   /** Complete local presentation retained while the provider creates and echoes the first turn. */
   optimisticItem: TimelineItem;
   simplify?: JsonObject;
+  goalObjective?: string;
 }
 
 export interface QueuedNewTaskPresentation {
@@ -126,11 +129,12 @@ export interface QueuedNewTaskPresentation {
   readonly optimisticItem: TimelineItem;
 }
 
-export type ComposerTaskAction = "handoff" | "branch" | "browser" | "side_chat" | "delegate" | "goal" | "eyes" | "mesh" | "mesh_send" | "instant";
+export type ComposerTaskAction = "handoff" | "branch" | "browser" | "side_chat" | "delegate" | "goal" | "permission" | "eyes" | "mesh" | "mesh_send" | "model_switch_send" | "instant";
 
 export interface DraftSessionMaterializeInput {
-  /** Local-only session id that App replaces with the provider-backed task. */
+  /** Draft or source session id that App replaces with the destination task. */
   draftSessionId: string;
+  requestId?: string;
   providerId: Session["providerId"];
   workingDirectory: string;
   modelId: string;
@@ -368,8 +372,8 @@ export interface ComposerProps {
   onWorkflowAttachmentsChange?: (value: readonly WorkflowAttachment[]) => void;
   initialAnnotations?: readonly ResponseAnnotation[];
   onAnnotationsChange?: (value: readonly ResponseAnnotation[]) => void;
-  initialMode?: "queue" | "steer";
-  onModeChange?: (value: "queue" | "steer") => void;
+  initialMode?: "queue" | "steer" | "goal";
+  onModeChange?: (value: "queue" | "steer" | "goal") => void;
   initialMeshTargets?: readonly MeshTarget[];
   onMeshTargetsChange?: (value: readonly MeshTarget[]) => void;
   initialDelegationDraft?: DelegationDraft | undefined;
@@ -647,13 +651,14 @@ export function recentModelKeysFromSessions(
   return recentModelUsesFromSessions(sessions, modelsByProvider).slice(0, limit).map((item) => item.key);
 }
 
-function ModelCatalogResults({ entries, recentKeys, query, activeProviderId, selectedKey, allowProviderChange, onChoose }: {
+function ModelCatalogResults({ entries, recentKeys, query, activeProviderId, selectedKey, allowProviderChange, currentTaskProviderId, onChoose }: {
   entries: readonly CatalogModel[];
   recentKeys: readonly string[];
   query: string;
   activeProviderId: string;
   selectedKey: string | undefined;
   allowProviderChange: boolean;
+  currentTaskProviderId?: string | undefined;
   onChoose: (entry: CatalogModel) => void;
 }) {
   const visible = entries.filter((entry) => modelMatchesCatalogQuery(query, entry.provider.id, entry.provider.name, entry.model));
@@ -670,7 +675,7 @@ function ModelCatalogResults({ entries, recentKeys, query, activeProviderId, sel
   });
   const button = (entry: CatalogModel, recent = false) => {
     const providerReady = entry.provider.state === "online" && entry.provider.capabilities.includes("Create Session") && entry.provider.capabilities.includes("Send Message");
-    const selectable = allowProviderChange ? providerReady : entry.provider.id === activeProviderId;
+    const selectable = entry.provider.id === currentTaskProviderId || (allowProviderChange ? providerReady : entry.provider.id === activeProviderId);
     const selected = entry.key === selectedKey;
     const canonicalSelected = selected && !recent;
     const needsApiKey = entry.model.walletKind === "user_api" && entry.model.apiKeyConfigured === false;
@@ -743,12 +748,13 @@ function queuedTaskModelSelection(
   };
 }
 
-function ModelPicker({ snapshot, providerId, sessionModel, value, allowProviderChange = false, onChange }: {
+function ModelPicker({ snapshot, providerId, sessionModel, value, allowProviderChange = false, currentTaskProviderId, onChange }: {
   snapshot: DesktopSnapshot;
   providerId: Session["providerId"];
   sessionModel: string;
   value: string;
   allowProviderChange?: boolean;
+  currentTaskProviderId?: string | undefined;
   onChange: (providerId: Session["providerId"], modelId: string) => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -854,7 +860,7 @@ function ModelPicker({ snapshot, providerId, sessionModel, value, allowProviderC
     closePicker();
   };
   const search = <label className="model-catalog-search"><SearchIcon /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search models and providers" aria-label="Search models"/><kbd>Esc</kbd></label>;
-  const results = <ModelCatalogResults entries={entries} recentKeys={recentKeys} query={query} activeProviderId={providerId} selectedKey={selected?.key} allowProviderChange={allowProviderChange} onChoose={choose}/>;
+  const results = <ModelCatalogResults entries={entries} recentKeys={recentKeys} query={query} activeProviderId={providerId} selectedKey={selected?.key} allowProviderChange={allowProviderChange} currentTaskProviderId={currentTaskProviderId} onChoose={choose}/>;
   return <div className="model-picker-root composer-setting" ref={root}>
     <span className="composer-setting-label">Model</span>
     <button ref={modelTrigger} className={`model-picker-trigger ${selectedNeedsApiKey ? "needs-api-key" : ""}`} type="button" aria-label={`Choose model. Current model: ${label}${selectedNeedsApiKey ? ". API key required" : ""}`} aria-haspopup="dialog" aria-expanded={open || expanded} aria-controls={open ? dropupId : expanded ? libraryId : undefined} onClick={() => { if (open || expanded) closePicker(); else setOpen(true); }}><span className="composer-setting-value model-setting-value"><ProviderLogo providerId={providerId} provider={selectedProvider} size={24}/><strong>{displayLabel}</strong>{selectedNeedsApiKey ? <AlertIcon className="model-setting-caution" title="API key required"/> : null}<ChevronDownIcon /></span></button>
@@ -1768,7 +1774,9 @@ export interface DelegationDraft {
 // caps additions before a request is ever sent.
 const maximumMeshTargets = 4;
 const MESH_RECENT_TARGETS_KEY = "tethoq:mesh-recent-targets:v1";
+const MESH_RECENT_MODELS_KEY = "tethoq:mesh-recent-models:v1";
 const maximumMeshRecentSessions = 60;
+const maximumMeshRecentModels = 5;
 
 function safeMeshTarget(value: unknown): MeshTarget | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
@@ -1808,14 +1816,37 @@ export function meshRecentTargetsForSession(sessionId: string): readonly MeshTar
   return storedMeshRecentTargetMap()[sessionId]?.targets ?? [];
 }
 
+function uniqueRecentMeshModels(values: readonly unknown[]): readonly MeshTarget[] {
+  const seen = new Set<string>();
+  return values.map(safeMeshTarget).filter((target): target is MeshTarget => {
+    if (!target?.modelId) return false;
+    const key = JSON.stringify([target.providerId, target.modelId]);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(0, maximumMeshRecentModels);
+}
+
+/** Model recency spans tasks and never falls back to ordinary model usage. */
+export function recentMeshModels(): readonly MeshTarget[] {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(MESH_RECENT_MODELS_KEY) ?? "null");
+    if (Array.isArray(value)) return uniqueRecentMeshModels(value);
+  } catch { /* Older accepted Mesh history remains available below. */ }
+  return uniqueRecentMeshModels(Object.values(storedMeshRecentTargetMap())
+    .sort((left, right) => right.updatedAt - left.updatedAt).flatMap((entry) => entry.targets));
+}
+
 export function persistMeshRecentTargetsForSession(sessionId: string, targets: readonly MeshTarget[], usedAt = Date.now()): void {
   try {
     const safeTargets = targets.map(safeMeshTarget).filter((target): target is MeshTarget => target !== null).slice(0, maximumMeshTargets);
+    const recentModels = uniqueRecentMeshModels([...safeTargets, ...recentMeshModels()]);
     const entries = Object.entries({
       ...storedMeshRecentTargetMap(),
       [sessionId]: { updatedAt: usedAt, targets: safeTargets },
     }).sort(([, left], [, right]) => right.updatedAt - left.updatedAt).slice(0, maximumMeshRecentSessions);
     localStorage.setItem(MESH_RECENT_TARGETS_KEY, JSON.stringify(Object.fromEntries(entries)));
+    localStorage.setItem(MESH_RECENT_MODELS_KEY, JSON.stringify(recentModels));
   } catch {
     // A restricted preview can still use provider-backed snapshot recency.
   }
@@ -1884,6 +1915,19 @@ export function availableMeshProviders(snapshot: DesktopSnapshot, targets: reado
 
 function meshTargetModelLabel(snapshot: DesktopSnapshot, target: MeshTarget): string {
   return snapshot.models[target.providerId]?.find((model) => model.id === target.modelId)?.name ?? target.modelId ?? "Harness default";
+}
+
+export function matchingRecentMeshModels(snapshot: DesktopSnapshot, recent: readonly MeshTarget[], query: string): readonly MeshTarget[] {
+  const prefix = query.toLocaleLowerCase();
+  const providers = availableMeshProviders(snapshot, []);
+  return recent.slice(0, maximumMeshRecentModels).filter((target) => {
+    if (!providers.some((provider) => provider.id === target.providerId)) return false;
+    const models = snapshot.models[target.providerId] ?? [];
+    if (models.length && !models.some((model) => model.id === target.modelId)) return false;
+    const label = meshTargetModelLabel(snapshot, target);
+    return [label, label.replace(/^[^:]+:\s*/u, ""), target.modelId ?? "", target.modelId?.split("/").at(-1) ?? ""]
+      .some((name) => name.toLocaleLowerCase().startsWith(prefix));
+  });
 }
 
 function MeshModelPicker({ snapshot, provider, existing, initial, onHydrateProviderModels, onCommit, onBack, onClose }: {
@@ -2012,6 +2056,36 @@ function MeshPanel({ snapshot, options, targets, selections, activeIndex, listId
       <strong>{!room ? "Four subagents are already referenced" : "No other coding tool is ready"}</strong>
       <small>{targets.length ? "Write the instruction below and send it to them." : "Connect another tool before meshing."}</small>
     </div> : null}
+  </section>;
+}
+
+function MeshMentionPanel({ snapshot, options, emptyMessage, activeIndex, listId, onHighlight, onSelect, onClose }: {
+  snapshot: DesktopSnapshot;
+  options: readonly MeshTarget[];
+  emptyMessage: string;
+  activeIndex: number;
+  listId: string;
+  onHighlight: (index: number) => void;
+  onSelect: (target: MeshTarget) => void;
+  onClose: () => void;
+}) {
+  const rows = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    rows.current?.querySelector<HTMLElement>(`[data-mesh-index="${activeIndex}"]`)?.scrollIntoView({ block: "nearest" });
+  }, [activeIndex, options]);
+  return <section className="mesh-panel mesh-mention-panel" role="dialog" aria-label="Recent mesh models">
+    <header className="mesh-panel-header"><span className="mesh-add-label">Recent mesh models</span><button type="button" aria-label="Close recent models" onClick={onClose}><XIcon /></button></header>
+    <div ref={rows} className="mesh-add" id={listId} role="listbox" aria-label="Recent mesh models">
+      {options.map((target, index) => {
+        const provider = providerFor(snapshot.providers, target.providerId)!;
+        const modelLabel = meshTargetModelLabel(snapshot, target);
+        const effort = reasoningLabel(target.reasoningEffort ?? "", { providerId: target.providerId, modelId: target.modelId, displayName: modelLabel });
+        return <div id={`${listId}-${index}`} data-mesh-index={index} className={`mesh-add-row mesh-mention-row ${index === activeIndex ? "selected" : ""}`} role="option" aria-selected={index === activeIndex} key={`${target.providerId}:${target.modelId}`} onPointerMove={() => onHighlight(index)}>
+          <button type="button" className="mesh-add-select" aria-label={`Tag ${modelLabel} via ${provider.name}${effort ? `, ${effort}` : ""}`} onMouseDown={(event) => event.preventDefault()} onFocus={() => onHighlight(index)} onClick={() => onSelect(target)}><ProviderLogo providerId={provider.id} provider={provider} size={25}/><span><strong>{modelLabel}</strong><small>{provider.name}{effort ? ` · ${effort}` : ""}</small></span></button>
+        </div>;
+      })}
+    </div>
+    {!options.length ? <div className="mesh-panel-empty" role="status"><strong>{emptyMessage}</strong></div> : null}
   </section>;
 }
 
@@ -4109,13 +4183,27 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
   const workflowAttachmentsChangeRef = useRef(onWorkflowAttachmentsChange);
   const annotationsChangeRef = useRef(onAnnotationsChange);
   const restoreFailedSubmissionRef = useRef(onRestoreFailedSubmission);
-  const [mode, setModeState] = useState<"queue" | "steer">(initialMode);
-  const setMode = useCallback((next: "queue" | "steer") => {
+  const draftSession = session.draft === true;
+  const [mode, setModeState] = useState<"queue" | "steer" | "goal">(initialMode);
+  const setMode = useCallback((next: "queue" | "steer" | "goal") => {
     setModeState(next);
     onModeChange?.(next);
   }, [onModeChange]);
-  const draftSession = session.draft === true;
+  const goalArmed = mode === "goal";
+  const onGoalRef = useRef(onGoal);
+  onGoalRef.current = onGoal;
+  useEffect(() => {
+    if (draftSession || !onGoalRef.current) return;
+    let disposed = false;
+    const expectedRevision = goal?.revision ?? -1;
+    void loadSessionGoal(session.id).then((loaded) => {
+      if (!disposed) onGoalRef.current?.(loaded, undefined, expectedRevision);
+    }).catch(() => undefined);
+    return () => { disposed = true; };
+  }, [session.id, draftSession]);
   const [providerId, setProviderId] = useState(session.providerId);
+  const switchingHarness = !draftSession && providerId !== session.providerId;
+  const modelSwitchAttempt = useRef<{ key: string; requestId: string } | null>(null);
   const models = snapshot.models[providerId] ?? [];
   const initialSelection = draftSession
     ? resolveConcreteModelSelection(models, { modelId: session.model, reasoningEffort: session.effort }, agentDefaults[session.providerId])
@@ -4218,6 +4306,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
   const [materializingAction, setMaterializingAction] = useState<ComposerTaskAction | null>(null);
   const materializingActionRef = useRef<ComposerTaskAction | null>(null);
   const [goalOpen, setGoalOpen] = useState(false);
+  const [permissionOpen, setPermissionOpen] = useState(false);
   const [earsOpen, setEarsOpen] = useState(false);
   const [earsBusy, setEarsBusy] = useState(false);
   const [dropActive, setDropActive] = useState(false);
@@ -4237,6 +4326,8 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
   const [meshModelPicker, setMeshModelPicker] = useState<Session["providerId"] | null>(null);
   const [meshSelection, setMeshSelection] = useState(0);
   const [meshRecentRevision, setMeshRecentRevision] = useState(0);
+  const [meshMentionSelection, setMeshMentionSelection] = useState(0);
+  const [meshMentionDismissed, setMeshMentionDismissed] = useState(false);
   const meshHydrationAttempted = useRef(new Set<Session["providerId"]>());
   const [attachmentPreview, setAttachmentPreview] = useState<{ readonly name: string; readonly dataUrl: string } | null>(null);
   const [queuedMessages, setQueuedMessages] = useState<readonly QueuedMessageView[]>([]);
@@ -4268,6 +4359,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
   const [composerCaret, setComposerCaret] = useState<number | null>(null);
   const slashListId = useId();
   const meshListId = useId();
+  const meshMentionListId = useId();
   const scheduleFieldId = useId();
   const scheduleTitleId = useId();
   const textarea = useRef<ComposerTextInput>(null);
@@ -4336,8 +4428,8 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
     void reverifyProvider().catch(() => undefined).finally(() => { if (abandoned) return; });
     return () => { abandoned = true; };
   }, [canSend, preview, reverifyProvider]);
-  const canSteer = !draftSession && canSend && holdsFollowUpQueue && session.state === "working" && provider?.capabilities.includes("Steering") === true;
-  const canInterrupt = !draftSession && holdsFollowUpQueue && provider?.capabilities.includes("Interrupt") === true && onInterrupt !== undefined;
+  const canSteer = !draftSession && !switchingHarness && canSend && holdsFollowUpQueue && session.state === "working" && provider?.capabilities.includes("Steering") === true;
+  const canInterrupt = !draftSession && holdsFollowUpQueue && providerFor(snapshot.providers, session.providerId)?.capabilities.includes("Interrupt") === true && onInterrupt !== undefined;
   const canAttach = provider?.supportsAttachments === true && (canSend || session.provisional === true);
   const canAttachFiles = provider?.supportsAttachments === true && (canSend || session.provisional === true) && supportsGenericFileAttachments(providerId);
   const canDelegate = snapshot.providers.some((item) => item.id !== session.providerId && item.state === "online" && item.capabilities.includes("Create Session") && item.capabilities.includes("Send Message"));
@@ -4359,6 +4451,12 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
     || meshTargets.length > 0;
   const simplifyCommand = useMemo(() => parseSimplifyCommand(content), [content]);
   const editorContent = meshEditorValue(content, meshTargets);
+  const meshMention = meshMentionAtCaret(editorContent, composerCaret ?? editorContent.length);
+  const recentMentionModels = useMemo(() => recentMeshModels(), [meshRecentRevision, session.id, meshMention?.start]);
+  const meshMentionOptions = useMemo(() => meshTargets.length >= maximumMeshTargets ? []
+    : matchingRecentMeshModels(snapshot, recentMentionModels, meshMention?.query ?? ""), [meshTargets.length, snapshot, recentMentionModels, meshMention?.query]);
+  const meshMentionVisible = meshMention !== null && !meshMentionDismissed && !meshOpen && meshModelPicker === null;
+  const safeMeshMentionSelection = Math.min(meshMentionSelection, Math.max(0, meshMentionOptions.length - 1));
   const commandContent = editorContent.replace(/[\uE000-\uF8FF]/gu, " ");
   const slashPrefix = commandContent.slice(0, Math.max(0, composerCaret ?? commandContent.length));
   const slashSuggestions = useMemo(() => {
@@ -4505,9 +4603,10 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
   }, [simplifySettings]);
   useEffect(() => { if (!simplifyCommand.active) setSimplifyOpen(false); }, [simplifyCommand.active]);
   useEffect(() => { setSlashSelection(0); }, [slashPrefix]);
+  useEffect(() => { setMeshMentionSelection(0); setMeshMentionDismissed(false); }, [meshMention?.start, meshMention?.query]);
   const requestDraftAction = useCallback(async (action: ComposerTaskAction): Promise<void> => {
     setActionsOpen(false);
-    if (!draftSession) return;
+    if (!draftSession && action !== "model_switch_send") return;
     if (materializingActionRef.current !== null) return;
     if (!onMaterializeDraft) {
       notify("This local draft cannot be created right now.", "error");
@@ -4516,8 +4615,13 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
     materializingActionRef.current = action;
     setMaterializingAction(action);
     try {
+      if (action === "model_switch_send") {
+        const key = `${session.id}\u0000${providerId}\u0000${model}\u0000${effort}`;
+        if (modelSwitchAttempt.current?.key !== key) modelSwitchAttempt.current = { key, requestId: crypto.randomUUID() };
+      }
       await onMaterializeDraft({
         draftSessionId: session.id,
+        ...(action === "model_switch_send" ? { requestId: modelSwitchAttempt.current!.requestId } : {}),
         providerId,
         workingDirectory: session.workingDirectory,
         modelId: model,
@@ -4532,7 +4636,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
   }, [draftSession, effort, model, notify, onMaterializeDraft, providerId, session.id, session.workingDirectory]);
   useEffect(() => {
     if (!draftSession) return;
-    const action = hasSlashCommandToken(content, "/goal") ? "goal"
+    const action = hasSlashCommandToken(content, "/permission") ? "permission"
       : hasSlashCommandToken(content, "/eyes") ? "eyes"
         : null;
     if (action !== null) void requestDraftAction(action);
@@ -4570,8 +4674,8 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
     else notify("Scheduling is currently available for new tasks only.", "error");
   }, [commitContent, content, draftSession, notify, openDraftSchedule]);
   useEffect(() => {
-    if (draftSession || !hasSlashCommandToken(content, "/goal")) return;
-    setGoalOpen(true);
+    if (!hasSlashCommandToken(content, "/goal")) return;
+    setMode("goal");
     const next = removeSlashCommandToken(content, "/goal");
     commitContent(next);
     historyIndex.current = null;
@@ -4635,6 +4739,21 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
       requestAnimationFrame(() => textarea.current?.focus());
     }
   }, []);
+  const closePermission = useCallback((restoreFocus = true) => {
+    setPermissionOpen(false);
+    if (restoreFocus) requestAnimationFrame(() => textarea.current?.focus());
+  }, []);
+  useEffect(() => {
+    if (draftSession || !hasSlashCommandToken(content, "/permission")) return;
+    setActionsOpen(false);
+    setGoalOpen(false);
+    setEarsOpen(false);
+    setPermissionOpen(true);
+    const next = removeSlashCommandToken(content, "/permission");
+    commitContent(next);
+    historyIndex.current = null;
+    unsentHistoryDraft.current = next;
+  }, [commitContent, content, setMode]);
   const closeEars = useCallback((restoreFocus = true) => {
     setEarsOpen(false);
     if (restoreFocus) requestAnimationFrame(() => textarea.current?.focus());
@@ -4660,6 +4779,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
     // on the composer so the user can write the instruction they are for; each
     // chip removes itself, and sending clears them.
     setMeshOpen(false);
+    setMeshMentionDismissed(true);
     setMeshModelPicker(null);
     if (restoreFocus) requestAnimationFrame(() => textarea.current?.focus());
   }, []);
@@ -4703,7 +4823,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
     };
   }, [closeDraftSchedule, scheduleOpen]);
   useEffect(() => {
-    if (!meshOpen && meshModelPicker === null) return;
+    if (!meshOpen && meshModelPicker === null && !meshMentionVisible) return;
     const escape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       event.preventDefault();
@@ -4712,6 +4832,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
     const outside = (event: PointerEvent) => {
       if (meshPanel.current?.contains(event.target as Node)) return;
       if (meshModelPanel.current?.contains(event.target as Node)) return;
+      if (meshMentionVisible && textarea.current?.contains(event.target as Node)) return;
       const target = event.target instanceof Element ? event.target : null;
       const willOwnFocus = target?.closest('button, input, textarea, select, a[href], [tabindex]:not([tabindex="-1"])') !== null;
       closeMesh(!willOwnFocus);
@@ -4722,7 +4843,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
       window.removeEventListener("keydown", escape);
       document.removeEventListener("pointerdown", outside);
     };
-  }, [closeMesh, meshModelPicker, meshOpen]);
+  }, [closeMesh, meshModelPicker, meshOpen, meshMentionVisible]);
   useEffect(() => {
     if (!attachmentPreview) return;
     const close = (event: KeyboardEvent) => { if (event.key === "Escape") setAttachmentPreview(null); };
@@ -4973,6 +5094,10 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
 
   const submit = async () => {
     if (scheduleBusyRef.current) return;
+    if (switchingHarness && meshTargetsRef.current.length > 0) {
+      if (compositionHasContent && !sendingRef.current && !earsBusy) await requestDraftAction("model_switch_send");
+      return;
+    }
     if (draftSession && meshTargetsRef.current.length > 0) {
       // A scheduled draft can retain committed Mesh targets after its Schedule
       // panel closes. Materialize the parent first, then replay this exact send
@@ -4990,6 +5115,8 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
     // /mesh stays visible while the panel is open, so strip it before it can be
     // mistaken for the instruction.
     const trimmed = removeSlashCommandToken(submittedDraft.content, "/mesh").trim();
+    const submittedAsGoal = mode === "goal";
+    if (submittedAsGoal && trimmed.length > 4000) { notify("Keep the goal under 4,000 characters.", "error"); return; }
     const submittedHasContent = trimmed.length > 0
       || submittedDraft.annotations.length > 0
       || submittedDraft.attachments.length > 0
@@ -5032,6 +5159,10 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
           ? { ...item, state: "working", preview: trimmed, updatedAt: acceptedTimestamp } : item),
       } : current);
       try {
+        if (submittedAsGoal) {
+          const nextGoal = await setSessionGoal(session.id, { objective: trimmed, status: "active", tokenBudget: null });
+          onGoalRef.current?.(nextGoal);
+        }
         // An empty prompt is a deliberate mesh send: the bridge and the parent
         // agent compose the instruction, so the send control stays enabled.
         await request("delegation.prepare", {
@@ -5043,6 +5174,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
           ...(effort ? { reasoningEffort: effort } : {}),
         }, acceptedId);
         persistMeshRecentTargetsForSession(session.id, submittedMeshTargets);
+        if (submittedAsGoal) setMode("queue");
         setMeshRecentRevision((current) => current + 1);
         notify("Mesh delegation started");
       } catch (error) {
@@ -5091,17 +5223,17 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
     } : submittedDraft;
     const optimisticRow = optimisticComposerTimelineItem(acceptedId, acceptedTimestamp, simplified.content, optimisticDraft);
     const blockedByAttention = holdsFollowUpQueue || turnInFlight.current || transportQueueSuppressions.current.length > 0;
-    const liveGuidance = mode === "steer" || (!queueingEnabled && canSteer);
+    const liveGuidance = !submittedAsGoal && (mode === "steer" || (!queueingEnabled && canSteer));
     const requestType = composerMessageRequestType({
       liveGuidance,
       hasAttachments: submittedDraft.attachments.length > 0 || submittedDraft.annotations.some((annotation) => annotation.audio !== undefined),
       blockedByAttention,
-      queueingEnabled,
+      queueingEnabled: submittedAsGoal || queueingEnabled,
       externalWriter: session.externalWriter === true,
     });
     const queuedSubmission = requestType === "message_queue.enqueue";
     const transportOnlySubmission = queuedSubmission && session.externalWriter === true && !blockedByAttention;
-    const appearsInTranscript = draftSession || composerSubmissionAppearsInTranscript(requestType, transportOnlySubmission);
+    const appearsInTranscript = draftSession || switchingHarness || composerSubmissionAppearsInTranscript(requestType, transportOnlySubmission);
     // Submission owns this exact snapshot. Clear it and paint the matching user
     // row in the same boundary, before attachment work or provider IPC, so the
     // composition visibly moves instead of disappearing while delivery waits.
@@ -5219,6 +5351,8 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
       const attachmentIds = outgoingAttachments.length ? await uploadAttachments(outgoingAttachments, uploadRequest(request), (id) => pendingUploadIds.push(id)) : [];
       const annotationAudioCount = submissionAnnotations.filter((annotation) => annotation.audio).length;
       const transportContent = serializeResponseAnnotations(messageContent, submissionAnnotations, outgoingAudio.length - annotationAudioCount);
+      const goalObjective = submittedAsGoal ? messageContent.trim() : undefined;
+      if (goalObjective !== undefined && (!goalObjective || goalObjective.length > 4000)) throw new Error("Enter a goal of 1–4,000 characters.");
       const workflowItems = submittedDraft.workflowAttachments.map((workflow) => ({
         id: workflow.id,
         name: workflow.name,
@@ -5252,10 +5386,15 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
         timestamp: acceptedTimestamp,
         state: "completed",
       };
-      if (draftSession) {
+      if (draftSession || switchingHarness) {
         if (!onCreateDraftSend) throw new Error("This local draft cannot be created right now.");
+        if (switchingHarness) {
+          const key = `${session.id}\u0000${providerId}\u0000${model}\u0000${effort}`;
+          if (modelSwitchAttempt.current?.key !== key) modelSwitchAttempt.current = { key, requestId: crypto.randomUUID() };
+        }
         await onCreateDraftSend({
           draftSessionId: session.id,
+          ...(switchingHarness ? { requestId: modelSwitchAttempt.current!.requestId } : {}),
           providerId,
           workingDirectory: session.workingDirectory,
           content: transportContent,
@@ -5265,8 +5404,9 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
           workflowIds: submittedDraft.workflowAttachments.map((workflow) => workflow.id),
           optimisticItem: acceptedRow,
           ...(simplified.simplify !== undefined ? { simplify: simplified.simplify } : {}),
+          ...(goalObjective !== undefined ? { goalObjective } : {}),
         });
-        sentLabel = "Task started";
+        sentLabel = switchingHarness ? null : "Task started";
       } else {
         const payload: JsonObject = {
           sessionId: session.id,
@@ -5276,6 +5416,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
           ...(attachmentIds.length ? { attachmentIds: [...attachmentIds] } : {}),
           ...(submittedDraft.workflowAttachments.length ? { workflowIds: submittedDraft.workflowAttachments.map((workflow) => workflow.id) } : {}),
           ...(simplified.simplify !== undefined ? { simplify: simplified.simplify } : {}),
+          ...(goalObjective !== undefined ? { goal: { objective: goalObjective } } : {}),
         };
         if (transportOnlySubmission) {
           transportSuppressionToken = `transport-${acceptedRow.id}`;
@@ -5346,6 +5487,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
         setAcceptedSelectionRevision((current) => current + 1);
       }
       deliveryAccepted = true;
+      if (submittedAsGoal) setMode("queue");
       pendingUploadIds.length = 0;
       promptHistory.current = rememberPrompt(trimmed, promptHistory.current);
       historyIndex.current = null;
@@ -5360,6 +5502,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
         // consumed attachments, and cleared composer while the durable Bridge
         // tombstone reconciles; restoring any of them would expose a duplicate.
         deliveryAccepted = true;
+        if (submittedAsGoal) setMode("queue");
         pendingUploadIds.length = 0;
         void loadQueuedMessages();
         notify(error.message, "error");
@@ -5658,8 +5801,16 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
       openDraftSchedule();
       return;
     }
-    if (command.id === "goal" && !draftSession) {
-      setGoalOpen(true);
+    if (command.id === "goal") {
+      setMode("goal");
+      commitEditor(removeSlashCommandToken(inserted, command.command));
+      return;
+    }
+    if (command.id === "permission" && !draftSession) {
+      setActionsOpen(false);
+      setGoalOpen(false);
+      setEarsOpen(false);
+      setPermissionOpen(true);
       commitEditor(removeSlashCommandToken(inserted, command.command));
       return;
     }
@@ -5678,6 +5829,24 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
     });
   };
   const onKeyDown = (event: ReactKeyboardEvent<ComposerTextInput>) => {
+    if (event.nativeEvent.isComposing) return;
+    if (!event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && meshMentionVisible) {
+      if (event.key === "Escape") { event.preventDefault(); closeMesh(); return; }
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        if (meshMentionOptions.length) {
+          const direction = event.key === "ArrowDown" ? 1 : -1;
+          setMeshMentionSelection((current) => (current + direction + meshMentionOptions.length) % meshMentionOptions.length);
+        }
+        return;
+      }
+      if (event.key === "Enter" || (event.key === "Tab" && meshMentionOptions.length)) {
+        event.preventDefault();
+        const selected = meshMentionOptions[safeMeshMentionSelection];
+        if (selected && meshMention) commitMeshTarget(selected, meshMention);
+        return;
+      }
+    }
     if (!event.nativeEvent.isComposing && !event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && slashPaletteVisible) {
       if (event.key === "Escape") {
         event.preventDefault();
@@ -5782,13 +5951,15 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
     setMeshEditingToken(null);
     requestAnimationFrame(() => textarea.current?.focus());
   };
-  const commitMeshTarget = (target: MeshTarget) => {
+  const commitMeshTarget = (target: MeshTarget, mention?: NonNullable<ReturnType<typeof meshMentionAtCaret>>) => {
     const before = contentRef.current;
-    const editing = meshEditingToken && meshModelPicker !== null;
+    const editing = !mention && meshEditingToken && meshModelPicker !== null;
     const editor = meshEditorValue(before, meshTargetsRef.current);
     const match = /(^|[\s\uE000-\uF8FF])\/mesh(?=$|\s)/iu.exec(editor);
-    const tokenStart = match ? readMeshEditorValue(editor.slice(0, match.index + match[1]!.length), meshTargetsRef.current).content.length : 0;
-    const next = editing || !match ? before : before.slice(0, tokenStart) + before.slice(tokenStart + "/mesh".length);
+    const editorStart = mention?.start ?? (match ? match.index + match[1]!.length : 0);
+    const tokenStart = readMeshEditorValue(editor.slice(0, editorStart), meshTargetsRef.current).content.length;
+    const tokenLength = mention ? mention.end - mention.start : match ? "/mesh".length : 0;
+    const next = editing ? before : before.slice(0, tokenStart) + before.slice(tokenStart + tokenLength);
     let committed: MeshTarget | undefined;
     if (editing) {
       setMeshTargets((current) => current.map((item) => item.composerToken === meshEditingToken ? { ...item, ...target } : item));
@@ -5798,7 +5969,10 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
       let code = 0xE000;
       while (used.has(String.fromCharCode(code))) code += 1;
       committed = { ...target, composerToken: String.fromCharCode(code), offset: Math.min(tokenStart, next.length) };
-      commitContent(next, [...moveMeshTargets(before, next, meshTargetsRef.current), committed]);
+      if (mention) {
+        const draft = readMeshEditorValue(editor.slice(0, mention.start) + committed.composerToken + editor.slice(mention.end), [...meshTargetsRef.current, committed]);
+        commitContent(draft.content, draft.targets);
+      } else commitContent(next, [...moveMeshTargets(before, next, meshTargetsRef.current), committed]);
     }
     setMeshModelPicker(null);
     setMeshEditingToken(null);
@@ -5811,6 +5985,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
       if (committed && textarea.current) {
         const caret = textarea.current.value.indexOf(committed.composerToken!) + 1;
         textarea.current.setSelectionRange(caret, caret);
+        setComposerCaret(caret);
       }
     });
   };
@@ -5867,10 +6042,11 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
       if (!onCreateSideChat) notify("Side chats are unavailable right now.", "error");
       else void onCreateSideChat(session.id).catch((error: unknown) => notify(error instanceof Error ? error.message : String(error), "error"));
     } else if (pendingAction.action === "delegate") setDelegationOpen(true);
-    else if (pendingAction.action === "goal") setGoalOpen(true);
+    else if (pendingAction.action === "goal") setMode("goal");
+    else if (pendingAction.action === "permission") setPermissionOpen(true);
     else if (pendingAction.action === "eyes") setVisionAction("settings");
     else if (pendingAction.action === "mesh") setMeshOpen(true);
-    else if (pendingAction.action === "mesh_send") void submit();
+    else if (pendingAction.action === "mesh_send" || pendingAction.action === "model_switch_send") void submit();
     else if (pendingAction.action === "instant") onInstantSession?.();
   // The request id is the one-shot boundary. The action is consumed before any
   // asynchronous branch/browser work so a rerender cannot replay it.
@@ -5892,6 +6068,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
     <button type="button" role="menuitem" onClick={() => { setAttachmentsOpen(false); if (draftSession) setWorkflowPickerOpen(true); else void openVisualAction("workflow"); }}><WorkflowIcon /><span><strong>Attach workflow</strong><small>Use recorded local context</small></span></button>
   </>;
   const actions = <>
+    <button type="button" role="menuitem" disabled={materializingAction !== null} onClick={() => { if (draftSession) void requestDraftAction("permission"); else { setActionsOpen(false); setGoalOpen(false); setEarsOpen(false); setPermissionOpen(true); } }}><SlidersIcon /><span><strong>Permissions</strong><small>Choose this task’s harness permissions</small></span></button>
     {draftSession ? <button type="button" role="menuitem" onClick={openDraftSchedule}><ClockIcon /><span><strong>Schedule task</strong><small>Run this text-only task later</small></span></button> : null}
     <button type="button" role="menuitem" disabled={deriving || materializingAction !== null} onClick={() => { if (draftSession) void requestDraftAction("handoff"); else { setActionsOpen(false); setHandoffOpen(true); } }}><ChatIcon /><span><strong>Context Handoff</strong><small>Same model drafts a pickup prompt in a side chat</small></span></button>
     <button type="button" role="menuitem" disabled={deriving || materializingAction !== null} onClick={() => { if (draftSession) void requestDraftAction("branch"); else void branchSession(); }}><BranchIcon /><span><strong>Branch in New Task</strong><small>Continue from this exact conversation</small></span>{deriving || materializingAction === "branch" ? <span className="spinner" /> : null}</button>
@@ -5899,7 +6076,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
     <button type="button" role="menuitem" disabled={!onCreateSideChat || materializingAction !== null} onClick={() => { if (draftSession) void requestDraftAction("side_chat"); else { setActionsOpen(false); void onCreateSideChat?.(session.id).catch((error: unknown) => notify(error instanceof Error ? error.message : String(error), "error")); } }}><ChatIcon /><span><strong>Open side chat</strong><small>Ask with this task's current context</small></span></button>
     <button type="button" role="menuitem" disabled={!canDelegate || materializingAction !== null} onClick={() => { if (draftSession) void requestDraftAction("delegate"); else { setActionsOpen(false); setDelegationOpen(true); } }}><AgentIcon /><span><strong>Delegate task</strong><small>Start grouped child sessions</small></span></button>
     <button type="button" role="menuitem" onClick={() => { setMode(mode === "queue" && canSteer ? "steer" : "queue"); setActionsOpen(false); }}><SendIcon /><span><strong>Send behavior: {mode === "steer" ? "Steer" : "Queue"}</strong><small>{canSteer ? "Switch between next-up and live guidance" : "Instructions run next"}</small></span><CheckIcon /></button>
-    <button type="button" role="menuitem" disabled={materializingAction !== null} onClick={() => { if (draftSession) void requestDraftAction("goal"); else { setActionsOpen(false); setGoalOpen(true); } }}><GoalIcon /><span><strong>Goal</strong><small>{goal ? `${goalLabels[goal.status]} · ${goal.objective}` : "Set and manage this task's objective"}</small></span></button>
+    <button type="button" role="menuitemcheckbox" aria-checked={goalArmed} disabled={sending || materializingAction !== null} onClick={() => { setActionsOpen(false); setGoalOpen(false); setMode(goalArmed ? "queue" : "goal"); requestAnimationFrame(() => textarea.current?.focus()); }}><GoalIcon /><span><strong>Goal</strong><small>Send the next message as this task’s goal</small></span>{goalArmed ? <CheckIcon /> : null}</button>
     <button type="button" role="menuitem" onClick={() => { setActionsOpen(false); setEarsOpen(true); }}><MicrophoneIcon /><span><strong>EARS settings</strong><small>Preprocess dictation before the destination agent</small></span></button>
     <button type="button" role="menuitem" disabled={materializingAction !== null} onClick={() => { if (draftSession) void requestDraftAction("eyes"); else { setActionsOpen(false); setVisionAction("settings"); } }}><EyeIcon /><span><strong>EYES settings</strong><small>Choose the model that reads images</small></span></button>
     <button type="button" role="menuitem" onClick={() => { setActionsOpen(false); onManageWorkflow(); }}><SlidersIcon /><span><strong>Manage workflows</strong><small>Review recordings in Settings</small></span></button>
@@ -5960,7 +6137,8 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
     <div className={`composer-box${dropActive ? " composer-drop-active" : ""}${dictationRecording ? " composer-recording" : ""}`} ref={composerBox} onDragEnter={onComposerDragOver} onDragOver={onComposerDragOver} onDragLeave={onComposerDragLeave} onDrop={(event) => void onComposerDrop(event)}>
       <ComposerSurfaceOutline />
       <div className="composer-footer" aria-label="Message options">
-        <ModelPicker snapshot={snapshot} providerId={providerId} sessionModel={providerId === session.providerId ? session.model : ""} value={model} allowProviderChange={draftSession} onChange={selectComposerModel} />
+        <ModelPicker snapshot={snapshot} providerId={providerId} sessionModel={providerId === session.providerId ? session.model : ""} value={model} allowProviderChange={draftSession || onMaterializeDraft !== undefined} currentTaskProviderId={draftSession ? undefined : session.providerId} onChange={selectComposerModel} />
+        {switchingHarness ? <span className="model-switch-notice" role="img" tabIndex={0} aria-label="Switching coding tools uses a private context summary; some earlier details may be lost" title="Your next message will switch coding tools using a private context summary. Some earlier details may be lost."><InfoIcon /></span> : null}
         {effort && efforts.length ? <ChoiceMenu value={effort} options={efforts.map((item) => ({ value: item, label: reasoningLabel(item, { providerId, modelId: model, displayName: chosenModel?.name }) }))} onChange={selectComposerEffort} label="Choose reasoning effort" className="effort-choice" triggerDescription="Reasoning" /> : null}
       </div>
       {slashPaletteVisible ? <div className="slash-command-palette" id={slashListId} role="listbox" aria-label="Commands">
@@ -5986,6 +6164,9 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
       {meshOpen && meshModelPicker === null ? <div className="mesh-panel-anchor" ref={meshPanel}>
         <MeshPanel snapshot={snapshot} options={meshProviderOptions} targets={meshTargets} selections={meshQuickTargets} activeIndex={safeMeshSelection} listId={meshListId} onHighlight={setMeshSelection} onSelect={commitMeshTarget} onDetails={openMeshModelPicker} onClose={closeMesh} />
       </div> : null}
+      {meshMentionVisible ? <div className="mesh-panel-anchor" ref={meshPanel}>
+        <MeshMentionPanel snapshot={snapshot} options={meshMentionOptions} emptyMessage={meshTargets.length >= maximumMeshTargets ? "Four subagents are already referenced" : !recentMentionModels.length ? "Use /mesh to choose your first models." : meshMention.query ? `No recent models match @${meshMention.query}. Use /mesh to choose another model.` : "Recent models are unavailable. Use /mesh to choose a model."} activeIndex={safeMeshMentionSelection} listId={meshMentionListId} onHighlight={setMeshMentionSelection} onSelect={(target) => commitMeshTarget(target, meshMention)} onClose={closeMesh} />
+      </div> : null}
       {meshPickerProvider ? <div className="mesh-panel-anchor" ref={meshModelPanel}>
         <MeshModelPicker key={`${meshPickerProvider.id}:${meshEditingTarget?.modelId ?? meshPickerInitialTarget?.modelId ?? ""}:${meshEditingTarget?.reasoningEffort ?? meshPickerInitialTarget?.reasoningEffort ?? ""}`} snapshot={snapshot} provider={meshPickerProvider} {...(meshEditingTarget ? { existing: meshEditingTarget } : {})} {...(!meshEditingTarget && meshPickerInitialTarget ? { initial: meshPickerInitialTarget } : {})} onHydrateProviderModels={onHydrateProviderModels} onCommit={commitMeshTarget} onBack={backToMesh} onClose={closeMesh} />
       </div> : null}
@@ -6009,6 +6190,10 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
           </div>
         </Popover>
       </div> : null}
+      {goalArmed || goal ? <div className={`composer-goal-indicator${goalArmed ? " is-armed" : ""}`}>
+        {goalArmed ? <><span role="status"><GoalIcon /><strong>Goal</strong><span>{sending ? "Sending…" : "Next message"}</span></span><button type="button" aria-label="Cancel goal for next message" disabled={sending} onClick={() => setMode("queue")}><XIcon /></button></>
+          : <button type="button" className="composer-current-goal" title={goal!.objective} aria-label={`Manage goal: ${goal!.objective}`} onClick={() => setGoalOpen(true)}><GoalIcon /><strong>Goal {goalLabels[goal!.status].toLowerCase()}</strong><span>{goal!.objective}</span><ChevronDownIcon /></button>}
+      </div> : null}
       {annotations.length ? <div className="composer-annotation-chips" role="list" aria-label="Response annotations">{annotations.map((annotation, index) => <ComposerAnnotationChip
         key={annotation.id}
         annotation={annotation}
@@ -6021,6 +6206,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
         {workflowAttachments.map((attachment) => <span className="workflow-attachment-chip" key={attachment.id}><button type="button" className="workflow-chip-link" title="View workflow details" onClick={() => onManageWorkflow(attachment.id)}><WorkflowIcon /><span><strong>{attachment.name}</strong><small>Recorded workflow</small></span></button><button type="button" aria-label={`Remove ${attachment.name}`} onClick={() => commitWorkflowAttachments((current) => current.filter((item) => item.id !== attachment.id))}><XIcon /></button></span>)}
       </div> : null}
       {goalOpen && !draftSession && onGoal ? <GoalSettingsPanel session={session} goal={goal} goalClearRevision={goalClearRevision} notify={notify} onGoal={onGoal} onClose={closeGoal} panelRef={goalPanel} /> : null}
+      {permissionOpen && !draftSession ? <PermissionSettings key={session.id} sessionId={session.id} request={request} onClose={closePermission} /> : null}
       {earsOpen ? <EarsSettingsPanel settings={ears} routes={earsRoutesFromSnapshot(snapshot)} onChange={(value) => { void onEarsChange?.(value); }} onClose={() => closeEars()} panelRef={earsPanel} /> : null}
       {earsBusy ? <div className="ears-progress" role="status" aria-live="polite">
         <span>Transcribing dictation…</span>
@@ -6042,21 +6228,22 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
               historyIndex.current = null;
               unsentHistoryDraft.current = draft.content;
               setSlashPaletteDismissed(false);
+              setMeshMentionDismissed(false);
               commitContent(draft.content, draft.targets);
             }} onSelectionChange={(start, end) => setComposerCaret(start === end ? start : -1)} onCopy={copyMeshSelection} onCut={(event) => {
               if (copyMeshSelection(event)) document.execCommand("delete");
             }} onPaste={onPaste} onKeyDown={onKeyDown}
               onEdit={(token) => { const target = meshTargets.find((item) => item.composerToken === token); if (target) openMeshModelPicker(target.providerId, token); }}
               onRemove={removeMeshTarget}
-              placeholder={draftSession ? "Describe the task…" : meshOpen ? "Optional instruction for the mesh…" : holdsFollowUpQueue ? "Add an instruction…" : "Continue this task…"}
-              expanded={slashPaletteVisible || meshOpen} controls={slashPaletteVisible ? slashListId : meshOpen ? meshListId : undefined}
-              activeDescendant={slashPaletteVisible && slashSuggestions?.length ? `${slashListId}-${slashSuggestions[Math.min(slashSelection, slashSuggestions.length - 1)]!.id}` : meshOpen && meshProviderOptions.length ? `${meshListId}-${safeMeshSelection}` : undefined} />
+              placeholder={goalArmed ? "Describe the goal…" : draftSession ? "Describe the task…" : meshOpen ? "Optional instruction for the mesh…" : holdsFollowUpQueue ? "Add an instruction…" : "Continue this task…"}
+              expanded={slashPaletteVisible || meshOpen || meshMentionVisible} controls={slashPaletteVisible ? slashListId : meshOpen ? meshListId : meshMentionVisible ? meshMentionListId : undefined}
+              activeDescendant={slashPaletteVisible && slashSuggestions?.length ? `${slashListId}-${slashSuggestions[Math.min(slashSelection, slashSuggestions.length - 1)]!.id}` : meshOpen && meshProviderOptions.length ? `${meshListId}-${safeMeshSelection}` : meshMentionVisible && meshMentionOptions.length ? `${meshMentionListId}-${safeMeshMentionSelection}` : undefined} />
           </div>
         <div className="composer-primary-actions">
           <Popover label="More message actions" className="composer-actions-menu" open={actionsOpen} onOpen={(open) => { setActionsOpen(open); if (open) setAttachmentsOpen(false); }} trigger={<MoreIcon />}>{actions}</Popover>
           <DictationControl providerId={providerId} ref={dictationControl} request={request} notify={notify} onTranscript={(transcript) => { const sending = sendAfterDictation.current; commitContent((current) => appendTranscript(current, transcript)); if (!sending) requestAnimationFrame(() => textarea.current?.focus()); }} onAudio={(audio) => { const sending = sendAfterDictation.current; addAudio(audio); if (!sending) requestAnimationFrame(() => textarea.current?.focus()); }} audioDictationAvailable={audioRecordingAvailable} directToModel={audioDictationAvailable} liveStripHost={audioStripHost} onPhaseChange={setDictationPhase} onSettled={(committed) => { const sending = sendAfterDictation.current; sendAfterDictation.current = false; if (committed && sending && mounted.current) void submit(); }}/>
           <IconButton
-            label={dictationRecording ? "Stop dictation and send" : meshTargets.length ? "Send mesh delegation" : stopTaskAvailable ? "Stop task" : draftSession ? "Start task" : mode === "steer" ? "Steer task" : "Send instruction"}
+            label={dictationRecording ? "Stop dictation and send" : meshTargets.length ? "Send mesh delegation" : stopTaskAvailable ? "Stop task" : goalArmed ? "Send as goal" : draftSession ? "Start task" : mode === "steer" ? "Steer task" : "Send instruction"}
             className={`send-button ${stopTaskAvailable ? "stop-button" : ""}`}
             /* Never disabled by what we last wrote down about the harness. That note
                can be wrong - it is rebuilt on a handful of occasions and any moment the
@@ -6064,10 +6251,10 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
                a person nothing to press and no reason why, so a message simply vanished
                on the way out. Pressing send now always attempts it, and the attempt asks
                the harness itself; a real refusal comes back in the harness's own words. */
-            disabled={sending || scheduleBusy || interrupting || dictationPhase === "transcribing" || (meshTargets.length ? false : !dictationRecording && !stopTaskAvailable && nothingToSend)}
+            disabled={sending || materializingAction !== null || scheduleBusy || interrupting || dictationPhase === "transcribing" || (meshTargets.length ? false : !dictationRecording && !stopTaskAvailable && nothingToSend)}
             onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); event.currentTarget.click(); } }}
             onClick={primaryAction}
-          >{sending ? <span className="spinner" /> : stopTaskAvailable ? <StopIcon /> : mode === "steer" && !dictationRecording ? <SlidersIcon /> : <SendIcon className="send-arrow-icon" />}</IconButton>
+          >{sending || materializingAction !== null ? <span className="spinner" /> : stopTaskAvailable ? <StopIcon /> : mode === "steer" && !dictationRecording ? <SlidersIcon /> : <SendIcon className="send-arrow-icon" />}</IconButton>
         </div>
       </div>
     </div>

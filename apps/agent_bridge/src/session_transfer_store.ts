@@ -11,6 +11,7 @@ export interface SessionTransferRecord {
   readonly bootstrap?: string;
   readonly copiedMessages?: readonly RemoteMessage[];
   readonly sideChatPreview?: string;
+  readonly requestId?: string;
 }
 
 export interface SessionTransferState {
@@ -33,7 +34,7 @@ function relationship(value: unknown): SessionRelationship {
   const kind = value.kind;
   const strategy = value.strategy;
   const sourceSessionId = boundedString(value.sourceSessionId, "source session ID", 16_384)!;
-  if (kind === "handoff" && strategy === "summary_bootstrap") return { kind, strategy, sourceSessionId };
+  if ((kind === "handoff" || kind === "model_switch") && strategy === "summary_bootstrap") return { kind, strategy, sourceSessionId };
   if ((kind === "branch" || kind === "side_chat") && (strategy === "native" || strategy === "transcript_bootstrap")) return { kind, strategy, sourceSessionId };
   if (kind === "subagent" && strategy === "native") return { kind, strategy, sourceSessionId };
   throw new Error("Persisted session-transfer relationship is invalid");
@@ -63,8 +64,9 @@ function transfer(value: unknown): SessionTransferRecord {
   const prompt = boundedString(value.prompt, "handoff prompt", 100_000, true);
   const bootstrap = boundedString(value.bootstrap, "branch bootstrap", 1_000_000, true);
   const sideChatPreview = boundedString(value.sideChatPreview, "side-chat preview", 1_000, true);
+  const requestId = boundedString(value.requestId, "transfer request ID", 1_000, true);
   const copiedMessages = messages(value.copiedMessages);
-  if (relation.kind === "handoff" && summary === undefined) throw new Error("Persisted handoff summary is missing");
+  if ((relation.kind === "handoff" || relation.kind === "model_switch") && summary === undefined) throw new Error("Persisted handoff summary is missing");
   if ((relation.kind === "branch" || relation.kind === "side_chat") && relation.strategy === "transcript_bootstrap" && value.pending === true && bootstrap === undefined) {
     throw new Error("Persisted pending branch bootstrap is missing");
   }
@@ -77,6 +79,7 @@ function transfer(value: unknown): SessionTransferRecord {
     ...(bootstrap !== undefined ? { bootstrap } : {}),
     ...(copiedMessages !== undefined ? { copiedMessages } : {}),
     ...(sideChatPreview !== undefined ? { sideChatPreview } : {}),
+    ...(requestId !== undefined ? { requestId } : {}),
   };
 }
 

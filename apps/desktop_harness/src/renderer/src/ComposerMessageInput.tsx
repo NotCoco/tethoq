@@ -1,4 +1,4 @@
-import { forwardRef, useLayoutEffect, useRef, type ClipboardEvent, type KeyboardEvent } from "react";
+import { forwardRef, useEffect, useLayoutEffect, useRef, type ClipboardEvent, type KeyboardEvent } from "react";
 
 export interface MeshBadge {
   token: string;
@@ -140,9 +140,19 @@ export const ComposerMessageInput = forwardRef<ComposerTextInput, Props>(functio
   // restore it. Tasks which never use Mesh keep their existing textarea.
   const rich = useRef(false);
   if (props.badges.length) rich.current = true;
+  const richEditor = rich.current;
   const element = useRef<ComposerTextInput | null>(null);
   const latest = useRef(props);
   latest.current = props;
+  useEffect(() => {
+    if (!richEditor) return;
+    const selectionChanged = () => {
+      const node = element.current;
+      if (node && document.activeElement === node) latest.current.onSelectionChange?.(node.selectionStart, node.selectionEnd);
+    };
+    document.addEventListener("selectionchange", selectionChanged);
+    return () => document.removeEventListener("selectionchange", selectionChanged);
+  }, [richEditor]);
   const bind = (node: HTMLTextAreaElement | HTMLDivElement | null) => {
     if (node instanceof HTMLDivElement && !Object.hasOwn(node, "value")) {
       Object.defineProperties(node, {

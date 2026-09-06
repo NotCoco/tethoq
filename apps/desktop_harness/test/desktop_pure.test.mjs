@@ -858,7 +858,7 @@ test("the desktop keeps its own server alive as a secondary feed while a turn it
   // The secondary feed forwards session events but never the connection state,
   // and marks sessions busy so the retirement tick knows when it can stop.
   assert.match(adapterSource, /private async runSecondaryEventLoop/u);
-  assert.match(adapterSource, /if \(payload\.type === "server\.connected"\) continue;/u);
+  assert.match(adapterSource, /if \(payload\.type === "server\.connected"\) \{\s*this\.discoverPendingQuestions\(\);\s*continue;\s*\}/u);
   assert.match(adapterSource, /public isSecondaryBusy/u);
   assert.match(adapterSource, /public setSecondaryBaseUrl/u);
 });

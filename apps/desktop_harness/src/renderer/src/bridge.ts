@@ -602,6 +602,7 @@ export function mapSession(value: RemoteSession, includeDerived = false): Sessio
     providerId: value.providerId,
     title: value.title,
     state: sessionState(value.state),
+    ...(value.state === "idle" && typeof metadata.tethoqInterruptedAt === "string" ? { interruptedAt: metadata.tethoqInterruptedAt } : {}),
     project: value.project ?? value.workingDirectory?.split(/[\\/]/).filter(Boolean).at(-1) ?? "Untitled project",
     workingDirectory: value.workingDirectory ?? "",
     preview: visibleResponseAnnotationBody(value.preview ?? "No recent output."),
@@ -928,11 +929,10 @@ function nativeMetadataText(message: RemoteMessage, ...keys: string[]): string |
   return undefined;
 }
 
-function timelineOrigin(message: RemoteMessage): TimelineItem["origin"] | undefined {
-  const origin = message.origin;
-  if (!origin) return undefined;
+function timelineOrigin(value: unknown): TimelineItem["origin"] | undefined {
+  const origin = object(value);
   if (origin.kind === "delegation") return origin.sender === "codex" || origin.sender === "tethoq" ? { kind: "delegation", sender: origin.sender } : undefined;
-  if (typeof origin.envelopeId !== "string" || typeof origin.sourceSessionId !== "string" || typeof origin.sourceTitle !== "string") return undefined;
+  if (origin.kind !== "cross_session" || typeof origin.envelopeId !== "string" || typeof origin.sourceSessionId !== "string" || typeof origin.sourceTitle !== "string") return undefined;
   return {
     kind: "cross_session",
     envelopeId: origin.envelopeId,
@@ -978,7 +978,7 @@ function safeEyesFailureNotice(value: string): string {
 }
 
 function mapPart(message: RemoteMessage, part: ContentPart, index: number): TimelineItem | null {
-  const origin = timelineOrigin(message);
+  const origin = timelineOrigin(message.origin);
   const mesh = message.role === "user" ? object(message.nativeMetadata.tethoqMesh) : {};
   const meshId = string(mesh.delegationId);
   const providerPartId = "providerPartId" in part && typeof part.providerPartId === "string" && part.providerPartId.length > 0
@@ -1186,11 +1186,32 @@ function mapApproval(value: ProtocolApproval): ApprovalRequest {
   };
 }
 
-function mapInput(value: ProtocolInput): InputRequest {
+export function mapInput(value: ProtocolInput): InputRequest {
   const requestObject = object(value.request);
   const firstQuestion = object(array(requestObject.questions)[0]);
   const optionSource = array(firstQuestion.options).length ? firstQuestion.options : requestObject.options;
   const options = array(optionSource).map((option) => string(typeof option === "string" ? option : object(option).label)).filter(Boolean);
+  const sourceQuestions = array(requestObject.questions);
+  const questions = (sourceQuestions.length ? sourceQuestions : [requestObject]).map((source, index) => {
+    const question = object(source);
+    const choices = array(question.options).flatMap((sourceOption) => {
+      const option = object(sourceOption);
+      const label = typeof sourceOption === "string" ? sourceOption : string(option.label, string(option.name));
+      return label ? [{ value: string(option.value, label), label,
+        ...(typeof option.description === "string" ? { description: option.description } : {}),
+        ...(typeof option.preview === "string" ? { preview: option.preview } : {}),
+      }] : [];
+    });
+    return {
+      id: string(question.id, sourceQuestions.length ? `question_${index}` : string(requestObject.questionId, "answer")),
+      title: string(question.header, value.title),
+      prompt: string(question.question, string(question.prompt, value.prompt ?? "The coding tool needs more information.")),
+      options: choices,
+      multiple: question.multiple === true || question.multiSelect === true || question.multi_select === true,
+      allowCustom: !choices.length || (question.custom !== false && question.isOther !== false),
+      secret: question.isSecret === true,
+    };
+  });
   return {
     id: value.requestId,
     sessionId: value.sessionId,
@@ -1198,6 +1219,8 @@ function mapInput(value: ProtocolInput): InputRequest {
     prompt: string(firstQuestion.question, value.prompt ?? "The coding tool needs more information."),
     answerKey: string(firstQuestion.id || requestObject.questionId, "answer"),
     ...(options.length ? { options } : {}),
+    questions,
+    ...(requestObject.kind === "elicitation" ? { elicitation: requestObject } : {}),
   };
 }
 
@@ -1683,13 +1706,6 @@ function messageKind(event: AgentEvent): "user" | "assistant" | "reasoning" {
     : "assistant";
 }
 
-function eventDelegationOrigin(event: AgentEvent): TimelineItem["origin"] | undefined {
-  const origin = object(event.payload.origin);
-  return origin.kind === "delegation" && (origin.sender === "codex" || origin.sender === "tethoq")
-    ? { kind: "delegation", sender: origin.sender }
-    : undefined;
-}
-
 function eventUserRecordMetadata(event: AgentEvent): Pick<TimelineItem, "turnId" | "canonicalUserMessage"> {
   for (const source of eventSources(event)) {
     const turnId = firstText(source.turnId, source.turn_id);
@@ -1727,6 +1743,7 @@ function completedUserImageAttachments(event: AgentEvent): NonNullable<TimelineI
 }
 
 function delegationTimelineState(taskState: string, childState: string): NonNullable<TimelineItem["state"]> {
+  if (childState === "working" || childState === "needs_approval" || childState === "needs_input") return "running";
   if (childState === "failed") return "failed";
   if (childState === "completed" || childState === "idle" || taskState === "completed") return "completed";
   if (taskState === "failed") return "failed";
@@ -1756,6 +1773,7 @@ export function delegationTimelineItems(value: unknown, fallbackTimestamp = new 
       const childProviderId = string(child.providerId).trim();
       const childModelId = string(child.modelId).trim();
       const childReasoningEffort = string(child.reasoningEffort).trim();
+      const childInterruptedAt = string(child.state) === "idle" ? string(child.interruptedAt).trim() : "";
       const body = [childProviderId, childModelId, childReasoningEffort].filter(Boolean).join(" · ");
       return [{
         id: `${parentSessionId}:delegation:${delegationId}:child:${childId}`,
@@ -1769,9 +1787,34 @@ export function delegationTimelineItems(value: unknown, fallbackTimestamp = new 
         ...(childProviderId ? { childProviderId } : {}),
         ...(childModelId ? { childModelId } : {}),
         ...(childReasoningEffort ? { childReasoningEffort } : {}),
+        ...(childInterruptedAt ? { childInterruptedAt } : {}),
+        childStatusUpdatedAt: delegationCreatedAt(task.updatedAt, timestamp),
       }];
     });
   });
+}
+
+/** A child session owns its status, independently of the parent turn. */
+export function reconcileSubagentTimeline(parentSessionId: string, timeline: readonly TimelineItem[], sessions: readonly Session[]): TimelineItem[] {
+  const children = new Map(sessions.filter((session) => session.relationshipKind === "subagent"
+    && session.relationshipSourceSessionId === parentSessionId).map((session) => [session.id, session]));
+  let changed = false;
+  const reconciled = timeline.map((item) => {
+    if (item.kind !== "subagent" || !item.childSessionId) return item;
+    const child = children.get(item.childSessionId);
+    if (!child) return item;
+    const state = delegationTimelineState("working", child.state);
+    // An older cached session cannot replace a newer settled child row.
+    const childUpdatedAt = Date.parse(child.updatedAt);
+    const recordedAt = Date.parse(item.childStatusUpdatedAt ?? item.timestamp);
+    if (item.state !== "running" && (!Number.isFinite(childUpdatedAt) || childUpdatedAt <= recordedAt)) return item;
+    const interruptedAt = child.state === "idle" ? child.interruptedAt : undefined;
+    if (state === item.state && interruptedAt === item.childInterruptedAt) return item;
+    changed = true;
+    const { childInterruptedAt: _previous, ...rest } = item;
+    return { ...rest, state, ...(interruptedAt ? { childInterruptedAt: interruptedAt } : {}), childStatusUpdatedAt: child.updatedAt };
+  });
+  return changed ? reconciled : timeline as TimelineItem[];
 }
 
 export function eventToTimeline(event: AgentEvent): TimelineItem | null {
@@ -1859,7 +1902,7 @@ export function eventToTimeline(event: AgentEvent): TimelineItem | null {
     if (!body) return null;
     const responseAnnotations = parseResponseAnnotations(body);
     const id = eventIdentity(event, "message");
-    const origin = eventDelegationOrigin(event);
+    const origin = timelineOrigin(event.payload.origin);
     return {
       id: `${sessionId}:user:${id}`,
       messageId: id,
@@ -1879,7 +1922,7 @@ export function eventToTimeline(event: AgentEvent): TimelineItem | null {
     const id = eventIdentity(event, kind === "reasoning" ? "reasoning" : "message");
     const providerPartId = providerPartIdentity(event);
     const phase = kind === "assistant" ? timelineMessagePhase(event.payload.phase) : undefined;
-    const origin = eventDelegationOrigin(event);
+    const origin = timelineOrigin(event.payload.origin);
     const body = eventText(event);
     const images = kind === "user" ? completedUserImageAttachments(event) : [];
     // Codex rollout imports arrive as completed user messages rather than the

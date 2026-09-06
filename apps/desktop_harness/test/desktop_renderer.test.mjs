@@ -491,6 +491,7 @@ test("initial renderer snapshot paints providers before attention requests settl
     prompt: "Where should this deploy?",
     answerKey: "deployment_target",
     options: ["Staging", "Production"],
+    questions: [{ id: "deployment_target", title: "Choose target", prompt: "Where should this deploy?", options: [{ value: "Staging", label: "Staging" }, { value: "Production", label: "Production" }], multiple: false, allowCustom: true, secret: false }],
   }]);
   assert.equal(result.snapshot.providers[0].id, "acme-agent");
   assert.equal(result.snapshot.providers[0].supportsAttachments, true);
@@ -1297,7 +1298,7 @@ test("renderer source submits keyed input answers and chunked attachment ids", a
     source(join("src", "renderer", "src", "composer_helpers.ts")),
   ]);
 
-  assert.match(app, /user_input\.respond[\s\S]*?answers:\s*\{\s*\[input\.answerKey\]:\s*\[answer\]\s*\}/);
+  assert.match(app, /user_input\.respond[\s\S]*?requestId: input\.id, answers,/);
   assert.match(helpers, /attachment\.upload\.begin[\s\S]*?attachment\.upload\.chunk[\s\S]*?attachment\.upload\.complete/);
   assert.match(helpers, /onUploadStarted\(uploadId\)/);
   assert.match(composer, /attachmentIds\.length \? \{ attachmentIds: \[\.\.\.attachmentIds\] \} : \{\}/);
@@ -2068,6 +2069,92 @@ test("an echoed Grok user chunk renders live instead of waiting for a history re
     type: "message.started",
     payload: { messageId: "assistant_0", role: "assistant" },
   }), null);
+});
+
+test("verified cross-task sender attribution survives live echoes and history reconciliation", () => {
+  const origin = {
+    kind: "cross_session",
+    envelopeId: "remote_verified",
+    sourceSessionId: "desktop_test/codex/source-task",
+    sourceTitle: "Final integration and verification",
+  };
+  const message = {
+    id: "user-remote",
+    providerMessageId: "user-remote",
+    sessionId: "session-1",
+    role: "user",
+    createdAt: "2026-09-06T12:00:00.000Z",
+    status: "completed",
+    parts: [{ type: "text", text: "Please confirm the final build is ready." }],
+    origin,
+    nativeMetadata: {},
+  };
+  const history = bridge.mapMessages([message]);
+  assert.equal(history.length, 1);
+  assert.deepEqual(history[0].origin, origin);
+  for (const type of ["message.started", "message.completed"]) {
+    const echo = bridge.eventToTimeline({
+      sequence: 1,
+      hostId: "desktop_test",
+      providerId: "codex",
+      sessionId: "session-1",
+      eventId: `cross-task:${type}`,
+      occurredAt: message.createdAt,
+      type,
+      payload: { messageId: message.providerMessageId, role: "user", text: message.parts[0].text, origin },
+    });
+    assert.equal(echo.kind, "user");
+    assert.equal(echo.body, message.parts[0].text);
+    assert.deepEqual(echo.origin, origin);
+    const merged = timelineMerge.reconcileTimelinePage(history, [echo]);
+    assert.equal(merged.length, 1);
+    assert.deepEqual(merged[0].origin, origin);
+  }
+  const ordinary = bridge.mapMessages([{ ...message, origin: undefined }]);
+  assert.equal(ordinary[0].origin, undefined);
+  const invalid = bridge.mapMessages([{ ...message, origin: { ...origin, kind: "unverified" } }]);
+  assert.equal(invalid[0].origin, undefined);
+});
+
+test("child status follows confirmed child lifecycle across parent cancellation and reload", () => {
+  const interruptedAt = "2026-09-06T12:01:00.000Z";
+  const task = {
+    id: "delegation", parentSessionId: "parent", state: "failed", interruptedAt,
+    createdAt: "2026-09-06T12:00:00.000Z", updatedAt: interruptedAt,
+    children: [
+      { id: "running", sessionId: "running", providerId: "grok", state: "working" },
+      { id: "stopped", sessionId: "stopped", providerId: "codex", state: "idle", interruptedAt },
+      { id: "idle", sessionId: "idle", providerId: "opencode", state: "idle" },
+    ],
+  };
+  const rows = bridge.delegationTimelineItems([task]);
+  assert.equal(rows[0].state, "running", "a failed parent cannot stop a running child in presentation");
+  assert.equal(rows[0].childInterruptedAt, undefined);
+  assert.equal(rows[1].state, "completed");
+  assert.equal(rows[1].childInterruptedAt, interruptedAt);
+  assert.equal(rows[2].childInterruptedAt, undefined, "parent cancellation alone does not prove the child was interrupted");
+  assert.equal(bridge.delegationTimelineItems([{ ...task, state: "completed" }])[0].state, "running");
+  assert.equal(timelineMerge.settleRunningTimeline(rows, "failed")[0].state, "running", "parent settlement must preserve independent child activity");
+
+  const child = {
+    id: "running", state: "idle", interruptedAt, updatedAt: interruptedAt,
+    relationshipKind: "subagent", relationshipSourceSessionId: "parent",
+  };
+  const corrected = bridge.reconcileSubagentTimeline("parent", rows, [child]);
+  assert.equal(corrected[0].state, "completed");
+  assert.equal(corrected[0].childInterruptedAt, interruptedAt);
+  assert.strictEqual(bridge.reconcileSubagentTimeline("parent", rows, [{ ...child, relationshipSourceSessionId: "other" }]), rows);
+  const olderWorking = { ...child, state: "working", interruptedAt: undefined, updatedAt: "2026-09-06T12:00:30.000Z" };
+  assert.strictEqual(bridge.reconcileSubagentTimeline("parent", corrected, [olderWorking]), corrected, "stale cached working must not revive the stopped child");
+  const resumed = bridge.reconcileSubagentTimeline("parent", corrected, [{ ...olderWorking, updatedAt: "2026-09-06T12:02:00.000Z" }]);
+  assert.equal(resumed[0].state, "running");
+  assert.equal(resumed[0].childInterruptedAt, undefined);
+
+  const beforeConfirmedStop = { ...rows[1], childInterruptedAt: undefined };
+  const confirmed = timelineMerge.mergeTimeline([beforeConfirmedStop], rows[1]);
+  assert.equal(confirmed[0].childInterruptedAt, interruptedAt, "an unchanged idle status still updates the stop reason");
+  const mapped = bridge.mapSession({ id: "stopped", providerId: "codex", title: "Stopped child", state: "idle", lastActivityAt: interruptedAt, nativeMetadata: { tethoqInterruptedAt: interruptedAt } }, true);
+  assert.equal(mapped.interruptedAt, interruptedAt);
 });
 
 test("an explicit interruption becomes the visible unsuccessful terminal row", () => {

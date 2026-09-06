@@ -71,6 +71,19 @@ test("mounted task recovery sends once, preserves composition, and keeps Eyes an
       qa.stage("ordinary"); await settle(); check(!running(), "ordinary idle tool acquired an Eyes override");
       qa.stage("eyes-working"); await settle(); qa.toolEnd("failed"); qa.status("idle"); await settle();
       check(!running() && document.querySelector(".timeline-error-notice").textContent.includes("API key"), "Eyes failure did not settle with its notice");
+      qa.stageStop(); await settle();
+      const stopButton = () => document.querySelector('[aria-label="Stop task"]');
+      check(stopButton() && running() === 1, "the running task must expose Stop and live reasoning");
+      stopButton().click(); await settle();
+      check(qa.calls.length === 1 && qa.pendingInterrupt, "Stop must dispatch one interrupt request");
+      check(qa.snapshot.sessions[0].state === "working" && !qa.stop && running() === 1, "pending Stop falsely presented the task as stopped");
+      qa.pendingInterrupt("No active provider turn"); await settle();
+      check(qa.notifications.includes("No active provider turn"), "a rejected interrupt must remain visible");
+      check(qa.snapshot.sessions[0].state === "working" && !qa.stop && running() === 1 && stopButton(), "a rejected Stop falsely settled the task");
+      stopButton().click(); await settle();
+      qa.confirmStop(); qa.pendingInterrupt(); await settle();
+      check(qa.calls.length === 2 && qa.snapshot.sessions[0].state === "idle" && !running(), "confirmed interruption did not settle the task");
+      check(!stopButton() && recovery(), "confirmed interruption must offer Continue rather than Stop");
       return { ok: true };
     };
     await writeFile(join(directory, "main.cjs"), `

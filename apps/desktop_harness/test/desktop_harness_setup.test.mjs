@@ -68,3 +68,27 @@ test("failed tool installs do not block another harness and can be retried witho
   assert.doesNotMatch(JSON.stringify(issues), /private diagnostic secret/);
   assert.deepEqual(await installProviderToolHelpers([{ providerId: "opencode", install: async () => {} }]), []);
 });
+
+test("harness setup uses installed app instructions without requiring source files", () => {
+  for (const guide of HARNESS_GUIDES) {
+    const prompt = harnessSetupPrompt(guide.id, { packaged: true, platform: "win32" });
+    assert.match(prompt, /copied from a packaged Tethoq app/);
+    assert.doesNotMatch(prompt, /apps\/desktop_harness|packages\/provider_|npm run setup:desktop|npm start|Source checkout setup:/);
+  }
+  const connector = harnessSetupPrompt("other", { packaged: true, connectorDirectory: "C:\\My Tools\\connectors" });
+  assert.match(connector, /resources\/connector-sdk/);
+  assert.doesNotMatch(connector, /packages\/connector_sdk|src\/types\.ts/);
+  assert.ok(connector.includes(JSON.stringify("C:\\My Tools\\connectors")));
+});
+
+test("harness setup distinguishes source runs and unknown installations", () => {
+  const source = harnessSetupPrompt("codex", { packaged: false });
+  assert.match(source, /copied from a Tethoq development\/source run/);
+  assert.match(source, /npm run setup:desktop/);
+  assert.doesNotMatch(source, /Packaged app setup/);
+  const unknown = harnessSetupPrompt("other");
+  assert.match(unknown, /Installation type is unavailable/);
+  assert.match(unknown, /A\. Packaged app setup/);
+  assert.match(unknown, /B\. Source checkout setup/);
+  assert.match(unknown, /If both exist, target the instance the user is using/);
+});

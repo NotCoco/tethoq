@@ -123,11 +123,12 @@ test("context handoff is send-free until the first user submit, then injects con
   const createdMessages = await provider.getMessages(result.session.providerSessionId);
   const bootstrap = createdMessages.flatMap((message) => message.parts).find((part) => part.type === "text");
   assert.equal(bootstrap?.type, "text");
-  assert.match(bootstrap.text, /TETHOQ_CONTEXT_HANDOFF_V1/);
-  assert.match(bootstrap.text, /Continue with focused verification/);
-  assert.match(bootstrap.text, /Seed message for fixture 1/);
-  assert.match(bootstrap.text, /Run the focused tests now/);
-  assert.equal(bootstrap.text.match(/TETHOQ_CONTEXT_HANDOFF_V1/g)?.length, 1);
+  assert.equal(bootstrap.text, firstUserContent, "provider history exposes only the readable request");
+  assert.match(provider.sentContents[0]!, /TETHOQ_CONTEXT_HANDOFF_V1/);
+  assert.match(provider.sentContents[0]!, /Continue with focused verification/);
+  assert.match(provider.sentContents[0]!, /Seed message for fixture 1/);
+  assert.match(provider.sentContents[0]!, /Run the focused tests now/);
+  assert.equal(provider.sentContents.join("").match(/TETHOQ_CONTEXT_HANDOFF_V1/g)?.length, 1);
 
   const opened = await bridge.openSession(result.session.id);
   assert.deepEqual(opened.messages.flatMap((message) => message.parts), [{ type: "text", text: firstUserContent }]);
@@ -169,7 +170,7 @@ test("a failed first handoff submit retains the pending context until an adapter
 });
 
 test("generic branch fallback bootstraps the full normalized transcript and tags its strategy", async (t) => {
-  const provider = new FakeProviderAdapter({ hostId: "host-branch-fallback", providerId: "fallback", sessionCount: 1 });
+  const provider = new ObservedSendFakeProvider({ hostId: "host-branch-fallback", providerId: "fallback", sessionCount: 1 });
   const bridge = new AgentBridge(bridgeConfig("host-branch-fallback", provider.providerId), [provider]);
   t.after(() => bridge.dispose());
   await bridge.start();
@@ -188,9 +189,10 @@ test("generic branch fallback bootstraps the full normalized transcript and tags
   const createdMessages = await provider.getMessages(result.session.providerSessionId);
   const text = createdMessages.flatMap((message) => message.parts).find((part) => part.type === "text");
   assert.equal(text?.type, "text");
-  assert.match(text.text, /TETHOQ_BRANCH_TRANSCRIPT_BOOTSTRAP_V1/);
-  assert.match(text.text, /Seed message for fixture 1/);
-  assert.match(text.text, /Take an independent approach/);
+  assert.equal(text.text, "Take an independent approach.", "provider history excludes private bootstrap metadata");
+  assert.match(provider.sentContents[0]!, /TETHOQ_BRANCH_TRANSCRIPT_BOOTSTRAP_V1/);
+  assert.match(provider.sentContents[0]!, /Seed message for fixture 1/);
+  assert.match(provider.sentContents[0]!, /Take an independent approach/);
 
   const opened = await bridge.openSession(result.session.id);
   const visibleText = opened.messages.flatMap((message) => message.parts).filter((part) => part.type === "text").map((part) => part.text).join("\n");

@@ -1,0 +1,23 @@
+.question-card { margin: 14px 0 20px; color: var(--text); }
+.question-card > summary { display: flex; align-items: center; gap: 9px; cursor: pointer; list-style: none; color: var(--muted); font-size: 12px; min-height: 34px; }
+.question-card > summary::-webkit-details-marker { display: none; }
+.question-card > summary svg { width: 14px; height: 14px; margin-right: 7px; }
+.question-card > summary strong { font-weight: 550; }
+.question-form { margin: 10px 0 0 30px; padding: 17px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.question-form fieldset { margin: 0 0 20px; padding: 0; border: 0; min-width: 0; }
+.question-form legend { font-size: 13px; font-weight: 550; }
+.question-form p { margin: 6px 0 13px; font-size: 13px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.question-hint, .question-custom > span { display: block; margin: 8px 0; color: var(--muted); font-size: 11px; }
+.question-options { display: grid; gap: 7px; }
+.question-options > label { display: flex; gap: 10px; align-items: flex-start; padding: 11px 12px; border: 1px solid var(--line); border-radius: 7px; cursor: pointer; }
+.question-options > label.selected { border-color: #65655f; background: #262625; }
+.question-options input { margin-top: 2px; accent-color: #bebdb7; }
+.question-options label > span { flex: 1; min-width: 0; }
+.question-options strong { font-size: 12px; font-weight: 500; }
+.question-options small { display: block; color: var(--muted); font-size: 11px; line-height: 1.5; margin-top: 4px; }
+.question-options pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+.question-options svg { width: 14px; height: 14px; flex-shrink: 0; }
+.question-custom textarea, .question-custom input { width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg); color: var(--text); font: inherit; font-size: 12px; resize: vertical; }
+.question-custom textarea:focus, .question-custom input:focus { outline: 1px solid #92928b; }
+
+.question-custom select { width: 100%; padding: 8px; margin-bottom: 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); font-size: 12px; }

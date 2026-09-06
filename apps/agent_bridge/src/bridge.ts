@@ -79,6 +79,7 @@ import {
   type ProviderDetection,
   type ProviderQueuedMessage,
   type ProviderSessionGoal,
+  type ProviderSessionPermissions,
   type ProviderClientTooling,
   type MessageAttachment,
   type SendMessageRequest,
@@ -104,9 +105,9 @@ import {
   branchBootstrap,
   branchBootstrapWithUserRequest,
   clientVisibleBranchMessages,
-  clientVisibleHandoffMessages,
   handoffBootstrap,
   handoffSummary,
+  modelSwitchSummary,
   persistableBranchMessages,
 } from "./context_transfer.js";
 import { maximumCompactionThresholds } from "./compaction_threshold_store.js";
@@ -702,6 +703,9 @@ export class AgentBridge {
   readonly #historicallyScannedExternalLaunchParents = new Set<string>();
   readonly #externalLaunchHistoryScans = new Map<string, Promise<void>>();
   readonly #interruptions = new Map<string, Promise<void>>();
+  readonly #stoppedSessions = new Set<string>();
+  readonly #stopGenerations = new Map<string, number>();
+  readonly #pendingProviderSends = new Map<string, Set<Promise<SendMessageResult>>>();
   readonly #internalSessionIds = new Set<string>();
   readonly #internalTurnTerminals = new Map<string, InternalTurnTerminal[]>();
   readonly #activeVisionHelperTurns = new Map<string, ActiveVisionHelperTurn>();
@@ -1131,6 +1135,23 @@ export class AgentBridge {
     };
   }
 
+  public async sessionPermissions(globalSessionId: string): Promise<ProviderSessionPermissions> {
+    this.assertActive();
+    const { providerId, providerSessionId } = this.assertSessionHost(globalSessionId);
+    const adapter = this.requireAdapter(providerId);
+    return adapter.getSessionPermissions === undefined
+      ? { controls: [], note: `${adapter.displayName} does not expose permission settings for this task.` }
+      : await adapter.getSessionPermissions(providerSessionId);
+  }
+
+  public async setSessionPermission(globalSessionId: string, controlId: string, value: string): Promise<ProviderSessionPermissions> {
+    this.assertActive();
+    const { providerId, providerSessionId } = this.assertSessionHost(globalSessionId);
+    const adapter = this.requireAdapter(providerId);
+    if (adapter.setSessionPermission === undefined) throw new Error(`${adapter.displayName} does not expose permission settings for this task.`);
+    return await adapter.setSessionPermission(providerSessionId, controlId, value);
+  }
+
   public async sessionGoal(globalSessionId: string): Promise<SessionGoal | null> {
     this.assertActive();
     const { providerId, providerSessionId } = this.assertSessionHost(globalSessionId);
@@ -1490,7 +1511,10 @@ export class AgentBridge {
   }
 
   public sessions(): readonly RemoteSession[] {
-    return this.#cache.all().filter((session) => !this.isInternalSession(session));
+    const continued = new Set([...this.#sessionTransfers.values()]
+      .filter((record) => record.relationship.kind === "model_switch" && this.#cache.get(record.sessionId) !== undefined)
+      .map((record) => record.relationship.sourceSessionId));
+    return this.#cache.all().filter((session) => !this.isInternalSession(session) && !continued.has(session.id));
   }
 
   public async visionProxyTargets(): Promise<VisionProxyTargetCatalogue> {
@@ -1883,6 +1907,27 @@ export class AgentBridge {
         return { session: cached, ...anchoredMessagePage(snapshot, undefined, boundedLimit) };
       }
 
+      if (cached?.sessionKind === "side_chat" || cached?.relationship?.kind === "model_switch") {
+        // Before its first send, the child has only Bridge-owned context. Some
+        // harnesses cannot read a native transcript until a turn exists.
+        const awaitingFirstSend = (this.#pendingBranchBootstraps.has(globalSessionId) || this.#pendingContextHandoffs.has(globalSessionId))
+          && cached.state === "idle" && !this.#pendingProviderSends.has(globalSessionId)
+          && !this.sessionTurnInFlight(globalSessionId);
+        const refreshSession = refresh && !sessionFetched && !awaitingFirstSend;
+        const authoritativeSessionBaseline = refreshSession ? { cached } : undefined;
+        const [session, history] = await Promise.all([
+          refreshSession ? adapter.getSession(providerSessionId).catch(() => cached!) : Promise.resolve(cached),
+          awaitingFirstSend
+            ? Promise.resolve({ messages: [] as readonly RemoteMessage[], complete: true })
+            : this.sideChatHistory(adapter, providerSessionId, globalSessionId),
+        ]);
+        await this.reconcileQueueDeliveriesFromMessages(globalSessionId, history.messages);
+        // sideChatHistory has exhausted the available history paths. Do not
+        // advertise an older page that would repeat an unsupported native read.
+        const opened = this.finishOpenSession(globalSessionId, session, history.messages, generation, true, undefined, authoritativeSessionBaseline);
+        return { session: opened.session, ...anchoredMessagePage(this.#messageSnapshots.get(globalSessionId)!, undefined, boundedLimit) };
+      }
+
       // A forced refresh invalidates the Bridge snapshot; it must not disable a
       // provider's bounded history path. Doing so made a stale client cursor
       // fall through to getMessages(), which reconstructs an entire Codex
@@ -1978,7 +2023,7 @@ export class AgentBridge {
     }
     this.restoreSessionTransferLinks();
     let resolvedSession = this.#cache.get(globalSessionId) ?? session;
-    const visibleProviderMessages = clientVisibleBranchMessages(clientVisibleHandoffMessages(providerMessages));
+    const visibleProviderMessages = clientVisibleBranchMessages(providerMessages);
     const providerVisible = this.isTethoqDelegationChild(globalSessionId)
       ? withDelegationOrigin(visibleProviderMessages, "tethoq")
       : visibleProviderMessages;
@@ -1993,7 +2038,8 @@ export class AgentBridge {
       this.#cache.upsert(hydrated);
       resolvedSession = this.#cache.get(globalSessionId) ?? hydrated;
     }
-    const copied = (resolvedSession.relationship?.kind === "branch" || resolvedSession.relationship?.kind === "side_chat") && resolvedSession.relationship.strategy === "transcript_bootstrap"
+    const copied = resolvedSession.relationship?.kind === "model_switch"
+      || (resolvedSession.relationship?.kind === "branch" || resolvedSession.relationship?.kind === "side_chat") && resolvedSession.relationship.strategy === "transcript_bootstrap"
       ? this.#branchCopies.get(globalSessionId)
       : undefined;
     const messages = copied === undefined
@@ -2410,6 +2456,12 @@ export class AgentBridge {
     parentTurnSelection?: Readonly<Pick<RemoteSession, "modelId" | "reasoningEffort">>,
   ): Promise<PreparedDelegationResult> {
     this.assertActive();
+    const replay = this.#delegations.get(idempotencyId)?.task;
+    if (replay?.parentTurnAcceptedAt === undefined) {
+      if (replay?.interruptedAt !== undefined) throw new Error("This Mesh request was stopped by the user. Start a new Mesh turn to resume.");
+      await this.resumeStoppedSession(parentSessionId);
+    }
+    const stopGeneration = this.#stopGenerations.get(parentSessionId) ?? 0;
     const parent = this.#cache.get(parentSessionId);
     if (parent === undefined) throw new Error("Parent session is not loaded on this bridge");
     if (this.#clientTooling === undefined
@@ -2452,6 +2504,7 @@ export class AgentBridge {
       }
     } else {
       await this.validateDelegationTargetAvailability(targets);
+      this.assertSessionNotStopped(parentSessionId, stopGeneration);
       const now = new Date().toISOString();
       runtime = {
         task: {
@@ -2482,7 +2535,8 @@ export class AgentBridge {
     }
 
     try {
-      const delivery = await this.sendMessage(parentSessionId, {
+      this.assertSessionNotStopped(parentSessionId, stopGeneration);
+      const delivery = await this.sendMessageInternal(parentSessionId, {
         requestId: idempotencyId,
         content: prompt.trim()
           ? prompt
@@ -2568,6 +2622,8 @@ export class AgentBridge {
     parentTurnSelection?: Readonly<Pick<RemoteSession, "modelId" | "reasoningEffort">>,
   ): Promise<DelegationTask> {
     this.assertActive();
+    const stopGeneration = this.#stopGenerations.get(parentSessionId) ?? 0;
+    this.assertSessionNotStopped(parentSessionId, stopGeneration);
     const parent = this.#cache.get(parentSessionId);
     if (parent === undefined) throw new Error("Parent session is not loaded on this bridge");
     const trimmedPrompt = prompt.trim();
@@ -2600,6 +2656,7 @@ export class AgentBridge {
       return existing;
     }
     await this.validateDelegationTargetAvailability(targets);
+    this.assertSessionNotStopped(parentSessionId, stopGeneration);
     const now = new Date().toISOString();
     const runtime: DelegationRuntime = {
       task: {
@@ -2637,7 +2694,7 @@ export class AgentBridge {
         });
         const linked: RemoteSession = {
           ...created,
-          state: "working",
+          state: this.sessionIsStopped(created.id) ? created.state : "working",
           preview: trimmedPrompt || "Awaiting instruction from the parent task",
           lastActivityAt: new Date().toISOString(),
           parentSessionId,
@@ -2655,7 +2712,8 @@ export class AgentBridge {
           sessionId: linked.id,
           ...(target.modelId !== undefined ? { modelId: target.modelId } : {}),
           ...(target.reasoningEffort !== undefined ? { reasoningEffort: target.reasoningEffort } : {}),
-          state: "working",
+          state: linked.state,
+          ...(typeof linked.nativeMetadata.tethoqInterruptedAt === "string" ? { interruptedAt: linked.nativeMetadata.tethoqInterruptedAt } : {}),
         };
       } catch (error) {
         return {
@@ -2670,7 +2728,7 @@ export class AgentBridge {
     }));
     runtime.task = {
       ...runtime.task,
-      state: children.every((child) => child.state === "failed") ? "failed" : "working",
+      state: runtime.task.interruptedAt !== undefined || children.every((child) => child.state === "failed") ? "failed" : "working",
       updatedAt: new Date().toISOString(),
       children,
       ...(children.every((child) => child.state === "failed") ? { error: "No delegated harness could be started" } : {}),
@@ -2796,6 +2854,7 @@ export class AgentBridge {
 
   public async executeMeshTool(parentSessionId: string, tool: string, input: JsonObject): Promise<JsonObject> {
     this.assertActive();
+    this.assertSessionNotStopped(parentSessionId);
     this.assertSessionHost(parentSessionId);
     if (this.#cache.get(parentSessionId) === undefined) throw new Error("Parent session is not loaded on this bridge");
     if (tool === "mesh_dispatch_delegation") {
@@ -2829,6 +2888,7 @@ export class AgentBridge {
     if (tool === "mesh_list_children") return { children: this.meshChildren(parentSessionId) };
     if (tool === "mesh_message_child") {
       const childSessionId = this.requireMeshChild(parentSessionId, requiredMeshString(input, "child_session_id")).sessionId!;
+      this.assertSessionNotStopped(childSessionId);
       const message = requiredMeshString(input, "message");
       const child = this.#cache.get(childSessionId);
       if (child === undefined) throw new Error("Delegated child session is not loaded");
@@ -2844,8 +2904,8 @@ export class AgentBridge {
         const queued = await this.enqueueMessage(childSessionId, { requestId, content: message });
         return { delivery: "queued", childSessionId, queuedMessageId: queued.id };
       }
-      await this.sendMessage(childSessionId, { requestId, content: message });
-      this.#cache.updateState(childSessionId, "working", false);
+      await this.sendMessageInternal(childSessionId, { requestId, content: message });
+      if (!this.sessionIsStopped(childSessionId) && this.#cache.get(childSessionId) === child) this.#cache.updateState(childSessionId, "working", false);
       void this.pumpDelegationsForSession(childSessionId);
       return { delivery: "sent", childSessionId };
     }
@@ -2973,7 +3033,7 @@ export class AgentBridge {
         });
         const linked: RemoteSession = {
           ...created,
-          state: "working",
+          state: this.sessionIsStopped(created.id) ? created.state : "working",
           preview: assignment.instruction.slice(0, 240),
           lastActivityAt: new Date().toISOString(),
           parentSessionId: parent.id,
@@ -2991,23 +3051,26 @@ export class AgentBridge {
           sessionId: linked.id,
           ...(target.modelId !== undefined ? { modelId: target.modelId } : {}),
           ...(target.reasoningEffort !== undefined ? { reasoningEffort: target.reasoningEffort } : {}),
-          state: "working",
+          state: linked.state,
+          ...(typeof linked.nativeMetadata.tethoqInterruptedAt === "string" ? { interruptedAt: linked.nativeMetadata.tethoqInterruptedAt } : {}),
         };
       } catch (error) {
+        const stoppedAt = createdSessionId === undefined ? undefined : this.#cache.get(createdSessionId)?.nativeMetadata.tethoqInterruptedAt;
         return {
           id: childId,
           providerId: target.providerId,
           ...(createdSessionId !== undefined ? { sessionId: createdSessionId } : {}),
           ...(target.modelId !== undefined ? { modelId: target.modelId } : {}),
           ...(target.reasoningEffort !== undefined ? { reasoningEffort: target.reasoningEffort } : {}),
-          state: "failed",
+          state: typeof stoppedAt === "string" ? "idle" : "failed",
+          ...(typeof stoppedAt === "string" ? { interruptedAt: stoppedAt } : {}),
           error: error instanceof Error ? error.message : String(error),
         };
       }
     }));
     runtime.task = {
       ...runtime.task,
-      state: children.every((child) => child.state === "failed") ? "failed" : "working",
+      state: runtime.task.interruptedAt !== undefined || children.every((child) => child.state === "failed") ? "failed" : "working",
       updatedAt: new Date().toISOString(),
       children,
       ...(children.every((child) => child.state === "failed") ? { error: "No delegated harness could be started" } : {}),
@@ -3068,8 +3131,9 @@ export class AgentBridge {
       await this.enqueueMessage(parent.id, request);
       return;
     }
-    await this.sendMessage(parent.id, request);
-    this.#cache.updateState(parent.id, "working", false);
+    const dispatchBaseline = this.#cache.get(parent.id);
+    await this.sendMessageInternal(parent.id, request);
+    if (!this.sessionIsStopped(parent.id) && this.#cache.get(parent.id) === dispatchBaseline) this.#cache.updateState(parent.id, "working", false);
   }
 
   private hasQueuedParentDelegationTurn(task: DelegationTask): boolean {
@@ -3119,6 +3183,9 @@ export class AgentBridge {
         firstInstruction,
         ...providerOptions
       } = options;
+      const delegationParent = typeof options.metadata?.parentSessionId === "string" && typeof options.metadata.delegationId === "string"
+        ? options.metadata.parentSessionId : undefined;
+      if (delegationParent !== undefined) this.assertSessionNotStopped(delegationParent);
       const providerSession = await adapter.createSession({
         ...providerOptions,
         ...(!separatedFirstTurn && firstInstruction !== undefined ? { firstInstruction } : {}),
@@ -3131,6 +3198,21 @@ export class AgentBridge {
       // instruction after provider creation, before cache/title work can widen
       // the otherwise-unrecoverable empty-task window.
       await onProviderSessionCreated?.(providerSession);
+      const delegation = typeof options.metadata?.delegationId === "string" ? this.#delegations.get(options.metadata.delegationId) : undefined;
+      if (delegationParent !== undefined && (this.sessionIsStopped(delegationParent) || delegation?.task.interruptedAt !== undefined)) {
+        this.#cache.upsert({ ...providerSession, parentSessionId: delegationParent, agentRole: "cross_harness_delegate" });
+        this.markSessionStopped(providerSession.id);
+        if (separatedFirstTurn) {
+          // Creation did not submit an instruction, so this worker is already
+          // quiescent; no provider turn exists to interrupt.
+          const interruptedAt = new Date().toISOString();
+          this.#cache.updateState(providerSession.id, "idle", false, interruptedAt);
+          this.#cache.updateNativeMetadata(providerSession.id, { tethoqInterruptedAt: interruptedAt });
+          this.#events.append({ type: "agent.interrupted", providerId, sessionId: providerSession.id, payload: { interruptedAt } });
+          this.notifySessionCatalogueChange();
+        } else await this.interruptSession(providerSession.id);
+        throw new Error("Delegation interrupted by the user before the worker started");
+      }
       const clientTitle = options.title?.trim() || options.firstInstruction?.split(/\r?\n/u)[0]?.trim().slice(0, 96);
       const clientPreview = options.firstInstruction?.trim().slice(0, 240);
       const session: RemoteSession = {
@@ -3158,6 +3240,7 @@ export class AgentBridge {
           ...(options.reasoningEffort !== undefined ? { reasoningEffort: options.reasoningEffort } : {}),
         }, allowDuringDispose);
         if (!result.accepted) throw new Error(result.details.join(" ") || "The harness did not accept the first instruction");
+        if (this.sessionIsStopped(session.id)) return this.#cache.get(session.id) ?? session;
         const active = { ...session, state: "working" as const, preview: options.firstInstruction!.slice(0, 240), lastActivityAt: new Date().toISOString() };
         this.#cache.upsert(active);
         return active;
@@ -3281,14 +3364,14 @@ export class AgentBridge {
 
   private restoreSessionTransferRuntime(record: SessionTransferRecord): void {
     this.#sessionTransfers.set(record.sessionId, record);
-    if (record.relationship.kind === "handoff" && record.pending && record.summary !== undefined) {
+    if ((record.relationship.kind === "handoff" || record.relationship.kind === "model_switch") && record.pending && record.summary !== undefined) {
       this.#pendingContextHandoffs.set(record.sessionId, {
         summary: record.summary,
         relationship: record.relationship,
         ...(record.prompt !== undefined ? { prompt: record.prompt } : {}),
       });
     }
-    if (record.relationship.kind === "branch" || record.relationship.kind === "side_chat") {
+    if (record.relationship.kind === "branch" || record.relationship.kind === "side_chat" || record.relationship.kind === "model_switch") {
       if (record.copiedMessages !== undefined) this.#branchCopies.set(record.sessionId, record.copiedMessages);
       if (record.pending && record.bootstrap !== undefined) {
         this.#pendingBranchBootstraps.set(record.sessionId, { bootstrap: record.bootstrap, relationship: record.relationship });
@@ -3319,6 +3402,7 @@ export class AgentBridge {
       ...(record.summary !== undefined ? { summary: record.summary } : {}),
       ...(record.copiedMessages !== undefined ? { copiedMessages: record.copiedMessages } : {}),
       ...(record.sideChatPreview !== undefined ? { sideChatPreview: record.sideChatPreview } : {}),
+      ...(record.requestId !== undefined ? { requestId: record.requestId } : {}),
     };
     this.#sessionTransfers.set(sessionId, completed);
     this.#onSessionTransfersChange?.([...this.#sessionTransfers.values()]);
@@ -3332,13 +3416,16 @@ export class AgentBridge {
         const current = parseGlobalSessionId(record.sessionId);
         const source = parseGlobalSessionId(record.relationship.sourceSessionId);
         if (current.hostId !== this.config.hostId || source.hostId !== this.config.hostId
-          || (record.relationship.kind !== "subagent" && current.providerId !== source.providerId)) continue;
+          || (record.relationship.kind !== "subagent" && record.relationship.kind !== "model_switch" && current.providerId !== source.providerId)) continue;
       } catch {
         continue;
       }
       const nativeMetadata: JsonObject = record.relationship.kind === "handoff" ? {
         ...(record.summary !== undefined ? { tethoqHandoffSummary: record.summary } : {}),
         ...(record.prompt !== undefined ? { tethoqHandoffPrompt: record.prompt } : {}),
+        tethoqHandoffPending: record.pending,
+      } : record.relationship.kind === "model_switch" ? {
+        ...(record.summary !== undefined ? { tethoqModelSwitchSummary: record.summary } : {}),
         tethoqHandoffPending: record.pending,
       } : record.relationship.kind === "branch" || record.relationship.kind === "side_chat" ? {
         ...(record.bootstrap !== undefined ? { tethoqBranchBootstrap: record.bootstrap } : {}),
@@ -3352,7 +3439,7 @@ export class AgentBridge {
           parentSessionId: record.relationship.sourceSessionId,
           ...(record.sideChatPreview !== undefined ? { preview: record.sideChatPreview } : {}),
         } : record.relationship.kind === "subagent" ? { parentSessionId: record.relationship.sourceSessionId } : {}),
-        ...(record.summary !== undefined ? { contextHandoffSummary: record.summary } : {}),
+        ...(record.relationship.kind === "handoff" && record.summary !== undefined ? { contextHandoffSummary: record.summary } : {}),
         nativeMetadata: {
           ...session.nativeMetadata,
           ...transferMetadata(record.relationship),
@@ -3405,6 +3492,73 @@ export class AgentBridge {
       ...(prompt !== undefined ? { prompt } : {}),
     });
     return { summary, session, ...(prompt !== undefined ? { prompt } : {}) };
+  }
+
+  public async switchSessionModel(sourceSessionId: string, selection: {
+    readonly providerId: string;
+    readonly modelId: string;
+    readonly reasoningEffort?: string;
+    readonly requestId: string;
+  }): Promise<RemoteSession> {
+    this.assertActive();
+    this.assertSessionHost(sourceSessionId);
+    return await this.withSessionDispatchLock(sourceSessionId, async () => {
+      const retained = [...this.#sessionTransfers.values()].find((record) => record.requestId === selection.requestId);
+      if (retained !== undefined) {
+        const session = this.#cache.get(retained.sessionId);
+        if (retained.relationship.kind !== "model_switch" || retained.relationship.sourceSessionId !== sourceSessionId
+          || session?.providerId !== selection.providerId || session.modelId !== selection.modelId) {
+          throw new Error("This model-switch request was already used for a different selection");
+        }
+        return session;
+      }
+      const target = this.requireAdapter(selection.providerId);
+      const capabilities = await target.getCapabilities();
+      if (!capabilities.createSession || !capabilities.sendMessage) throw new Error(`${target.displayName} cannot continue this task`);
+      const model = (await this.listModels(selection.providerId)).find((candidate) => candidate.id === selection.modelId);
+      if (model === undefined) throw new Error("The selected model is no longer available");
+      if (selection.reasoningEffort !== undefined && !modelReasoningEfforts(model).includes(selection.reasoningEffort)) {
+        throw new Error("The selected reasoning level is not available for this model");
+      }
+      const { source, messages, historyComplete } = await this.transferSource(sourceSessionId, true);
+      if (this.isInternalSession(source)) throw new Error("Internal helper sessions cannot switch coding tools");
+      if (source.providerId === target.providerId) throw new Error("Models in the same coding tool can be selected directly");
+      if (source.state === "working" || this.sessionTurnInFlight(sourceSessionId) || this.#pendingProviderSends.has(sourceSessionId)) {
+        throw new Error("Wait for the current response to finish, or stop it before switching coding tools");
+      }
+      if ([...this.#queuedMessages.values()].some((message) => message.view.sessionId === sourceSessionId)) {
+        throw new Error("Send or remove the queued instructions before switching coding tools");
+      }
+      const summary = modelSwitchSummary(source, messages, historyComplete);
+      const relationship: SessionRelationship = { kind: "model_switch", sourceSessionId, strategy: "summary_bootstrap" };
+      const created = await target.createSession({
+        workingDirectory: this.sessionWorkingDirectory(source),
+        title: source.title,
+        modelId: selection.modelId,
+        ...(selection.reasoningEffort !== undefined ? { reasoningEffort: selection.reasoningEffort } : {}),
+        ...(target.sessionCreationFeatures?.hiddenDeveloperInstructions === true ? { developerInstructions: summary } : {}),
+        metadata: transferMetadata(relationship),
+      });
+      if (created.id === source.id || created.hostId !== source.hostId || created.providerId !== target.providerId) {
+        throw new Error("The coding tool returned an invalid continuation session");
+      }
+      const session: RemoteSession = {
+        ...created,
+        title: source.title,
+        ...(source.project !== undefined ? { project: source.project } : {}),
+        workingDirectory: this.sessionWorkingDirectory(source),
+        modelId: selection.modelId,
+        ...(selection.reasoningEffort !== undefined ? { reasoningEffort: selection.reasoningEffort } : {}),
+        relationship,
+        nativeMetadata: { ...created.nativeMetadata, ...transferMetadata(relationship), tethoqModelSwitchSummary: summary, tethoqHandoffPending: true },
+      };
+      this.#cache.upsert(session);
+      this.#pendingContextHandoffs.set(session.id, { summary, relationship });
+      this.#branchCopies.set(session.id, messages);
+      this.rememberSessionTransfer({ sessionId: session.id, relationship, pending: true, summary, copiedMessages: persistableBranchMessages(messages), requestId: selection.requestId });
+      this.notifySessionCatalogueChange();
+      return session;
+    });
   }
 
   public async branchSession(sourceSessionId: string, prompt?: string): Promise<BranchSessionResult> {
@@ -3579,15 +3733,15 @@ export class AgentBridge {
     }
     if (normalizedPrompt !== undefined && queued !== undefined) throw new Error("Choose either a new side-chat message or a queued instruction, not both");
 
-    const { adapter, source, messages } = await this.transferSource(parentSessionId);
+    const { adapter, source, messages, historyComplete } = await this.transferSource(parentSessionId, true);
     if (source.sessionKind === "internal") throw new Error("Internal helper sessions cannot create side chats");
     const capabilities = await adapter.getCapabilities();
     if (!capabilities.createSession || !capabilities.sendMessage) {
       throw new Error(`${adapter.displayName} cannot create a side chat`);
     }
     const relationship: SessionRelationship = { kind: "side_chat", sourceSessionId: parentSessionId, strategy: "transcript_bootstrap" };
-    const fallback = branchBootstrap(source, messages);
-    const bootstrap = sideChatBootstrap(fallback.content);
+    const fallback = branchBootstrap(source, messages, undefined, historyComplete);
+    const bootstrap = sideChatBootstrap(fallback.content, historyComplete);
     const created = await adapter.createSession({
       workingDirectory: this.sessionWorkingDirectory(source),
       title: `Side chat: ${source.title}`.slice(0, 120),
@@ -3679,34 +3833,66 @@ export class AgentBridge {
     return { ...result, session: promoted };
   }
 
-  private async transferSource(sourceSessionId: string): Promise<{
+  private async sideChatHistory(adapter: AgentProviderAdapter, providerSessionId: string, sessionId: string): Promise<{
+    readonly messages: readonly RemoteMessage[];
+    readonly complete: boolean;
+  }> {
+    let recent: readonly RemoteMessage[] | undefined;
+    try {
+      const snapshot = await adapter.getRecentMessages?.(providerSessionId);
+      if (snapshot?.complete) return snapshot;
+      recent = snapshot?.messages;
+    } catch { /* A harness may expose full history without supporting a bounded read. */ }
+    try {
+      return { messages: await adapter.getMessages(providerSessionId), complete: true };
+    } catch {
+      // History is useful context, not a prerequisite for opening a side chat.
+      // Keep the exact session's retained context and any newer bounded page.
+      const available = new Map((this.#messageSnapshots.get(sessionId)?.providerMessages ?? [])
+        .map((message) => [message.id, message]));
+      for (const message of recent ?? []) available.set(message.id, message);
+      return {
+        messages: [...available.values()].sort((left, right) => left.createdAt.localeCompare(right.createdAt)),
+        complete: false,
+      };
+    }
+  }
+
+  private async transferSource(sourceSessionId: string, allowPartialHistory = false): Promise<{
     readonly adapter: AgentProviderAdapter;
     readonly source: RemoteSession;
     readonly messages: readonly RemoteMessage[];
+    readonly historyComplete: boolean;
   }> {
     const { providerId, providerSessionId } = this.assertSessionHost(sourceSessionId);
     const adapter = this.requireAdapter(providerId);
     const cached = this.#cache.get(sourceSessionId);
-    const [providerSession, providerMessages] = await Promise.all([
+    const [providerSession, history] = await Promise.all([
       cached === undefined ? adapter.getSession(providerSessionId) : Promise.resolve(cached),
-      adapter.getMessages(providerSessionId),
+      allowPartialHistory ? this.sideChatHistory(adapter, providerSessionId, sourceSessionId)
+        : adapter.getMessages(providerSessionId).then((messages) => ({ messages, complete: true })),
     ]);
+    const providerMessages = history.messages;
     await this.reconcileQueueDeliveriesFromMessages(sourceSessionId, providerMessages);
     this.#cache.upsert(providerSession);
     this.restoreSessionTransferLinks();
     const source = this.#cache.get(sourceSessionId) ?? providerSession;
-    const providerVisible = clientVisibleBranchMessages(clientVisibleHandoffMessages(providerMessages));
+    const providerVisible = clientVisibleBranchMessages(providerMessages);
     const providerVisibleWithClientToolFailures = this.decorateBridgeOwnedClientToolFailures(sourceSessionId, providerVisible);
-    const copied = (source.relationship?.kind === "branch" || source.relationship?.kind === "side_chat") && source.relationship.strategy === "transcript_bootstrap"
+    const copied = source.relationship?.kind === "model_switch"
+      || (source.relationship?.kind === "branch" || source.relationship?.kind === "side_chat") && source.relationship.strategy === "transcript_bootstrap"
       ? this.#branchCopies.get(sourceSessionId)
       : undefined;
     const messages = copied === undefined
       ? providerVisibleWithClientToolFailures
       : [...copyBranchMessages(copied, sourceSessionId), ...providerVisibleWithClientToolFailures];
-    return { adapter, source, messages };
+    return { adapter, source, messages, historyComplete: history.complete };
   }
 
   public async sendMessage(globalSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
+    const replay = this.#sendLedger.get(request.requestId);
+    if (replay !== undefined) return replay;
+    await this.resumeStoppedSession(globalSessionId);
     return await this.sendMessageInternal(globalSessionId, request);
   }
 
@@ -3714,6 +3900,7 @@ export class AgentBridge {
     globalSessionId: string,
     request: Pick<SendMessageRequest, "requestId" | "modelId" | "reasoningEffort">,
   ): Promise<SendMessageResult> {
+    await this.resumeStoppedSession(globalSessionId);
     return await this.sendMessageInternal(globalSessionId, {
       ...request,
       content: hiddenProviderControlContent("continue"),
@@ -3728,23 +3915,39 @@ export class AgentBridge {
     queueDelivery?: QueueDeliveryRecord,
   ): Promise<SendMessageResult> {
     this.assertActive(allowDuringDispose);
+    const stopGeneration = this.#stopGenerations.get(globalSessionId) ?? 0;
+    this.assertSessionNotStopped(globalSessionId, stopGeneration);
     // New instructions must wait for the compacted context to be ready.
     await this.#autoCompactions.get(globalSessionId);
     await this.#compactingSessions.get(globalSessionId)?.catch(() => undefined);
-    const prepared = withSimplifyResponseGuidance(await this.withGlobalAgentInstructions(globalSessionId, request));
+    const prepared = withSimplifyResponseGuidance(request);
     // Automatic inspection can take a full helper turn. Keep retries and later
     // messages behind it so they cannot duplicate the send or replace its images.
-    if (this.#visionProxies.has(globalSessionId) || this.#sessionDispatchTails.has(globalSessionId)
+    if (request.metadata?.tethoqGoalObjective !== undefined || this.#visionProxies.has(globalSessionId) || this.#sessionDispatchTails.has(globalSessionId)
       || this.pendingContextHandoff(globalSessionId) !== undefined || this.pendingBranchBootstrap(globalSessionId) !== undefined) {
       return await this.withSessionDispatchLock(globalSessionId, async () =>
-        await this.dispatchMessage(globalSessionId, prepared, queueDelivery));
+        await this.dispatchMessage(globalSessionId, prepared, queueDelivery, stopGeneration));
     }
-    return await this.dispatchMessage(globalSessionId, prepared, queueDelivery);
+    return await this.dispatchMessage(globalSessionId, prepared, queueDelivery, stopGeneration);
   }
 
   private async withGlobalAgentInstructions(globalSessionId: string, request: SendMessageRequest): Promise<SendMessageRequest> {
+    const goalObjective = request.metadata?.tethoqGoalObjective;
+    if (goalObjective !== undefined) {
+      if (typeof goalObjective !== "string") throw new Error("Goal objective must be a string");
+      const currentGoal = this.#goals.get(globalSessionId);
+      if (currentGoal?.objective !== goalObjective.trim() || currentGoal.status !== "active") {
+        await this.setSessionGoal(globalSessionId, { objective: goalObjective, status: "active", tokenBudget: null });
+      }
+      const { tethoqGoalObjective: _goalObjective, ...metadata } = request.metadata!;
+      request = { ...request, metadata };
+    }
     const selected = await this.#globalAgentInstructions?.();
-    let developerInstructions = request.developerInstructions;
+    // Queued requests may outlive an edited or cleared goal. Remove only that
+    // control block, retaining the other instructions before and after it.
+    let developerInstructions = request.developerInstructions
+      ?.replace(/<tethoq_task_goal>[\s\S]*?<\/tethoq_task_goal>\s*/gu, "")
+      .replace(/Tethoq persistent task goal \(private control context; do not quote this block\):[\s\S]*?(?:Keep this objective in view across turns\. The goal lifecycle is controlled by Tethoq and is independent of whether this turn is busy or finished\.|$)\s*/gu, "").trim() || undefined;
     const goalHeader = "Tethoq persistent task goal (private control context; do not quote this block):";
     if (selected !== undefined) {
       const globalHeader = "Use these user-selected global AGENTS.md instructions for this Tethoq turn:";
@@ -3759,23 +3962,11 @@ export class AgentBridge {
       const budgetContext = goal.tokenBudget === null
         ? ""
         : `\nToken budget: ${goal.tokenBudget} tokens. This bridge-owned fallback has no provider-neutral usage accounting or enforcement; treat the budget as advisory.`;
-      const goalContext = `${goalHeader}\n\nObjective: ${goal.objective}\nStatus: ${goal.status}.${budgetContext}\nKeep this objective in view across turns. The goal lifecycle is controlled by Tethoq and is independent of whether this turn is busy or finished.`;
-      const existingGoalOffset = developerInstructions?.indexOf(goalHeader) ?? -1;
-      if (existingGoalOffset >= 0) {
-        // Queued provider-owned messages may carry guidance captured before a
-        // later goal edit. Replace that private block instead of preserving a
-        // stale objective in the steering request.
-        developerInstructions = `${developerInstructions!.slice(0, existingGoalOffset).trimEnd()}\n\n${goalContext}`.trim();
-      } else {
-        developerInstructions = developerInstructions === undefined ? goalContext : `${developerInstructions}\n\n${goalContext}`;
-      }
-    } else {
-      const existingGoalOffset = developerInstructions?.indexOf(goalHeader) ?? -1;
-      if (existingGoalOffset >= 0) {
-        // A queued request can outlive the goal that supplied its private
-        // context. Do not let a cleared/replaced goal leak into steering.
-        developerInstructions = developerInstructions!.slice(0, existingGoalOffset).trimEnd() || undefined;
-      }
+      const pursuit = goal.status === "active"
+        ? "Work toward this objective across turns. Complete the necessary work before concluding, or explain what blocks further progress. Do not claim success without evidence."
+        : `This goal is ${goal.status}. Do not pursue it autonomously or reopen it; follow the current user message.`;
+      const goalContext = `<tethoq_task_goal>\n${goalHeader}\n\nObjective: ${goal.objective}\nStatus: ${goal.status}.${budgetContext}\n${pursuit}\nThis private context is not a user message. Keep control labels and metadata out of the response.\n</tethoq_task_goal>`;
+      developerInstructions = developerInstructions === undefined ? goalContext : `${developerInstructions}\n\n${goalContext}`;
     }
     if (this.#clientTooling !== undefined
       && this.#sessionMaySpawnForeignSubagents?.(globalSessionId) === true
@@ -3784,9 +3975,9 @@ export class AgentBridge {
         ? foreignSubagentInstruction()
         : `${foreignSubagentInstruction()}\n\n${developerInstructions}`;
     }
-    return developerInstructions === undefined || developerInstructions === request.developerInstructions
-      ? request
-      : { ...request, developerInstructions };
+    if (developerInstructions === request.developerInstructions) return request;
+    const { developerInstructions: _previousInstructions, ...withoutInstructions } = request;
+    return developerInstructions === undefined ? withoutInstructions : { ...withoutInstructions, developerInstructions };
   }
 
   public async sendUploadedMessage(
@@ -3813,27 +4004,35 @@ export class AgentBridge {
     globalSessionId: string,
     request: SendMessageRequest,
     queueDelivery?: QueueDeliveryRecord,
+    stopGeneration = this.#stopGenerations.get(globalSessionId) ?? 0,
   ): Promise<SendMessageResult> {
     const previous = this.#sendLedger.get(request.requestId);
     if (previous !== undefined) return previous;
     const { providerId, providerSessionId, hostId } = parseGlobalSessionId(globalSessionId);
     if (hostId !== this.config.hostId) throw new Error("Session belongs to a different host");
+    this.assertSessionNotStopped(globalSessionId, stopGeneration);
+    request = await this.withGlobalAgentInstructions(globalSessionId, request);
     const pending = this.pendingContextHandoff(globalSessionId);
     const pendingBranch = this.pendingBranchBootstrap(globalSessionId);
     const contextualRequest: SendMessageRequest = pending !== undefined
       ? {
           ...request,
-          content: handoffBootstrap(pending.summary, request.content, pending.prompt),
+          ...(pending.relationship.kind === "model_switch"
+            ? { developerInstructions: [pending.summary, request.developerInstructions].filter(Boolean).join("\n\n") }
+            : { content: handoffBootstrap(pending.summary, request.content, pending.prompt) }),
           metadata: {
             ...(request.metadata ?? {}),
             ...transferMetadata(pending.relationship),
             handoffBootstrapApplied: true,
+            ...(pending.relationship.kind === "model_switch" ? { contextSummary: pending.summary } : {}),
           },
         }
       : pendingBranch !== undefined
         ? {
             ...request,
-            content: branchBootstrapWithUserRequest(pendingBranch.bootstrap, request.content),
+            ...(pendingBranch.relationship.kind === "side_chat"
+              ? { developerInstructions: [pendingBranch.bootstrap, request.developerInstructions].filter(Boolean).join("\n\n") }
+              : { content: branchBootstrapWithUserRequest(pendingBranch.bootstrap, request.content) }),
             metadata: {
               ...(request.metadata ?? {}),
               ...transferMetadata(pendingBranch.relationship),
@@ -3843,6 +4042,7 @@ export class AgentBridge {
         : request;
     this.assertAttachmentProvider(providerId, contextualRequest.attachments);
     const routedRequest = await this.routeVisionAttachments(globalSessionId, contextualRequest);
+    this.assertSessionNotStopped(globalSessionId, stopGeneration);
     const adapter = this.requireAdapter(providerId);
     let delivery = queueDelivery ?? await this.prepareDirectDelivery(
       globalSessionId,
@@ -3862,8 +4062,17 @@ export class AgentBridge {
     const compactionGenerationBeforeSend = this.#compactionTurnGenerations.get(globalSessionId)?.generation;
     const reportedSelectionGenerationBeforeSend = this.#cache.reportedSelectionGeneration(globalSessionId);
     let result: SendMessageResult;
+    try { this.assertSessionNotStopped(globalSessionId, stopGeneration); }
+    catch (error) {
+      await this.markQueueDeliveryRejected(delivery, error);
+      throw error;
+    }
+    const pendingSends = this.#pendingProviderSends.get(globalSessionId) ?? new Set<Promise<SendMessageResult>>();
+    const sending = adapter.sendMessage(providerSessionId, providerRequest);
+    pendingSends.add(sending);
+    this.#pendingProviderSends.set(globalSessionId, pendingSends);
     try {
-      result = await adapter.sendMessage(providerSessionId, providerRequest);
+      result = await sending;
     } catch (error) {
       if (isProvenDeliveryRejection(providerId, error)) {
         if (await this.markQueueDeliveryRejected(delivery, error)) throw error;
@@ -3871,6 +4080,9 @@ export class AgentBridge {
       }
       await this.markQueueDeliveryUnknown(delivery, error);
       throw asDeliveryUnknown(providerId, error);
+    } finally {
+      pendingSends.delete(sending);
+      if (pendingSends.size === 0) this.#pendingProviderSends.delete(globalSessionId);
     }
     if (result.accepted) await this.markQueueDeliveryConfirmed(delivery);
     else {
@@ -3951,6 +4163,13 @@ export class AgentBridge {
     const current = this.#pendingContextHandoffs.get(globalSessionId);
     if (current !== undefined) return current;
     const session = this.#cache.get(globalSessionId);
+    // Some harnesses apply system instructions per request instead of retaining
+    // them in history. Keep the source context available on subsequent turns too.
+    if (session?.relationship?.kind === "model_switch" && typeof session.nativeMetadata.tethoqModelSwitchSummary === "string") {
+      const recovered = { summary: session.nativeMetadata.tethoqModelSwitchSummary, relationship: session.relationship };
+      this.#pendingContextHandoffs.set(globalSessionId, recovered);
+      return recovered;
+    }
     if (session?.relationship?.kind !== "handoff"
       || session.nativeMetadata.tethoqHandoffPending !== true
       || typeof session.nativeMetadata.tethoqHandoffSummary !== "string") return undefined;
@@ -3969,9 +4188,11 @@ export class AgentBridge {
     const current = this.#pendingBranchBootstraps.get(globalSessionId);
     if (current !== undefined) return current;
     const session = this.#cache.get(globalSessionId);
+    // Some harnesses accept private context only for the current request. Keep
+    // the parent snapshot available on later side-chat turns and after restart.
     if ((session?.relationship?.kind !== "branch" && session?.relationship?.kind !== "side_chat")
       || session.relationship.strategy !== "transcript_bootstrap"
-      || session.nativeMetadata.tethoqBranchPending !== true
+      || session.relationship.kind !== "side_chat" && session.nativeMetadata.tethoqBranchPending !== true
       || typeof session.nativeMetadata.tethoqBranchBootstrap !== "string") return undefined;
     const recovered: PendingBranchBootstrap = {
       bootstrap: session.nativeMetadata.tethoqBranchBootstrap,
@@ -4179,6 +4400,7 @@ export class AgentBridge {
       ...(input.reasoningEffort !== undefined ? { reasoningEffort: input.reasoningEffort } : {}),
       ...(attachments.length > 0 ? { attachments } : {}),
       ...(prepared.workflows?.length ? { workflows: prepared.workflows } : {}),
+      ...(prepared.metadata !== undefined ? { metadata: prepared.metadata } : {}),
     };
     // A provider-owned Codex queue cannot carry Tethoq's EYES routing
     // contract: delivering that native row later would reconstruct the
@@ -4198,6 +4420,8 @@ export class AgentBridge {
     // Desktop queue ownership semantics.
     const activeGrokFollowUp = providerId === "grok" && this.sessionHoldsFollowUpQueue(globalSessionId);
     if (adapter.enqueueQueuedMessage !== undefined
+      && request.metadata?.tethoqGoalObjective === undefined
+      && !this.sessionIsStopped(globalSessionId)
       && !activeGrokFollowUp
       && providerQueueSupportsAttachments
       && (prepared.workflows?.length ?? 0) === 0) {
@@ -4366,9 +4590,11 @@ export class AgentBridge {
         return view;
       }
       if (record.request === undefined) throw new Error("That queued instruction cannot be edited");
+      const isGoal = record.request.metadata?.tethoqGoalObjective !== undefined;
+      if (isGoal && normalized.length > sessionGoalObjectiveMaxLength) throw new Error(`Goal objective must contain between 1 and ${sessionGoalObjectiveMaxLength} characters`);
       const { error: _error, ...viewWithoutError } = record.view;
       record.view = { ...viewWithoutError, content: normalized, state: "queued" };
-      record.request = { ...record.request, content: normalized };
+      record.request = { ...record.request, content: normalized, ...(isGoal ? { metadata: { ...record.request.metadata, tethoqGoalObjective: normalized } } : {}) };
       this.appendQueueEvent("message.queue_updated", record.view);
       return record.view;
     });
@@ -4392,6 +4618,7 @@ export class AgentBridge {
       const adapter = this.requireAdapter(providerId);
       const session = this.#cache.get(record.view.sessionId);
       if (session === undefined) throw new Error("The target task is not loaded on this bridge");
+      await this.resumeStoppedSession(record.view.sessionId);
       const active = session.state === "working" || session.state === "needs_approval" || session.state === "needs_input";
       if (mode === "send" && active) throw new Error("Wait for the active turn to finish, or steer this instruction instead");
       if (mode === "steer" && adapter.steerMessage === undefined) {
@@ -4788,9 +5015,10 @@ export class AgentBridge {
     }
     const pump = (async (): Promise<QueuedNewTaskDelivery> => {
       record.view = { id: deliveryId, sessionId: record.view.sessionId, state: "sending" };
-      this.#cache.updateState(record.view.sessionId, "working", false);
       try {
-        const result = await this.sendMessage(record.view.sessionId, record.request);
+        this.assertSessionNotStopped(record.view.sessionId);
+        this.#cache.updateState(record.view.sessionId, "working", false);
+        const result = await this.sendMessageInternal(record.view.sessionId, record.request);
         if (!result.accepted) {
           this.#sendLedger.delete(record.request.requestId);
           throw new Error(result.details.join(" ") || "The new task did not accept the queued instruction");
@@ -4837,6 +5065,7 @@ export class AgentBridge {
       ...(input.reasoningEffort !== undefined ? { reasoningEffort: input.reasoningEffort } : {}),
       ...(attachments.length > 0 ? { attachments } : {}),
       ...(prepared.workflows?.length ? { workflows: prepared.workflows } : {}),
+      ...(prepared.metadata !== undefined ? { metadata: prepared.metadata } : {}),
     };
     const adapter = this.requireAdapter(providerId);
     if (adapter.steerMessage === undefined) {
@@ -4862,11 +5091,22 @@ export class AgentBridge {
   private async steerWithVision(globalSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
     const { providerId, providerSessionId } = this.assertSessionHost(globalSessionId);
     const adapter = this.requireAdapter(providerId);
-    if (!this.#visionProxies.has(globalSessionId)) return await adapter.steerMessage!(providerSessionId, request);
-    return await this.withSessionDispatchLock(globalSessionId, async () => {
-      const routed = await this.routeVisionAttachments(globalSessionId, request);
-      return await adapter.steerMessage!(providerSessionId, routed);
-    });
+    const stopGeneration = this.#stopGenerations.get(globalSessionId) ?? 0;
+    this.assertSessionNotStopped(globalSessionId, stopGeneration);
+    const steer = async () => {
+      const routed = this.#visionProxies.has(globalSessionId) ? await this.routeVisionAttachments(globalSessionId, request) : request;
+      this.assertSessionNotStopped(globalSessionId, stopGeneration);
+      const pending = this.#pendingProviderSends.get(globalSessionId) ?? new Set<Promise<SendMessageResult>>();
+      const sending = adapter.steerMessage!(providerSessionId, routed);
+      pending.add(sending);
+      this.#pendingProviderSends.set(globalSessionId, pending);
+      try { return await sending; }
+      finally {
+        pending.delete(sending);
+        if (pending.size === 0) this.#pendingProviderSends.delete(globalSessionId);
+      }
+    };
+    return this.#visionProxies.has(globalSessionId) ? await this.withSessionDispatchLock(globalSessionId, steer) : await steer();
   }
 
   private assertSteeringAvailable(
@@ -4942,6 +5182,65 @@ export class AgentBridge {
   }
 
   public async interrupt(globalSessionId: string): Promise<void> {
+    this.assertSessionHost(globalSessionId);
+    // Freeze the entire known subtree before any provider can publish its
+    // terminal event and wake a queued message or a pending Mesh dispatch.
+    const targets = new Set([globalSessionId]);
+    for (const parentId of targets) {
+      for (const session of this.#cache.all()) {
+        if (session.relationship?.kind === "branch" || session.relationship?.kind === "side_chat"
+          || session.relationship?.kind === "handoff") continue;
+        if (session.relationship?.kind === "subagent" && session.relationship.sourceSessionId === parentId) targets.add(session.id);
+      }
+      for (const { task } of this.#delegations.values()) {
+        if (task.parentSessionId !== parentId) continue;
+        for (const child of task.children) if (child.sessionId !== undefined) targets.add(child.sessionId);
+      }
+      const helperId = this.#visionProxies.get(parentId)?.helperSessionId;
+      if (helperId !== undefined) targets.add(helperId);
+    }
+    for (const id of targets) this.markSessionStopped(id);
+    const results = await Promise.allSettled([...targets].map(async (id) => await this.interruptSession(id)));
+    const failures = results.flatMap((result, index) => result.status === "rejected"
+      ? [`${this.#cache.get([...targets][index]!)?.title ?? [...targets][index]}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`]
+      : []);
+    if (failures.length > 0) throw new Error(`Could not stop every task. ${failures.join("; ")}`);
+  }
+
+  private sessionIsStopped(sessionId: string): boolean {
+    return this.#stoppedSessions.has(sessionId) || this.#cache.get(sessionId)?.nativeMetadata.tethoqUserStopped === true;
+  }
+
+  private assertSessionNotStopped(sessionId: string, generation = this.#stopGenerations.get(sessionId) ?? 0): void {
+    if (this.sessionIsStopped(sessionId) || generation !== (this.#stopGenerations.get(sessionId) ?? 0)) {
+      throw new Error("This task was stopped by the user. Resume it before sending more instructions.");
+    }
+  }
+
+  private async resumeStoppedSession(sessionId: string): Promise<void> {
+    await this.#interruptions.get(sessionId);
+    if (!this.sessionIsStopped(sessionId) && this.#cache.get(sessionId)?.nativeMetadata.tethoqInterruptedAt == null) return;
+    this.#stoppedSessions.delete(sessionId);
+    this.#cache.updateNativeMetadata(sessionId, { tethoqUserStopped: false, tethoqInterruptedAt: null });
+    this.notifySessionCatalogueChange();
+  }
+
+  private markSessionStopped(sessionId: string): void {
+    this.#stoppedSessions.add(sessionId);
+    this.#stopGenerations.set(sessionId, (this.#stopGenerations.get(sessionId) ?? 0) + 1);
+    this.#cache.updateNativeMetadata(sessionId, { tethoqUserStopped: true });
+    const automaticVision = this.#automaticVisionTurns.get(sessionId);
+    if (automaticVision !== undefined) automaticVision.cancelled = true;
+    for (const runtime of this.#delegations.values()) {
+      if (runtime.task.parentSessionId !== sessionId || runtime.task.interruptedAt !== undefined) continue;
+      runtime.task = { ...runtime.task, state: "failed", interruptedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(), error: "Delegation interrupted by the user" };
+      this.appendDelegationEvent("delegation.updated", runtime.task);
+    }
+    this.notifySessionCatalogueChange();
+  }
+
+  private async interruptSession(globalSessionId: string): Promise<void> {
     const active = this.#interruptions.get(globalSessionId);
     if (active !== undefined) {
       await active;
@@ -4953,16 +5252,43 @@ export class AgentBridge {
     const automaticVision = this.#automaticVisionTurns.get(globalSessionId);
     if (automaticVision !== undefined) automaticVision.cancelled = true;
     if (adapter.interrupt === undefined && automaticVision === undefined) throw new Error(`${providerId} does not support interruption`);
-    const helperId = automaticVision === undefined ? undefined : this.#visionProxies.get(globalSessionId)?.helperSessionId;
-    const helper = helperId === undefined ? undefined : parseGlobalSessionId(helperId);
-    const interruption = Promise.all([
-      adapter.interrupt?.(providerSessionId),
-      helper === undefined ? undefined : this.requireAdapter(helper.providerId).interrupt?.(helper.providerSessionId),
-    ]).then(() => undefined);
+    const pendingSends = [...(this.#pendingProviderSends.get(globalSessionId) ?? [])];
+    const nativeDrafts = providerId === "grok" ? [...this.#queuedMessages.values()].filter((record) =>
+      record.providerOwned && record.view.sessionId === globalSessionId && record.view.attachments.length === 0) : [];
+    const interruption = (async () => {
+      let failure: unknown;
+      try { await adapter.interrupt?.(providerSessionId); } catch (error) { failure = error; }
+      if (pendingSends.length > 0) {
+        // A turn may be accepted after the first cancel frame. Drain acceptance
+        // and cancel that turn too before acknowledging Stop to the UI.
+        await Promise.allSettled(pendingSends);
+        await adapter.interrupt?.(providerSessionId);
+      } else if (failure !== undefined) throw failure;
+      const now = new Date().toISOString();
+      const alreadyIdle = this.#cache.get(globalSessionId)?.state === "idle";
+      this.#locallyOwnedActiveTurns.delete(globalSessionId);
+      this.#cache.updateState(globalSessionId, "idle", false, now);
+      this.#cache.updateProviderStatus(globalSessionId, null);
+      this.#cache.updateNativeMetadata(globalSessionId, { tethoqInterruptedAt: now });
+      this.invalidateMessageSnapshot(globalSessionId);
+      this.#events.append({ type: alreadyIdle ? "session.status_changed" : "agent.interrupted", providerId,
+        sessionId: globalSessionId, payload: { state: "idle", interruptedAt: now } });
+      await this.pumpDelegationsForSession(globalSessionId);
+      this.notifySessionCatalogueChange();
+    })();
     this.#interruptions.set(globalSessionId, interruption);
     try {
       await interruption;
     } finally {
+      for (const record of nativeDrafts) {
+        if (this.#queuedMessages.has(record.view.id)) continue;
+        const request: SendMessageRequest = { ...record.request, requestId: record.request?.requestId ?? `paused_${record.view.id}`,
+          content: record.view.content,
+          ...(record.view.modelId !== undefined ? { modelId: record.view.modelId } : {}),
+          ...(record.view.reasoningEffort !== undefined ? { reasoningEffort: record.view.reasoningEffort } : {}) };
+        this.#queuedMessages.set(record.view.id, { view: record.view, request, providerOwned: false });
+        this.appendQueueEvent("message.queued", record.view);
+      }
       if (this.#interruptions.get(globalSessionId) === interruption) this.#interruptions.delete(globalSessionId);
     }
   }
@@ -5059,7 +5385,7 @@ export class AgentBridge {
       const observedAt = new Date().toISOString();
       this.#attentionClearStates.set(request.sessionId, { state: "working", observedAt });
       this.reconcileAttentionState(request.sessionId, "working", "input_resolved", observedAt);
-    } else {
+    } else if (this.#cache.get(request.sessionId)?.state !== "working") {
       this.#attentionClearStates.delete(request.sessionId);
     }
     this.#events.append({
@@ -5509,6 +5835,17 @@ export class AgentBridge {
       this.#cache.updateState(globalSessionId, "needs_input", false, event.occurredAt);
       this.scheduleAttentionExpiry();
     }
+    if (event.type === "user_input.resolved" && globalSessionId !== undefined) {
+      const providerRequestId = typeof event.payload.providerRequestId === "string" ? event.payload.providerRequestId : undefined;
+      const resolved = providerRequestId === undefined ? undefined : this.#userInputs.clearProviderRequest(globalSessionId, providerRequestId);
+      if (resolved === undefined) return;
+      payload = { ...event.payload, requestId: resolved.requestId };
+      if (this.#cache.get(globalSessionId)?.state === "needs_input") {
+        this.#attentionClearStates.set(globalSessionId, { state: "working", observedAt: event.occurredAt });
+        this.reconcileAttentionState(globalSessionId, "working", "input_resolved", event.occurredAt);
+      }
+      this.scheduleAttentionExpiry();
+    }
     if (globalSessionId !== undefined && event.type === "session.goal_updated") {
       const native = providerGoalFromUnknown(event.payload.goal);
       if (native === undefined) return;
@@ -5575,6 +5912,12 @@ export class AgentBridge {
       const reportedState = isSessionState(event.payload.state)
         ? event.payload.state as RemoteSession["state"]
         : undefined;
+      if ((event.type === "session.status_changed" || event.type === "session.updated") && reportedState === "working"
+        && !this.#interruptions.has(globalSessionId)) {
+        // Fresh provider activity can also come from a user resuming in its
+        // native client. A prior interruption must not hide that new turn.
+        this.#cache.updateNativeMetadata(globalSessionId, { tethoqInterruptedAt: null });
+      }
       const providerAdvancedPastAttention = event.type === "agent.completed"
         || event.type === "agent.error"
         || event.type === "agent.interrupted"
@@ -5604,6 +5947,17 @@ export class AgentBridge {
       if ((event.type === "message.started" || event.type === "message.completed")
         && event.payload.role === "user" && delegatedPrompt !== undefined && eventUserText?.trim() === delegatedPrompt.trim()) {
         payload = { ...payload, origin: { kind: "delegation", sender: "tethoq" } };
+      }
+      if (event.type === "message.started" || event.type === "message.delta" || event.type === "message.completed") {
+        const sources = crossSessionEventMessageSources(event.payload);
+        if (sources.some((source) => source.role === "user")) {
+          const texts = sources.flatMap((source) => [source.text, source.content, source.message]
+            .filter((value): value is string => typeof value === "string"));
+          const envelope = this.verifiedCrossSessionEnvelope(globalSessionId, [...texts, texts.join(""), texts.join("\n")]);
+          if (envelope !== undefined) {
+            payload = { ...payload, role: "user", text: envelope.content, origin: crossSessionMessageOrigin(envelope) };
+          }
+        }
       }
       if (event.type === "message.started" || event.type === "message.delta" || event.type === "message.completed") {
         this.invalidateMessageSnapshot(globalSessionId);
@@ -5675,6 +6029,8 @@ export class AgentBridge {
         void this.pumpDelegationsForSession(globalSessionId);
         void this.releaseProviderIfIdle(this.requireAdapter(event.providerId));
       });
+    } else if (globalSessionId !== undefined && (event.type === "session.status_changed" || event.type === "session.updated")) {
+      void this.pumpDelegationsForSession(globalSessionId);
     }
   }
 
@@ -5748,6 +6104,20 @@ export class AgentBridge {
   private async pumpDelegation(id: string): Promise<void> {
     const runtime = this.#delegations.get(id);
     if (runtime === undefined || this.#delegationPumps.has(id)) return;
+    // Terminal delegation records still back visible worker rows. Refresh the
+    // child snapshot even after orchestration ended, including individual Stop.
+    const currentChildren = runtime.task.children.map((child): DelegationChild => {
+      const session = child.sessionId === undefined ? undefined : this.#cache.get(child.sessionId);
+      if (session === undefined) return child;
+      const { interruptedAt: _previous, ...rest } = child;
+      const stoppedAt = session.nativeMetadata.tethoqInterruptedAt === undefined ? child.interruptedAt : session.nativeMetadata.tethoqInterruptedAt;
+      return { ...rest, state: session.state,
+        ...(session.state === "idle" && typeof stoppedAt === "string" ? { interruptedAt: stoppedAt } : {}) };
+    });
+    if (JSON.stringify(currentChildren) !== JSON.stringify(runtime.task.children)) {
+      runtime.task = { ...runtime.task, children: currentChildren, updatedAt: new Date().toISOString() };
+      this.appendDelegationEvent("delegation.updated", runtime.task);
+    }
     if (this.#compactingSessions.has(runtime.task.parentSessionId) || this.#autoCompactions.has(runtime.task.parentSessionId)) return;
     if (runtime.task.state === "completed" || runtime.task.state === "failed") {
       this.reconcileDelegationTimer();
@@ -5848,13 +6218,15 @@ export class AgentBridge {
         const messages = await this.requireAdapter(child.providerId).getMessages(providerSessionId);
         return { child, output: latestAssistantOutput(messages) ?? child.error ?? "The worker returned no text output." };
       }));
+      this.assertSessionNotStopped(runtime.task.parentSessionId);
+      if (runtime.task.interruptedAt !== undefined) return;
       runtime.resultsReady = true;
       runtime.synthesisDispatched = true;
       runtime.task = { ...clearDelegationError(runtime.task), state: "synthesizing", updatedAt: new Date().toISOString() };
       this.appendDelegationEvent("delegation.updated", runtime.task);
       this.#cache.updateState(runtime.task.parentSessionId, "working", false);
       const selection = runtime.parentTurnSelection ?? parent;
-      await this.sendMessage(runtime.task.parentSessionId, {
+      await this.sendMessageInternal(runtime.task.parentSessionId, {
         requestId: `delegation_synthesis_${runtime.task.id}`,
         content: hiddenProviderControlContent(`mesh-result:${runtime.task.id}`),
         developerInstructions: delegationSynthesisInstruction(runtime.task, reports, this.#clientTooling !== undefined),
@@ -6978,6 +7350,7 @@ export class AgentBridge {
   }
 
   private sessionHoldsFollowUpQueue(globalSessionId: string): boolean {
+    if (this.sessionIsStopped(globalSessionId)) return true;
     if (this.#compactingSessions.has(globalSessionId) || this.#autoCompactions.has(globalSessionId)) return true;
     const session = this.#cache.get(globalSessionId);
     if (session === undefined) return false;
@@ -7160,7 +7533,7 @@ export class AgentBridge {
         throw new Error("Cross-task delivery envelope no longer matches its persisted inbox record");
       }
       const deliveryRequestId = crossSessionDeliveryRequestId(next.envelope.id);
-      const result = await this.sendMessage(targetSessionId, {
+      const result = await this.sendMessageInternal(targetSessionId, {
         requestId: deliveryRequestId,
         content: crossSessionDispatchContent(next.envelope),
         metadata: {
@@ -7180,7 +7553,7 @@ export class AgentBridge {
         providerMessageIds: [...new Set([deliveryRequestId, next.envelope.id, ...(result.providerTurnId === undefined ? [] : [result.providerTurnId])])],
       };
       this.#crossSessionMessages.set(next.envelope.id, delivered);
-      this.#cache.updateState(targetSessionId, "working", false);
+      if (!this.sessionIsStopped(targetSessionId) && this.#cache.get(targetSessionId) === target) this.#cache.updateState(targetSessionId, "working", false);
       this.invalidateMessageSnapshot(targetSessionId);
       await this.persistCrossSessionMessages();
       this.#events.append({
@@ -7245,29 +7618,41 @@ export class AgentBridge {
   }
 
   private decorateCrossSessionMessages(sessionId: string, messages: readonly RemoteMessage[]): readonly RemoteMessage[] {
-    const inbox = new Map([...this.#crossSessionMessages.values()]
-      .filter((message) => message.state === "delivered" && message.envelope.targetSessionId === sessionId)
-      .map((message) => [message.envelope.id, message]));
-    if (inbox.size === 0) return messages;
+    if (this.#crossSessionMessages.size === 0) return messages;
     return messages.map((message) => {
       if (message.role !== "user") return message;
-      const markerId = message.parts.flatMap((part) => part.type === "text" ? [crossSessionMarkerId(part.text)] : []).find((id) => id !== undefined);
-      if (markerId === undefined) return message;
-      const persisted = inbox.get(markerId);
-      if (persisted === undefined || crossSessionDispatchContent(persisted.envelope) !== message.parts.find((part) => part.type === "text")?.text) return message;
+      const texts = message.parts.flatMap((part) => part.type === "text" ? [part.text] : []);
+      const envelope = this.verifiedCrossSessionEnvelope(sessionId, [texts.join(""), texts.join("\n")]);
+      if (envelope === undefined) return message;
+      let replacedText = false;
       return {
         ...message,
-        parts: message.parts.map((part) => part.type === "text" && part.text === crossSessionDispatchContent(persisted.envelope)
-          ? { ...part, text: persisted.envelope.content }
-          : part),
-        origin: {
-          kind: "cross_session",
-          envelopeId: persisted.envelope.id,
-          sourceSessionId: persisted.envelope.sourceSessionId,
-          sourceTitle: persisted.envelope.sourceTitle,
-        },
+        parts: message.parts.flatMap<RemoteMessage["parts"][number]>((part) => {
+          if (part.type !== "text") return [part];
+          if (replacedText) return [];
+          replacedText = true;
+          return [{ ...part, text: envelope.content }];
+        }),
+        origin: crossSessionMessageOrigin(envelope),
       };
     });
+  }
+
+  private verifiedCrossSessionEnvelope(sessionId: string, contents: readonly string[]): CrossSessionMessageEnvelope | undefined {
+    for (const content of contents) {
+      const normalized = content.replace(/\r\n/gu, "\n").trim();
+      const markerId = crossSessionMarkerId(normalized);
+      if (markerId === undefined) continue;
+      const persisted = this.#crossSessionMessages.get(markerId);
+      // Providers can echo an accepted prompt before sendMessage resolves. The
+      // durable sending record already proves its route; a marker alone never does.
+      if (persisted === undefined || persisted.state === "pending" || persisted.attemptCount === 0
+        || persisted.envelope.targetSessionId !== sessionId) continue;
+      if (crossSessionDispatchContent(persisted.envelope).replace(/\r\n/gu, "\n").trim() === normalized) {
+        return persisted.envelope;
+      }
+    }
+    return undefined;
   }
 
   private pruneCrossSessionMessages(incoming: number): void {
@@ -8471,6 +8856,32 @@ function crossSessionDispatchContent(envelope: CrossSessionMessageEnvelope): str
 
 function crossSessionMarkerId(content: string): string | undefined {
   return /^\[\[TETHOQ_REMOTE_MESSAGE_V1:([a-zA-Z0-9_-]{1,128})\]\]\n/u.exec(content)?.[1];
+}
+
+function crossSessionMessageOrigin(envelope: CrossSessionMessageEnvelope): NonNullable<RemoteMessage["origin"]> & JsonObject {
+  return {
+    kind: "cross_session",
+    envelopeId: envelope.id,
+    sourceSessionId: envelope.sourceSessionId,
+    sourceTitle: envelope.sourceTitle,
+  };
+}
+
+function crossSessionEventMessageSources(payload: JsonObject): readonly JsonObject[] {
+  const sources: JsonObject[] = [payload];
+  for (const value of [payload.info, payload.item, payload.part, payload.content]) {
+    if (typeof value === "object" && value !== null && !Array.isArray(value)) sources.push(value);
+  }
+  for (const source of [...sources]) {
+    if (Array.isArray(source.content)) {
+      for (const value of source.content) {
+        if (typeof value === "object" && value !== null && !Array.isArray(value)) sources.push(value);
+      }
+    } else if (typeof source.content === "object" && source.content !== null) {
+      if (!sources.includes(source.content)) sources.push(source.content);
+    }
+  }
+  return sources;
 }
 
 function isCrossSessionDeliveryMessage(message: RemoteMessage, envelope: CrossSessionMessageEnvelope): boolean {

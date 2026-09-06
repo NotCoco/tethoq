@@ -43,6 +43,7 @@ export function createConfiguredProviders(
     const localStateEnabled = tethoqEnvironmentFlag(environment, "TETHOQ_ENABLE_CODEX_LOCAL_STATE");
     adapters.push(new CodexAdapter({
       hostId: config.hostId,
+      permissionStatePath: join(dirname(directApiStatePath), "codex-task-permissions.json"),
       environment,
       ...(command !== undefined ? { command } : {}),
       ...(commandArgs !== undefined ? { commandArgs } : {}),

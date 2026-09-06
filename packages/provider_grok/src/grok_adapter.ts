@@ -16,6 +16,7 @@ import {
   ProviderEventHub,
   UnsupportedProviderCapabilityError,
   providerPromptContent,
+  elicitationResponse,
   stripProviderPromptGuidance,
   buildSpawnCommand,
   resolveCommand,
@@ -31,6 +32,8 @@ import {
   type ListSessionsOptions,
   type PaginatedSessions,
   type ProviderApprovalResponse,
+  type ProviderUserInputResponse,
+  type ProviderSessionPermissions,
   type ProviderDetection,
   type ProviderClientTooling,
   type ProviderEvent,
@@ -85,6 +88,15 @@ interface SessionContext {
   readonly additionalDirectories: readonly string[];
 }
 
+interface PendingQuestion {
+  readonly providerSessionId: string;
+  readonly toolCallId?: string;
+  readonly questions: readonly Record<string, unknown>[];
+  readonly elicitation?: Record<string, unknown>;
+  readonly resolve: (value: unknown) => void;
+  readonly reject: (error: unknown) => void;
+}
+
 interface LocallyCreatedSession {
   readonly session: RemoteSession;
   readonly requestedTitle?: string;
@@ -109,6 +121,7 @@ interface AcpSessionConfigOption {
   readonly category?: string;
   readonly currentValue?: string;
   readonly values: readonly string[];
+  readonly choices: readonly { value: string; label: string; description?: string }[];
 }
 
 interface AppliedSessionSelections {
@@ -724,6 +737,7 @@ function sessionConfigOptions(value: unknown): readonly AcpSessionConfigOption[]
       ...(typeof entry.category === "string" ? { category: entry.category } : {}),
       ...(typeof entry.currentValue === "string" ? { currentValue: entry.currentValue } : {}),
       values: configOptionValues(entry.options),
+      choices: configOptionChoices(entry.options),
     }];
   });
 }
@@ -735,6 +749,14 @@ function firstUpdateString(source: Record<string, unknown>, keys: readonly strin
     if (typeof value === "string" && value.trim().length > 0) return value.trim();
   }
   return undefined;
+}
+
+function configOptionChoices(value: unknown): Array<{ value: string; label: string; description?: string }> {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => !isRecord(entry) ? [] : typeof entry.value === "string"
+    ? [{ value: entry.value, label: typeof entry.name === "string" ? entry.name : entry.value,
+      ...(typeof entry.description === "string" ? { description: entry.description } : {}) }]
+    : configOptionChoices(entry.options));
 }
 
 function reportedSessionTitle(source: unknown): string | undefined {
@@ -854,6 +876,8 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
   readonly #capabilityNote: string;
   readonly #events = new ProviderEventHub();
   readonly #pendingPermissions = new Map<string, PendingPermission>();
+  readonly #pendingQuestions = new Map<string, PendingQuestion>();
+  readonly #sessionModes = new Map<string, { value: string; options: Array<{ value: string; label: string; description?: string }> }>();
   readonly #sessionContexts = new Map<string, SessionContext>();
   readonly #historyCapture = new Map<string, AcpMessageAccumulator>();
   readonly #historyReportedContexts = new Map<string, ReportedSessionContext>();
@@ -875,6 +899,10 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
   readonly #reportedSessionTitles = new Map<string, string>();
   readonly #watchedSessions = new Set<string>();
   readonly #activePrompts = new Set<string>();
+  readonly #terminalSessions = new Set<string>();
+  readonly #promptCompletions = new Map<string, Set<Promise<void>>>();
+  readonly #interruptingSessions = new Set<string>();
+  readonly #interruptionAcknowledgements = new Map<string, { readonly promptId: string | undefined; readonly resolve: () => void }>();
   readonly #promptEpochs = new Map<string, number>();
   readonly #inFlightPromptCounts = new Map<string, number>();
   readonly #deferredPromptTerminals = new Map<string, DeferredPromptTerminal>();
@@ -983,7 +1011,7 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
       commandEvents: true,
       fileChanges: true,
       approvals: true,
-      userInput: false,
+      userInput: this.providerId === "grok",
       interrupt: true,
       modelEnumeration: modelEntries(response, this.providerId).length > 0,
       projectAssociation: true,
@@ -1208,6 +1236,7 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     if (!clientToolsEnabled) this.#sessionClientToolModes.set(response.sessionId, "disabled");
     else if (binding !== undefined) this.#sessionClientToolModes.set(response.sessionId, "enabled");
     this.#activeSessions.add(response.sessionId);
+    this.#terminalSessions.add(response.sessionId);
     await this.applySessionSelections(response.sessionId, options.modelId, options.reasoningEffort);
     const session = normalizeAcpSession(this.#hostId, {
       sessionId: response.sessionId,
@@ -1353,6 +1382,7 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
   }
 
   private markLiveTurn(providerSessionId: string): void {
+    this.#terminalSessions.delete(providerSessionId);
     this.#lastLiveUpdateAt.set(providerSessionId, this.#now().getTime());
   }
 
@@ -1621,15 +1651,17 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     void this.emit({ type: "session.status_changed", providerSessionId, payload: { state: "working" } });
     this.#inFlightPromptCounts.set(providerSessionId, (this.#inFlightPromptCounts.get(providerSessionId) ?? 0) + 1);
     this.#activePrompts.add(providerSessionId);
+    this.#terminalSessions.delete(providerSessionId);
     const promptEpoch = this.#promptEpochs.get(providerSessionId) ?? 0;
     const promptIsCurrent = (): boolean => !this.#disposed
       && (this.#promptEpochs.get(providerSessionId) ?? 0) === promptEpoch;
     const completion = started.result.then(async (result) => {
-      if (!promptIsCurrent()) return;
+      if (!promptIsCurrent() || this.#interruptingSessions.has(providerSessionId)) return;
       this.captureReportedContext(providerSessionId, result);
       await this.settleNativePrompt(providerSessionId, "completed", { result: asJsonObject(result) });
     }).catch(async (error: unknown) => {
       if (!promptIsCurrent()) return;
+      if (this.#interruptingSessions.has(providerSessionId)) throw error;
       await this.settleNativePrompt(providerSessionId, "failed", {
         message: error instanceof Error ? error.message : String(error),
       });
@@ -1638,6 +1670,13 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     // Ordinary interactive sends retain their frame-accepted behavior. Own the
     // eventual result rejection even when no caller waits for it.
     void completion.catch(() => undefined);
+    const completions = this.#promptCompletions.get(providerSessionId) ?? new Set<Promise<void>>();
+    completions.add(completion);
+    this.#promptCompletions.set(providerSessionId, completions);
+    void completion.finally(() => {
+      completions.delete(completion);
+      if (completions.size === 0) this.#promptCompletions.delete(providerSessionId);
+    }).catch(() => undefined);
     try {
       try {
         await started.sent;
@@ -1740,6 +1779,13 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     outcome: "completed" | "failed" | "interrupted",
     payload: Record<string, unknown>,
   ): Promise<void> {
+    for (const [requestId, pending] of this.#pendingQuestions) {
+      if (pending.providerSessionId !== providerSessionId) continue;
+      this.#pendingQuestions.delete(requestId);
+      pending.resolve({ outcome: pending.elicitation ? "cancel" : "cancelled" });
+      await this.emit({ type: "user_input.resolved", providerSessionId, payload: { providerRequestId: requestId, reason: "cancelled" } });
+    }
+    this.#terminalSessions.add(providerSessionId);
     this.#deferredPromptTerminals.delete(providerSessionId);
     this.#runningPromptIds.delete(providerSessionId);
     // Recent chunks used to suppress this event. They are the wrong signal: the
@@ -1817,6 +1863,8 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
       this.confirmNativeQueueInterjection(snapshot.sessionId, snapshot.runningPromptId);
     }
     else this.#runningPromptIds.delete(snapshot.sessionId);
+    const interruption = this.#interruptionAcknowledgements.get(snapshot.sessionId);
+    if (interruption?.promptId !== undefined && snapshot.runningPromptId === undefined && snapshot.entries.length === 0) interruption.resolve();
     const remaining = [...this.#queueWaiters];
     this.#queueWaiters.length = 0;
     for (const waiter of remaining) {
@@ -1840,7 +1888,48 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
   }
 
   public async interrupt(providerSessionId: string): Promise<void> {
-    await (await this.peer()).notify("session/cancel", { sessionId: providerSessionId });
+    this.#interruptingSessions.add(providerSessionId);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const completions = [...(this.#promptCompletions.get(providerSessionId) ?? [])];
+      const queued = this.#nativeQueues.get(providerSessionId) ?? [];
+      const nativeTurn = this.#runningPromptIds.has(providerSessionId) || this.#activePrompts.has(providerSessionId)
+        || (this.#activeToolCallIds.get(providerSessionId)?.size ?? 0) > 0 || this.#lastLiveUpdateAt.has(providerSessionId);
+      let nativeAcknowledgement: Promise<void> | undefined;
+      if (completions.length === 0 && nativeTurn) {
+        nativeAcknowledgement = new Promise<void>((resolve) => this.#interruptionAcknowledgements.set(providerSessionId, {
+          promptId: this.#runningPromptIds.get(providerSessionId), resolve,
+        }));
+      } else if (completions.length === 0 && queued.length === 0 && !this.#terminalSessions.has(providerSessionId)) {
+        const local = this.#locallyCreatedSessions.get(providerSessionId);
+        const session = local?.nativeConfirmed !== true && local !== undefined ? local.session : await this.getSession(providerSessionId);
+        if (session.state !== "idle" && session.state !== "completed" && session.state !== "failed") {
+          nativeAcknowledgement = new Promise<void>((resolve) => this.#interruptionAcknowledgements.set(providerSessionId, {
+            promptId: undefined, resolve,
+          }));
+        }
+      }
+      // A queued ACP prompt can start as soon as the current prompt cancels.
+      // Remove that future work first; the Bridge retains its visible draft.
+      for (const message of queued) {
+        await this.cancelNativeQueuedMessage(providerSessionId, message.id);
+      }
+      await (await this.peer()).notify("session/cancel", { sessionId: providerSessionId });
+      if (completions.length > 0 || nativeAcknowledgement !== undefined) {
+        // ACP cancellation is a notification. Its write acknowledgement does
+        // not mean execution stopped; the pending prompt response does.
+        await Promise.race([
+          nativeAcknowledgement ?? Promise.all(completions),
+          new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new ProviderAdapterError(
+            this.providerId, "INTERRUPTION_UNCONFIRMED", `${this.displayName} has not confirmed that the task stopped. Try Stop again.`, true,
+          )), Math.min(this.#requestTimeoutMs, 15_000)); }),
+        ]);
+      }
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+      this.#interruptingSessions.delete(providerSessionId);
+      this.#interruptionAcknowledgements.delete(providerSessionId);
+    }
     this.#promptEpochs.set(providerSessionId, (this.#promptEpochs.get(providerSessionId) ?? 0) + 1);
     this.#inFlightPromptCounts.delete(providerSessionId);
     this.#deferredPromptTerminals.delete(providerSessionId);
@@ -1869,6 +1958,70 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     await this.emit({ type: "approval.resolved", providerSessionId: pending.providerSessionId, payload: { providerRequestId: response.providerRequestId, choiceId: response.choiceId } });
   }
 
+  public async respondToUserInput(response: ProviderUserInputResponse): Promise<void> {
+    const pending = this.#pendingQuestions.get(response.providerRequestId);
+    if (pending === undefined) throw new ProviderAdapterError(this.providerId, "INPUT_REQUEST_NOT_FOUND", "This question is no longer waiting for an answer", false);
+    if (pending.elicitation !== undefined) {
+      const result = elicitationResponse(pending.elicitation, response.answers);
+      this.#pendingQuestions.delete(response.providerRequestId);
+      pending.resolve({ outcome: result.action, ...(result.content !== null ? { content: result.content } : {}) });
+      await this.emit({ type: "user_input.resolved", providerSessionId: pending.providerSessionId, payload: { providerRequestId: response.providerRequestId, reason: "answered" } });
+      return;
+    }
+    const answers: Record<string, string[]> = Object.create(null) as Record<string, string[]>;
+    const annotations: Record<string, { notes?: string; preview?: string }> = Object.create(null) as Record<string, { notes?: string; preview?: string }>;
+    pending.questions.forEach((question, index) => {
+      const source = response.answers[`question_${index}`];
+      const answer = typeof source === "string" ? [source] : Array.isArray(source) ? source : isRecord(source) ? source.answers : undefined;
+      if (!Array.isArray(answer) || !answer.length || answer.some((value) => typeof value !== "string" || !value.trim())) throw new Error("Answer every question before submitting");
+      if (question.multiSelect !== true && question.multi_select !== true && answer.length > 1) throw new Error("This question allows one answer");
+      const options = Array.isArray(question.options) ? question.options.filter(isRecord) : [];
+      const chosen = answer.filter((value) => options.some((option) => option.label === value)) as string[];
+      const freeform = answer.filter((value) => !options.some((option) => option.label === value)) as string[];
+      const key = question.question as string;
+      answers[key] = [...chosen, ...(freeform.length ? ["Other"] : [])];
+      const preview = question.multiSelect !== true && question.multi_select !== true
+        ? options.find((option) => chosen.length === 1 && option.label === chosen[0])?.preview : undefined;
+      if (freeform.length || typeof preview === "string") annotations[key] = {
+        ...(freeform.length ? { notes: freeform.join("\n") } : {}), ...(typeof preview === "string" ? { preview } : {}),
+      };
+    });
+    this.#pendingQuestions.delete(response.providerRequestId);
+    pending.resolve({ outcome: "accepted", answers, annotations });
+    await this.emit({ type: "user_input.resolved", providerSessionId: pending.providerSessionId,
+      payload: { providerRequestId: response.providerRequestId, reason: "answered" } });
+  }
+
+  public async getSessionPermissions(providerSessionId: string): Promise<ProviderSessionPermissions> {
+    if (!this.#activeSessions.has(providerSessionId) && !this.hasActiveTurn(providerSessionId)) await this.resumeSession(providerSessionId);
+    const options = (this.#sessionConfigOptions.get(providerSessionId) ?? []).filter((option) =>
+      option.category === "mode" || /permission|approval|sandbox/iu.test(`${option.id} ${option.name} ${option.category ?? ""}`));
+    const controls = options.filter((option) => option.choices.length > 0 && option.currentValue !== undefined).map((option) => ({
+      id: option.id, label: option.name, value: option.currentValue!, options: option.choices,
+    }));
+    const modes = this.#sessionModes.get(providerSessionId);
+    if (!options.some((option) => option.category === "mode") && modes?.options.length) {
+      controls.push({ id: "session_mode", label: "Session mode", value: modes.value, options: modes.options });
+    }
+    return { controls, note: controls.length ? "Choices are provided by this harness for the current task."
+      : `${this.displayName} does not expose permission settings for this task.` };
+  }
+
+  public async setSessionPermission(providerSessionId: string, controlId: string, value: string): Promise<ProviderSessionPermissions> {
+    const available = await this.getSessionPermissions(providerSessionId);
+    if (!available.controls.find((control) => control.id === controlId)?.options.some((option) => option.value === value)) throw new Error("This harness did not offer that permission setting");
+    if (controlId === "session_mode") {
+      await (await this.peer()).request("session/set_mode", { sessionId: providerSessionId, modeId: value });
+      const modes = this.#sessionModes.get(providerSessionId)!;
+      this.#sessionModes.set(providerSessionId, { ...modes, value });
+    } else {
+      await this.setSessionConfigOption(providerSessionId, this.#sessionConfigOptions.get(providerSessionId)!.find((option) => option.id === controlId)!, value);
+    }
+    const result = await this.getSessionPermissions(providerSessionId);
+    if (result.controls.find((control) => control.id === controlId)?.value !== value) throw new Error("The harness did not confirm the selected setting. Refresh and try again.");
+    return result;
+  }
+
   public async releaseIdleResources(): Promise<void> {
     if (this.#disposed) return;
     this.cancelIdleRelease();
@@ -1888,6 +2041,8 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     this.cancelIdleRelease();
     for (const pending of this.#pendingPermissions.values()) pending.reject(new Error(`${this.displayName} adapter disposed`));
     this.#pendingPermissions.clear();
+    for (const pending of this.#pendingQuestions.values()) pending.reject(new Error(`${this.displayName} adapter disposed`));
+    this.#pendingQuestions.clear();
     this.#historyCapture.clear();
     this.#historyReportedContexts.clear();
     this.#liveMessages.clear();
@@ -1895,6 +2050,10 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     this.#lastLiveUpdateAt.clear();
     this.#watchedSessions.clear();
     this.#activePrompts.clear();
+    this.#terminalSessions.clear();
+    this.#promptCompletions.clear();
+    this.#interruptingSessions.clear();
+    this.#interruptionAcknowledgements.clear();
     this.#promptEpochs.clear();
     this.#inFlightPromptCounts.clear();
     this.#deferredPromptTerminals.clear();
@@ -1970,7 +2129,8 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
       args: this.#args,
       ...(this.#cwd !== undefined ? { cwd: this.#cwd } : {}),
     });
-    const peer = new JsonRpcPeer(transport, {
+    let peer!: JsonRpcPeer;
+    peer = new JsonRpcPeer(transport, {
       includeJsonRpc: true,
       timeoutMs: this.#requestTimeoutMs,
       idPrefix: this.providerId,
@@ -1978,6 +2138,19 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
         type: "provider.disconnected",
         payload: { message: error.message, source: "json_rpc_callback" },
       }),
+      onTransportClosed: async (error) => {
+        if (this.#disposed || (this.#peer !== peer && this.#startingPeer !== peer)) return;
+        // Native questions can outlive the local prompt RPC or arrive without
+        // one. A prompt terminal alone cannot retire every incoming request.
+        const pendingQuestions = [...this.#pendingQuestions];
+        this.#pendingQuestions.clear();
+        for (const [, pending] of pendingQuestions) pending.reject(error);
+        for (const [requestId, pending] of pendingQuestions) {
+          await this.emit({ type: "user_input.resolved", providerSessionId: pending.providerSessionId,
+            payload: { providerRequestId: requestId, reason: "cancelled" } });
+        }
+        await this.emit({ type: "provider.disconnected", payload: { message: error.message, source: "transport_closed" } });
+      },
     });
     this.#startingPeer = peer;
     peer.onNotification((method, params) => this.handleNotification(method, params));
@@ -2019,7 +2192,7 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     const peer = this.#peer;
     if (peer === null) return;
     if (this.#watchedSessions.size > 0) return;
-    if (this.#activePrompts.size > 0 || this.#pendingPermissions.size > 0) return;
+    if (this.#activePrompts.size > 0 || this.#pendingPermissions.size > 0 || this.#pendingQuestions.size > 0) return;
     if (this.#activeSessions.size > 0 && !this.canRestoreActiveSessions()) return;
     this.#peer = null;
     this.resetProcessState();
@@ -2112,6 +2285,18 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
   }
 
   private captureSessionConfigOptions(providerSessionId: string, source: unknown): void {
+    if (isRecord(source)) {
+      const modes = isRecord(source.modes) ? source.modes : undefined;
+      if (modes !== undefined && typeof modes.currentModeId === "string" && Array.isArray(modes.availableModes)) {
+        this.#sessionModes.set(providerSessionId, { value: modes.currentModeId, options: modes.availableModes.flatMap((mode) =>
+          isRecord(mode) && typeof mode.id === "string" ? [{ value: mode.id, label: typeof mode.name === "string" ? mode.name : mode.id,
+            ...(typeof mode.description === "string" ? { description: mode.description } : {}) }] : []) });
+      }
+      if (source.sessionUpdate === "current_mode_update" && typeof source.currentModeId === "string") {
+        const current = this.#sessionModes.get(providerSessionId);
+        if (current !== undefined) this.#sessionModes.set(providerSessionId, { ...current, value: source.currentModeId });
+      }
+    }
     const options = sessionConfigOptions(source);
     if (options === undefined) return;
     this.#sessionConfigOptions.set(providerSessionId, options);
@@ -2288,6 +2473,34 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
   }
 
   private async handleClientRequest(method: string, params: unknown, id: RpcId): Promise<unknown> {
+    if (this.providerId === "grok" && (method === "x.ai/mcp/elicit" || method === "_x.ai/mcp/elicit")) {
+      if (!isRecord(params) || typeof params.sessionId !== "string" || (params.mode !== "form" && params.mode !== "url")) throw new Error("Grok sent an invalid form request");
+      const providerSessionId = params.sessionId;
+      const providerRequestId = String(id);
+      return await new Promise<unknown>((resolve, reject) => {
+        this.#pendingQuestions.set(providerRequestId, { providerSessionId, questions: [], elicitation: params, resolve, reject,
+          ...(typeof params.toolCallId === "string" ? { toolCallId: params.toolCallId } : {}) });
+        void this.emit({ type: "user_input.requested", providerSessionId, payload: { providerRequestId,
+          request: asJsonObject({ ...params, kind: "elicitation", title: params.serverName ?? "Question", prompt: params.message }) } });
+      });
+    }
+    if (this.providerId === "grok" && (method === "x.ai/ask_user_question" || method === "_x.ai/ask_user_question")) {
+      if (!isRecord(params) || typeof params.sessionId !== "string" || !Array.isArray(params.questions)
+        || !params.questions.length || params.questions.some((question) => !isRecord(question) || typeof question.question !== "string")) {
+        throw new ProviderAdapterError(this.providerId, "INVALID_QUESTION_REQUEST", "Grok sent an invalid question request", false);
+      }
+      const providerSessionId = params.sessionId;
+      const questions = params.questions as Record<string, unknown>[];
+      const providerRequestId = String(id);
+      return await new Promise<unknown>((resolve, reject) => {
+        this.#pendingQuestions.set(providerRequestId, { providerSessionId, questions, resolve, reject,
+          ...(typeof params.toolCallId === "string" ? { toolCallId: params.toolCallId } : {}) });
+        void this.emit({ type: "user_input.requested", providerSessionId, payload: {
+          providerRequestId, request: asJsonObject({ title: "Question", ...params,
+            questions: questions.map((question, index) => ({ ...question, id: `question_${index}`, custom: true })) }),
+        } });
+      });
+    }
     if (method !== "session/request_permission") throw new ProviderAdapterError(this.providerId, "ACP_CLIENT_METHOD_UNSUPPORTED", `${this.displayName} requested unsupported ACP client method ${method}`, false);
     if (!isRecord(params) || typeof params.sessionId !== "string") throw new ProviderAdapterError(this.providerId, "INVALID_PERMISSION_REQUEST", `${this.displayName} permission request omitted sessionId`, false);
     const options = Array.isArray(params.options) ? params.options.flatMap((entry): readonly { readonly optionId: string; readonly name: string; readonly kind?: string }[] => {
@@ -2322,6 +2535,18 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
   }
 
   private async handleNotification(method: string, params: unknown): Promise<void> {
+    if ((method === "x.ai/session_notification" || method === "_x.ai/session_notification") && isRecord(params)
+      && typeof params.sessionId === "string" && isRecord(params.update)
+      && params.update.sessionUpdate === "interaction_resolved" && typeof params.update.tool_call_id === "string") {
+      for (const [requestId, pending] of this.#pendingQuestions) {
+        if (pending.providerSessionId !== params.sessionId || pending.toolCallId !== params.update.tool_call_id) continue;
+        this.#pendingQuestions.delete(requestId);
+        pending.resolve({ outcome: pending.elicitation ? "cancel" : "cancelled" });
+        await this.emit({ type: "user_input.resolved", providerSessionId: pending.providerSessionId,
+          payload: { providerRequestId: requestId, reason: "cancelled" } });
+      }
+      return;
+    }
     if (this.providerId === "grok" && isGrokQueueChangedMethod(method)) {
       await this.applyNativeQueueChanged(params);
       return;
@@ -2511,6 +2736,11 @@ export class AcpProviderAdapter implements AgentProviderAdapter {
     this.retireActiveToolCallsForTurn(providerSessionId, promptId);
     const runningPromptId = this.#runningPromptIds.get(providerSessionId);
     if (promptId === undefined || runningPromptId === promptId) this.#runningPromptIds.delete(providerSessionId);
+    const interruption = this.#interruptionAcknowledgements.get(providerSessionId);
+    if (interruption !== undefined && (interruption.promptId === undefined || promptId === undefined || interruption.promptId === promptId)) {
+      interruption.resolve();
+      return;
+    }
 
     // An owned prompt RPC remains authoritative. Flush its deferred result
     // first; that cleanup removes the live marker and suppresses a second

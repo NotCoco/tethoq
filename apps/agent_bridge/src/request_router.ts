@@ -5,6 +5,7 @@ import {
   parseSimplifyCommand,
   simplifyDeveloperInstructions,
   sessionGoalStatuses,
+  sessionGoalObjectiveMaxLength,
   validateApprovalResponse,
   validateSessionTransferRequest,
   validateUserInputResponse,
@@ -96,9 +97,22 @@ function requireEmptyPayload(value: JsonObject, requestType: string): void {
   if (Object.keys(value).length !== 0) throw new Error(`${requestType} does not accept any payload fields`);
 }
 
+function messageMetadata(input: Record<string, unknown>): JsonObject | undefined {
+  const metadata: JsonObject = {};
+  if (input.simplify !== undefined) metadata.simplify = simplifyMetadata(input.simplify);
+  if (input.goal !== undefined) {
+    const goal = record(input.goal, "goal");
+    const objective = stringField(goal, "objective").trim();
+    if (!objective || objective.length > sessionGoalObjectiveMaxLength) throw new Error(`Goal objective must contain between 1 and ${sessionGoalObjectiveMaxLength} characters`);
+    metadata.tethoqGoalObjective = objective;
+  }
+  return Object.keys(metadata).length ? metadata : undefined;
+}
+
 function queuedMessageInput(input: Record<string, unknown>, requestId: string) {
   const attachmentIds = input.attachmentIds === undefined ? undefined : messageAttachmentIds(input.attachmentIds);
   const workflows = input.workflows === undefined ? undefined : workflowReferences(input.workflows);
+  const metadata = messageMetadata(input);
   return {
     requestId,
     content: messageContentField(input, (attachmentIds?.length ?? 0) > 0 || (workflows?.length ?? 0) > 0),
@@ -106,7 +120,7 @@ function queuedMessageInput(input: Record<string, unknown>, requestId: string) {
     ...(typeof input.reasoningEffort === "string" ? { reasoningEffort: input.reasoningEffort } : {}),
     ...(attachmentIds !== undefined ? { attachmentIds } : {}),
     ...(workflows !== undefined ? { workflows } : {}),
-    ...(input.simplify !== undefined ? { metadata: { simplify: simplifyMetadata(input.simplify) } } : {}),
+    ...(metadata !== undefined ? { metadata } : {}),
   };
 }
 
@@ -731,6 +745,14 @@ export class BridgeRequestRouter {
         const input = record(payload, "payload");
         return toJson({ goal: await this.bridge.sessionGoal(stringField(input, "sessionId")) });
       }
+      case "session.permissions.get": {
+        const input = record(payload, "payload");
+        return toJson(await this.bridge.sessionPermissions(stringField(input, "sessionId")));
+      }
+      case "session.permissions.set": {
+        const input = record(payload, "payload");
+        return toJson(await this.bridge.setSessionPermission(stringField(input, "sessionId"), stringField(input, "controlId"), stringField(input, "value")));
+      }
       case "session.goal.set": {
         const input = record(payload, "payload");
         if (input.objective !== undefined && typeof input.objective !== "string") throw new Error("objective must be a string");
@@ -876,6 +898,16 @@ export class BridgeRequestRouter {
         const result = await this.bridge.contextHandoff(input.sessionId, input.prompt);
         return toJson({ ...result, session: clientSession(result.session) });
       }
+      case "session.switch_model": {
+        const input = record(payload, "payload");
+        const session = await this.bridge.switchSessionModel(stringField(input, "sessionId"), {
+          providerId: stringField(input, "providerId"),
+          modelId: stringField(input, "modelId"),
+          requestId: stringField(input, "requestId"),
+          ...(typeof input.reasoningEffort === "string" && input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
+        });
+        return toJson({ session: clientSession(session) });
+      }
       case "session.branch": {
         const input = validateSessionTransferRequest(payload);
         const result = await this.bridge.branchSession(input.sessionId, input.prompt);
@@ -917,6 +949,7 @@ export class BridgeRequestRouter {
         }
         const attachments = input.attachments === undefined ? undefined : messageAttachments(input.attachments);
         const workflows = input.workflows === undefined ? undefined : workflowReferences(input.workflows);
+        const metadata = messageMetadata(input);
         const message: SendMessageRequest = {
           requestId,
           content: messageContentField(input, (attachmentIds?.length ?? 0) > 0 || (attachments?.length ?? 0) > 0 || (workflows?.length ?? 0) > 0),
@@ -924,7 +957,7 @@ export class BridgeRequestRouter {
           ...(typeof input.reasoningEffort === "string" ? { reasoningEffort: input.reasoningEffort } : {}),
           ...(attachments !== undefined ? { attachments } : {}),
           ...(workflows !== undefined ? { workflows } : {}),
-          ...(input.simplify !== undefined ? { metadata: { simplify: simplifyMetadata(input.simplify) } } : {}),
+          ...(metadata !== undefined ? { metadata } : {}),
         };
         const sessionId = stringField(input, "sessionId");
         return toJson(attachmentIds === undefined
