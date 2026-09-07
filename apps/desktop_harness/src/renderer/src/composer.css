@@ -352,6 +352,7 @@
 .mode-choice .composer-popover { right: 0; left: auto; }
 
 .model-picker-root { position: relative; min-width: 0; }
+.model-picker-trigger { min-width: 0; }
 .model-picker-trigger .provider-logo { flex: 0 0 auto; margin-right: 2px; transform: translateY(1px); }
 .model-picker-trigger .provider-monogram[data-monogram-length="2"] { font-size: 15px; }
 .model-picker-trigger .provider-monogram[data-monogram-length="3"] { font-size: 12px; }
@@ -923,7 +924,8 @@
   background: #1b1b19;
 }
 
-.composer-goal-indicator { min-width: 0; display: flex; align-items: center; gap: 7px; margin: 7px 40px 1px; color: #909987; font-size: 12px; }
+.composer-goal-indicator { min-width: 0; display: flex; align-items: center; gap: 7px; margin: 1px 40px 1px; color: #909987; font-size: 12px; }
+.composer-goal-indicator:has(.composer-current-goal) { margin-inline: 34px; }
 .composer-goal-indicator > span, .composer-current-goal { min-width: 0; display: flex; align-items: center; gap: 7px; }
 .composer-goal-indicator strong { flex: 0 0 auto; font-size: 12px; font-weight: 600; }
 .composer-goal-indicator.is-armed { color: #c5d49c; }
@@ -933,7 +935,7 @@
 .composer-goal-indicator > button:not(.composer-current-goal) { width: 24px; height: 24px; display: grid; place-items: center; }
 .composer-goal-indicator button:hover:not(:disabled) { color: #e3ebd7; background: #2b2e25; }
 .composer-goal-indicator button:focus-visible { outline: 1px solid #a3b18a; outline-offset: 3px; }
-.composer-goal-indicator .composer-current-goal { max-width: 100%; min-height: 24px; text-align: left; }
+.composer-goal-indicator .composer-current-goal { max-width: 100%; min-height: 24px; padding: 0 6px; text-align: left; }
 .composer-current-goal > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #899081; }
 .goal-popover.composer-goal-panel {
   position: static;

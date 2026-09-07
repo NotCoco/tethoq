@@ -363,6 +363,7 @@
 .session-row.compact { height: 31px; min-height: 31px; display: grid; grid-template-columns: subgrid; grid-template-rows: 1fr; align-content: center; column-gap: 0; padding: 3px 7px 3px 1px; }
 .session-project-harness { width: 24px; height: 24px; display: grid; place-items: center; grid-column: 1; grid-row: 1; justify-self: start; translate: 0 2px; }
 .session-project-harness .provider-logo { border: 0; background: transparent; box-shadow: none; }
+.session-project-harness .provider-monogram[data-monogram-length="2"] { font-size: 12px; }
 .session-draft-harness { width: 20px; height: 20px; display: grid; place-items: center; color: #8b918b; }
 .session-draft-harness svg { width: 15px; height: 15px; }
 .session-row-top > .session-draft-harness { width: 36px; height: 36px; }
