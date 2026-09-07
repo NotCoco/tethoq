@@ -642,6 +642,25 @@ test("failed compaction reports a retryable system notice without claiming succe
   assert.equal(item.state, "completed");
 });
 
+test("OpenCode compaction summaries use a disclosure in history and from the first live text", () => {
+  const message = { id: "opencode/summary", providerMessageId: "summary", sessionId: "session", role: "assistant",
+    createdAt: "2026-09-07T11:00:00.000Z", status: "completed",
+    nativeMetadata: { mode: "compaction", summary: true },
+    parts: [{ type: "reasoning", text: "Internal summary preparation", redacted: false }, { type: "text", text: "## Objective\nPreserve the goal and next steps" }] };
+  const items = bridge.mapMessages([message]);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].title, "Compaction");
+  assert.equal(items[0].body, message.parts[1].text);
+  const event = { sequence: 1, eventId: "summary-chunk", type: "message.delta", hostId: "host", providerId: "opencode", sessionId: "session",
+    occurredAt: message.createdAt, payload: { messageId: "summary", partId: "text", partType: "text", text: "## Objective", compaction: true } };
+  assert.equal(bridge.eventToTimeline(event).title, "Compaction");
+  assert.equal(bridge.eventToTimeline({ ...event, payload: { ...event.payload, partType: "reasoning" } }), null);
+  assert.equal(bridge.mapMessages([{ ...message, nativeMetadata: {}, parts: [message.parts[1]] }])[0].title, undefined, "ordinary answers with identical headings remain visible");
+  const failed = bridge.mapMessages([{ ...message, status: "failed", parts: [...message.parts, { type: "error", message: "Summary failed" }] }]);
+  assert.equal(failed[0].state, "failed");
+  assert.equal(failed[1].body, "Summary failed");
+});
+
 test("streaming events reuse provider message identity through completion", () => {
   const base = {
     sequence: 1,

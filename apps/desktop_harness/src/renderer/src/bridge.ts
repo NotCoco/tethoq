@@ -1076,6 +1076,16 @@ function renderableAudioUri(value: unknown): string {
 
 export function mapMessages(messages: RemoteMessage[]): TimelineItem[] {
   return messages.flatMap((message) => {
+    // The native summary is an internal assistant message. Identify it from
+    // metadata, never from ordinary headings such as "Objective" in its prose.
+    if (message.role === "assistant" && (message.nativeMetadata.summary === true
+      || message.nativeMetadata.mode === "compaction" || message.nativeMetadata.agent === "compaction")) {
+      const body = message.parts.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n\n");
+      const errors = message.parts.flatMap((part, index) => part.type === "error" ? [mapPart(message, part, index)!] : []);
+      return [...(body.trim() ? [{ id: `${message.id}-compaction`, messageId: message.providerMessageId || message.id,
+        timestamp: message.createdAt, kind: "assistant" as const, title: "Compaction", body,
+        state: message.status === "streaming" ? "running" as const : message.status === "failed" ? "failed" as const : "completed" as const }] : []), ...errors];
+    }
     const userRecordMetadata = timelineUserRecordMetadata(message);
     const workflows = message.parts.flatMap((part) => part.type === "workflow" ? [{
       id: part.workflow.id,
@@ -1919,6 +1929,7 @@ export function eventToTimeline(event: AgentEvent): TimelineItem | null {
   }
   if (event.type === "message.delta" || event.type === "message.completed") {
     const kind = messageKind(event);
+    if (event.payload.compaction === true && kind === "reasoning") return null;
     const id = eventIdentity(event, kind === "reasoning" ? "reasoning" : "message");
     const providerPartId = providerPartIdentity(event);
     const phase = kind === "assistant" ? timelineMessagePhase(event.payload.phase) : undefined;
@@ -1934,7 +1945,7 @@ export function eventToTimeline(event: AgentEvent): TimelineItem | null {
     // a second copy onto what is already shown.
     const streaming = event.type === "message.delta" && event.payload.replace !== true;
     const replacing = event.type === "message.delta" && event.payload.replace === true;
-    return { id: `${sessionId}:${kind}:${id}`, messageId: messageIdentity(event, id), ...(providerPartId ? { providerPartId } : {}), ...(kind === "user" ? eventUserRecordMetadata(event) : {}), timestamp: event.occurredAt, kind, ...(phase ? { phase } : {}), ...(origin ? { origin } : {}), ...(kind === "reasoning" ? { title: "Reasoning" } : {}), body: responseAnnotations?.body ?? body, ...(images.length ? { images } : {}), ...(responseAnnotations ? { annotations: responseAnnotations.annotations } : {}), state: event.type === "message.delta" ? "running" : "completed", ...(streaming ? { streamDelta: true, sourceEventId: event.eventId } : replacing ? { streamDelta: false } : {}) };
+    return { id: `${sessionId}:${kind}:${id}`, messageId: messageIdentity(event, id), ...(providerPartId ? { providerPartId } : {}), ...(kind === "user" ? eventUserRecordMetadata(event) : {}), timestamp: event.occurredAt, kind, ...(phase ? { phase } : {}), ...(origin ? { origin } : {}), ...(event.payload.compaction === true ? { title: "Compaction" } : kind === "reasoning" ? { title: "Reasoning" } : {}), body: responseAnnotations?.body ?? body, ...(images.length ? { images } : {}), ...(responseAnnotations ? { annotations: responseAnnotations.annotations } : {}), state: event.type === "message.delta" ? "running" : "completed", ...(streaming ? { streamDelta: true, sourceEventId: event.eventId } : replacing ? { streamDelta: false } : {}) };
   }
   return null;
 }

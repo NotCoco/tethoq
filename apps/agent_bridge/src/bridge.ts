@@ -693,6 +693,7 @@ export class AgentBridge {
   readonly #compactedTurnGenerations = new Map<string, Set<number>>();
   readonly #goals = new Map<string, SessionGoal>();
   readonly #goalContinuations = new Map<string, { timer: ReturnType<typeof setTimeout>; sending: boolean; completedDuringSend: boolean }>();
+  readonly #goalContextRecoveries = new Map<string, { goal: SessionGoal; pending: boolean }>();
   /** Local generations make delayed get/set/clear replies unable to clobber a newer event. */
   readonly #goalGenerations = new Map<string, number>();
   /** Provider ordering tokens are optional, but valuable when timestamps tie. */
@@ -5782,6 +5783,7 @@ export class AgentBridge {
     this.#earsJobs.clear();
     for (const continuation of this.#goalContinuations.values()) clearTimeout(continuation.timer);
     this.#goalContinuations.clear();
+    this.#goalContextRecoveries.clear();
     this.#goals.clear();
     this.#goalGenerations.clear();
     this.#nativeGoalRevisions.clear();
@@ -6081,7 +6083,9 @@ export class AgentBridge {
       const goal = this.#goals.get(globalSessionId);
       if (goal?.source === "tethoq" && goal.status === "active"
         && (event.type === "agent.interrupted" || event.type === "agent.error" || event.payload.state === "failed")) {
-        void this.setSessionGoal(globalSessionId, { status: event.type === "agent.interrupted" ? "paused" : "blocked" }).catch(() => undefined);
+        const recovering = event.type === "agent.error" && event.payload.recovery === "compact_context"
+          && this.recoverGoalContext(globalSessionId, goal);
+        if (!recovering) void this.setSessionGoal(globalSessionId, { status: event.type === "agent.interrupted" ? "paused" : "blocked" }).catch(() => undefined);
       }
       const completed = event.type === "agent.completed"
         || ((event.type === "session.status_changed" || event.type === "session.updated")
@@ -6101,6 +6105,13 @@ export class AgentBridge {
       });
     } else if (globalSessionId !== undefined && (event.type === "session.status_changed" || event.type === "session.updated")) {
       void this.pumpDelegationsForSession(globalSessionId);
+    }
+    if (globalSessionId !== undefined && event.type === "tool.completed"
+      && this.#goalContextRecoveries.get(globalSessionId)?.pending === false
+      && !this.#compactingSessions.has(globalSessionId) && !providerToolStatusFailed(event.payload)) {
+      // A new tool result proves that a model request succeeded after recovery.
+      // A repeated rejection with no intervening work gets no second retry.
+      this.#goalContextRecoveries.delete(globalSessionId);
     }
   }
 
@@ -6808,6 +6819,41 @@ export class AgentBridge {
       && !this.#crossSessionPumps.has(sessionId) && !this.#pendingProviderSends.has(sessionId);
   }
 
+  private recoverGoalContext(sessionId: string, goal: SessionGoal): boolean {
+    const session = this.#cache.get(sessionId);
+    if (session === undefined || this.#clientTooling === undefined || this.sessionIsStopped(sessionId)
+      || this.#disposed || this.requireAdapter(session.providerId).compactSession === undefined) return false;
+    const previous = this.#goalContextRecoveries.get(sessionId);
+    if (previous?.goal === goal) return previous.pending;
+    if (this.#compactingSessions.has(sessionId)) return false;
+    const recovery = { goal, pending: true };
+    this.#goalContextRecoveries.set(sessionId, recovery);
+    const stopGeneration = this.#stopGenerations.get(sessionId);
+    const stillCurrent = () => !this.#disposed && this.#goals.get(sessionId) === goal
+      && goal.status === "active" && this.#stopGenerations.get(sessionId) === stopGeneration
+      && !this.sessionIsStopped(sessionId);
+    // compactSession registers its queue barrier synchronously; never await the
+    // model from the serial provider feed needed to observe its completion.
+    void this.compactSession(sessionId, "automatic").then(() => {
+      if (!stillCurrent()) return;
+      // Native summary lifecycle events can leave the cache working/failed.
+      // The adapter's confirmed compaction completion releases that boundary.
+      if (!this.#pendingProviderSends.has(sessionId) && !this.#locallyOwnedActiveTurns.has(sessionId)) {
+        this.#cache.updateState(sessionId, "idle", false);
+      }
+    }).catch(async () => {
+      if (stillCurrent()) await this.setSessionGoal(sessionId, { status: "blocked" });
+    }).finally(() => {
+      recovery.pending = false;
+      if (stillCurrent()) {
+        void this.pumpQueue(sessionId);
+        void this.pumpCrossSessionInbox(sessionId);
+        this.scheduleGoalContinuation(sessionId);
+      }
+    }).catch(() => undefined);
+    return true;
+  }
+
   private scheduleGoalContinuation(sessionId: string): void {
     const goal = this.#goals.get(sessionId);
     if (goal?.source !== "tethoq" || goal.status !== "active" || this.#disposed
@@ -7485,6 +7531,7 @@ export class AgentBridge {
 
   private sessionHoldsFollowUpQueue(globalSessionId: string): boolean {
     if (this.sessionIsStopped(globalSessionId)) return true;
+    if (this.#goalContextRecoveries.get(globalSessionId)?.pending === true) return true;
     if (this.#compactingSessions.has(globalSessionId) || this.#autoCompactions.has(globalSessionId)) return true;
     const session = this.#cache.get(globalSessionId);
     if (session === undefined) return false;

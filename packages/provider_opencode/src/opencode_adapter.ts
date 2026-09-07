@@ -28,7 +28,7 @@ import {
   SqliteOpenCodeSessionIndexReader,
   type OpenCodeSessionIndexReader,
 } from "./catalogue.js";
-import { asJsonObject, isContinuingOpenCodeToolPart, isOpenCodeEyesTool, isRecord, normalizeOpenCodeMessages, normalizeOpenCodeProviderStatus, normalizeOpenCodeSession, normalizeOpenCodeToolEventPayload, normalizeStatus } from "./normalize.js";
+import { asJsonObject, isContinuingOpenCodeToolPart, isOpenCodeEyesTool, isRecord, normalizeOpenCodeError, normalizeOpenCodeMessages, normalizeOpenCodeProviderStatus, normalizeOpenCodeSession, normalizeOpenCodeToolEventPayload, normalizeStatus } from "./normalize.js";
 import { extractedPdfTextAttachment, isPdfAttachment } from "./pdf_fallback.js";
 
 export interface OpenCodeAdapterOptions extends OpenCodeHttpClientOptions {
@@ -271,6 +271,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   readonly #partTexts = new Map<string, string>();
   readonly #partTypes = new Map<string, string>();
   readonly #messageRoles = new Map<string, string>();
+  readonly #compactionMessageIds = new Set<string>();
   readonly #reportedSelections = new Map<string, { readonly key: string; readonly messageCreatedAt?: number }>();
   readonly #activePromptMessageIds = new Map<string, string>();
   readonly #compactionLifecycleWaiters = new Map<string, Set<() => void>>();
@@ -727,8 +728,10 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       let latestSelectionInfo: Record<string, unknown> | undefined;
       let latestSelection: OpenCodeMessageSelection | undefined;
       for (const entry of value) {
+        if (isRecord(entry) && Array.isArray(entry.parts) && entry.parts.some((part) => isRecord(part) && part.type === "compaction")) continue;
         const info = isRecord(entry) && isRecord(entry.info) ? entry.info : isRecord(entry) ? entry : undefined;
         if (info === undefined) continue;
+        if (info.role === "assistant" && (info.summary === true || info.mode === "compaction" || info.agent === "compaction")) this.rememberMessageRole(entry as Record<string, unknown>);
         const selection = openCodeMessageSelection(info);
         if (selection === undefined) continue;
         const isNewer = latestSelection === undefined
@@ -808,6 +811,12 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   }
 
   private async performCompaction(providerSessionId: string): Promise<void> {
+    const cleanup = this.#terminalCleanupGenerations.get(providerSessionId);
+    if (cleanup !== undefined) await this.waitForTerminalCleanupGeneration(providerSessionId, cleanup);
+    if (this.hasActiveTurn(providerSessionId) || (cleanup !== undefined && !cleanup.cleanupObserved)
+      || (cleanup !== undefined && this.#terminalCleanupGenerations.get(providerSessionId) !== cleanup)) {
+      throw new ProviderAdapterError("opencode", "COMPACTION_SESSION_BUSY", "Wait for the current OpenCode turn to stop before compacting its context", true);
+    }
     const timeoutMs = this.#compactionTimeoutMs;
     const deadline = Date.now() + timeoutMs;
     const signal = AbortSignal.any([this.#abort.signal, AbortSignal.timeout(timeoutMs)]);
@@ -827,7 +836,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     let requestOutcome: { readonly kind: "completed" } | { readonly kind: "failed"; readonly error: unknown } | undefined;
     const request = this.#client.request("POST", `/session/${encodeURIComponent(providerSessionId)}/summarize`, {
       query: this.query(),
-      body: { providerID, modelID },
+      body: { providerID, modelID, auto: false },
       signal: AbortSignal.any([requestAbort.signal, signal]),
       timeoutMs,
     }).then(() => {
@@ -1237,6 +1246,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     this.#partTexts.clear();
     this.#partTypes.clear();
     this.#messageRoles.clear();
+    this.#compactionMessageIds.clear();
     this.#reportedSelections.clear();
     this.#permissions.clear();
     this.#questions.clear();
@@ -2268,6 +2278,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
           payload: {
             text: update.text,
             partType,
+            ...(messageId !== undefined && this.#compactionMessageIds.has(messageId) ? { compaction: true } : {}),
             // A replaced part carries its whole text, so consumers must overwrite
             // the row rather than append to what they already showed.
             ...(update.replace ? { replace: true } : {}),
@@ -2362,6 +2373,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
           text: delta,
           partType,
           partId,
+          ...(messageId !== undefined && this.#compactionMessageIds.has(messageId) ? { compaction: true } : {}),
           ...(messageId !== undefined ? { messageId } : {}),
         },
       });
@@ -2454,7 +2466,13 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
         this.#nativeStates.set(sessionId, "failed");
         this.clearDisconnectedSession(sessionId);
       }
-      return await this.emit({ ...base, type: "agent.error", payload: { ...asJsonObject(properties), providerStatus: null } });
+      const error = normalizeOpenCodeError(properties.error);
+      return await this.emit({ ...base, type: "agent.error", payload: {
+        ...error,
+        error: { name: isRecord(properties.error) && typeof properties.error.name === "string" ? properties.error.name : error.code,
+          data: { message: error.message } },
+        providerStatus: null,
+      } });
     }
   }
 
@@ -2486,10 +2504,12 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     if (id === undefined || role === undefined) return;
     this.#messageRoles.delete(id);
     this.#messageRoles.set(id, role);
+    if (role === "assistant" && (info.summary === true || info.mode === "compaction" || info.agent === "compaction")) this.#compactionMessageIds.add(id);
     while (this.#messageRoles.size > maxTrackedParts) {
       const oldest = this.#messageRoles.keys().next().value as string | undefined;
       if (oldest === undefined) break;
       this.#messageRoles.delete(oldest);
+      this.#compactionMessageIds.delete(oldest);
     }
   }
 
@@ -3214,6 +3234,9 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     info: Record<string, unknown>,
     options: { readonly source: "history" | "live"; readonly nativeEvent?: JsonObject },
   ): Promise<void> {
+    // Summarization is an internal turn, often on a different model/default
+    // variant. It must not change the next ordinary turn's selected settings.
+    if (this.#compactions.has(providerSessionId)) return;
     const selection = openCodeMessageSelection(info);
     if (selection === undefined) return;
     const key = JSON.stringify([selection.modelId, selection.variantId ?? null]);
@@ -3568,6 +3591,7 @@ type OpenCodeMessageSelection = {
 
 /** The model route OpenCode persisted on one native message record. */
 function openCodeMessageSelection(info: Record<string, unknown>): OpenCodeMessageSelection | undefined {
+  if (info.summary === true || info.mode === "compaction" || info.agent === "compaction") return undefined;
   const nested = isRecord(info.model) ? info.model : {};
   const user = info.role === "user";
   const providerId = user

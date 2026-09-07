@@ -2,7 +2,28 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { OpenCodeHttpClient, type FetchLike } from "./http_client.js";
-import { normalizeOpenCodeMessages, normalizeOpenCodeProviderStatus, normalizeOpenCodeSession, normalizeOpenCodeToolEventPayload, normalizeStatus } from "./normalize.js";
+import { normalizeOpenCodeError, normalizeOpenCodeMessages, normalizeOpenCodeProviderStatus, normalizeOpenCodeSession, normalizeOpenCodeToolEventPayload, normalizeStatus } from "./normalize.js";
+
+test("OpenCode image-limit failures expose actionable text in live and persisted history", () => {
+  const failure = { name: "APIError", data: { statusCode: 400, isRetryable: false,
+    message: "Error from provider (Console Go): Upstream request failed: [invalid_request_error] request contains 51 images, exceeding the maximum of 50 allowed per request",
+    responseBody: "private transport body", responseHeaders: { authorization: "private header" }, metadata: { url: "https://private.example" } } };
+  const error = normalizeOpenCodeError(failure);
+  assert.equal(error.code, "IMAGE_LIMIT_EXCEEDED");
+  assert.equal(error.recovery, "compact_context");
+  assert.match(error.message, /51 images.*50 per request/);
+  const [message] = normalizeOpenCodeMessages("host", "session", [{ info: { id: "failed", role: "assistant", error: failure }, parts: [] }]);
+  assert.equal(message?.status, "failed");
+  assert.deepEqual(message?.parts, [{ type: "error", code: error.code, message: error.message }]);
+  assert.doesNotMatch(JSON.stringify(message?.parts), /private|responseBody|metadata|authorization/);
+  for (const data of [
+    { ...failure.data, statusCode: 429 },
+    { ...failure.data, message: "API key rejected" },
+    { ...failure.data, message: "request contains 4 images, exceeding the maximum of 50 allowed per request" },
+  ]) assert.equal(normalizeOpenCodeError({ name: "APIError", data }).recovery, undefined);
+  assert.deepEqual(normalizeOpenCodeError({ name: "APIError", data: { message: "Authentication failed for sk-secret-token at https://provider.example/?key=secret" } }),
+    { code: "APIError", message: "Authentication failed for [redacted] at [provider URL]" });
+});
 
 const pdfFallbackPreamble = "Tethoq extracted this text because the selected OpenCode model does not advertise native PDF input.";
 

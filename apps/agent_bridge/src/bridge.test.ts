@@ -8762,6 +8762,99 @@ test("fallback goal continuations yield to pause, clear, stop, errors, and newer
   }
 });
 
+class GoalContextRecoveryProvider extends GoalCapturingFakeProvider {
+  compactCalls = 0;
+  compactBlocker: Promise<void> | undefined;
+  failCompaction = false;
+  async compactSession(): Promise<void> {
+    this.compactCalls++;
+    await this.compactBlocker;
+    if (this.failCompaction) throw new Error("summary failed");
+  }
+}
+
+const imageLimitFailure = { code: "IMAGE_LIMIT_EXCEEDED", recovery: "compact_context", message: "51 images exceed the limit of 50" };
+
+test("goal image-limit recovery waits for compaction, coalesces errors and bounds retries without progress", async (t) => {
+  const hostId = "host-goal-image-recovery";
+  const provider = new GoalContextRecoveryProvider({ hostId, sessionCount: 1 });
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider]);
+  bridge.configureClientTooling(testClientTooling());
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  await bridge.refresh();
+  const session = bridge.sessions()[0]!;
+  await bridge.setSessionGoal(session.id, { objective: "Continue until the reviewer approves" });
+  await bridge.sendMessage(session.id, { requestId: "start-image-goal", content: "Start", modelId: "fake-model", reasoningEffort: "high" });
+  let release!: () => void;
+  provider.compactBlocker = new Promise<void>((resolve) => { release = resolve; });
+  await resolvesPromptly(provider.finish(session.providerSessionId, "agent.error", imageLimitFailure), "recovery must not block its own provider event feed");
+  await provider.finish(session.providerSessionId, "agent.error", imageLimitFailure);
+  await waitFor(() => provider.compactCalls === 1, "one shared compaction");
+  await provider.finish(session.providerSessionId, "agent.completed");
+  await new Promise((resolve) => setTimeout(resolve, 850));
+  assert.equal(provider.requests.length, 1, "a summary completion event cannot bypass the compaction barrier");
+  assert.equal((await bridge.sessionGoal(session.id))?.status, "active");
+  release();
+  await waitFor(() => provider.requests.length === 2, "one continuation after confirmed summary");
+  assert.equal(provider.lastRequest?.modelId, "fake-model");
+  assert.equal(provider.lastRequest?.reasoningEffort, "high");
+  assert.match(provider.lastRequest!.developerInstructions!, /Continue until the reviewer approves/);
+  assert.equal(stripProviderPromptGuidance(provider.lastRequest!.content), "");
+  await provider.finish(session.providerSessionId, "agent.error", imageLimitFailure);
+  assert.equal((await bridge.sessionGoal(session.id))?.status, "blocked", "another rejection without progress stalls the goal");
+  assert.equal(provider.compactCalls, 1, "do not compact and retry the same failure indefinitely");
+});
+
+test("goal image-limit recovery can recover again after a successful model tool call", async (t) => {
+  const hostId = "host-goal-image-progress";
+  const provider = new GoalContextRecoveryProvider({ hostId, sessionCount: 1 });
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider]);
+  bridge.configureClientTooling(testClientTooling());
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  await bridge.refresh();
+  const session = bridge.sessions()[0]!;
+  await bridge.setSessionGoal(session.id, { objective: "Review many images" });
+  await provider.finish(session.providerSessionId, "agent.error", imageLimitFailure);
+  await waitFor(() => provider.requests.length === 1, "first recovery");
+  await provider.finish(session.providerSessionId, "tool.completed", { status: "completed", callId: "new-successful-tool" });
+  await provider.finish(session.providerSessionId, "agent.error", imageLimitFailure);
+  await waitFor(() => provider.requests.length === 2, "later capacity failure after actual progress");
+  assert.equal(provider.compactCalls, 2);
+});
+
+test("goal image-limit recovery preserves pause, clear, stop, newer messages and compaction failure", async (t) => {
+  for (const action of ["pause", "clear", "stop", "message", "failure", "unrelated-error"] as const) {
+    await t.test(action, async (t) => {
+      const hostId = `host-goal-image-${action}`;
+      const provider = new GoalContextRecoveryProvider({ hostId, sessionCount: 1 });
+      const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider]);
+      bridge.configureClientTooling(testClientTooling());
+      t.after(() => bridge.dispose());
+      await bridge.start();
+      await bridge.refresh();
+      const session = bridge.sessions()[0]!;
+      await bridge.setSessionGoal(session.id, { objective: "Preserve user control" });
+      let release!: () => void;
+      provider.compactBlocker = new Promise<void>((resolve) => { release = resolve; });
+      provider.failCompaction = action === "failure";
+      await provider.finish(session.providerSessionId, "agent.error", action === "unrelated-error" ? { message: "Authentication failed" } : imageLimitFailure);
+      if (action !== "unrelated-error") await waitFor(() => provider.compactCalls === 1, "recovery started");
+      if (action === "pause") await bridge.setSessionGoal(session.id, { status: "paused" });
+      if (action === "clear") await bridge.clearSessionGoal(session.id);
+      if (action === "stop") await bridge.interrupt(session.id);
+      if (action === "message") await bridge.enqueueMessage(session.id, { requestId: "new-user-instruction", content: "Use this correction first" });
+      release();
+      await new Promise((resolve) => setTimeout(resolve, 950));
+      assert.equal(provider.requests.some((request) => request.requestId.startsWith("goal_continue_")), false);
+      if (action === "message") assert.equal(provider.requests[0]?.content, "Use this correction first");
+      if (action === "failure" || action === "unrelated-error") assert.equal((await bridge.sessionGoal(session.id))?.status, "blocked");
+      if (action === "unrelated-error") assert.equal(provider.compactCalls, 0);
+    });
+  }
+});
+
 test("goal RPCs route get/set/clear without a model turn and reject malformed payloads", async (t) => {
   const hostId = "host-goal-rpc";
   const provider = new GoalCapturingFakeProvider({ hostId, sessionCount: 1 });
