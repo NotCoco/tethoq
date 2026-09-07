@@ -976,6 +976,15 @@ class _PairingScreenState extends State<PairingScreen> {
                     'available on that computer.',
                   ),
                   const SizedBox(height: 20),
+                  Text('Windows installer',
+                      style: Theme.of(sheetContext).textTheme.labelLarge),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Open Tethoq Bridge from the Start menu and choose Pair '
+                    'phone. The Desktop installer includes Bridge. Keep it '
+                    'running in the tray while using your phone.',
+                  ),
+                  const SizedBox(height: 20),
                   Text('Development setup',
                       style: Theme.of(sheetContext).textTheme.labelLarge),
                   const SizedBox(height: 8),
