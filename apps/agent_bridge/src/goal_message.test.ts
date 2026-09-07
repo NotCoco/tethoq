@@ -65,11 +65,11 @@ test("fallback goals persist privately and cleared or paused goals cannot retain
   assert.match(first.developerInstructions!, /<tethoq_task_goal>[\s\S]*Objective: Finish the documentation/);
   assert.equal(stripProviderPromptGuidance(providerPromptContent(first)), first.content);
   await bridge.sendMessage(session.id, { requestId: "follow-up", content: "Continue" });
-  assert.match(provider.sends.at(-1)!.developerInstructions!, /Work toward this objective across turns/);
+  assert.match(provider.sends.at(-1)!.developerInstructions!, /Keep working until this objective is achieved/);
   await bridge.setSessionGoal(session.id, { status: "paused" });
   await bridge.sendMessage(session.id, { requestId: "paused", content: "Answer this question", developerInstructions: first.developerInstructions! });
   assert.match(provider.sends.at(-1)!.developerInstructions!, /This goal is paused/);
-  assert.doesNotMatch(provider.sends.at(-1)!.developerInstructions!, /Work toward this objective/);
+  assert.doesNotMatch(provider.sends.at(-1)!.developerInstructions!, /Keep working until this objective is achieved|Tethoq will continue unfinished active goals/);
   await bridge.clearSessionGoal(session.id);
   await bridge.sendMessage(session.id, { requestId: "cleared", content: "A new request", developerInstructions: first.developerInstructions! });
   assert.equal(provider.sends.at(-1)!.developerInstructions, undefined);

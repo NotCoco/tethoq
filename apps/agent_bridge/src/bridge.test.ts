@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { CURRENT_PROTOCOL_VERSION, createDeviceIdentity, createHostIdentity, earsModelKey, makeGlobalSessionId, parseGlobalSessionId, type DelegationTask, type JsonObject, type ProviderCapabilities, type RemoteMessage, type RemoteModel, type RemoteSession, type SessionContextState, type SessionGoal } from "../../../packages/protocol/src/index.js";
 import { FakeProviderAdapter } from "../../../packages/provider_fake/src/index.js";
-import { ProviderAdapterError } from "../../../packages/provider_contract/src/index.js";
+import { ProviderAdapterError, stripProviderPromptGuidance } from "../../../packages/provider_contract/src/index.js";
 import { AgentBridge, maxLocalQueuedAttachmentBytes, maxLocalQueuedMessages, messageAnchorCursor, messagePage, visionProxyAvailabilityInstructions } from "./bridge.js";
 import { AttachmentUploadManager } from "./attachment_uploads.js";
 import { SessionCache } from "./session_cache.js";
@@ -222,8 +223,19 @@ class TerminalAttentionFakeProvider extends FakeProviderAdapter {
 
 class GoalCapturingFakeProvider extends FakeProviderAdapter {
   public lastRequest: SendMessageRequest | undefined;
+  public readonly requests: SendMessageRequest[] = [];
+  #sink: ProviderEventSink | undefined;
+  public override async subscribe(providerSessionId: string | null, sink: ProviderEventSink): Promise<Subscription> {
+    this.#sink = sink;
+    return await super.subscribe(providerSessionId, sink);
+  }
+  public async finish(providerSessionId: string, type: ProviderEvent["type"] = "agent.completed"): Promise<void> {
+    await this.#sink?.({ eventId: `goal-end-${randomUUID()}`, providerId: this.providerId, providerSessionId,
+      type, occurredAt: new Date().toISOString(), payload: {} });
+  }
   public override async sendMessage(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
     this.lastRequest = request;
+    this.requests.push(request);
     return { accepted: true, providerTurnId: `goal-turn-${providerSessionId}`, details: [] };
   }
 }
@@ -6063,6 +6075,63 @@ test("provider queue identities stay session-scoped and malformed list scopes ar
   assert.match(invalid.error?.message ?? "", /sessionId must be a non-empty string/);
 });
 
+test("provisional creation titles stay local and yield to generated native titles", async (t) => {
+  const hostId = "host-provisional-title";
+  const provider = new (class extends RelationshipFakeProvider {
+    public readonly creates: CreateSessionOptions[] = [];
+    public override async createSession(options: CreateSessionOptions) {
+      this.creates.push(options);
+      return await super.createSession(options);
+    }
+  })(hostId);
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider]);
+  t.after(() => bridge.dispose());
+  await bridge.start();
+
+  const response = await new BridgeRequestRouter(bridge).handle({
+    protocolVersion: CURRENT_PROTOCOL_VERSION,
+    messageId: "message-provisional-title",
+    hostId,
+    sentAt: new Date().toISOString(),
+    kind: "request",
+    type: "session.create",
+    requestId: "request-provisional-title",
+    payload: { providerId: provider.providerId, workingDirectory: "C:/project", title: "New task", provisionalTitle: true },
+  });
+  assert.equal(response.ok, true);
+  assert.equal(provider.creates[0]?.title, undefined, "a placeholder must not disable native title generation");
+  assert.equal(provider.creates[0]?.provisionalTitle, undefined, "the bridge owns the local title policy");
+  const session = bridge.sessions().find((item) => item.title === "New task")!;
+  assert.ok(session);
+  await bridge.refresh();
+  assert.equal(bridge.sessions().find((item) => item.id === session.id)?.title, "New task");
+  await provider.emitSessionUpdate(session.providerSessionId, { title: "  Generated goal title  " });
+  await waitFor(() => bridge.sessions().find((item) => item.id === session.id)?.title === "Generated goal title", "generated title adoption");
+
+  const named = await bridge.createSession(provider.providerId, { workingDirectory: "C:/project", title: "My chosen title" });
+  assert.equal(provider.creates.at(-1)?.title, "My chosen title", "explicit titles must still reach the harness");
+  assert.equal(named.title, "My chosen title");
+});
+
+test("separating first-turn guidance leaves native title generation enabled", async (t) => {
+  const hostId = "host-separated-title";
+  const provider = new MeshCaptureProvider({ hostId, sessionCount: 0 });
+  const bridge = new AgentBridge(config(hostId), [provider], {
+    globalAgentInstructions: async () => "Keep changes focused.",
+  });
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  const session = await bridge.createSession(provider.providerId, {
+    workingDirectory: "C:/project",
+    firstInstruction: "Improve the visual quality\nPreserve the controls.",
+  });
+  assert.equal(provider.creates[0]?.firstInstruction, undefined);
+  assert.equal(provider.creates[0]?.title, undefined, "hidden guidance must not turn a prompt preview into a fixed native title");
+  assert.equal(session.title, "Improve the visual quality");
+  assert.equal(provider.requests[0]?.content, "Improve the visual quality\nPreserve the controls.");
+  assert.match(provider.requests[0]?.developerInstructions ?? "", /Keep changes focused/u);
+});
+
 test("child-session requests are capability-gated, cached, and retain validated live metadata", async (t) => {
   const hostId = "host-children";
   const provider = new RelationshipFakeProvider(hostId);
@@ -8219,6 +8288,7 @@ test("an off-page working-to-idle race settles idle after its shared identity re
   const idle = provider.emitState(providerSessionId, "idle");
   provider.releaseSessionRead();
   await Promise.all([working, idle]);
+  await waitFor(() => bridge.sessions().find((session) => session.id === globalSessionId)?.state === "idle", "buffered terminal event after the identity read");
 
   assert.equal(bridge.sessions().find((session) => session.id === globalSessionId)?.state, "idle");
   assert.equal(provider.exactSessionCalls, 1, "overlapping lifecycle events share the exact identity read");
@@ -8536,6 +8606,86 @@ test("Tethoq goals support the full lifecycle on a provider with no native goal 
   assert.ok(persisted.length >= 7);
   assert.deepEqual(persisted.at(-1), {});
   await bridge.dispose();
+});
+
+test("discovering a provider task cannot deadlock events emitted by its identity read", async (t) => {
+  const hostId = "host-reentrant-identity";
+  class ReentrantProvider extends GoalCapturingFakeProvider {
+    reads = 0;
+    override async listSessions(options: ListSessionsOptions = {}): Promise<PaginatedSessions> {
+      const page = await super.listSessions(options);
+      return { ...page, sessions: page.sessions.slice(0, 1) };
+    }
+    override async getSession(providerSessionId: string): Promise<RemoteSession> {
+      this.reads++;
+      await Promise.resolve();
+      await this.finish(providerSessionId, "message.started");
+      await this.finish(providerSessionId);
+      return await super.getSession(providerSessionId);
+    }
+  }
+  const provider = new ReentrantProvider({ hostId, sessionCount: 2 });
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider]);
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  await bridge.refresh();
+  const childId = makeGlobalSessionId(hostId, provider.providerId, "fake_session_0002");
+  assert.equal(bridge.sessions().some((session) => session.id === childId), false);
+  await resolvesPromptly(provider.finish("fake_session_0002", "message.started"), "identity lookup must leave the provider feed free");
+  await waitFor(() => bridge.sessions().find((session) => session.id === childId)?.state === "completed", "ordered terminal event after identity discovery");
+  assert.equal(provider.reads, 1, "nested provider events share the identity read");
+});
+
+test("active fallback goals continue privately and stop when the model completes the goal", async (t) => {
+  const hostId = "host-goal-continuation";
+  const provider = new GoalCapturingFakeProvider({ hostId, sessionCount: 1 });
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider]);
+  bridge.configureClientTooling(testClientTooling());
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  await bridge.refresh();
+  const session = bridge.sessions()[0]!;
+  await bridge.setSessionGoal(session.id, { objective: "Finish the requested repair" });
+  await bridge.sendMessage(session.id, { requestId: "start-goal", content: "Repair it", modelId: "fake-model", reasoningEffort: "high" });
+  await provider.finish(session.providerSessionId);
+  await provider.finish(session.providerSessionId);
+  await waitFor(() => provider.requests.length === 2, "one automatic goal continuation");
+  assert.equal(stripProviderPromptGuidance(provider.lastRequest!.content), "", "automatic control text is hidden from the conversation");
+  assert.match(provider.lastRequest!.developerInstructions!, /next concrete improvement/);
+  assert.match(provider.lastRequest!.developerInstructions!, /tethoq_goal/);
+  assert.equal(provider.lastRequest!.modelId, "fake-model");
+  assert.equal(provider.lastRequest!.reasoningEffort, "high");
+  assert.deepEqual(await bridge.executeClientTool(session.id, "tethoq_goal", {}), { objective: "Finish the requested repair", status: "active" });
+  await assert.rejects(bridge.executeClientTool(session.id, "tethoq_goal", { status: "active" }), /complete or blocked/);
+  assert.deepEqual(await bridge.executeClientTool(session.id, "tethoq_goal", { status: "complete" }), { status: "complete" });
+  await provider.finish(session.providerSessionId);
+  await new Promise((resolve) => setTimeout(resolve, 850));
+  assert.equal(provider.requests.length, 2);
+  await assert.rejects(bridge.executeClientTool(session.id, "tethoq_goal", { status: "complete" }), /no longer active/);
+});
+
+test("fallback goal continuations yield to pause, clear, stop, errors, and newer user instructions", async (t) => {
+  for (const action of ["paused", "clear", "stop", "error", "queued", "blocked"] as const) {
+    await t.test(action, async (t) => {
+      const hostId = `host-goal-cancel-${action}`;
+      const provider = new GoalCapturingFakeProvider({ hostId, sessionCount: 1 });
+      const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider]);
+      bridge.configureClientTooling(testClientTooling());
+      t.after(() => bridge.dispose());
+      await bridge.start();
+      await bridge.refresh();
+      const session = bridge.sessions()[0]!;
+      await bridge.setSessionGoal(session.id, { objective: "Keep working only while this goal is active" });
+      await provider.finish(session.providerSessionId, action === "error" ? "agent.error" : "agent.completed");
+      if (action === "paused") await bridge.setSessionGoal(session.id, { status: "paused" });
+      if (action === "clear") await bridge.clearSessionGoal(session.id);
+      if (action === "stop") await bridge.interrupt(session.id);
+      if (action === "blocked") await bridge.executeClientTool(session.id, "tethoq_goal", { status: "blocked" });
+      if (action === "queued") await bridge.enqueueMessage(session.id, { requestId: "user-priority", content: "Follow this newer instruction first" });
+      await new Promise((resolve) => setTimeout(resolve, 850));
+      assert.equal(provider.requests.some((request) => request.requestId.startsWith("goal_continue_")), false);
+    });
+  }
 });
 
 test("goal RPCs route get/set/clear without a model turn and reject malformed payloads", async (t) => {

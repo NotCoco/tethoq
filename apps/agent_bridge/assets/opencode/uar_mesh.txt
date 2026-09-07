@@ -180,6 +180,14 @@ export const list_children = tool({
   },
 })
 
+export const tethoq_goal = tool({
+  description: "Read the Tethoq goal in this task's private instructions, or mark it complete after verifying success, or blocked when progress requires user input or an external change. Never create or reopen a goal.",
+  args: { status: tool.schema.enum(["complete", "blocked"]).optional() },
+  async execute(args, context) {
+    return await call(context.sessionID, "tethoq_goal", args)
+  },
+})
+
 export const list_sessions = tool({
   description: "Find other indexed Tethoq tasks on this host without scanning folders or session databases.",
   args: {

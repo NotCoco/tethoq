@@ -841,6 +841,7 @@ export class BridgeRequestRouter {
         const options: CreateSessionOptions = {
           workingDirectory: typeof input.workingDirectory === "string" ? input.workingDirectory : "",
           ...(typeof input.title === "string" ? { title: input.title } : {}),
+          ...(input.provisionalTitle === true ? { provisionalTitle: true } : {}),
           ...(typeof input.modelId === "string" ? { modelId: input.modelId } : {}),
           ...(typeof input.reasoningEffort === "string" ? { reasoningEffort: input.reasoningEffort } : {}),
           ...(first !== undefined ? { firstInstruction: first.content } : {}),

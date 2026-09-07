@@ -31,7 +31,7 @@ const faqs = [
 
 function AgentCanvas() {
   return (
-    <div className="agent-canvas" aria-label="Illustration of a phone connected to coding agents on a computer">
+    <div className="agent-canvas" role="img" aria-label="Illustration of a phone connected to coding agents on a computer">
       <div className="canvas-grid" />
       <div className="orbit orbit-one" /><div className="orbit orbit-two" />
       <div className="laptop-card">

@@ -87,6 +87,8 @@ export interface PaginatedSessions {
 export interface CreateSessionOptions {
   readonly workingDirectory: string;
   readonly title?: string;
+  /** Local display fallback; leave the native title unset so the harness can generate it. */
+  readonly provisionalTitle?: boolean;
   readonly modelId?: string;
   readonly reasoningEffort?: string;
   readonly firstInstruction?: string;
@@ -346,8 +348,8 @@ export interface AgentProviderAdapter {
   hasActiveTurn?(providerSessionId: string): boolean;
   /** True only when this adapter, rather than an external peer, owns the active writer. */
   ownsActiveTurn?(providerSessionId: string): boolean;
-  /** Provider-native session ids that currently have a model turn in flight. */
-  activeSessionIds?(): readonly string[];
+  /** Include unresolved disconnected turns when deciding whether a server can be stopped. */
+  activeSessionIds?(options?: { readonly includeDisconnected?: boolean }): readonly string[];
   /** True while any session streams through the adapter's secondary server feed. */
   isSecondaryBusy?(): boolean;
   /** Attaches (url) or detaches (undefined) the secondary server feed. */

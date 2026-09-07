@@ -1068,7 +1068,8 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     return this.#nativeStates.get(providerSessionId) === "working";
   }
 
-  public activeSessionIds(): readonly string[] {
+  public activeSessionIds(options: { readonly includeDisconnected?: boolean } = {}): readonly string[] {
+    if (options.includeDisconnected) return [...new Set([...this.knownActiveSessionIds(), ...this.#disconnectedActiveSessionIds])];
     if (this.#primaryEventStreamDisconnected) return [];
     return [...this.knownActiveSessionIds()].filter((sessionId) => !this.#disconnectedActiveSessionIds.has(sessionId));
   }

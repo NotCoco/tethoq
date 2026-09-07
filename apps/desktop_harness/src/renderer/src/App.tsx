@@ -2689,7 +2689,7 @@ function App() {
   }, [notify, rememberProject]);
 
   const beginDraftMaterialization = useCallback((input: DraftSessionMaterializeInput, firstTurn?: {
-    readonly content: string;
+    readonly content?: string;
     readonly title: string;
     readonly simplify?: JsonObject;
   }): Promise<DraftMaterializationResult> => {
@@ -2731,12 +2731,13 @@ function App() {
         providerId: input.providerId,
         workingDirectory: input.workingDirectory,
         title,
+        provisionalTitle: true,
         ...modelFields,
-        ...(firstTurn ? { firstInstruction: firstTurn.content } : {}),
+        ...(firstTurn?.content !== undefined ? { firstInstruction: firstTurn.content } : {}),
         ...(firstTurn?.simplify !== undefined ? { simplify: firstTurn.simplify } : {}),
       });
-      const firstInstructionIncluded = firstTurn !== undefined;
-      const visibleInput = firstTurn ? parseResponseAnnotations(firstTurn.content)?.body ?? firstTurn.content : "";
+      const firstInstructionIncluded = firstTurn?.content !== undefined;
+      const visibleInput = firstTurn?.content !== undefined ? parseResponseAnnotations(firstTurn.content)?.body ?? firstTurn.content : "";
       return {
         session: materializedDraftSession(response.session, input, source, title, firstInstructionIncluded ? "working" : "idle", visibleInput),
         firstInstructionIncluded,
@@ -2864,10 +2865,12 @@ function App() {
       ...(!isAmbiguousSelectionValue(input.effort) ? { reasoningEffort: input.effort.toLowerCase() } : {}),
     };
     const separatedFirstTurn = input.attachmentIds.length > 0 || input.workflowIds.length > 0 || input.goalObjective !== undefined;
-    const result = await beginDraftMaterialization(materializeInput, separatedFirstTurn ? undefined : {
-      content: input.content,
+    const result = await beginDraftMaterialization(materializeInput, {
       title,
-      ...(input.simplify !== undefined ? { simplify: input.simplify } : {}),
+      ...(!separatedFirstTurn ? {
+        content: input.content,
+        ...(input.simplify !== undefined ? { simplify: input.simplify } : {}),
+      } : {}),
     });
     if (separatedFirstTurn || !result.firstInstructionIncluded) {
       try {

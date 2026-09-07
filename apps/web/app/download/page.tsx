@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { BridgeMark, Check, Download, Laptop, Shield } from "@/components/icons";
 import { SiteFooter } from "@/components/site-footer";
 import { SiteHeader } from "@/components/site-header";
+import { canonicalOrigin, openGraph, twitter } from "@/lib/site-metadata";
 import {
   bridgeChecksumUrl,
   bridgeWindowsDownloadUrl,
@@ -10,8 +11,20 @@ import {
 } from "@/lib/config";
 
 export const metadata: Metadata = {
-  title: "Download Tethoq for Windows",
+  title: "Download for Windows",
   description: "Download Tethoq Desktop with the bridge included, or install the standalone Tethoq Bridge.",
+  alternates: { canonical: "/download" },
+  openGraph: {
+    ...openGraph,
+    title: "Download Tethoq for Windows",
+    description: "Download Tethoq Desktop with the bridge included, or install the standalone Tethoq Bridge.",
+    url: `${canonicalOrigin}/download`,
+  },
+  twitter: {
+    ...twitter,
+    title: "Download Tethoq for Windows",
+    description: "Download Tethoq Desktop with the bridge included, or install the standalone Tethoq Bridge.",
+  },
 };
 
 interface DownloadActionProps {

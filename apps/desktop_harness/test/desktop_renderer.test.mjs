@@ -1706,8 +1706,8 @@ test("new task opens a local draft and materializes it once from the composer", 
   assert.doesNotMatch(app, /function NewSessionModal|<NewSessionModal/);
   assert.match(app, /const createDraftSend = useCallback/);
   assert.match(app, /const separatedFirstTurn = input\.attachmentIds\.length > 0 \|\| input\.workflowIds\.length > 0/);
-  assert.match(app, /beginDraftMaterialization\(materializeInput, separatedFirstTurn \? undefined : \{/);
-  assert.match(app, /\.\.\.\(firstTurn \? \{ firstInstruction: firstTurn\.content \} : \{\}\)/);
+  assert.match(app, /beginDraftMaterialization\(materializeInput, \{\s*title,\s*\.\.\.\(!separatedFirstTurn \? \{/);
+  assert.match(app, /\.\.\.\(firstTurn\?\.content !== undefined \? \{ firstInstruction: firstTurn\.content \} : \{\}\)/);
   assert.match(app, /await request\("session\.send_message"/);
   assert.match(app, /input\.workflowIds\.length \? \{ workflowIds: \[\.\.\.input\.workflowIds\] \} : \{\}/);
   assert.match(composer, /optimisticItem: acceptedRow/);

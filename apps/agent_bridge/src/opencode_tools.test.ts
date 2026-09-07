@@ -105,6 +105,7 @@ const tool = Object.assign((definition) => definition, { schema: {
   string: () => schemaNode("string"),
   number: () => schemaNode("number"),
   boolean: () => schemaNode("boolean"),
+  enum: (values) => schemaNode("enum", { values }),
   array: (items) => schemaNode("array", { items }),
   object: (properties) => schemaNode("object", { properties }),
 } })`;
