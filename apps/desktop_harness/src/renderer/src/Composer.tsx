@@ -10,7 +10,7 @@ import {
   parseSimplifyCommand,
   type SimplifySettings,
 } from "../../../../../packages/protocol/src/simplify";
-import type { JsonObject, ProviderWalletStatus } from "../../../../../packages/protocol/src/index";
+import type { JsonObject, ProviderWalletStatus, QueuedMessage } from "../../../../../packages/protocol/src/index";
 import type { DesktopPreferencesState, EarsSettings, ScreenCaptureSource, SelectedFile, SelectedImage, VisionProxySelection, VisionProxyStatus, VisionProxyTarget, WorkflowAttachment, WorkflowDescriptor } from "@shared/desktop_api";
 import {
   composeEarsDestinationText,
@@ -2395,6 +2395,7 @@ export interface QueuedMessageView {
   readonly state: "queued" | "sending" | "failed";
   readonly attachmentCount: number;
   readonly attachments: readonly QueuedAttachmentView[];
+  readonly mesh?: QueuedMessage["mesh"];
   readonly retryable?: boolean;
   readonly error?: string;
 }
@@ -2504,6 +2505,10 @@ export function queuedMessagesForSession(value: unknown, sessionId: string): rea
       attachmentCount: attachments.length,
       attachments,
       retryable: message.retryable !== false,
+      ...(message.mesh && typeof message.mesh === "object" && !Array.isArray(message.mesh)
+        && Array.isArray((message.mesh as QueuedMessage["mesh"])?.targets)
+        && Array.isArray((message.mesh as QueuedMessage["mesh"])?.segments)
+        ? { mesh: message.mesh as NonNullable<QueuedMessage["mesh"]> } : {}),
       ...(typeof message.error === "string" && message.error.trim() ? { error: message.error } : {}),
     };
     if (attachments.some((attachment) => attachment.dataUrl)) {
@@ -2546,6 +2551,7 @@ function optimisticQueuedSteerTimelineItem(message: QueuedMessageView, id: strin
     presentationId: id,
     kind: "user",
     body: message.content,
+    ...(message.mesh ? { mesh: message.mesh } : {}),
     ...(images.length ? { images } : {}),
     ...(audio.length ? { audio } : {}),
     ...(files.length ? { files } : {}),
@@ -2625,8 +2631,9 @@ function ComposerSurfaceOutline() {
   return <svg ref={ref} className="composer-surface-outline" viewBox={`0 0 ${width} ${totalHeight}`} preserveAspectRatio="none" style={{ top: -shelfHeight, height: totalHeight }} aria-hidden="true"><path d={path} vectorEffect="non-scaling-stroke"/></svg>;
 }
 
-function QueuedMessageRow({ message, busy, canSteer, queueingEnabled, onSteer, onRemove, onEdit, onSideChat, onNewTask, onToggleQueueing }: {
+function QueuedMessageRow({ message, snapshot, busy, canSteer, queueingEnabled, onSteer, onRemove, onEdit, onSideChat, onNewTask, onToggleQueueing }: {
   message: QueuedMessageView;
+  snapshot: DesktopSnapshot;
   busy: boolean;
   canSteer: boolean;
   queueingEnabled: boolean;
@@ -2657,6 +2664,7 @@ function QueuedMessageRow({ message, busy, canSteer, queueingEnabled, onSteer, o
   }}>
     <span className="queued-state" aria-hidden="true">{message.state === "sending" ? <span className="spinner"/> : <QueueGlyph/>}</span>
     {editing ? <div className="queued-message-edit"><input autoFocus value={value} aria-label="Edit queued instruction" onChange={(event) => setValue(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void save(); } else if (event.key === "Escape") setEditing(false); }}/><button type="button" disabled={saving || !value.trim()} onClick={() => void save()}>{saving ? <span className="spinner"/> : <CheckIcon/>}<span>Save</span></button></div> : <div className="queued-message-content">{message.attachments.length ? <div className="queued-attachment-widgets">{message.attachments.map((attachment, index) => <QueuedAttachmentWidget key={`${attachment.name}-${attachment.mimeType}-${index}`} attachment={attachment}/>)}</div> : null}<strong>{queuedMessagePreview(message.content)}</strong></div>}
+    {message.mesh ? <div className="queued-mesh-targets" aria-label="Queued Mesh targets">{message.mesh.targets.map((target, index) => <span key={index} className="composer-mesh-widget message-mesh-widget"><span className="composer-mesh-widget-body">{meshTargetModelLabel(snapshot, target)}{target.reasoningEffort ? ` · ${reasoningLabel(target.reasoningEffort, { providerId: target.providerId, modelId: target.modelId })}` : ""}</span></span>)}</div> : null}
     {!editing ? <div className="queued-message-actions">
       {canSteer ? <button type="button" className="queued-steer" disabled={busy || message.state === "sending" || deliveryUnresolved} aria-label="Steer with this queued instruction" data-tooltip="Steer" onClick={() => void onSteer()}><SendIcon/><span>Steer</span></button> : null}
       <button type="button" disabled={busy || message.state === "sending"} aria-label="Remove queued instruction" data-tooltip="Remove" onClick={() => void onRemove()}><XIcon/></button>
@@ -5133,6 +5141,16 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
     const submittedSelectionRevision = selectionRevision.current;
     sendingRef.current = true;
     setSending(true);
+    const blockedByAttention = holdsFollowUpQueue || turnInFlight.current || transportQueueSuppressions.current.length > 0;
+    const liveGuidance = !submittedAsGoal && (mode === "steer" || (!queueingEnabled && canSteer));
+    const requestType = composerMessageRequestType({
+      liveGuidance,
+      hasAttachments: submittedDraft.attachments.length > 0 || submittedDraft.annotations.some((annotation) => annotation.audio !== undefined),
+      blockedByAttention,
+      queueingEnabled: submittedAsGoal || queueingEnabled,
+      externalWriter: session.externalWriter === true,
+    });
+    const queuedSubmission = requestType === "message_queue.enqueue";
     if (meshTargets.length > 0) {
       const submittedMeshTargets = [...meshTargetsRef.current];
       const acceptedId = `local-${Date.now()}`;
@@ -5154,37 +5172,44 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
       setMeshModelPicker(null);
       setMeshOpen(false);
       commitContent("");
-      updateSnapshot((current) => current ? {
+      if (!queuedSubmission) updateSnapshot((current) => current ? {
         ...current,
         timelines: { ...current.timelines, [session.id]: [...(current.timelines[session.id] ?? []), optimisticRow] },
         sessions: current.sessions.map((item) => item.id === session.id
           ? { ...item, state: "working", preview: trimmed, updatedAt: acceptedTimestamp } : item),
       } : current);
       try {
-        if (submittedAsGoal) {
+        if (submittedAsGoal && !queuedSubmission) {
           const nextGoal = await setSessionGoal(session.id, { objective: trimmed, status: "active", tokenBudget: null });
           onGoalRef.current?.(nextGoal);
         }
         // An empty prompt is a deliberate mesh send: the bridge and the parent
         // agent compose the instruction, so the send control stays enabled.
-        await request("delegation.prepare", {
+        const response = await request("delegation.prepare", {
           parentSessionId: session.id,
           prompt: trimmed,
           targets: submittedMeshTargets.map(meshTargetRoute),
           presentationSegments,
+          mode: queuedSubmission ? "queue" : requestType === "session.steer_message" ? "steer" : "send",
+          ...(submittedAsGoal && queuedSubmission ? { goal: true } : {}),
           ...(model ? { modelId: model } : {}),
           ...(effort ? { reasoningEffort: effort } : {}),
         }, acceptedId);
+        if (queuedSubmission) {
+          const queued = queuedMessagesForSession({ messages: [response.message] }, session.id)[0];
+          if (queued) setQueuedMessages((current) => current.some((item) => item.id === queued.id) ? current : [...current, queued]);
+          void loadQueuedMessages();
+        }
         persistMeshRecentTargetsForSession(session.id, submittedMeshTargets);
         if (submittedAsGoal) setMode("queue");
         setMeshRecentRevision((current) => current + 1);
-        notify("Mesh delegation started");
+        if (!queuedSubmission) notify(requestType === "session.steer_message" ? "Task steered" : "Mesh delegation started");
       } catch (error) {
         if (isDeliveryUnknownError(error)) {
           notify(error.message, "error");
           return;
         }
-        updateSnapshot((current) => current ? {
+        if (!queuedSubmission) updateSnapshot((current) => current ? {
           ...current,
           timelines: { ...current.timelines, [session.id]: rollbackOptimisticComposerRow(current.timelines[session.id] ?? [], acceptedId) },
           sessions: current.sessions.map((item) => item.id === session.id && item.updatedAt === acceptedTimestamp
@@ -5224,16 +5249,6 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
       annotations: submittedDraft.annotations.map(({ audio: _audio, ...annotation }) => annotation),
     } : submittedDraft;
     const optimisticRow = optimisticComposerTimelineItem(acceptedId, acceptedTimestamp, simplified.content, optimisticDraft);
-    const blockedByAttention = holdsFollowUpQueue || turnInFlight.current || transportQueueSuppressions.current.length > 0;
-    const liveGuidance = !submittedAsGoal && (mode === "steer" || (!queueingEnabled && canSteer));
-    const requestType = composerMessageRequestType({
-      liveGuidance,
-      hasAttachments: submittedDraft.attachments.length > 0 || submittedDraft.annotations.some((annotation) => annotation.audio !== undefined),
-      blockedByAttention,
-      queueingEnabled: submittedAsGoal || queueingEnabled,
-      externalWriter: session.externalWriter === true,
-    });
-    const queuedSubmission = requestType === "message_queue.enqueue";
     const transportOnlySubmission = queuedSubmission && session.externalWriter === true && !blockedByAttention;
     const appearsInTranscript = draftSession || switchingHarness || composerSubmissionAppearsInTranscript(requestType, transportOnlySubmission);
     // Submission owns this exact snapshot. Clear it and paint the matching user
@@ -6121,6 +6136,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
     {queuedMessages.length ? <div className="queued-strip" role="list" aria-label="Queued instructions">{queuedMessages.map((message) => <QueuedMessageRow
       key={message.id}
       message={message}
+      snapshot={snapshot}
       busy={cancellingQueuedId === message.id || updatingQueuedId === message.id}
       canSteer={canSteer}
       queueingEnabled={queueingEnabled}

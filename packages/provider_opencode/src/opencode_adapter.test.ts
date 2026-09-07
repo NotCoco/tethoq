@@ -517,6 +517,25 @@ test("OpenCode scheduled retries fail closed when native message history is unav
   await adapter.dispose();
 });
 
+test("OpenCode grants the installed dispatch tool for a prepared Mesh turn", async (t) => {
+  const bodies: Record<string, unknown>[] = [];
+  const adapter = new OpenCodeAdapter({ hostId: "mesh-tool-host", baseUrl: "http://127.0.0.1:4096/",
+    fetch: async (_input, init) => { bodies.push(JSON.parse(String(init?.body))); return new Response(null, { status: 204 }); },
+    activityReader: new SequenceActivityReader(new Set()),
+  });
+  t.after(() => adapter.dispose());
+  await adapter.sendMessage("mesh-parent", { requestId: "mesh-tool-grant", content: "Ask the selected worker for feedback",
+    developerInstructions: "Call uar_mesh_dispatch_delegation with the prepared assignments.",
+    clientToolOverrides: { mesh_dispatch_delegation: true },
+  });
+  assert.equal((bodies[0]?.tools as Record<string, boolean>).uar_mesh_dispatch_delegation, true);
+  assert.equal((bodies[0]?.tools as Record<string, boolean>).mesh_dispatch_delegation, undefined);
+  await adapter.sendMessage("vision-helper", { requestId: "mesh-helper-denied", content: "Read this image",
+    metadata: { internalPurpose: "vision_proxy" }, clientToolOverrides: { mesh_dispatch_delegation: true },
+  });
+  assert.deepEqual(bodies[1]?.tools, { "*": false }, "internal vision helpers must retain their tool boundary");
+});
+
 test("OpenCode omits the internal default effort sentinel from native prompts", async () => {
   let requestBody: Record<string, unknown> | undefined;
   const fetchLike: FetchLike = async (_input, init) => {

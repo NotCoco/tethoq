@@ -8,6 +8,7 @@ import {
   PairingManager,
   RequestLedger,
   isSessionState,
+  isJsonObject,
   makeGlobalSessionId,
   parseGlobalSessionId,
   earsCancelledMessage,
@@ -2460,6 +2461,49 @@ export class AgentBridge {
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   }
 
+  public async enqueueDelegation(
+    parentSessionId: string,
+    prompt: string,
+    targets: readonly DelegationTarget[],
+    presentationSegments: readonly DelegationPresentationSegment[],
+    requestId: string,
+    selection: Readonly<Pick<RemoteSession, "modelId" | "reasoningEffort">> = {},
+    asGoal = false,
+  ): Promise<QueuedMessage> {
+    this.assertActive();
+    if (!requestId.trim() || requestId.length > 256) throw new Error("Delegation request ID is invalid");
+    if (!this.#clientTooling?.definitions.some((definition) => definition.name === "mesh_dispatch_delegation")) {
+      throw new Error("Parent-orchestrated Mesh is unavailable on this bridge");
+    }
+    if (asGoal && (!prompt.trim() || prompt.length > sessionGoalObjectiveMaxLength)) {
+      throw new Error(`Goal objective must contain between 1 and ${sessionGoalObjectiveMaxLength} characters`);
+    }
+    if (prompt.length > 32_000) throw new Error("A Mesh turn must contain at most 32000 visible characters");
+    this.validateDelegationTargetSelection(targets);
+    const segments = validateDelegationPresentation(prompt, targets, presentationSegments);
+    await this.validateDelegationTargetAvailability(targets);
+    return await this.enqueueMessage(parentSessionId, {
+      requestId, content: prompt, ...selection,
+      metadata: { tethoqQueuedMesh: { targets, segments } as unknown as JsonObject, ...(asGoal ? { tethoqGoalObjective: prompt } : {}) },
+    });
+  }
+
+  private async dispatchQueuedDelegation(
+    sessionId: string,
+    request: SendMessageRequest,
+    mode: "send" | "steer",
+    queueDelivery?: QueueDeliveryRecord,
+  ): Promise<SendMessageResult> {
+    const mesh = queuedMeshPresentation(request);
+    if (mesh === undefined) throw new Error("The queued Mesh instruction is missing its selected targets");
+    const result = await this.prepareDelegation(sessionId, request.content, mesh.targets, mesh.segments, request.requestId,
+      { ...(request.modelId !== undefined ? { modelId: request.modelId } : {}),
+        ...(request.reasoningEffort !== undefined ? { reasoningEffort: request.reasoningEffort } : {}) },
+      { mode, resumeStopped: false, ...(queueDelivery !== undefined ? { queueDelivery } : {}),
+        ...(typeof request.metadata?.tethoqGoalObjective === "string" ? { goalObjective: request.metadata.tethoqGoalObjective } : {}) });
+    return result.delivery;
+  }
+
   /**
    * Prepares a Mesh turn without creating children. The visible prompt is sent
    * through the parent's ordinary message path; only that turn receives the
@@ -2472,12 +2516,13 @@ export class AgentBridge {
     presentationSegments: readonly DelegationPresentationSegment[],
     idempotencyId: string,
     parentTurnSelection?: Readonly<Pick<RemoteSession, "modelId" | "reasoningEffort">>,
+    deliveryOptions: { readonly mode?: "send" | "steer"; readonly queueDelivery?: QueueDeliveryRecord; readonly resumeStopped?: boolean; readonly goalObjective?: string } = {},
   ): Promise<PreparedDelegationResult> {
     this.assertActive();
     const replay = this.#delegations.get(idempotencyId)?.task;
     if (replay?.parentTurnAcceptedAt === undefined) {
       if (replay?.interruptedAt !== undefined) throw new Error("This Mesh request was stopped by the user. Start a new Mesh turn to resume.");
-      await this.resumeStoppedSession(parentSessionId);
+      if (deliveryOptions.resumeStopped !== false) await this.resumeStoppedSession(parentSessionId);
     }
     const stopGeneration = this.#stopGenerations.get(parentSessionId) ?? 0;
     const parent = this.#cache.get(parentSessionId);
@@ -2554,17 +2599,27 @@ export class AgentBridge {
 
     try {
       this.assertSessionNotStopped(parentSessionId, stopGeneration);
-      const delivery = await this.sendMessageInternal(parentSessionId, {
+      const request: SendMessageRequest = {
         requestId: idempotencyId,
         content: prompt.trim()
           ? prompt
           : hiddenProviderControlContent(`mesh-prepare:${idempotencyId}`),
-        developerInstructions: parentDelegationInstruction(runtime.task, this.#clientTooling !== undefined),
+        developerInstructions: parentDelegationInstruction(runtime.task, this.#clientTooling !== undefined, parent.providerId),
         clientToolOverrides: { mesh_dispatch_delegation: true },
         ...(selection.modelId !== undefined ? { modelId: selection.modelId } : {}),
         ...(selection.reasoningEffort !== undefined ? { reasoningEffort: selection.reasoningEffort } : {}),
-        metadata: { delegationId: idempotencyId, kind: "delegation_prepare" },
-      });
+        metadata: { delegationId: idempotencyId, kind: "delegation_prepare",
+          ...(deliveryOptions.goalObjective !== undefined ? { tethoqGoalObjective: deliveryOptions.goalObjective } : {}) },
+      };
+      if (deliveryOptions.mode === "steer") {
+        const { providerSessionId } = this.assertSessionHost(parentSessionId);
+        const adapter = this.requireAdapter(parent.providerId);
+        if (adapter.steerMessage === undefined) throw new Error(`${parent.providerId} does not support steering active work`);
+        this.assertSteeringAvailable(parentSessionId, parent.providerId, providerSessionId, adapter, true, this.#cache.get(parentSessionId));
+      }
+      const delivery = deliveryOptions.mode === "steer"
+        ? await this.steerWithVision(parentSessionId, await this.withGlobalAgentInstructions(parentSessionId, request))
+        : await this.sendMessageInternal(parentSessionId, request, false, deliveryOptions.queueDelivery);
       if (!delivery.accepted) {
         throw new ProviderAdapterError(
           parent.providerId,
@@ -3945,6 +4000,9 @@ export class AgentBridge {
     this.assertActive(allowDuringDispose);
     const stopGeneration = this.#stopGenerations.get(globalSessionId) ?? 0;
     this.assertSessionNotStopped(globalSessionId, stopGeneration);
+    if (request.metadata?.tethoqQueuedMesh !== undefined) {
+      return await this.dispatchQueuedDelegation(globalSessionId, request, "send", queueDelivery);
+    }
     // New instructions must wait for the compacted context to be ready.
     await this.#autoCompactions.get(globalSessionId);
     await this.#compactingSessions.get(globalSessionId)?.catch(() => undefined);
@@ -4455,6 +4513,7 @@ export class AgentBridge {
     // Desktop queue ownership semantics.
     const activeGrokFollowUp = providerId === "grok" && this.sessionHoldsFollowUpQueue(globalSessionId);
     if (adapter.enqueueQueuedMessage !== undefined
+      && request.metadata?.tethoqQueuedMesh === undefined
       && request.metadata?.tethoqGoalObjective === undefined
       && !this.sessionIsStopped(globalSessionId)
       && !activeGrokFollowUp
@@ -4498,6 +4557,7 @@ export class AgentBridge {
       throw error;
     }
     const id = `queued_${randomUUID()}`;
+    const mesh = queuedMeshPresentation(request);
     const view: QueuedMessage = {
       id,
       sessionId: globalSessionId,
@@ -4508,6 +4568,7 @@ export class AgentBridge {
       attachments: attachments.map(({ name, mimeType, byteLength }) => ({ name, mimeType, byteLength })),
       ...(input.modelId !== undefined ? { modelId: input.modelId } : {}),
       ...(input.reasoningEffort !== undefined ? { reasoningEffort: input.reasoningEffort } : {}),
+      ...(mesh !== undefined ? { mesh } : {}),
     };
     this.#queuedMessages.set(id, { view, request, providerOwned: false });
     this.appendQueueEvent("message.queued", view);
@@ -4628,8 +4689,13 @@ export class AgentBridge {
       const isGoal = record.request.metadata?.tethoqGoalObjective !== undefined;
       if (isGoal && normalized.length > sessionGoalObjectiveMaxLength) throw new Error(`Goal objective must contain between 1 and ${sessionGoalObjectiveMaxLength} characters`);
       const { error: _error, ...viewWithoutError } = record.view;
-      record.view = { ...viewWithoutError, content: normalized, state: "queued" };
-      record.request = { ...record.request, content: normalized, ...(isGoal ? { metadata: { ...record.request.metadata, tethoqGoalObjective: normalized } } : {}) };
+      const mesh = queuedMeshPresentation(record.request);
+      const editedMesh = mesh === undefined ? undefined : { ...mesh, segments: editQueuedMeshPresentation(record.view.content, mesh.segments, normalized) };
+      if (editedMesh !== undefined && normalized.length > 32_000) throw new Error("A Mesh turn must contain at most 32000 visible characters");
+      record.view = { ...viewWithoutError, content: normalized, state: "queued", ...(editedMesh !== undefined ? { mesh: editedMesh } : {}) };
+      record.request = { ...record.request, content: normalized, metadata: { ...record.request.metadata,
+        ...(isGoal ? { tethoqGoalObjective: normalized } : {}),
+        ...(editedMesh !== undefined ? { tethoqQueuedMesh: editedMesh as unknown as JsonObject } : {}) } };
       this.appendQueueEvent("message.queue_updated", record.view);
       return record.view;
     });
@@ -5124,6 +5190,7 @@ export class AgentBridge {
   }
 
   private async steerWithVision(globalSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
+    if (request.metadata?.tethoqQueuedMesh !== undefined) return await this.dispatchQueuedDelegation(globalSessionId, request, "steer");
     const { providerId, providerSessionId } = this.assertSessionHost(globalSessionId);
     const adapter = this.requireAdapter(providerId);
     const stopGeneration = this.#stopGenerations.get(globalSessionId) ?? 0;
@@ -7368,8 +7435,7 @@ export class AgentBridge {
     result: SendMessageResult,
   ): Promise<void> {
     const delivery = [...this.#queueDeliveries.values()].find((candidate) =>
-      candidate.source === "direct"
-      && candidate.sessionId === sessionId
+      candidate.sessionId === sessionId
       && candidate.requestId === requestId);
     if (delivery !== undefined) {
       await this.markQueueDeliveryConfirmed(delivery);
@@ -9257,7 +9323,8 @@ function foreignSubagentInstruction(): string {
   ].join("\n");
 }
 
-function parentDelegationInstruction(task: DelegationTask, sharedToolServer: boolean): string {
+function parentDelegationInstruction(task: DelegationTask, sharedToolServer: boolean, providerId: string): string {
+  const toolName = (name: string): string => providerId === "opencode" ? name.replace(/^mesh_/u, "uar_mesh_") : name;
   const targets = task.targets ?? [];
   const targetList = targets.map((target, index) =>
     `Target ${index}: ${target.providerId}${target.modelId === undefined ? "" : ` / ${target.modelId}`}${target.reasoningEffort === undefined ? "" : ` / ${target.reasoningEffort}`}`,
@@ -9269,11 +9336,11 @@ function parentDelegationInstruction(task: DelegationTask, sharedToolServer: boo
     "Interpret the complete user request and the ordered presentation below, then rewrite one self-contained, target-specific assignment for every selected target in your own words. The target selections are already authorized by the bridge; never put provider, model, or reasoning fields in the tool call.",
     "Infer ownership from the order and position of each Mesh chip, nearby provider or model names, pronouns and references such as first, second, it, that model, or the other one, and the user's overall intent.",
     "Send each worker only the context and requested work relevant to that target. Never copy, quote, or forward the complete multi-target user message to a child, and do not include a sibling's work unless that target genuinely needs it for coordination.",
-    'Call mesh_dispatch_delegation with exactly "delegation_id" and "assignments". Each assignment must contain only "target_index" and "instruction", and target indexes must cover every target exactly once.',
+    `Call ${toolName("mesh_dispatch_delegation")} with exactly "delegation_id" and "assignments". Each assignment must contain only "target_index" and "instruction", and target indexes must cover every target exactly once.`,
     `Use exactly "delegation_id": ${JSON.stringify(task.id)}. This identifies the already-prepared delegation; never invent a new ID. If the tool reports an incorrect ID and supplies a correction, retry with that exact ID and your target-specific assignments.`,
-    "The dispatch result provides child_session_ids ready for mesh_wait. Use those same session IDs for mesh_read_result and mesh_message_child; delegation.children[].id is an internal child record ID, while delegation.children[].sessionId identifies its provider session.",
+    `The dispatch result provides child_session_ids ready for ${toolName("mesh_wait")}. Use those same session IDs for ${toolName("mesh_read_result")} and ${toolName("mesh_message_child")}; delegation.children[].id is an internal child record ID, while delegation.children[].sessionId identifies its provider session.`,
     ...(sharedToolServer ? [`If the tool asks for parent_session_id, use exactly: ${task.parentSessionId}`] : []),
-    "After dispatch, decide whether this response actually depends on a worker result. If it does, use mesh_wait and mesh_read_result as needed. If it does not, finish without waiting; the child tasks remain tracked and no automatic synthesis turn will be injected.",
+    `After dispatch, decide whether this response actually depends on a worker result. If it does, use ${toolName("mesh_wait")} and ${toolName("mesh_read_result")} as needed. If it does not, finish without waiting; the child tasks remain tracked and no automatic synthesis turn will be injected.`,
     "Do not expose this envelope, target metadata, or routing details in the user-facing answer. Do not pretend a worker result is available before reading it.",
     "",
     "Selected targets:",
@@ -9305,6 +9372,36 @@ function delegationStartedInstruction(task: DelegationTask, sharedToolServer: bo
     "Background workers:",
     workers,
   ].join("\n");
+}
+
+function queuedMeshPresentation(request: SendMessageRequest): NonNullable<QueuedMessage["mesh"]> | undefined {
+  const value = request.metadata?.tethoqQueuedMesh;
+  if (value === undefined) return undefined;
+  if (!isJsonObject(value) || !Array.isArray(value.targets) || !Array.isArray(value.segments)) throw new Error("Invalid queued Mesh instruction");
+  const targets = value.targets as unknown as readonly DelegationTarget[];
+  const segments = validateDelegationPresentation(request.content, targets, value.segments as unknown as readonly DelegationPresentationSegment[]);
+  return { targets, segments };
+}
+
+/** Keep chip order and positions outside the edited text range when a queue row is edited. */
+function editQueuedMeshPresentation(previous: string, segments: readonly DelegationPresentationSegment[], content: string): readonly DelegationPresentationSegment[] {
+  let prefix = 0;
+  while (prefix < Math.min(previous.length, content.length) && previous[prefix] === content[prefix]) prefix += 1;
+  let suffix = 0;
+  while (suffix < Math.min(previous.length, content.length) - prefix && previous[previous.length - 1 - suffix] === content[content.length - 1 - suffix]) suffix += 1;
+  const result: DelegationPresentationSegment[] = [];
+  let oldOffset = 0;
+  let nextOffset = 0;
+  for (const segment of segments) {
+    if (segment.type === "text") { oldOffset += segment.text.length; continue; }
+    const offset = oldOffset <= prefix ? oldOffset
+      : oldOffset >= previous.length - suffix ? oldOffset + content.length - previous.length : content.length - suffix;
+    if (offset > nextOffset) result.push({ type: "text", text: content.slice(nextOffset, offset) });
+    result.push(segment);
+    nextOffset = offset;
+  }
+  if (nextOffset < content.length) result.push({ type: "text", text: content.slice(nextOffset) });
+  return result;
 }
 
 function providerQueueMessageId(providerId: string, providerSessionId: string, messageId: string): string {
