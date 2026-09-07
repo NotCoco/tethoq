@@ -1,24 +1,52 @@
 import type { Metadata, Viewport } from "next";
+import { canonicalOrigin, openGraph, siteDescription, siteTitle, twitter } from "@/lib/site-metadata";
 import "./globals.css";
 
-const siteDescription = "A free, open-source Windows workspace for your coding agents. Download Tethoq Desktop with Bridge included, or install Bridge on its own.";
-
 export const metadata: Metadata = {
-  metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL || "http://localhost:3000"),
-  title: { default: "Tethoq — Your coding agents, within reach", template: "%s — Tethoq" },
+  metadataBase: new URL(canonicalOrigin),
+  title: { default: siteTitle, template: "%s — Tethoq" },
   description: siteDescription,
   applicationName: "Tethoq",
   keywords: ["Tethoq", "Codex", "OpenCode", "Grok", "coding harnesses", "remote coding agents"],
+  alternates: { canonical: "/" },
+  manifest: "/manifest.webmanifest",
+  robots: { index: true, follow: true, googleBot: { "max-image-preview": "large" } },
   icons: {
     icon: [{ url: "/tethoq-mark.png", type: "image/png", sizes: "512x512" }],
     apple: [{ url: "/tethoq-mark.png", type: "image/png", sizes: "512x512" }],
   },
-  openGraph: { title: "Tethoq", description: siteDescription, type: "website" },
-  twitter: { card: "summary", title: "Tethoq", description: siteDescription },
+  openGraph: { ...openGraph, url: canonicalOrigin },
+  twitter,
 };
 
 export const viewport: Viewport = { themeColor: "#10100f", colorScheme: "dark" };
 
+const structuredData = {
+  "@context": "https://schema.org",
+  "@graph": [
+    { "@type": "WebSite", "@id": `${canonicalOrigin}/#website`, name: "Tethoq", url: canonicalOrigin, inLanguage: "en-GB" },
+    {
+      "@type": "SoftwareApplication",
+      "@id": `${canonicalOrigin}/#application`,
+      name: "Tethoq",
+      url: canonicalOrigin,
+      description: siteDescription,
+      applicationCategory: "DeveloperApplication",
+      operatingSystem: "Windows 10, Windows 11",
+      image: `${canonicalOrigin}/tethoq-mark.png`,
+      isAccessibleForFree: true,
+      sameAs: "https://github.com/NotCoco/tethoq",
+    },
+  ],
+};
+
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
-  return <html lang="en"><body>{children}</body></html>;
+  return (
+    <html lang="en">
+      <body>
+        <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(structuredData).replace(/</g, "\\u003c") }} />
+        {children}
+      </body>
+    </html>
+  );
 }
