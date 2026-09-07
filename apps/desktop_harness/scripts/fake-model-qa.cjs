@@ -1929,7 +1929,7 @@ async function scenarioMasterStream(window, captures, host) {
   await waitFor(window, `document.querySelector('.reasoning-group[aria-busy="true"]')`, 'Fake reasoning did not start');
   await waitFor(window, `Boolean(document.querySelector(${JSON.stringify(`[data-scroll-members*="${runId}-fake-stream-tool"]`)}))`, 'Tool activity did not reach the timeline', 6_000);
   await waitFor(window, `Boolean(document.querySelector(${JSON.stringify(`[data-scroll-members*="${runId}-fake-stream-command"]`)}))`, 'Command activity did not reach the timeline', 6_000);
-  const liveReasoningFlowSelector = `[data-scroll-members*="${runId}-fake-stream-reasoning"] .reasoning-flow-running`;
+  const liveReasoningFlowSelector = `[data-scroll-members*="${runId}-fake-stream-reasoning"] .reasoning-flow`;
   await waitFor(window, `(() => {
     const flow = document.querySelector(${JSON.stringify(liveReasoningFlowSelector)});
     return flow && flow.scrollHeight > flow.clientHeight + 80 && flow.textContent?.includes('enough deterministic detail to overflow');
@@ -2003,8 +2003,9 @@ async function scenarioMasterStream(window, captures, host) {
   const activeReasoning = await evaluate(window, `(() => {
     const groups = [...document.querySelectorAll(${JSON.stringify(`[data-scroll-members*="${runId}-fake-stream-reasoning"]`)})];
     const group = groups[0];
-    const label = group?.querySelector('.reasoning-label');
-    const flowingText = group?.querySelector('.reasoning-flow-running > .rich-text');
+    const pulse = document.querySelector('.working-pulse');
+    const label = pulse?.querySelector('.reasoning-label');
+    const flowingText = group?.querySelector('.reasoning-flow > .rich-text');
     const labelStyle = label ? getComputedStyle(label) : null;
     const flowStyle = flowingText ? getComputedStyle(flowingText) : null;
     const tool = document.querySelector(${JSON.stringify(`[data-scroll-members*="${runId}-fake-stream-tool"]`)});
@@ -2014,26 +2015,34 @@ async function scenarioMasterStream(window, captures, host) {
       clickable: group?.querySelector('button.reasoning-disclosure') !== null,
       running: group?.matches('[aria-busy="true"]') === true,
       extraPulses: document.querySelectorAll('.working-pulse').length,
+      headerShimmer: group?.querySelector('button.reasoning-running') !== null,
+      pulseAfterWork: Boolean(group && pulse && (group.compareDocumentPosition(pulse) & Node.DOCUMENT_POSITION_FOLLOWING)),
+      pulseBottom: pulse?.getBoundingClientRect().bottom,
+      composerTop: document.querySelector('.composer-wrap')?.getBoundingClientRect().top,
       reducedMotion: matchMedia('(prefers-reduced-motion: reduce)').matches,
       labelAnimation: labelStyle?.animationName ?? null,
       labelPlayState: labelStyle?.animationPlayState ?? null,
       flowingText: Boolean(flowingText),
+      historicalTextShimmer: Boolean(group?.querySelector('.reasoning-flow-running')),
       flowAnimation: flowStyle?.animationName ?? null,
       flowPlayState: flowStyle?.animationPlayState ?? null,
       toolText: tool?.textContent?.replace(/\\s+/gu, ' ').trim() ?? '',
       commandText: command?.textContent?.replace(/\\s+/gu, ' ').trim() ?? '',
     };
   })()`);
-  assert.deepEqual({ groups: activeReasoning.groups, clickable: activeReasoning.clickable, running: activeReasoning.running, extraPulses: activeReasoning.extraPulses }, { groups: 1, clickable: true, running: true, extraPulses: 0 }, 'Active fake work must use one clickable Reasoning disclosure, not a second pulse');
+  assert.deepEqual({ groups: activeReasoning.groups, clickable: activeReasoning.clickable, running: activeReasoning.running, extraPulses: activeReasoning.extraPulses }, { groups: 1, clickable: true, running: true, extraPulses: 1 }, 'Expanded work keeps its disclosure and one live status at the transcript end');
+  assert.equal(activeReasoning.headerShimmer, false, 'The historical header must not shimmer above expanded work');
+  assert.equal(activeReasoning.pulseAfterWork, true, 'The live status must follow the latest work');
+  assert.ok(activeReasoning.pulseBottom <= activeReasoning.composerTop && activeReasoning.pulseBottom >= activeReasoning.composerTop - 100, `Live status must remain visible just above the composer: ${JSON.stringify(activeReasoning)}`);
   assert.match(activeReasoning.toolText, /Read\s*repo state/u, `Tool activity hid its known operation: ${activeReasoning.toolText}`);
   assert.match(activeReasoning.commandText, /npm run fake-check/u, `Command activity hid its known command: ${activeReasoning.commandText}`);
   assert.doesNotMatch(`${activeReasoning.toolText} ${activeReasoning.commandText}`, /Tool started|Command is running|Command running/u, 'Concrete live activity regressed to a generic placeholder');
   if (!activeReasoning.reducedMotion) {
     assert.equal(activeReasoning.labelAnimation, 'reasoning-label-shimmer', `Live Reasoning label was not shimmering: ${JSON.stringify(activeReasoning)}`);
     assert.equal(activeReasoning.labelPlayState, 'running', `Live Reasoning label animation was paused: ${JSON.stringify(activeReasoning)}`);
-    assert.equal(activeReasoning.flowingText, true, `Live reasoning had no painted text shimmer owner: ${JSON.stringify(activeReasoning)}`);
-    assert.equal(activeReasoning.flowAnimation, 'reasoning-flow-shimmer', `Live reasoning text was not shimmering: ${JSON.stringify(activeReasoning)}`);
-    assert.equal(activeReasoning.flowPlayState, 'running', `Live reasoning text animation was paused: ${JSON.stringify(activeReasoning)}`);
+    assert.equal(activeReasoning.flowingText, true, `Reasoning text disappeared while later tools ran: ${JSON.stringify(activeReasoning)}`);
+    assert.equal(activeReasoning.historicalTextShimmer, false, 'Earlier reasoning must stay settled while newer tools own the live status');
+    assert.equal(activeReasoning.flowAnimation, 'none', `Historical reasoning still shimmered above the latest work: ${JSON.stringify(activeReasoning)}`);
   }
   await capture(window, '01-stream-active', captures);
   await waitFor(window, `[...document.querySelectorAll('.message-assistant')].some((node) => node.textContent?.includes('The fake model completed its deterministic pass.'))`, 'Final answer did not begin after nested reasoning interaction', 6_000);

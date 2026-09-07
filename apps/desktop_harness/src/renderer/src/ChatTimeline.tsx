@@ -348,20 +348,6 @@ export function reasoningSegments(items: readonly TimelineItem[], namespace = ""
     // because every activity in one message shares it.
     segments.push({ kind: "activity", id: `activity:${scope}${item.detail ?? item.id}`, items: [item] });
   }
-  // A live reasoning span can move from prose into a command/tool without ending
-  // the span. withCurrentActivity intentionally keeps only the newest raw row
-  // running, but the disclosure icon and its newest readable thought represent
-  // that whole span. Project the shared live state onto that thought so the text
-  // cannot become inert while its own icon continues to pulse. The segment id and
-  // membership stay unchanged as adjacent activity arrives, avoiding a remount.
-  if (items.some((item) => item.state === "running")) {
-    for (let index = segments.length - 1; index >= 0; index -= 1) {
-      const segment = segments[index];
-      if (segment?.kind !== "thinking") continue;
-      if (segment.item.state !== "running") segments[index] = { ...segment, item: { ...segment.item, state: "running" } };
-      break;
-    }
-  }
   return segments;
 }
 
@@ -857,7 +843,9 @@ export function liveReasoningIds(groups: readonly TimelineGroup[]): { readonly g
     if (group.kind !== "reasoning") continue;
     const segments = reasoningSegments(group.items, group.key);
     const live = segments.filter((segment) => segment.kind === "thinking" && segment.item.state === "running");
-    if (!live.length) continue;
+    // Keep a readable span open while its tools run, without pretending an older
+    // thought is still being written. Group activity and live text are distinct.
+    if (!segments.some((segment) => segment.kind === "thinking") || !group.items.some((item) => item.state === "running")) continue;
     groupKeys.push(reasoningGroupKey(group));
     for (const segment of live) segmentIds.push(segment.id);
   }
@@ -976,8 +964,11 @@ export function withCurrentActivity(timeline: readonly TimelineItem[], active: b
  * it offered a dropdown over nothing, and on the way out the transcript had to
  * recognise and delete a row it had written itself.
  */
-export function showsWorkingPulse(timeline: readonly TimelineItem[], active: boolean, blockedByProviderStatus = false): boolean {
-  if (!active || blockedByProviderStatus) return false;
+export function showsWorkingPulse(timeline: readonly TimelineItem[], active: boolean, blockedByStatus = false, expandedLiveGroup = false): boolean {
+  if (!active || blockedByStatus) return false;
+  // An expanded group can contain a whole goal's activity. Its header is history;
+  // keep the live status at the transcript's end as more work arrives below it.
+  if (expandedLiveGroup) return true;
   // A running assistant message is visible output, not evidence of thinking. Treating it
   // as the live activity left a working task with nothing marked live at all, which is the
   // common shape for harnesses that stream commentary instead of reasoning items. Only a
@@ -1143,12 +1134,13 @@ function ReasoningGroupImpl({ items, groupKey, expanded, onToggleGroup, onLinkOp
 }) {
   const segments = reasoningSegments(items, groupKey);
   const running = items.some((item) => item.state === "running");
+  const headerRunning = running && !expanded;
   return <section className="reasoning-group" aria-busy={running || undefined} data-scroll-anchor={groupKey} data-scroll-members={items.map((item) => encodeURIComponent(item.id)).join("|")}>
-    <button type="button" className={`reasoning-disclosure ${running ? "reasoning-running" : ""}`} aria-expanded={expanded} onClick={onToggleGroup}>
+    <button type="button" className={`reasoning-disclosure ${headerRunning ? "reasoning-running" : ""}`} aria-expanded={expanded} onClick={onToggleGroup}>
       <span className="reasoning-mark" aria-hidden="true"><i/><i/><i/></span>
       {/* The trailing ellipsis is the tense marker: dots alone read as decoration, so a
           span that is still being written should say so in the word itself. */}
-      <span className="reasoning-label">{running ? "Reasoning…" : "Reasoning"}</span>
+      <span className="reasoning-label">{headerRunning ? "Reasoning…" : "Reasoning"}</span>
       <ChevronDownIcon className={expanded ? "expanded" : ""}/>
     </button>
     {expanded ? <div className="reasoning-detail">
@@ -1541,6 +1533,8 @@ function ChatTimelineImpl({ timeline, providerId, provider, providerStatus, reas
     setOpenedGroups((current) => withMember(current, key, !open));
     setClosedGroups((current) => withMember(current, key, open));
   }, [groupExpanded]);
+  const expandedLiveGroup = groups.some((group) => group.kind === "reasoning"
+    && group.items.some((item) => item.state === "running") && groupExpanded(reasoningGroupKey(group)));
   return <>{groups.map((group) => {
     if (group.kind === "boundary") return <TimelineBoundary key={group.item.id} item={group.item} label={group.label}/>;
     if (group.kind === "reasoning") {
@@ -1579,7 +1573,7 @@ function ChatTimelineImpl({ timeline, providerId, provider, providerStatus, reas
     const presentationId = group.item.presentationId ?? group.item.id;
     const card = <ChatTimelineCard key={presentationId} item={group.item} providerId={providerId} provider={provider} identityMode={identityMode} finalBoundary={finalBoundary} copyText={identityMode === "final" ? finalAnswerCopyText(visibleTimeline, group.index) : undefined} onLinkOpen={onLinkOpen} onWorkflowOpen={onWorkflowOpen} onAnnotationSelection={onAnnotateSelection ? (text, anchor) => setAnnotationAction({ text, ...anchor, ownerId: annotationOwnerId }) : undefined} onRetryQueuedNewTaskDelivery={onRetryQueuedNewTaskDelivery}/>;
     return <Fragment key={presentationId}>{finalBoundary ? <TimelineBoundary label="Final answer" final/> : null}{card}</Fragment>;
-  })}{providerStatus ? <ProviderStatusNotice status={providerStatus}/> : null}{showsWorkingPulse(visibleTimeline, active, providerStatus?.kind === "retry") ? <WorkingPulse /> : null}{isCompacting ? <ActiveCompactionStatus kind={compactionKind} /> : null}{annotationAction?.ownerId === annotationOwnerId ? createPortal(<AnnotationActionPopover action={annotationAction} onAnnotate={(text, anchor) => { onAnnotateSelection?.(text, anchor); setAnnotationAction(null); }} onCopy={(text) => { void copyToClipboard(text); setAnnotationAction(null); }}/>, document.body) : null}</>;
+  })}{providerStatus ? <ProviderStatusNotice status={providerStatus}/> : null}{showsWorkingPulse(visibleTimeline, active, isCompacting || providerStatus?.kind === "retry", expandedLiveGroup) ? <WorkingPulse /> : null}{isCompacting ? <ActiveCompactionStatus kind={compactionKind} /> : null}{annotationAction?.ownerId === annotationOwnerId ? createPortal(<AnnotationActionPopover action={annotationAction} onAnnotate={(text, anchor) => { onAnnotateSelection?.(text, anchor); setAnnotationAction(null); }} onCopy={(text) => { void copyToClipboard(text); setAnnotationAction(null); }}/>, document.body) : null}</>;
 }
 
 /** Unrelated session/context heartbeats must not repaint a settled transcript. */
