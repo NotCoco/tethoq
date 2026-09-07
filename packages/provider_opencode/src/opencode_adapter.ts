@@ -2680,6 +2680,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     continuationAssistantId?: string,
     requireSelectedTail = false,
     requireLatestPrompt = false,
+    supersededPromptId?: string,
   ): Promise<TerminalConfirmation> {
     const value = await this.rawMessages(sessionId, requireSelectedTail ? 2 : 500).catch((): unknown => undefined);
     if (!Array.isArray(value)) return { kind: "unavailable" };
@@ -2748,6 +2749,24 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     // proof the model will continue.
     if (typeof info.finish !== "string" || info.finish.length === 0) return { kind: "unavailable" };
     if (!isOpenCodeTurnExitFinish(info.finish)) return { kind: "continuing" };
+    if (supersededPromptId !== undefined) {
+      // A native-client follow-up can replace the prompt Tethoq dispatched.
+      // Prove it is newer before releasing that ownership: a delayed answer
+      // from an older prompt must never settle a newly dispatched turn.
+      const prompts = await Promise.all([supersededPromptId, parentId].map(async (id) => {
+        const message = await this.#client.request<unknown>(
+          "GET", `/session/${encodeURIComponent(sessionId)}/message/${encodeURIComponent(id)}`,
+          { query: this.query() },
+        ).catch((): unknown => undefined);
+        const prompt = isRecord(message) && isRecord(message.info) ? message.info : undefined;
+        const time = prompt !== undefined && isRecord(prompt.time) ? prompt.time : undefined;
+        return prompt?.id === id && prompt.role === "user" && typeof time?.created === "number"
+          ? time.created : undefined;
+      }));
+      const [ownedCreated, successorCreated] = prompts;
+      if (ownedCreated === undefined || successorCreated === undefined) return { kind: "unavailable" };
+      if (successorCreated <= ownedCreated) return { kind: "continuing" };
+    }
     return { kind: "terminal", assistantId: typeof info.id === "string" ? info.id : assistantId ?? "" };
   }
 
@@ -2826,7 +2845,8 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       pending.assistantId,
       undefined,
       pending.assistantId !== undefined,
-      pending.ownedPromptId === undefined,
+      pending.ownedPromptId !== pending.parentId,
+      pending.ownedPromptId !== pending.parentId ? pending.ownedPromptId : undefined,
     );
     pending.checksInFlight -= 1;
     if (this.#disposed || this.#pendingOwnedIdles.get(sessionId) !== pending
@@ -2965,11 +2985,10 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   private armTerminalCompletion(sessionId: string, info: Record<string, unknown>, nativeEvent?: JsonObject): void {
     const ownedPromptId = this.#activePromptMessageIds.get(sessionId);
     if (info.role !== "assistant" || typeof info.id !== "string" || typeof info.parentID !== "string"
-      || (ownedPromptId !== undefined && ownedPromptId !== info.parentID)
       || !isOpenCodeTurnExitFinish(info.finish) || info.error !== undefined || info.summary === true
       || this.#continuingToolMessageIds.has(info.id) || this.isSettledTerminalRepeat(sessionId, info)
       || this.#guardAbortGenerations.has(sessionId) || this.#terminalCleanupGenerations.has(sessionId)) return;
-    if (ownedPromptId !== undefined) this.rememberTerminalCandidate(info.parentID, info.id);
+    if (ownedPromptId === info.parentID) this.rememberTerminalCandidate(info.parentID, info.id);
     // Use the same persisted-history proof for observed turns without adopting
     // them into the dispatch/abort ownership maps.
     this.rememberPendingOwnedIdle(sessionId, info.parentID, nativeEvent, info.id);

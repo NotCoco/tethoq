@@ -4612,6 +4612,71 @@ test("OpenCode settles an exact persisted no-tool response without waiting for s
   assert.equal(adapter.hasActiveTurn("ses_persisted_terminal"), false);
 });
 
+for (const scenario of ["newer", "older", "missing-proof", "owned-successor"] as const) {
+  test(`OpenCode external follow-up completion handles ${scenario} prompt ownership`, async (t) => {
+    const events = new SseFixture();
+    const sessionID = "external_follow_up";
+    const promptTimes = new Map<string, number>([["external_user", scenario === "older" ? 5 : 20]]);
+    let proofAvailable = scenario !== "missing-proof";
+    let proofReads = 0;
+    let completions = 0;
+    let aborts = 0;
+    const info = {
+      id: "external_answer", sessionID, role: "assistant", parentID: "external_user",
+      finish: "stop", time: { created: 25, completed: 30 },
+    };
+    const adapter = new OpenCodeAdapter({
+      hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", nativeStatusPollIntervalMs: 60_000,
+      activityReader: new SequenceActivityReader(new Set()), activityPollIntervalMs: 60_000,
+      fetch: async (input, init) => {
+        const path = requestUrl(input).pathname;
+        if (path === "/global/event") return events.response(init?.signal ?? undefined);
+        if (path.endsWith("/prompt_async")) return new Response(null, { status: 204 });
+        if (path.endsWith("/abort")) { aborts += 1; return jsonResponse(true); }
+        if (path.endsWith("/message")) {
+          // The reported stall ended without an answer or a continuing tool.
+          return jsonResponse([{ info, parts: [{ type: "step-finish", reason: "stop" }] }]);
+        }
+        if (path.includes("/message/")) {
+          proofReads += 1;
+          const id = path.split("/").at(-1)!;
+          const created = promptTimes.get(id);
+          if (proofAvailable && created !== undefined) {
+            return jsonResponse({ info: { id, sessionID, role: "user", time: { created } }, parts: [] });
+          }
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    t.after(() => adapter.dispose());
+    await adapter.subscribe(null, (event) => { if (event.type === "agent.completed") completions += 1; });
+    const sent = await adapter.sendMessage(sessionID, { requestId: "owned_goal", content: "Continue the goal" });
+    promptTimes.set(sent.providerTurnId!, 10);
+    events.push({ payload: { type: "message.updated", properties: { info } } });
+    await waitFor(() => proofReads >= 2, "an outside terminal response must check both persisted user prompts");
+
+    if (scenario === "missing-proof") {
+      assert.equal(completions, 0, "missing history is not proof of completion");
+      assert.equal(adapter.hasActiveTurn(sessionID), true);
+      proofAvailable = true;
+    }
+    if (scenario === "owned-successor") {
+      const next = await adapter.sendMessage(sessionID, { requestId: "new_owned_goal", content: "A newer instruction" });
+      promptTimes.set(next.providerTurnId!, 40);
+    }
+    if (scenario === "older" || scenario === "owned-successor") {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.equal(completions, 0, "an older answer must not settle newer owned work");
+      assert.equal(adapter.hasActiveTurn(sessionID), true);
+    } else {
+      await waitFor(() => completions === 1, "a completed external follow-up must release the old dispatch mark");
+      assert.equal(adapter.hasActiveTurn(sessionID), false);
+      assert.ok(proofReads >= 4, "both quiet confirmations must verify successor ownership");
+    }
+    assert.equal(aborts, 0, "reconciling completion must not stop the provider");
+  });
+}
+
 for (const origin of ["owned", "external", "recovered"] as const) {
   test(`OpenCode settles ${origin} terminal output despite persistent database and native busy`, async (t) => {
     const events = new SseFixture();
