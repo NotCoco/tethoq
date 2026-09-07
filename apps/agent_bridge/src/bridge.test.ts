@@ -229,9 +229,9 @@ class GoalCapturingFakeProvider extends FakeProviderAdapter {
     this.#sink = sink;
     return await super.subscribe(providerSessionId, sink);
   }
-  public async finish(providerSessionId: string, type: ProviderEvent["type"] = "agent.completed"): Promise<void> {
+  public async finish(providerSessionId: string, type: ProviderEvent["type"] = "agent.completed", payload: JsonObject = {}): Promise<void> {
     await this.#sink?.({ eventId: `goal-end-${randomUUID()}`, providerId: this.providerId, providerSessionId,
-      type, occurredAt: new Date().toISOString(), payload: {} });
+      type, occurredAt: new Date().toISOString(), payload });
   }
   public override async sendMessage(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
     this.lastRequest = request;
@@ -8664,6 +8664,78 @@ test("active fallback goals continue privately and stop when the model completes
   await assert.rejects(bridge.executeClientTool(session.id, "tethoq_goal", { status: "complete" }), /no longer active/);
 });
 
+test("fallback goals continue across idle-only turn boundaries and late provider cleanup", async (t) => {
+  const hostId = "host-goal-idle-boundary";
+  class SettlingProvider extends GoalCapturingFakeProvider {
+    active = false;
+    override hasActiveTurn(): boolean { return this.active; }
+  }
+  const provider = new SettlingProvider({ hostId, sessionCount: 1 });
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider]);
+  bridge.configureClientTooling(testClientTooling());
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  await bridge.refresh();
+  const session = bridge.sessions()[0]!;
+  await bridge.setSessionGoal(session.id, { objective: "Keep improving until the reviewer agrees" });
+  await bridge.sendMessage(session.id, { requestId: "start-idle-goal", content: "Start" });
+  provider.active = true;
+  await provider.finish(session.providerSessionId, "session.status_changed", { state: "idle" });
+  await new Promise((resolve) => setTimeout(resolve, 850));
+  assert.equal(provider.requests.length, 1, "wait for the provider to release the completed turn");
+  provider.active = false;
+  await waitFor(() => provider.requests.length === 2, "cleanup must not discard the pending goal continuation");
+  await provider.finish(session.providerSessionId, "session.updated", { state: "idle" });
+  await waitFor(() => provider.requests.length === 3, "a later idle-only round must also continue");
+  await bridge.executeClientTool(session.id, "tethoq_goal", { status: "complete" });
+  await provider.finish(session.providerSessionId, "session.status_changed", { state: "idle" });
+  await new Promise((resolve) => setTimeout(resolve, 850));
+  assert.equal(provider.requests.length, 3, "verified completion ends the goal loop");
+});
+
+test("fallback goals retain a turn completion received before continuation acceptance", async (t) => {
+  const hostId = "host-goal-fast-turn";
+  class FastProvider extends GoalCapturingFakeProvider {
+    override async sendMessage(id: string, request: SendMessageRequest): Promise<SendMessageResult> {
+      const result = await super.sendMessage(id, request);
+      if (this.requests.length === 2) {
+        await this.finish(id, "message.started", { role: "assistant", messageId: "fast-answer" });
+        await this.finish(id);
+      }
+      return result;
+    }
+  }
+  const provider = new FastProvider({ hostId, sessionCount: 1 });
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider]);
+  bridge.configureClientTooling(testClientTooling());
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  await bridge.refresh();
+  const session = bridge.sessions()[0]!;
+  await bridge.setSessionGoal(session.id, { objective: "Continue through short progress reports" });
+  await bridge.sendMessage(session.id, { requestId: "fast-start", content: "Start" });
+  await provider.finish(session.providerSessionId);
+  await waitFor(() => provider.requests.length === 3, "the early completion must schedule the following goal turn");
+  await bridge.executeClientTool(session.id, "tethoq_goal", { status: "complete" });
+});
+
+test("resuming a stopped fallback goal restarts its loop without another user prompt", async (t) => {
+  const hostId = "host-goal-resume";
+  const provider = new GoalCapturingFakeProvider({ hostId, sessionCount: 1 });
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider]);
+  bridge.configureClientTooling(testClientTooling());
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  await bridge.refresh();
+  const session = bridge.sessions()[0]!;
+  await bridge.setSessionGoal(session.id, { objective: "Resume the review loop" });
+  await bridge.interrupt(session.id);
+  assert.equal((await bridge.sessionGoal(session.id))?.status, "paused");
+  await bridge.setSessionGoal(session.id, { status: "active" });
+  await waitFor(() => provider.requests.length === 1, "Resume must restart the stopped goal");
+  await bridge.executeClientTool(session.id, "tethoq_goal", { status: "complete" });
+});
+
 test("fallback goal continuations yield to pause, clear, stop, errors, and newer user instructions", async (t) => {
   for (const action of ["paused", "clear", "stop", "error", "queued", "blocked"] as const) {
     await t.test(action, async (t) => {
@@ -8684,6 +8756,8 @@ test("fallback goal continuations yield to pause, clear, stop, errors, and newer
       if (action === "queued") await bridge.enqueueMessage(session.id, { requestId: "user-priority", content: "Follow this newer instruction first" });
       await new Promise((resolve) => setTimeout(resolve, 850));
       assert.equal(provider.requests.some((request) => request.requestId.startsWith("goal_continue_")), false);
+      if (action === "stop") assert.equal((await bridge.sessionGoal(session.id))?.status, "paused");
+      if (action === "error") assert.equal((await bridge.sessionGoal(session.id))?.status, "blocked");
     });
   }
 });
@@ -8816,6 +8890,26 @@ test("Tethoq-owned goals survive bridge restart and provider refresh", async () 
   assert.equal(restored?.objective, "Persist this goal");
   assert.equal(restored?.status, "paused");
   await second.dispose();
+});
+
+test("a restored active fallback goal resumes after fresh provider state confirms idle", async (t) => {
+  const hostId = "host-active-goal-restart";
+  const provider = new GoalCapturingFakeProvider({ hostId, sessionCount: 2 });
+  const initial = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider]);
+  await initial.start();
+  await initial.refresh();
+  const session = initial.sessions().find((candidate) => candidate.state === "idle")!;
+  const goal = await initial.setSessionGoal(session.id, { objective: "Finish the restored review loop" });
+  await initial.dispose();
+  const restoredProvider = new GoalCapturingFakeProvider({ hostId, sessionCount: 2 });
+  const restored = new AgentBridge({ ...config(hostId), enabledProviders: [restoredProvider.providerId] }, [restoredProvider], { goals: { [session.id]: goal } });
+  restored.configureClientTooling(testClientTooling());
+  t.after(() => restored.dispose());
+  await restored.start();
+  assert.equal(restoredProvider.requests.length, 0, "persisted goal state alone cannot prove the provider is idle");
+  await restored.refresh();
+  await waitFor(() => restoredProvider.requests.length === 1, "fresh idle state must recover the active goal loop");
+  await restored.executeClientTool(session.id, "tethoq_goal", { status: "complete" });
 });
 
 test("native goal clears reject delayed updates and duplicate clear notifications", async () => {
