@@ -1371,7 +1371,7 @@ test("an active task animates its latest reasoning and otherwise pulses beside t
     { ...item("finished-thought", "reasoning"), body: "Inspecting the state flow." },
     projectedExternalTail[2],
   ]);
-  assert.equal(projectedSegments.find((segment) => segment.kind === "thinking")?.item.state, "running", "the text shares the trailing group's live state");
+  assert.equal(projectedSegments.find((segment) => segment.kind === "thinking")?.item.state, "completed", "the earlier thought stays settled while later work runs");
   const completedFinal = [timeline[0], { ...item("finished", "assistant", "final_answer"), state: "completed" }];
   const workingAfterAnswer = timelineHelpers.withCurrentActivity(completedFinal, true);
   assert.deepEqual(workingAfterAnswer, completedFinal, "a working session writes nothing into its own transcript");
@@ -1410,6 +1410,23 @@ test("an active task animates its latest reasoning and otherwise pulses beside t
     timestamp: "2026-08-15T12:00:00.000Z",
   }];
   assert.deepEqual(timelineHelpers.withCurrentActivity(lingeringPlaceholder, false), [timeline[0]]);
+});
+
+test("expanded long-running work keeps its live pulse after the latest activity", () => {
+  const row = (id, kind, state = "completed") => ({ id, kind, body: id, timestamp: "2026-09-07T12:00:00Z", state });
+  // Goal continuations have no visible user boundary; the work may stay in one
+  // expanded group across many completed tools and assistant messages.
+  const history = [row("goal", "user"), row("initial thought", "reasoning", "running"),
+    ...Array.from({ length: 80 }, (_, index) => row(`tool ${index}`, "tool"))];
+  const projected = timelineHelpers.withCurrentActivity(history, true);
+  const group = timelineHelpers.groupTimeline(projected, true).at(-1);
+  const segments = timelineHelpers.reasoningSegments(group.items, group.key);
+  assert.equal(segments.find((segment) => segment.kind === "thinking").item.state, "completed", "old reasoning must not shimmer when a later tool owns the live work");
+  assert.deepEqual(timelineHelpers.liveReasoningIds([group]), { groups: [group.key], segments: [] }, "the group stays open without inventing live text");
+  assert.equal(timelineHelpers.showsWorkingPulse(projected, true, false, true), true, "expanded work needs a pulse at the transcript end");
+  assert.equal(timelineHelpers.showsWorkingPulse(projected, true, false, false), false, "a collapsed group already has one live control");
+  assert.equal(timelineHelpers.showsWorkingPulse(projected, false, false, true), false, "settlement removes the pulse");
+  assert.equal(timelineHelpers.showsWorkingPulse(projected, true, true, true), false, "retry or compaction status takes precedence");
 });
 
 test("live reasoning stays on the bottommost disclosure and never crosses compaction", () => {
@@ -1539,7 +1556,7 @@ test("a provider retry is one quiet status row, never fake reasoning or an error
   assert.match(noticeSource, /data-provider-status=\{status\.kind\}/u);
   assert.doesNotMatch(noticeSource, /reasoning-group|reasoning-disclosure|timeline-error-notice|Agent error/u);
   assert.equal((chat.match(/<ProviderStatusNotice status=\{providerStatus\}/gu) ?? []).length, 1);
-  assert.match(chat, /showsWorkingPulse\(visibleTimeline, active, providerStatus\?\.kind === "retry"\)/u);
+  assert.match(chat, /showsWorkingPulse\(visibleTimeline, active, isCompacting \|\| providerStatus\?\.kind === "retry", expandedLiveGroup\)/u);
   assert.doesNotMatch(styles.match(/\.timeline-provider-status \{[^}]*\}/u)?.[0] ?? "", /background\s*:/u, "the notice is not a card");
 
   assert.match(app, /providerStatus=\{session\.providerStatus\}/u);
@@ -1747,7 +1764,7 @@ test("thinking outlives its turn as a collapsed dropdown the reader controls", a
   assert.match(chat, /const \[openedGroups, setOpenedGroups\] = useState<ReadonlySet<string>>/);
   assert.match(chat, /const \[closedGroups, setClosedGroups\] = useState<ReadonlySet<string>>/);
   assert.match(chat, /!closedGroups\.has\(key\) && \(activeGroups\.has\(key\) \|\| reasoningDisplay === "expanded"\)/);
-  assert.match(chat, /className=\{`reasoning-disclosure \$\{running \? "reasoning-running" : ""\}`\} aria-expanded=\{expanded\} onClick=\{onToggleGroup\}/);
+  assert.match(chat, /className=\{`reasoning-disclosure \$\{headerRunning \? "reasoning-running" : ""\}`\} aria-expanded=\{expanded\} onClick=\{onToggleGroup\}/);
   // Collapsed by default in compact mode, and the body is not even built until it
   // is opened — which is what keeps a long history of restored spans cheap.
   // Flow-through mode still opens a span by default, but the default now lives with the
@@ -1760,7 +1777,7 @@ test("thinking outlives its turn as a collapsed dropdown the reader controls", a
   // wrote. The old marker offered a dropdown over nothing, and had to be recognised and
   // deleted again on its way out.
   assert.doesNotMatch(chat, /tethoq-live-reasoning-/);
-  assert.match(chat, /showsWorkingPulse\(visibleTimeline, active, providerStatus\?\.kind === "retry"\) \? <WorkingPulse \/>/);
+  assert.match(chat, /showsWorkingPulse\(visibleTimeline, active, isCompacting \|\| providerStatus\?\.kind === "retry", expandedLiveGroup\) \? <WorkingPulse \/>/);
   // Before any words arrive this is truthful status, not a disclosure over an empty
   // panel. The real outer Reasoning control replaces it when content exists.
   assert.match(chat, /<div className="reasoning-disclosure reasoning-running" role="status" aria-label="Reasoning">/);
@@ -1801,7 +1818,7 @@ test("a live reasoning span names its own tense and carries the thinking sheen",
     source(join("src", "renderer", "src", "styles.css")),
   ]);
   // Animated dots alone read as decoration; the word itself has to say it is ongoing.
-  assert.match(chat, /\{running \? "Reasoning…" : "Reasoning"\}/);
+  assert.match(chat, /\{headerRunning \? "Reasoning…" : "Reasoning"\}/);
   assert.match(composer, /const activeTurn = sessionHoldsFollowUpQueue\(session, visible \?\? \[\]\);/);
   assert.match(composer, /active=\{activeTurn\}/);
   // A repeating tile translated by exactly its own width; a non-repeating gradient cannot
@@ -1824,7 +1841,7 @@ test("settled activity rows collapse behind the same Reasoning shell", async () 
   // A completed tool-only span is still execution trace, so it remains available
   // behind one quiet Reasoning disclosure rather than staying in the user's face.
   assert.doesNotMatch(chat, /reasoning-group-settled/);
-  assert.match(chat, /<span className="reasoning-label">\{running \? "Reasoning…" : "Reasoning"\}<\/span>/);
+  assert.match(chat, /<span className="reasoning-label">\{headerRunning \? "Reasoning…" : "Reasoning"\}<\/span>/);
   assert.match(composer, /\.message:has\(\.message-footer\) \+ \*,[\s\S]{0,200}margin-top:\s*36px/);
   assert.match(composer, /\.final-answer-block:has\(\.message-footer\) \+ \*,[^{]*\{[^}]*margin-top:\s*36px/);
 
@@ -1971,7 +1988,7 @@ test("timeline keeps one outer reasoning group while preserving inner chronology
   const beforeCommand = timelineHelpers.reasoningSegments([liveThought], "stable-group");
   const duringCommand = timelineHelpers.reasoningSegments([liveThought, liveCommand], "stable-group");
   const afterCommand = timelineHelpers.reasoningSegments([liveThought, { ...liveCommand, state: "completed", body: "12 tests passed" }], "stable-group");
-  assert.equal(duringCommand.find((segment) => segment.kind === "thinking")?.item.state, "running", "live icon state is projected onto its readable thought");
+  assert.equal(duringCommand.find((segment) => segment.kind === "thinking")?.item.state, "completed", "later activity must not reactivate historical reasoning text");
   assert.equal(afterCommand.find((segment) => segment.kind === "thinking")?.item.state, "completed", "settled spans stop text shimmer with the icon");
   assert.equal(beforeCommand[0].id, duringCommand[0].id, "adjacent activity does not remount or remove the reasoning text row");
   assert.equal(duringCommand.length, afterCommand.length, "command completion updates rows in place without structural jitter");

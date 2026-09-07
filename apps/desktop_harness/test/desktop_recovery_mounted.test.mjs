@@ -11,7 +11,7 @@ import { build } from "esbuild";
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const electronPath = createRequire(import.meta.url)("electron");
 
-test("mounted task recovery sends once, preserves composition, and keeps Eyes animated until settled", { timeout: 45_000 }, async () => {
+test("mounted task recovery sends once, preserves composition, and keeps Eyes live until settled", { timeout: 45_000 }, async () => {
   const directory = join(tmpdir(), `tethoq-recovery-${process.pid}-${Date.now()}`);
   await mkdir(directory, { recursive: true });
   try {
@@ -65,8 +65,19 @@ test("mounted task recovery sends once, preserves composition, and keeps Eyes an
       check(document.querySelectorAll(".timeline-error-recovery").length === 1, "only the new interruption should offer Continue");
       qa.stage("eyes-working"); await settle(); qa.status("idle"); await settle();
       check(running() === 1, "idle parent settled a running Eyes inspection");
-      const animation = document.querySelector(".reasoning-running").getAnimations({ subtree: true })[0];
-      check(animation?.playState === "running", "Eyes glimmer has no active animation");
+      const liveLabel = document.querySelector(".reasoning-running .reasoning-label");
+      check(liveLabel?.textContent === 'Reasoning…', 'Eyes lost its visible active status');
+      if (matchMedia('(prefers-reduced-motion: reduce)').matches) {
+        const style = getComputedStyle(liveLabel);
+        check(style.animationName === 'none' && style.webkitTextFillColor !== 'transparent'
+          && style.webkitTextFillColor !== 'rgba(0, 0, 0, 0)', 'Reduced-motion Eyes status must stay readable without shimmer');
+      } else {
+        // A newly mounted tail can commit before CSS animations start. Check the
+        // shimmer itself, not an unrelated hover transition on the old header.
+        const activeAnimation = () => liveLabel.getAnimations().find(animation => animation.animationName === 'reasoning-label-shimmer' && animation.playState === 'running');
+        for (let i = 0; !activeAnimation() && i < 100; i++) await new Promise(r => setTimeout(r, 20));
+        check(Boolean(activeAnimation()), `Eyes glimmer has no active animation: ${getComputedStyle(liveLabel).animationName}`);
+      }
       qa.toolEnd(); await settle(); check(!running(), "completed Eyes shimmered while idle");
       qa.stage("ordinary"); await settle(); check(!running(), "ordinary idle tool acquired an Eyes override");
       qa.stage("eyes-working"); await settle(); qa.toolEnd("failed"); qa.status("idle"); await settle();
