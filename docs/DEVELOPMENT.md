@@ -161,6 +161,11 @@ separators inside JSON strings, so Node `readline` is not suitable.
 
 ## Browser and visual-support tools
 
+Run layout experiments and packaged UI checks in an isolated application window
+with a separate user-data directory. Do not resize or inject temporary styles
+into a user's running workspace; even a short-lived check can disrupt active
+work and appear to be a layout regression.
+
 The Desktop runtime owns the Chromium workspace. Its agent surface accepts
 only bounded navigation, inspection, semantic-reference click/type, scrolling,
 and capture operations. Do not add arbitrary selector or script execution to

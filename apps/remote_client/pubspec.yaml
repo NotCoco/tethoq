@@ -1,5 +1,5 @@
 name: universal_agent_remote
-version: 0.1.0+1
+version: 0.1.1+2
 publish_to: none
 description: Provider-neutral mobile and desktop remote control for coding agents.
 
