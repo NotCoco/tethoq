@@ -1,0 +1,42 @@
+name: Prepare Desktop update
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-update-release
+  cancel-in-progress: false
+
+jobs:
+  desktop-update:
+    if: github.repository == 'NotCoco/tethoq' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.13.0
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            apps/desktop_harness/package-lock.json
+            apps/desktop_companion/package-lock.json
+      - run: npm ci
+      - run: npm ci
+        working-directory: apps/desktop_companion
+      - run: npm ci
+        working-directory: apps/desktop_harness
+      - run: npm run verify
+      - run: npm run verify
+        working-directory: apps/desktop_harness
+      - run: npm run pack:win
+        working-directory: apps/desktop_harness
+      - name: Create a draft with the installer and update feed
+        run: npm run release:draft
+        working-directory: apps/desktop_harness
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -51,6 +51,9 @@ export const IPC_CHANNELS = Object.freeze({
   rendererReady: "tethoq:renderer-ready",
   openCodeStatus: "tethoq:opencode-status",
   restartOpenCode: "tethoq:restart-opencode",
+  updateGetState: "tethoq:update-get-state",
+  updateAction: "tethoq:update-action",
+  updateState: "tethoq:update-state",
   connectorAction: "tethoq:connector-action",
   eventBatch: "tethoq:event-batch",
   runtimeState: "tethoq:runtime-state",
@@ -480,6 +483,16 @@ export interface UtteranceEvidence {
   readonly privacy: LiveSessionPrivacy;
 }
 
+export interface DesktopUpdateState {
+  readonly phase: "unavailable" | "idle" | "checking" | "available" | "downloading" | "downloaded" | "installing" | "error";
+  readonly currentVersion: string;
+  readonly version?: string;
+  readonly percent?: number;
+  readonly message?: string;
+}
+
+export type DesktopUpdateAction = "check" | "download" | "install";
+
 export interface DesktopHarnessApi {
   bootstrap(): Promise<DesktopBootstrap>;
   request(type: string, payload?: JsonObject, requestId?: string): Promise<ResponseEnvelope>;
@@ -505,6 +518,9 @@ export interface DesktopHarnessApi {
   notifyReady(): void;
   openCodeStatus(): Promise<OpenCodeProcessStatus>;
   restartOpenCode(): Promise<OpenCodeProcessStatus>;
+  updateState(): Promise<DesktopUpdateState>;
+  updateAction(action: DesktopUpdateAction): Promise<DesktopUpdateState>;
+  onUpdateState(listener: (state: DesktopUpdateState) => void): () => void;
   connectorAction(action: ConnectorAction): Promise<ConnectorActionResult>;
   browserState(): Promise<BrowserWorkspaceState>;
   browserAction(action: BrowserAction): Promise<BrowserWorkspaceState>;

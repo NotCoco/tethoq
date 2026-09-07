@@ -37,6 +37,7 @@ import {
   type MobileConnectionAction,
 } from "../shared/desktop_api.js";
 import type { DesktopRuntime } from "./runtime.js";
+import type { DesktopUpdateManager } from "./updates.js";
 import { HARNESS_GUIDES } from "../shared/harness_setup.js";
 import type { MobileConnectionManager } from "./mobile_connection.js";
 import type { DesktopPreferencesStore } from "./preferences.js";
@@ -133,6 +134,7 @@ const ALLOWED_REQUESTS = new Set([
 export interface RegisterDesktopIpcOptions {
   readonly window: BrowserWindow;
   readonly runtime: DesktopRuntime;
+  readonly updates?: DesktopUpdateManager;
   readonly bootstrap: () => Promise<DesktopBootstrap>;
   readonly allowedProviderIds: () => ReadonlySet<string>;
   readonly browser?: {
@@ -197,6 +199,11 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
   };
 
   handle(IPC_CHANNELS.bootstrap, async () => await options.bootstrap());
+  handle(IPC_CHANNELS.updateGetState, () => options.updates?.state() ?? { phase: "unavailable", currentVersion: app.getVersion() });
+  handle(IPC_CHANNELS.updateAction, async (_event, action: unknown) => {
+    if (action !== "check" && action !== "download" && action !== "install") throw new Error("Unknown update action");
+    return await options.updates?.action(action);
+  });
   handle(IPC_CHANNELS.request, async (_event, value: unknown) => {
     const input = record(value, "request");
     const type = nonEmptyString(input.type, "request type", 80);
