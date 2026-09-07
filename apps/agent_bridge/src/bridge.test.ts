@@ -8288,6 +8288,7 @@ test("an off-page working-to-idle race settles idle after its shared identity re
   const idle = provider.emitState(providerSessionId, "idle");
   provider.releaseSessionRead();
   await Promise.all([working, idle]);
+  await waitFor(() => bridge.sessions().find((session) => session.id === globalSessionId)?.state === "idle", "buffered terminal event after the identity read");
 
   assert.equal(bridge.sessions().find((session) => session.id === globalSessionId)?.state, "idle");
   assert.equal(provider.exactSessionCalls, 1, "overlapping lifecycle events share the exact identity read");
