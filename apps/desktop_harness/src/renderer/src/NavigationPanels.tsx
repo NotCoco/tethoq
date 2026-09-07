@@ -1,5 +1,6 @@
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { useDesktopUpdates } from "./DesktopUpdates";
 import type { TaskListMode, TaskOverride } from "@shared/desktop_api";
 import { MAX_TASK_TITLE_CHARACTERS } from "@shared/desktop_api";
 import { reasoningDisplayLabel } from "../../../../../packages/protocol/src/reasoning";
@@ -182,6 +183,8 @@ export interface SideChatAnchor { readonly x: number; readonly y: number }
 const noSavedProjects: readonly string[] = [];
 
 export function Sidebar({ loading = false, sessions, allSessions, providers, selected, selectedProvider, query, stateFilter, view, connected, runtimeConnectionState, hostName, appVersion, onQuery, onFilter, onProvider, onOpen, onOpenChild, onBranch, onOpenDirectory, onView, onNewTask, onNewTaskInProject, onNewProject, taskListMode, savedProjectDirectories = noSavedProjects, onTaskListMode, onCommandSearch, onMobileConnection, showSideChats, activeSideChatIds, onShowSideChats, onCreateSideChat, onOpenSideChat, onSideChatAnchor, showArchived, archivedCount, onShowArchived, onTaskOverride }: SidebarProps) {
+  const updates = useDesktopUpdates();
+  const updateAvailable = updates?.phase === "available" || updates?.phase === "downloaded";
   const [searchOpen, setSearchOpen] = useState(false);
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [sessionMenu, setSessionMenu] = useState<{ sessionId: string; title: string; workingDirectory: string; x: number; y: number } | null>(null);
@@ -491,7 +494,7 @@ export function Sidebar({ loading = false, sessions, allSessions, providers, sel
     <div className="sidebar-footer">
       <div className="sidebar-footer-actions">
         <button className="sidebar-mobile-connection" type="button" aria-label="Connect your phone" data-tooltip="Connect your phone" onClick={onMobileConnection}><BridgeIcon /></button>
-        <button className="sidebar-settings" type="button" aria-label={view === "settings" ? "Close settings" : "Open settings"} onClick={() => onView("settings")}><SettingsIcon /><span>Settings</span></button>
+        <button className="sidebar-settings" type="button" aria-label={view === "settings" ? "Close settings" : updateAvailable ? "Open settings, update available" : "Open settings"} onClick={() => onView("settings")}><SettingsIcon /><span>{updateAvailable ? "Update available" : "Settings"}</span></button>
       </div>
       {/* The version belongs with the thing it describes. Stamped on the rail it was
           a number floating in the corner of every screen for the one moment a year

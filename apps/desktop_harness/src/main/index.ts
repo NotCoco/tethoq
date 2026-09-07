@@ -25,6 +25,8 @@ import { registerLocalMediaProtocol, registerLocalMediaScheme } from "./local_me
 import { clampWindowStateToDisplay, readWindowState, trackWindowState } from "./window_state.js";
 import { startDesktopReadiness, type DesktopReadinessHandle } from "./desktop_readiness.js";
 import { MobileConnectionManager } from "./mobile_connection.js";
+import electronUpdater from "electron-updater";
+import { DesktopUpdateManager } from "./updates.js";
 import { recordStartupProfile } from "../../../agent_bridge/src/startup_profile.js";
 import {
   IPC_CHANNELS,
@@ -42,6 +44,7 @@ let recorder: RecorderManager | undefined;
 let preferences: DesktopPreferencesStore | undefined;
 let liveSession: LiveSessionManager | undefined;
 let mobileConnection: MobileConnectionManager | undefined;
+let updates: DesktopUpdateManager | undefined;
 let cleanupIpc: (() => void) | undefined;
 let flushWindowState: (() => Promise<void>) | undefined;
 let desktopReadiness: DesktopReadinessHandle | undefined;
@@ -214,6 +217,22 @@ async function startApplication(): Promise<void> {
     onState: (state) => sendRuntimeState(window, state),
   });
   const harness = runtime;
+  updates = new DesktopUpdateManager({
+    currentVersion: app.getVersion(),
+    ...(app.isPackaged && process.platform === "win32" && existsSync(join(process.resourcesPath, "app-update.yml"))
+      ? { updater: electronUpdater.autoUpdater } : {}),
+    onState: (state) => { if (!window.isDestroyed()) window.webContents.send(IPC_CHANNELS.updateState, state); },
+    beforeInstall: async () => {
+      if ([...harness.allowedProviderIds()].some((providerId) => harness.bridge.providerActiveSessions(providerId).length > 0)
+        || harness.bridge.sessions().some((task) => ["working", "needs_approval", "needs_input"].includes(task.state))) {
+        throw new Error("Finish or stop running tasks before restarting for an update.");
+      }
+      if (workflowRecorder.state().phase === "recording") throw new Error("Stop the recording before restarting for an update.");
+      // quitAndInstall uses the normal before-quit drain below. Preserve the
+      // managed provider so the next app generation can adopt it.
+      preserveOpenCodeForRestart = true;
+    },
+  });
   powerMonitor.on("resume", () => {
     void harness.reconcileScheduledTasks().catch((error: unknown) => {
       console.error("Tethoq could not reconcile scheduled tasks after resume", error);
@@ -230,6 +249,7 @@ async function startApplication(): Promise<void> {
     window,
     runtime: harness,
     allowedProviderIds: () => harness.allowedProviderIds(),
+    updates,
     browser,
     recorder: workflowRecorder,
     preferences: desktopPreferences,
@@ -262,6 +282,7 @@ async function startApplication(): Promise<void> {
   void harness.start().catch((error: unknown) => {
     sendRuntimeState(window, { state: "failed", message: error instanceof Error ? error.message : String(error) });
   });
+  updates.start();
 }
 
 async function createMainWindow(): Promise<BrowserWindow> {
@@ -571,7 +592,10 @@ app.on("before-quit", (event) => {
     app.quit();
   });
 });
-app.on("will-quit", () => recordStartupProfile({ type: "desktop-startup", phase: "will-quit" }));
+app.on("will-quit", () => {
+  updates?.dispose();
+  recordStartupProfile({ type: "desktop-startup", phase: "will-quit" });
+});
 app.on("quit", (_event, exitCode) => recordStartupProfile({ type: "desktop-startup", phase: "quit", exitCode }));
 
 async function shutdown(): Promise<void> {

@@ -4,6 +4,7 @@ const { createHash } = require('node:crypto');
 const { readFile, stat, writeFile } = require('node:fs/promises');
 const path = require('node:path');
 const { sourceMetadata } = require('../../../scripts/release/source-metadata.cjs');
+const { updateReleaseAssets } = require('./update-release-assets.cjs');
 
 async function sha256(file) {
   return createHash('sha256').update(await readFile(file)).digest('hex');
@@ -21,6 +22,7 @@ async function main() {
   if (!artifactStat.isFile() || artifactStat.size === 0) throw new Error(`Desktop installer is missing: ${artifactPath}`);
 
   const artifactSha256 = await sha256(artifactPath);
+  const updateAssets = await updateReleaseAssets(releaseDirectory, packageJson.version);
   const packagedBridgeRoot = path.join(releaseDirectory, 'win-unpacked', 'resources', 'bridge-companion');
   const stagedBridgeRoot = path.join(appRoot, 'build', 'bridge-companion');
   const bridgeRoot = await stat(packagedBridgeRoot).then(
@@ -59,6 +61,7 @@ async function main() {
       sizeBytes: artifactStat.size,
       sha256: artifactSha256,
     },
+    updates: { provider: 'github', repository: 'NotCoco/tethoq', metadata: 'latest.yml', sha512: updateAssets.sha512 },
     includes: {
       bridge: {
         product: 'Tethoq Bridge',

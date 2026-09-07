@@ -38,6 +38,7 @@ import {
 } from "./bridge";
 import { ChatTimeline, renderedTimelineAnchorIds } from "./ChatTimeline";
 import { AgentDefaultsSettings } from "./AgentDefaultsSettings";
+import { DesktopUpdates } from "./DesktopUpdates";
 import { HarnessConnections } from "./HarnessConnections";
 import { Composer, DictationSettings, ResponseAnnotationEditor, SideChatPanel, buildContextHandoffInstruction, clearScheduledDraftContent, formatDraftScheduleLocalTime, mergeFailedComposerDraft, mergeFailedSideChatDraft, parsedVisionStatus, persistRecentModelUsesFromSessions, remainingMeshTargetsAfterSchedule, type ComposerAttachment, type ComposerDraftSnapshot, type ComposerTaskAction, type DelegationDraft, type DraftModelSelection, type DraftSessionMaterializeInput, type DraftSessionScheduleAttemptState, type DraftSessionScheduleInput, type DraftSessionSendInput, type MeshTarget, type PendingComposerAction, type QueuedNewTaskPresentation, type SideChatDraft } from "./Composer";
 import { canonicalSessionWorkingBoundary, captureSessionWorkingBoundary, isAmbiguousSelectionValue, isPersistedCodexFinalAnswer, latestTurnHasCompletedFinal, modelAcceptsDirectAudio, parentSessionIdForBack, presentedSessionState, providerAcceptsDirectAudio, quietCatchUpDue, quietCatchUpIntervalMs, resolveConcreteModelSelection, selectedSessionLastDeltaAt, sessionBoundaryNeedsVisibleEnding, sessionHoldsFollowUpQueue, sessionNeedsTranscriptCatchUp, sessionPresentsLiveTurn, shouldApplySessionState, terminalSessionNeedsCanonicalHistory, terminalStateEventAction, type SessionWorkingBoundary, type TerminalStateEventAction, unownedTurnFollowMs, unownedTurnSilenceMs } from "./composer_helpers";
@@ -5531,6 +5532,7 @@ function SettingsPage({ snapshot, runtimeConnectionState, bootstrap, recorder, w
   }, []);
   return <main className="settings-page settings-simplified" id="settings-page">
     <button className="settings-close-button" type="button" aria-label="Close settings" data-tooltip="Close settings" onClick={onClose}><XIcon /></button>
+    <DesktopUpdates />
     <AgentDefaultsSettings snapshot={snapshot} preferences={preferences} onChange={onSetAgentDefault} onGlobalAgentsAction={onSetDesktopBehavior} onReconnect={onReconnect} onDirectApiSetup={onDirectApiSetup} onHarnessSetup={(id) => { setSetupHarness(id); document.getElementById("harness-connections")?.scrollIntoView({ block: "start" }); }} />
     <HarnessConnections snapshot={snapshot} {...(bootstrap ? { bootstrap } : {})} selected={setupHarness} onSelect={setSetupHarness} onReconnect={onReconnect} onDirectApiSetup={onDirectApiSetup} notify={notify} />
     <WorkflowSettings recorder={recorder} workflows={workflows} selectedWorkflowId={selectedWorkflowId} onSelectWorkflow={onSelectWorkflow} onStart={startWorkflow} onSave={onSaveWorkflow} onReveal={revealWorkflow} onDelete={deleteWorkflow} onListScreenshots={listWorkflowScreenshots} onLoadScreenshot={loadWorkflowScreenshot} />

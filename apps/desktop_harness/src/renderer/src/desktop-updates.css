@@ -1,0 +1,5 @@
+.desktop-update-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 14px; border: 1px solid var(--line); border-radius: 8px; }
+.desktop-update-row > span { display: grid; gap: 5px; min-width: 0; }
+.desktop-update-row strong { font-size: 13px; font-weight: 500; }
+.desktop-update-row small { color: var(--muted); line-height: 1.5; }
+.desktop-update-row .button { flex-shrink: 0; }

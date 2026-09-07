@@ -63,6 +63,11 @@ win:
   target:
     - nsis
 artifactName: Tethoq-Desktop-${version}-${arch}.${ext}
+publish:
+  provider: github
+  owner: NotCoco
+  repo: tethoq
+  releaseType: draft
 nsis:
   include: scripts/installer.nsh
   oneClick: false
