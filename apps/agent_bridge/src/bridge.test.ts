@@ -4,6 +4,8 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { CURRENT_PROTOCOL_VERSION, createDeviceIdentity, createHostIdentity, earsModelKey, makeGlobalSessionId, parseGlobalSessionId, type DelegationTask, type JsonObject, type ProviderCapabilities, type RemoteMessage, type RemoteModel, type RemoteSession, type SessionContextState, type SessionGoal } from "../../../packages/protocol/src/index.js";
 import { FakeProviderAdapter } from "../../../packages/provider_fake/src/index.js";
 import { ProviderAdapterError, stripProviderPromptGuidance } from "../../../packages/provider_contract/src/index.js";
@@ -6760,6 +6762,106 @@ test("delegation.prepare sends one clean parent turn and creates no child before
   await bridge.sendMessage(parent.id, { requestId: "ordinary-after-mesh", content: "Ordinary follow-up" });
   assert.doesNotMatch(parentProvider.requests.at(-1)?.developerInstructions ?? "", /UAR_MESH_PREPARED|mesh_dispatch_delegation/u,
     "Mesh orchestration guidance must be turn-scoped");
+});
+
+for (const providerId of ["opencode", "grok"]) {
+  test(`queued Mesh waits for ${providerId} to finish, preserves edits and dispatches once`, async (t) => {
+    const hostId = `host-queued-mesh-${providerId}`;
+    const parentProvider = new MeshCaptureProvider({ hostId, providerId, sessionCount: 2 });
+    const worker = new MeshCaptureProvider({ hostId, providerId: "worker", sessionCount: 0 });
+    const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [providerId, "worker"] }, [parentProvider, worker]);
+    const runtimeDirectory = await mkdtemp(join(tmpdir(), "tethoq-queued-mesh-"));
+    const gateway = new MeshToolGateway(hostId, (id, tool, input) => bridge.executeMeshTool(id, tool, input), { runtimePath: join(runtimeDirectory, "runtime.json") });
+    await gateway.listen();
+    bridge.configureClientTooling(gateway);
+    const client = new Client({ name: "queued-mesh-regression", version: "1.0.0" });
+    t.after(async () => { await client.close(); await gateway.close(); await rm(runtimeDirectory, { recursive: true, force: true }); });
+    t.after(() => bridge.dispose());
+    await bridge.start();
+    const parent = (await bridge.refresh()).sessions.find((session) => session.providerId === providerId && session.state === "idle")!;
+    await bridge.sendMessage(parent.id, { requestId: "busy-first", content: "Finish this first" });
+    await waitFor(() => bridge.pendingApprovals().length === 1, "active parent approval");
+    const targets = [{ providerId: "worker", modelId: "fake-careful", reasoningEffort: "high" }];
+    const segments = [{ type: "text" as const, text: "Ask " }, { type: "mesh" as const, targetIndex: 0 }, { type: "text" as const, text: " for feedback" }];
+    const response = await new BridgeRequestRouter(bridge).handle({
+      protocolVersion: 1, messageId: "queue-mesh", hostId, sentAt: new Date().toISOString(), kind: "request",
+      type: "delegation.prepare", requestId: "queue-mesh", payload: {
+        mode: "queue", parentSessionId: parent.id, prompt: "Ask  for feedback", targets, presentationSegments: segments,
+        modelId: "fake-careful", reasoningEffort: "high",
+      },
+    });
+    assert.equal(response.ok, true);
+    const queued = bridge.queuedMessages(parent.id)[0]!;
+    assert.deepEqual(queued.mesh, { targets, segments });
+    assert.equal(parentProvider.requests.length, 1, "queuing must not send or steer the active parent");
+    assert.equal(bridge.delegations(parent.id).length, 0, "a queued instruction must not appear as a started Mesh turn");
+    assert.equal(worker.creates.length, 0);
+    await bridge.editQueuedMessage(queued.id, "Please ask  for feedback");
+    const edited = bridge.queuedMessages(parent.id)[0]!;
+    assert.deepEqual(edited.mesh?.segments, [{ type: "text", text: "Please ask " }, { type: "mesh", targetIndex: 0 }, { type: "text", text: " for feedback" }]);
+    const approval = bridge.pendingApprovals()[0]!;
+    await bridge.respondToApproval({ requestId: approval.requestId, choiceId: "approve", respondedAt: new Date().toISOString() });
+    await waitFor(() => parentProvider.requests.length === 2, "queued Mesh delivery after completion");
+    const sent = parentProvider.requests[1]!;
+    assert.equal(sent.content, edited.content);
+    assert.equal(sent.modelId, "fake-careful");
+    assert.equal(sent.reasoningEffort, "high");
+    assert.equal(sent.clientToolOverrides?.mesh_dispatch_delegation, true);
+    assert.match(sent.developerInstructions ?? "", providerId === "opencode" ? /Call uar_mesh_dispatch_delegation/ : /Call mesh_dispatch_delegation/);
+    assert.ok(sent.developerInstructions?.includes(JSON.stringify(edited.mesh!.segments)));
+    assert.equal(worker.creates.length, 0, "only the parent's dispatch tool can start the worker");
+    await waitFor(() => bridge.queuedMessages(parent.id).length === 0, "queue consumption");
+    const server = gateway.mcpServer(providerId, parent.providerSessionId, "provider");
+    await client.connect(new StdioClientTransport({ command: server.command, args: [...server.args], env: { ...server.env }, stderr: "pipe" }));
+    assert.ok((await client.listTools()).tools.some((tool) => tool.name === "mesh_dispatch_delegation"), "the provider's bound MCP server must actually advertise dispatch");
+    const assignments = {
+      delegation_id: sent.requestId, assignments: [{ target_index: 0, instruction: "Review the completed work and return feedback only." }],
+    };
+    const dispatched = await client.callTool({ name: "mesh_dispatch_delegation", arguments: assignments });
+    assert.notEqual(dispatched.isError, true);
+    if (providerId === "opencode") {
+      await installOpenCodeMeshTools({ userHome: runtimeDirectory });
+      const source = await readFile(openCodeMeshToolPath(runtimeDirectory), "utf8");
+      const dispatchExport = source.slice(source.indexOf("export const dispatch_delegation"), source.indexOf("export const message_child"));
+      const executable = source
+        .replace(/import \{ tool \} from "@opencode-ai\/plugin"\r?\n/u,
+          "const schema = new Proxy(() => schema, { get: () => schema }); const tool = Object.assign((definition) => definition, { schema });\n")
+        .replace("  const runtimes = await matchingRuntimes(name)",
+          `  const runtimes = [JSON.parse(await readFile(${JSON.stringify(join(runtimeDirectory, "runtime.json"))}, "utf8"))]`)
+        .replace(/export const list_children[\s\S]*$/u, dispatchExport);
+      const installed = await import(`data:text/javascript;base64,${Buffer.from(executable).toString("base64")}#${randomUUID()}`);
+      await installed.dispatch_delegation.execute(assignments, { sessionID: parent.providerSessionId });
+    }
+    assert.equal(worker.creates.length, 1);
+    assert.equal(parentProvider.requests.length, 2);
+  });
+}
+
+test("queued Mesh can be cancelled or explicitly steered without losing target authorization", async (t) => {
+  const hostId = "host-queued-mesh-controls";
+  const parentProvider = new MeshCaptureProvider({ hostId, providerId: "opencode", sessionCount: 1 });
+  parentProvider.holdActiveTurn = true;
+  const worker = new MeshCaptureProvider({ hostId, providerId: "worker", sessionCount: 0 });
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: ["opencode", "worker"] }, [parentProvider, worker]);
+  bridge.configureClientTooling(testClientTooling());
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  const parent = (await bridge.refresh()).sessions[0]!;
+  const targets = [{ providerId: "worker" }];
+  const segments = [{ type: "mesh" as const, targetIndex: 0 }, { type: "text" as const, text: "Review this" }];
+  const cancelled = await bridge.enqueueDelegation(parent.id, "Review this", targets, segments, "cancel-mesh");
+  await bridge.cancelQueuedMessage(cancelled.id);
+  assert.equal(bridge.delegations(parent.id).length, 0);
+  assert.equal(parentProvider.requests.length, 0);
+  const queued = await bridge.enqueueDelegation(parent.id, "Review this", targets, segments, "steer-mesh");
+  let steers = 0;
+  const originalSteer = parentProvider.steerMessage.bind(parentProvider);
+  parentProvider.steerMessage = async (id, request) => { steers += 1; return await originalSteer(id, request); };
+  assert.equal(await bridge.deliverQueuedMessage(queued.id, "steer"), true);
+  assert.equal(steers, 1);
+  assert.deepEqual(bridge.delegations(parent.id)[0]?.targets, targets);
+  assert.match(parentProvider.requests[0]?.developerInstructions ?? "", /Call uar_mesh_dispatch_delegation/);
+  assert.equal(parentProvider.requests[0]?.clientToolOverrides?.mesh_dispatch_delegation, true);
 });
 
 test("manual compaction holds concurrent callers and new instructions until completion", async (t) => {

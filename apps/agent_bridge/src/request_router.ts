@@ -810,6 +810,17 @@ export class BridgeRequestRouter {
       case "delegation.prepare": {
         const input = record(payload, "payload");
         const targets = delegationTargets(input.targets);
+        const mode = input.mode ?? "send";
+        if (mode !== "send" && mode !== "queue" && mode !== "steer") throw new Error("Invalid Mesh delivery mode");
+        if (mode === "queue") {
+          return toJson({ message: await this.bridge.enqueueDelegation(
+            stringField(input, "parentSessionId"), textField(input, "prompt"), targets,
+            delegationPresentationSegments(input.presentationSegments), requestId,
+            { ...(typeof input.modelId === "string" && input.modelId.trim() ? { modelId: input.modelId.trim() } : {}),
+              ...(typeof input.reasoningEffort === "string" && input.reasoningEffort.trim() ? { reasoningEffort: input.reasoningEffort.trim() } : {}) },
+            input.goal === true,
+          ) });
+        }
         return toJson(await this.bridge.prepareDelegation(
           stringField(input, "parentSessionId"),
           textField(input, "prompt"),
@@ -822,6 +833,7 @@ export class BridgeRequestRouter {
               ? { reasoningEffort: input.reasoningEffort.trim() }
               : {}),
           },
+          { mode },
         ));
       }
       case "delegation.start": {

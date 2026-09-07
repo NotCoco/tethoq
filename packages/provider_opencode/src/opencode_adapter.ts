@@ -3415,6 +3415,7 @@ function openCodeTurnToolOverrides(request: SendMessageRequest, visionHelper = f
   return {
     uar_mesh_ask_eyes: enabled,
     uar_mesh_tethoq_turn_support: enabled,
+    ...(request.clientToolOverrides?.mesh_dispatch_delegation === true ? { uar_mesh_dispatch_delegation: true } : {}),
   };
 }
 

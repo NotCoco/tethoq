@@ -309,8 +309,9 @@ test("mounted Composer preserves pending content and closes transient panels cle
               }
               if (type === "attachment.upload.begin") return { uploadId: "upload-" + (++upload), chunkBytes: 32768 };
               if (type === "attachment.upload.complete") return { attachmentId: "attachment-" + upload };
-              if (type === "message_queue.enqueue") {
-                const message = { id: "queued-" + calls.length, sessionId: session.id, content: payload.content ?? "", state: "queued", attachments: [] };
+              if (type === "message_queue.enqueue" || (type === "delegation.prepare" && payload.mode === "queue")) {
+                const message = { id: "queued-" + calls.length, sessionId: session.id, content: payload.content ?? payload.prompt ?? "", state: "queued", attachments: [],
+                  ...(type === "delegation.prepare" ? { mesh: { targets: payload.targets, segments: payload.presentationSegments } } : {}) };
                 queue.push(message);
                 return { message };
               }
@@ -1444,8 +1445,26 @@ test("mounted Composer preserves pending content and closes transient panels cle
             check(repeated.payload.presentationSegments.map((segment) => segment.type).join(",") === "text,mesh,text,mesh,text", "Sent references lost their inline order");
             check(repeated.payload.presentationSegments.map((segment) => segment.type === "text" ? segment.text : [firstToken, secondToken][segment.targetIndex]).join("") === beforeTrimmedSend, "Trimming whitespace moved Mesh references away from their surrounding text");
 
+            progress("Mesh respects Queue mode and remains visibly queued");
+            for (const queuedProvider of ["opencode", "grok", "codex"]) {
+              state = await mount({ providerId: queuedProvider, deferDelegation: true });
+              await setField(composer(), "/mesh");
+              await click(buttonWithText(element('.mesh-panel'), "Mesh 1"));
+              await setField(composer(), "Once the current work is done, ask for feedback");
+              await click(send());
+              const queuedMeshCall = state.calls.find((call) => call.type === "delegation.prepare");
+              check(queuedMeshCall?.payload.mode === "queue", "A Mesh message steered instead of respecting Queue mode for " + queuedProvider);
+              check(state.snapshot().timelines["mounted-session"].length === 0, "A queued Mesh message appeared as a sent transcript row");
+              check(element('.queued-strip').textContent.includes("Once the current work is done"), "A queued Mesh message is not visibly queued");
+              check(element('.queued-mesh-targets').textContent.includes("Mesh 1"), "The queued message lost its model badge");
+              check(queuedMeshCall.payload.targets[0].reasoningEffort === "max", "Queue mode lost the selected reasoning level");
+              await click(element('button[aria-label="Steer with this queued instruction"]'));
+              check(state.calls.find((call) => call.type === "message_queue.deliver")?.payload.mode === "steer", "Explicit Mesh queue steering lost its mode");
+              check(state.snapshot().timelines["mounted-session"][0]?.mesh?.targets[0]?.reasoningEffort === "max", "Explicit steering lost the queued Mesh badge");
+            }
+
             progress("mesh delivery keeps follow-up composition");
-            state = await mount({ deferDelegation: true });
+            state = await mount({ deferDelegation: true, sessionState: "idle" });
             await setField(composer(), "/mesh");
             await click(buttonWithText(element('.mesh-panel'), "Mesh 1"));
             await setField(composer(), "First mesh instruction");
@@ -1468,6 +1487,7 @@ test("mounted Composer preserves pending content and closes transient panels cle
             check(plainComposerValue() === "Follow-up typed while mesh starts", "Successful Mesh delivery erased follow-up typing");
             check(!send().disabled, "Successful Mesh delivery left the composer stuck in its sending state");
 
+            state = await mount({ deferDelegation: true, sessionState: "idle" });
             await setField(composer(), "/mesh");
             await click(buttonWithText(element('.mesh-panel'), "Mesh 1"));
             await setField(composer(), "Failed mesh instruction");
@@ -1481,7 +1501,7 @@ test("mounted Composer preserves pending content and closes transient panels cle
             check(!send().disabled, "Failed Mesh delivery left the composer stuck in its sending state");
 
             progress("uncertain Mesh delivery retains the sent message");
-            state = await mount({ deferDelegation: true });
+            state = await mount({ deferDelegation: true, sessionState: "idle" });
             await setField(composer(), "/mesh");
             await click(buttonWithText(element('.mesh-panel'), "Mesh 1"));
             await setField(composer(), "Do not duplicate an uncertain send");
@@ -1495,7 +1515,7 @@ test("mounted Composer preserves pending content and closes transient panels cle
             const mentionStorageKeys = ["tethoq:mesh-recent-targets:v1", "tethoq:mesh-recent-models:v1"];
             const mentionStorageBackup = mentionStorageKeys.map((key) => localStorage.getItem(key));
             for (const key of mentionStorageKeys) localStorage.removeItem(key);
-            state = await mount({ deferDelegation: true });
+            state = await mount({ deferDelegation: true, sessionState: "idle" });
             await setField(composer(), "@");
             check(element('.mesh-mention-panel').textContent.includes("Use /mesh"), "First-use mentions did not explain how to populate recent models");
             await pressKey(composer(), "Enter");

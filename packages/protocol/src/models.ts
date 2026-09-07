@@ -297,6 +297,10 @@ export interface QueuedMessage {
   readonly modelId?: string;
   readonly reasoningEffort?: string;
   readonly error?: string;
+  readonly mesh?: {
+    readonly targets: readonly DelegationTarget[];
+    readonly segments: readonly DelegationPresentationSegment[];
+  };
   /** False quarantines an acknowledgement-ambiguous delivery until provider history confirms it. */
   readonly retryable?: boolean;
 }
