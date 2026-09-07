@@ -38,6 +38,8 @@ test("preload exposes a narrow frozen API without Node or raw IPC access", async
   const invokes = [...preload.matchAll(/ipcRenderer\.invoke\(IPC_CHANNELS\.([A-Za-z0-9_]+)/g)].map((match) => match[1]);
   assert.deepEqual(new Set(invokes), new Set([
     "bootstrap",
+    "updateGetState",
+    "updateAction",
     "request",
     "selectDirectory",
     "selectImages",

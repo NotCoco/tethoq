@@ -494,7 +494,7 @@ export function Sidebar({ loading = false, sessions, allSessions, providers, sel
     <div className="sidebar-footer">
       <div className="sidebar-footer-actions">
         <button className="sidebar-mobile-connection" type="button" aria-label="Connect your phone" data-tooltip="Connect your phone" onClick={onMobileConnection}><BridgeIcon /></button>
-        <button className="sidebar-settings" type="button" aria-label={view === "settings" ? "Close settings" : updateAvailable ? "Open settings, update available" : "Open settings"} onClick={() => onView("settings")}><SettingsIcon /><span>{updateAvailable ? "Update available" : "Settings"}</span></button>
+        <button className="sidebar-settings" type="button" aria-label={view === "settings" ? "Close settings" : "Open settings"} aria-description={updateAvailable ? "Tethoq update available" : undefined} onClick={() => onView("settings")}><SettingsIcon /><span>{updateAvailable ? "Update available" : "Settings"}</span></button>
       </div>
       {/* The version belongs with the thing it describes. Stamped on the rail it was
           a number floating in the corner of every screen for the one moment a year
