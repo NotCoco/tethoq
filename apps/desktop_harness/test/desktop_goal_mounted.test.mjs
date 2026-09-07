@@ -27,6 +27,8 @@ test("goal arms the main composer, survives retry, sends private controls, and r
       app.setPath('userData', path.join(__dirname, 'profile'));
       app.whenReady().then(async () => {
         const window = new BrowserWindow({ show: false, width: 1100, height: 820, webPreferences: { backgroundThrottling: false, offscreen: true } });
+        window.webContents.on('console-message', (event) => { if (event.level >= 2) process.stderr.write(event.message + '\\n'); });
+        window.webContents.on('render-process-gone', (_event, details) => process.stderr.write(JSON.stringify(details) + '\\n'));
         await window.loadFile(path.join(__dirname, 'index.html'));
         const wait = (expression) => window.webContents.executeJavaScript('new Promise((resolve,reject)=>{const end=performance.now()+20000; const poll=()=>{const value='+expression+'; if(value)return resolve(value);if(performance.now()>end)return reject(new Error("Goal renderer timed out"));setTimeout(poll,10);};poll();})');
         await wait('window.__goalReady || window.__goalResult');
@@ -59,6 +61,6 @@ test("goal arms the main composer, survives retry, sends private controls, and r
     assert.equal(result.ok, true, result.error);
   } finally {
     assert.equal(dirname(resolve(directory)), resolve(tmpdir()));
-    await rm(directory, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
