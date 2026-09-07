@@ -2515,6 +2515,8 @@ test("OpenCode marks every active task disconnected before the provider and rest
       `${sessionId} must become disconnected before the Bridge unsubscribes from its provider`);
   }
   assert.deepEqual(adapter.activeSessionIds(), [], "transport loss must suppress stale active claims");
+  assert.deepEqual([...adapter.activeSessionIds({ includeDisconnected: true })].sort(), ["now-idle", "still-working"],
+    "server handoff must preserve unresolved turns while their event feed is disconnected");
   assert.equal(observed.some((event) => event.type === "agent.completed"
     || event.type === "agent.interrupted" || event.type === "agent.error"), false,
   "disconnect must not invent any terminal outcome");
@@ -2531,6 +2533,8 @@ test("OpenCode marks every active task disconnected before the provider and rest
     && event.type === "session.status_changed" && event.payload.state === "idle"),
   "a task omitted by the authoritative reconnect snapshot must become idle");
   assert.deepEqual(adapter.activeSessionIds(), ["still-working"]);
+  assert.deepEqual(adapter.activeSessionIds({ includeDisconnected: true }), ["still-working"],
+    "confirmed idle tasks no longer need their previous server kept alive");
 });
 
 test("a delayed reconnect snapshot cannot overwrite a newer live session state", async (t) => {

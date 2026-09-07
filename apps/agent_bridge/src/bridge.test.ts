@@ -6063,6 +6063,63 @@ test("provider queue identities stay session-scoped and malformed list scopes ar
   assert.match(invalid.error?.message ?? "", /sessionId must be a non-empty string/);
 });
 
+test("provisional creation titles stay local and yield to generated native titles", async (t) => {
+  const hostId = "host-provisional-title";
+  const provider = new (class extends RelationshipFakeProvider {
+    public readonly creates: CreateSessionOptions[] = [];
+    public override async createSession(options: CreateSessionOptions) {
+      this.creates.push(options);
+      return await super.createSession(options);
+    }
+  })(hostId);
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider]);
+  t.after(() => bridge.dispose());
+  await bridge.start();
+
+  const response = await new BridgeRequestRouter(bridge).handle({
+    protocolVersion: CURRENT_PROTOCOL_VERSION,
+    messageId: "message-provisional-title",
+    hostId,
+    sentAt: new Date().toISOString(),
+    kind: "request",
+    type: "session.create",
+    requestId: "request-provisional-title",
+    payload: { providerId: provider.providerId, workingDirectory: "C:/project", title: "New task", provisionalTitle: true },
+  });
+  assert.equal(response.ok, true);
+  assert.equal(provider.creates[0]?.title, undefined, "a placeholder must not disable native title generation");
+  assert.equal(provider.creates[0]?.provisionalTitle, undefined, "the bridge owns the local title policy");
+  const session = bridge.sessions().find((item) => item.title === "New task")!;
+  assert.ok(session);
+  await bridge.refresh();
+  assert.equal(bridge.sessions().find((item) => item.id === session.id)?.title, "New task");
+  await provider.emitSessionUpdate(session.providerSessionId, { title: "  Generated goal title  " });
+  await waitFor(() => bridge.sessions().find((item) => item.id === session.id)?.title === "Generated goal title", "generated title adoption");
+
+  const named = await bridge.createSession(provider.providerId, { workingDirectory: "C:/project", title: "My chosen title" });
+  assert.equal(provider.creates.at(-1)?.title, "My chosen title", "explicit titles must still reach the harness");
+  assert.equal(named.title, "My chosen title");
+});
+
+test("separating first-turn guidance leaves native title generation enabled", async (t) => {
+  const hostId = "host-separated-title";
+  const provider = new MeshCaptureProvider({ hostId, sessionCount: 0 });
+  const bridge = new AgentBridge(config(hostId), [provider], {
+    globalAgentInstructions: async () => "Keep changes focused.",
+  });
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  const session = await bridge.createSession(provider.providerId, {
+    workingDirectory: "C:/project",
+    firstInstruction: "Improve the visual quality\nPreserve the controls.",
+  });
+  assert.equal(provider.creates[0]?.firstInstruction, undefined);
+  assert.equal(provider.creates[0]?.title, undefined, "hidden guidance must not turn a prompt preview into a fixed native title");
+  assert.equal(session.title, "Improve the visual quality");
+  assert.equal(provider.requests[0]?.content, "Improve the visual quality\nPreserve the controls.");
+  assert.match(provider.requests[0]?.developerInstructions ?? "", /Keep changes focused/u);
+});
+
 test("child-session requests are capability-gated, cached, and retain validated live metadata", async (t) => {
   const hostId = "host-children";
   const provider = new RelationshipFakeProvider(hostId);

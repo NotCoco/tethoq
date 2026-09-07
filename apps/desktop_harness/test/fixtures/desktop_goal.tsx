@@ -144,6 +144,7 @@ try {
   document.querySelector('.send-button').click();
   await waitFor(() => sends.length === 4 && document.querySelector('.composer-current-goal'), "new task goal delivery");
   check(creations.length === 1 && creations[0].firstInstruction === undefined, "Goal bypassed the separate create and send sequence");
+  check(creations[0].title === "Complete the new task" && creations[0].provisionalTitle === true, "Goal creation lost its prompt title or disabled native title generation");
   check(sends[3].sessionId === created.id && sends[3].goal.objective === "Complete the new task" && sends[3].content === "Complete the new task", "New task goal lost its route or plain prompt");
   window.__goalResult = { ok: true };
 } catch (error) {

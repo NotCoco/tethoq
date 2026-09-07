@@ -1029,9 +1029,9 @@ export class AgentBridge {
     await this.recoverProviderCatalogue(providerId);
   }
 
-  /** Provider-native session ids that currently have a model turn in flight. */
+  /** Possibly live native turns: losing the event feed is not permission to stop their server. */
   public providerActiveSessions(providerId: string): readonly string[] {
-    return this.#adapters.get(providerId)?.activeSessionIds?.() ?? [];
+    return this.#adapters.get(providerId)?.activeSessionIds?.({ includeDisconnected: true }) ?? [];
   }
 
   /** True while any session still streams through the provider's secondary feed. */
@@ -3181,6 +3181,8 @@ export class AgentBridge {
       const {
         firstInstructionDeveloperInstructions: _firstTurnGuidance,
         firstInstruction,
+        title,
+        provisionalTitle,
         ...providerOptions
       } = options;
       const delegationParent = typeof options.metadata?.parentSessionId === "string" && typeof options.metadata.delegationId === "string"
@@ -3188,10 +3190,8 @@ export class AgentBridge {
       if (delegationParent !== undefined) this.assertSessionNotStopped(delegationParent);
       const providerSession = await adapter.createSession({
         ...providerOptions,
+        ...(title !== undefined && !provisionalTitle ? { title } : {}),
         ...(!separatedFirstTurn && firstInstruction !== undefined ? { firstInstruction } : {}),
-        ...(separatedFirstTurn && providerOptions.title === undefined
-          ? { title: options.firstInstruction!.split(/\r?\n/u)[0]?.trim().slice(0, 96) || "New task" }
-          : {}),
         workingDirectory: this.newTaskWorkingDirectory(options.workingDirectory),
       });
       // A scheduled dispatch persists the provider identity at the first bridge

@@ -4190,6 +4190,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
     onModeChange?.(next);
   }, [onModeChange]);
   const goalArmed = mode === "goal";
+  const goalIndicatorVisible = goalArmed || Boolean(goal);
   const onGoalRef = useRef(onGoal);
   onGoalRef.current = onGoal;
   useEffect(() => {
@@ -4516,7 +4517,8 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
     if (box) {
       // The SVG outline catches up through ResizeObserver. Its previous height
       // must not count as content overflow while a picker closes.
-      const inputBottom = composerEntryRow.current?.getBoundingClientRect().bottom ?? target.getBoundingClientRect().bottom;
+      // The row can shrink without shrinking the editor, so measure both.
+      const inputBottom = Math.max(target.getBoundingClientRect().bottom, composerEntryRow.current?.getBoundingClientRect().bottom ?? 0);
       const overflow = Math.max(0, inputBottom + parseFloat(getComputedStyle(box).paddingBottom) - box.getBoundingClientRect().bottom);
       if (overflow > 0.5) growTextarea(target, Math.max(42, target.getBoundingClientRect().height - Math.ceil(overflow)));
     }
@@ -4561,7 +4563,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
       for (const task of tasks) window.clearTimeout(task);
     };
   }, [attachments, commitAttachments, notify]);
-  useLayoutEffect(() => { resizeTextarea(); }, [attachments, content, dictationPhase, meshTargets, resizeTextarea, workflowAttachments]);
+  useLayoutEffect(() => { resizeTextarea(); }, [attachments, content, dictationPhase, goalIndicatorVisible, meshTargets, resizeTextarea, workflowAttachments]);
   useEffect(() => {
     window.addEventListener("resize", resizeTextarea);
     return () => window.removeEventListener("resize", resizeTextarea);
@@ -6190,7 +6192,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
           </div>
         </Popover>
       </div> : null}
-      {goalArmed || goal ? <div className={`composer-goal-indicator${goalArmed ? " is-armed" : ""}`}>
+      {goalIndicatorVisible ? <div className={`composer-goal-indicator${goalArmed ? " is-armed" : ""}`}>
         {goalArmed ? <><span role="status"><GoalIcon /><strong>Goal</strong><span>{sending ? "Sending…" : "Next message"}</span></span><button type="button" aria-label="Cancel goal for next message" disabled={sending} onClick={() => setMode("queue")}><XIcon /></button></>
           : <button type="button" className="composer-current-goal" title={goal!.objective} aria-label={`Manage goal: ${goal!.objective}`} onClick={() => setGoalOpen(true)}><GoalIcon /><strong>Goal {goalLabels[goal!.status].toLowerCase()}</strong><span>{goal!.objective}</span><ChevronDownIcon /></button>}
       </div> : null}
