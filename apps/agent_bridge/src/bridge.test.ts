@@ -11,7 +11,8 @@ import { AgentBridge, maxLocalQueuedAttachmentBytes, maxLocalQueuedMessages, mes
 import { AttachmentUploadManager } from "./attachment_uploads.js";
 import { SessionCache } from "./session_cache.js";
 import { BridgeRequestRouter, clientMessagePage } from "./request_router.js";
-import { meshToolDefinitions } from "./mesh_tools.js";
+import { MeshToolGateway, meshToolDefinitions } from "./mesh_tools.js";
+import { installOpenCodeMeshTools, openCodeMeshToolPath } from "./opencode_tools.js";
 import type { BridgeConfig } from "./config.js";
 import type { AuthStatus, CreateSessionOptions, EnqueueProviderMessageRequest, ListSessionsOptions, MessageAttachment, ObservedExternalSessionLaunch, PaginatedSessions, ProviderApprovalResponse, ProviderClientTooling, ProviderDetection, ProviderEvent, ProviderEventSink, ProviderQueuedMessage, ProviderSessionGoal, ProviderSessionGoalUpdate, RestoreProviderMessageRequest, SendMessageRequest, SendMessageResult, SessionCreationFeatures, Subscription } from "../../../packages/provider_contract/src/index.js";
 import { defaultTranscriptionSourceRegistry, type DictationTranscriber } from "./dictation.js";
@@ -8678,6 +8679,64 @@ test("active fallback goals continue privately and stop when the model completes
   await new Promise((resolve) => setTimeout(resolve, 850));
   assert.equal(provider.requests.length, 2);
   await assert.rejects(bridge.executeClientTool(session.id, "tethoq_goal", { status: "complete" }), /no longer active/);
+});
+
+test("OpenCode's installed goal tool persists terminal states, publishes them, and stops automatic prompts", async (t) => {
+  for (const status of ["complete", "blocked"] as const) {
+    await t.test(status, async (t) => {
+      const directory = await mkdtemp(join(tmpdir(), "tethoq-goal-tool-"));
+      const hostId = `goal-tool-${status}-${randomUUID()}`;
+      const provider = new GoalCapturingFakeProvider({ hostId, providerId: "opencode", sessionCount: 1 });
+      let persisted: Readonly<Record<string, SessionGoal>> = {};
+      const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider], {
+        onGoalsChange: (goals) => { persisted = structuredClone(goals); },
+      });
+      const runtimePath = join(directory, "runtime.json");
+      const gateway = new MeshToolGateway(hostId, (...args) => bridge.executeClientTool(...args), { runtimePath });
+      t.after(async () => { await bridge.dispose(); await gateway.close(); await rm(directory, { recursive: true, force: true }); });
+      await gateway.listen();
+      bridge.configureClientTooling(gateway);
+      await installOpenCodeMeshTools({ userHome: directory });
+      const source = await readFile(openCodeMeshToolPath(directory), "utf8");
+      const goalExport = source.slice(source.indexOf("export const tethoq_goal"), source.indexOf("export const list_sessions"));
+      assert.match(goalExport, /Call this before your final response/);
+      // Keep the installed execute function and IPC transport intact. Only the
+      // schema helper and runtime discovery are scoped to this isolated fixture.
+      const executable = source
+        .replace(/import \{ tool \} from "@opencode-ai\/plugin"\r?\n/u,
+          'const tool = Object.assign((definition) => definition, { schema: { enum: () => ({ optional: () => ({}) }) } })\n')
+        .replace("  const runtimes = await matchingRuntimes(name)",
+          `  const runtimes = [JSON.parse(await readFile(${JSON.stringify(runtimePath)}, "utf8"))]`)
+        .replace(/export const list_children[\s\S]*$/u, goalExport);
+      const loaded = await import(`data:text/javascript;base64,${Buffer.from(executable).toString("base64")}#${randomUUID()}`);
+      await bridge.start();
+      await bridge.refresh();
+      const session = bridge.sessions()[0]!;
+      const execute = (input: JsonObject) => loaded.tethoq_goal.execute(input, { sessionID: session.providerSessionId }) as Promise<string>;
+      await bridge.setSessionGoal(session.id, { objective: "Verify the requested change" });
+      await bridge.sendMessage(session.id, { requestId: "goal-start", content: "Start" });
+      assert.match(provider.lastRequest!.developerInstructions!, /call uar_mesh_tethoq_goal with \{"status":"complete"\} before your final response/);
+      assert.match(provider.lastRequest!.developerInstructions!, /call uar_mesh_tethoq_goal with \{"status":"blocked"\} before explaining the blocker/);
+      await provider.finish(session.providerSessionId);
+      await waitFor(() => provider.requests.length === 2, "goal status check after a normal turn");
+      assert.match(provider.lastRequest!.developerInstructions!, /^Check the active goal's status against your latest response before doing more work/);
+      assert.match(provider.lastRequest!.developerInstructions!, /not new user input, approval, or a change that removes a blocker/);
+      assert.equal(JSON.parse(await execute({})).status, "active");
+      assert.deepEqual(JSON.parse(await execute({ status })), { status });
+      assert.equal(persisted[session.id]?.status, status, "the successful tool result must be durable");
+      const updated = bridge.eventsSince(0).filter((event) => event.type === "session.goal_updated").at(-1);
+      assert.equal((updated?.payload.goal as JsonObject)?.status, status, "clients receive the model's terminal goal state");
+      await provider.finish(session.providerSessionId);
+      await new Promise((resolve) => setTimeout(resolve, 850));
+      assert.equal(provider.requests.length, 2, "a terminal goal cannot prompt itself again");
+      await bridge.sendMessage(session.id, { requestId: "normal-follow-up", content: "Explain the result" });
+      assert.match(provider.lastRequest!.developerInstructions!, new RegExp(`This goal is ${status}`));
+      await provider.finish(session.providerSessionId);
+      await new Promise((resolve) => setTimeout(resolve, 850));
+      assert.equal(provider.requests.length, 3, "ordinary user messages still work without reopening the goal");
+      assert.equal((await bridge.sessionGoal(session.id))?.status, status);
+    });
+  }
 });
 
 test("fallback goals continue across idle-only turn boundaries and late provider cleanup", async (t) => {

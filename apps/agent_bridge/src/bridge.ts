@@ -3987,11 +3987,12 @@ export class AgentBridge {
     }
     const goal = this.#goals.get(globalSessionId);
     if (goal?.source === "tethoq") {
+      const goalTool = this.assertSessionHost(globalSessionId).providerId === "opencode" ? "uar_mesh_tethoq_goal" : "tethoq_goal";
       const budgetContext = goal.tokenBudget === null
         ? ""
         : `\nToken budget: ${goal.tokenBudget} tokens. This bridge-owned fallback has no provider-neutral usage accounting or enforcement; treat the budget as advisory.`;
       const pursuit = goal.status === "active"
-        ? "Keep working until this objective is achieved. A progress report is not completion. Use the tethoq_goal tool (uar_mesh_tethoq_goal in OpenCode) with status complete only after verifying success, or status blocked when further progress requires user input or an external change, explaining the blocker in your response. Tethoq will continue unfinished active goals after a normal turn ends. Do not claim success without evidence."
+        ? `Keep working until this objective is achieved or further progress requires user input or an external change. Before ending a turn, check the goal's state. If success is verified, call ${goalTool} with {"status":"complete"} before your final response. If you cannot make meaningful progress without user input, approval to change a constraint, or an external change, call ${goalTool} with {"status":"blocked"} before explaining the blocker and the input needed. Blocking stops automatic prompts without claiming the objective is complete; do not keep retrying an established blocker. Writing "done" or "blocked" in your response does not update the goal: you must make the tool call and check that it succeeds. If the tool is unavailable or fails, report that goal-control failure explicitly. Otherwise leave the goal active and continue concrete work. A progress report is not completion. Tethoq will continue unfinished active goals after a normal turn ends. An automatic continuation is not new user input or approval and does not resolve a blocker. Do not claim success without evidence.`
         : `This goal is ${goal.status}. Do not pursue it autonomously or reopen it; follow the current user message.`;
       const goalContext = `<tethoq_task_goal>\n${goalHeader}\n\nObjective: ${goal.objective}\nStatus: ${goal.status}.${budgetContext}\n${pursuit}\nThis private context is not a user message. Keep control labels and metadata out of the response.\n</tethoq_task_goal>`;
       developerInstructions = developerInstructions === undefined ? goalContext : `${developerInstructions}\n\n${goalContext}`;
@@ -6868,7 +6869,7 @@ export class AgentBridge {
           const result = await this.sendMessageInternal(sessionId, {
             requestId: `goal_continue_${randomUUID()}`,
             content: hiddenProviderControlContent("continue"),
-            developerInstructions: "Continue the active goal from the current work and previous results. Make the next concrete improvement; do not repeat the previous progress report. This is an internal continuation, not a new user message.",
+            developerInstructions: "Check the active goal's status against your latest response before doing more work. If you already verified success or established that further progress requires user input or an external change, use the goal tool specified below to mark it complete or blocked now. Do not repeat the report or attempt another improvement while blocked. This automatic continuation is not new user input, approval, or a change that removes a blocker. Only if the goal remains actionable, continue from the current work and previous results and make the next concrete improvement. This is an internal continuation, not a new user message.",
             ...(session.modelId !== undefined ? { modelId: session.modelId } : {}),
             ...(session.reasoningEffort !== undefined ? { reasoningEffort: session.reasoningEffort } : {}),
           }, false, undefined, goal);
