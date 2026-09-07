@@ -35,6 +35,7 @@ test("updates require explicit download and install, and cannot downgrade", asyn
   const { updater, manager, states } = setup(t);
   assert.equal(updater.autoDownload, false);
   assert.equal(updater.autoInstallOnAppQuit, false);
+  assert.equal(updater.disableWebInstaller, true);
   assert.equal(updater.allowDowngrade, false);
   assert.equal(updater.allowPrerelease, true);
   await manager.action("install");

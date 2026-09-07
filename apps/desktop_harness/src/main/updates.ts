@@ -1,7 +1,7 @@
 import type { AppUpdater } from "electron-updater";
 import type { DesktopUpdateAction, DesktopUpdateState } from "../shared/desktop_api.js";
 
-type Updater = Pick<AppUpdater, "on" | "removeListener" | "checkForUpdates" | "downloadUpdate" | "quitAndInstall" | "autoDownload" | "autoInstallOnAppQuit" | "allowPrerelease" | "allowDowngrade">;
+type Updater = Pick<AppUpdater, "on" | "removeListener" | "checkForUpdates" | "downloadUpdate" | "quitAndInstall" | "autoDownload" | "autoInstallOnAppQuit" | "allowPrerelease" | "allowDowngrade" | "disableWebInstaller">;
 
 export class DesktopUpdateManager {
   #state: DesktopUpdateState;
@@ -22,6 +22,7 @@ export class DesktopUpdateManager {
     if (!updater) return;
     updater.autoDownload = false;
     updater.autoInstallOnAppQuit = false;
+    updater.disableWebInstaller = true;
     // Tethoq's 0.x installers are published as GitHub preview releases.
     updater.allowPrerelease = options.currentVersion.startsWith("0.") || options.currentVersion.includes("-");
     updater.allowDowngrade = false;

@@ -20,6 +20,7 @@ export function useDesktopUpdates(): DesktopUpdateState | null {
 export function DesktopUpdates() {
   const state = useDesktopUpdates();
   const [error, setError] = useState<string | null>(null);
+  const [pending, setPending] = useState(false);
   if (!state) return null;
   const busy = ["checking", "downloading", "installing"].includes(state.phase);
   const action: DesktopUpdateAction = state.phase === "available" ? "download" : state.phase === "downloaded" ? "install" : "check";
@@ -34,14 +35,16 @@ export function DesktopUpdates() {
           : "Checks for new releases automatically. You choose when to download and restart.");
   const run = async () => {
     setError(null);
+    setPending(true);
     try { await window.tethoqDesktop.updateAction(action); }
     catch { setError("Tethoq could not start the update. Try again."); }
+    finally { setPending(false); }
   };
   return <section className="settings-block desktop-updates" aria-label="Tethoq updates">
     <header><h2>Updates</h2></header>
     <div className="desktop-update-row">
       <span><strong>Tethoq {state.currentVersion}</strong><small role="status">{error ?? description}</small></span>
-      {state.phase !== "unavailable" ? <Button type="button" disabled={busy} onClick={() => void run()}>{label}</Button> : null}
+      {state.phase !== "unavailable" ? <Button type="button" disabled={busy || pending} onClick={() => void run()}>{label}</Button> : null}
     </div>
   </section>;
 }

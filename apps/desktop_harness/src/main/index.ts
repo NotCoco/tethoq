@@ -1,5 +1,7 @@
 import { existsSync } from "node:fs";
+import { execFile } from "node:child_process";
 import { isAbsolute, join, resolve } from "node:path";
+import { promisify } from "node:util";
 import {
   app,
   BrowserWindow,
@@ -223,6 +225,13 @@ async function startApplication(): Promise<void> {
       ? { updater: electronUpdater.autoUpdater } : {}),
     onState: (state) => { if (!window.isDestroyed()) window.webContents.send(IPC_CHANNELS.updateState, state); },
     beforeInstall: async () => {
+      // The standalone companion is part of the installer too. Its mapped
+      // executable cannot be replaced while it is serving another workspace.
+      const companionPath = join(process.resourcesPath, "bridge-companion", "Tethoq Bridge.exe").replaceAll("'", "''");
+      const { stdout } = await promisify(execFile)("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+        `$ErrorActionPreference='Stop'; Get-CimInstance Win32_Process -Filter \"Name='Tethoq Bridge.exe'\" | Where-Object { $_.ExecutablePath -ieq '${companionPath}' } | Select-Object -First 1 | ForEach-Object { 'running' }`,
+      ], { windowsHide: true, timeout: 5_000 }).catch(() => { throw new Error("Tethoq could not check whether its standalone Bridge is running. Try again."); });
+      if (stdout.trim() === "running") throw new Error("Quit the standalone Tethoq Bridge before restarting for an update.");
       if ([...harness.allowedProviderIds()].some((providerId) => harness.bridge.providerActiveSessions(providerId).length > 0)
         || harness.bridge.sessions().some((task) => ["working", "needs_approval", "needs_input"].includes(task.state))) {
         throw new Error("Finish or stop running tasks before restarting for an update.");

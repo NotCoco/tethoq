@@ -6,6 +6,8 @@ updates**. When a release is available, the sidebar points to it. Users download
 inside Tethoq and choose **Restart to update** when their tasks are finished.
 Downloading never quits the app; closing the app does not silently install an
 update. Running tasks and recordings prevent an update restart.
+If the standalone Tethoq Bridge is running from the same installation, quit it
+before applying the update; the updater does not force-close that process.
 
 The current 0.x builds receive published preview releases. Stable 1.x builds
 receive stable releases. Draft releases are not offered, and downgrades are
