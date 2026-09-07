@@ -65,8 +65,17 @@ test("mounted task recovery sends once, preserves composition, and keeps Eyes an
       check(document.querySelectorAll(".timeline-error-recovery").length === 1, "only the new interruption should offer Continue");
       qa.stage("eyes-working"); await settle(); qa.status("idle"); await settle();
       check(running() === 1, "idle parent settled a running Eyes inspection");
-      const animation = document.querySelector(".reasoning-running").getAnimations({ subtree: true })[0];
-      check(animation?.playState === "running", "Eyes glimmer has no active animation");
+      // Moving live status from an expanded header creates a new tail element.
+      // Its DOM commit can precede the browser starting CSS animations, especially
+      // in a hidden CI window. Wait for the observable animation, not a fixed delay.
+      const activeAnimation = () => document.querySelector(".reasoning-running")?.getAnimations({ subtree: true }).find(animation => animation.playState === "running");
+      for (let i = 0; !activeAnimation() && i < 100; i++) await new Promise(r => setTimeout(r, 20));
+      const liveLabel = document.querySelector(".reasoning-running .reasoning-label");
+      check(Boolean(activeAnimation()), `Eyes glimmer has no active animation: ${JSON.stringify({
+        markers: running(), reducedMotion: matchMedia('(prefers-reduced-motion: reduce)').matches,
+        animationName: liveLabel ? getComputedStyle(liveLabel).animationName : null,
+        animations: liveLabel?.getAnimations().map(animation => ({ playState: animation.playState, pending: animation.pending })),
+      })}`);
       qa.toolEnd(); await settle(); check(!running(), "completed Eyes shimmered while idle");
       qa.stage("ordinary"); await settle(); check(!running(), "ordinary idle tool acquired an Eyes override");
       qa.stage("eyes-working"); await settle(); qa.toolEnd("failed"); qa.status("idle"); await settle();
