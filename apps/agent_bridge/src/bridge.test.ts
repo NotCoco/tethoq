@@ -8607,6 +8607,34 @@ test("Tethoq goals support the full lifecycle on a provider with no native goal 
   await bridge.dispose();
 });
 
+test("discovering a provider task cannot deadlock events emitted by its identity read", async (t) => {
+  const hostId = "host-reentrant-identity";
+  class ReentrantProvider extends GoalCapturingFakeProvider {
+    reads = 0;
+    override async listSessions(options: ListSessionsOptions = {}): Promise<PaginatedSessions> {
+      const page = await super.listSessions(options);
+      return { ...page, sessions: page.sessions.slice(0, 1) };
+    }
+    override async getSession(providerSessionId: string): Promise<RemoteSession> {
+      this.reads++;
+      await Promise.resolve();
+      await this.finish(providerSessionId, "message.started");
+      await this.finish(providerSessionId);
+      return await super.getSession(providerSessionId);
+    }
+  }
+  const provider = new ReentrantProvider({ hostId, sessionCount: 2 });
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider]);
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  await bridge.refresh();
+  const childId = makeGlobalSessionId(hostId, provider.providerId, "fake_session_0002");
+  assert.equal(bridge.sessions().some((session) => session.id === childId), false);
+  await resolvesPromptly(provider.finish("fake_session_0002", "message.started"), "identity lookup must leave the provider feed free");
+  await waitFor(() => bridge.sessions().find((session) => session.id === childId)?.state === "completed", "ordered terminal event after identity discovery");
+  assert.equal(provider.reads, 1, "nested provider events share the identity read");
+});
+
 test("active fallback goals continue privately and stop when the model completes the goal", async (t) => {
   const hostId = "host-goal-continuation";
   const provider = new GoalCapturingFakeProvider({ hostId, sessionCount: 1 });

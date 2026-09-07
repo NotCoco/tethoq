@@ -614,6 +614,7 @@ export class AgentBridge {
   readonly #bridgeOwnedClientToolFailures = new Map<string, PersistedBridgeOwnedClientToolFailure[]>();
   readonly #openSessionLoads = new Map<string, OpenSessionLoad>();
   readonly #unknownActiveSessionLoads = new Map<string, Promise<void>>();
+  readonly #unknownActiveSessionEvents = new Map<string, ProviderEvent[]>();
   readonly #cache = new SessionCache({
     preserveWorking: (sessionId) => this.sessionTurnInFlight(sessionId),
     onSelectionsChange: (selections) => this.#onSessionSelectionsChange?.(selections),
@@ -5725,6 +5726,7 @@ export class AgentBridge {
     this.#messageSnapshotGenerations.clear();
     this.#openSessionLoads.clear();
     this.#unknownActiveSessionLoads.clear();
+    this.#unknownActiveSessionEvents.clear();
     this.#pendingContextHandoffs.clear();
     this.#pendingBranchBootstraps.clear();
     this.#branchCopies.clear();
@@ -5773,14 +5775,40 @@ export class AgentBridge {
     if (scheduledTaskError !== undefined) throw scheduledTaskError;
   }
 
-  private async receiveProviderEvent(event: ProviderEvent): Promise<void> {
+  private async receiveProviderEvent(event: ProviderEvent, identityResolved = false): Promise<void> {
     const internalCreation = this.#internalSessionCreations.get(event.providerId);
     if (internalCreation !== undefined && event.type !== "provider.disconnected") {
       internalCreation.events.push(event);
       return;
     }
-    if (!this.#deduper.accept(`${event.providerId}:${event.eventId}`)) return;
     const globalSessionId = event.providerSessionId === undefined ? undefined : makeGlobalSessionId(this.config.hostId, event.providerId, event.providerSessionId);
+    if (!identityResolved && globalSessionId !== undefined && !this.#internalSessionIds.has(globalSessionId)) {
+      const pending = this.#unknownActiveSessionEvents.get(globalSessionId);
+      if (pending !== undefined) {
+        pending.push(event);
+        return;
+      }
+      const activeState = providerEventActiveState(event);
+      if (activeState !== undefined && this.#cache.get(globalSessionId) === undefined) {
+        const events = [event];
+        this.#unknownActiveSessionEvents.set(globalSessionId, events);
+        // getSession can publish status events of its own. Waiting for that
+        // read inside its event sink deadlocks both the read and the live feed.
+        void this.materializeUnknownActiveSession(globalSessionId, event.providerId, event.providerSessionId!, activeState)
+          .then(async () => {
+            try {
+              for (const queued of events) {
+                if (this.#disposed) return;
+                await this.receiveProviderEvent(queued, true);
+              }
+            } finally {
+              this.#unknownActiveSessionEvents.delete(globalSessionId);
+            }
+          }).catch(() => this.#unknownActiveSessionEvents.delete(globalSessionId));
+        return;
+      }
+    }
+    if (!this.#deduper.accept(`${event.providerId}:${event.eventId}`)) return;
     if (globalSessionId !== undefined && this.#internalSessionIds.has(globalSessionId)) {
       if (event.type === "agent.completed") this.rememberInternalTurnTerminal(globalSessionId, event, "completed");
       else if (event.type === "agent.error") this.rememberInternalTurnTerminal(globalSessionId, event, "failed");
@@ -5802,19 +5830,6 @@ export class AgentBridge {
     if (event.type === "message.queue_updated" && Array.isArray(event.payload.messages)) {
       this.syncProviderQueue(event.providerId, event.payload.messages);
       return;
-    }
-    if (globalSessionId !== undefined && this.#cache.get(globalSessionId) === undefined) {
-      const activeState = providerEventActiveState(event);
-      const pendingIdentityLoad = this.#unknownActiveSessionLoads.get(globalSessionId);
-      if (activeState !== undefined || pendingIdentityLoad !== undefined) {
-        await this.materializeUnknownActiveSession(
-          globalSessionId,
-          event.providerId,
-          event.providerSessionId!,
-          activeState,
-          pendingIdentityLoad,
-        );
-      }
     }
     const compactionTurnGeneration = globalSessionId === undefined
       ? undefined
