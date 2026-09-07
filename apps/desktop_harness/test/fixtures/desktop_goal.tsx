@@ -135,6 +135,17 @@ try {
   await waitFor(() => document.querySelector('.conversation')?.textContent.includes("The documentation is ready.")
     && document.getElementById("composer-message")?.placeholder === "Continue this task…"
     && !document.querySelector('.send-button')?.classList.contains('stop-button'), "completed goal response");
+  const activeGoal = goals.get(source.id);
+  for (const [status, label] of [["blocked", "Goal stalled"], ["complete", "Goal complete"]]) {
+    const terminalGoal = { ...activeGoal, status, revision: ++sequence };
+    goals.set(source.id, terminalGoal);
+    emit(source.id, "session.goal_updated", { goal: terminalGoal });
+    await waitFor(() => document.querySelector('.composer-current-goal strong')?.textContent === label, `${status} goal status`);
+    emit(source.id, "session.goal_updated", { goal: activeGoal });
+    await frame();
+    check(document.querySelector('.composer-current-goal strong')?.textContent === label, "A stale active goal overwrote the terminal state");
+    check(!document.querySelector('.send-button')?.classList.contains('stop-button'), "A terminal goal left the task running");
+  }
   await write("Explain the result");
   await waitFor(() => document.querySelector('.send-button')?.disabled === false, "follow-up send control");
   document.querySelector('.send-button').click();

@@ -136,6 +136,8 @@ const tool = Object.assign((definition) => definition, { schema: {
   for (const [name, definition] of Object.entries(browserTools)) {
     assert.match(definition.description, /browser|page|tab/iu, `${name} needs model-visible browser guidance`);
   }
+  assert.deepEqual(loaded.tethoq_goal?.args.status, { kind: "enum", values: ["complete", "blocked"], isOptional: true });
+  assert.match(loaded.tethoq_goal!.description, /stop its automatic prompts/);
 });
 
 test("OpenCode mesh finds the task-owning runtime without masking real EYES failures", async (context) => {

@@ -40,7 +40,7 @@ interface GatewayResponse {
 export const meshToolDefinitions: readonly ClientToolDefinition[] = [
   {
     name: "tethoq_goal",
-    description: "Read this task's active Tethoq goal, or mark it complete after verifying the objective, or blocked when progress requires user input or an external change. Use only for the goal in private Tethoq instructions; never create or reopen a goal.",
+    description: "Read this task's Tethoq goal, or stop its automatic prompts by marking it complete after verifying the objective or blocked when progress requires user input or an external change. Call this before your final response when done or blocked; saying so in prose does not update the goal. Blocking does not claim success. Use only for the goal in private Tethoq instructions; never create or reopen a goal.",
     inputSchema: {
       type: "object",
       properties: { status: { type: "string", enum: ["complete", "blocked"] } },
