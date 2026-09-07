@@ -692,7 +692,7 @@ export class AgentBridge {
   readonly #providerCompactionTurnGenerations = new Map<string, Map<string, number>>();
   readonly #compactedTurnGenerations = new Map<string, Set<number>>();
   readonly #goals = new Map<string, SessionGoal>();
-  readonly #goalContinuations = new Map<string, ReturnType<typeof setTimeout>>();
+  readonly #goalContinuations = new Map<string, { timer: ReturnType<typeof setTimeout>; sending: boolean; completedDuringSend: boolean }>();
   /** Local generations make delayed get/set/clear replies unable to clobber a newer event. */
   readonly #goalGenerations = new Map<string, number>();
   /** Provider ordering tokens are optional, but valuable when timestamps tie. */
@@ -1010,7 +1010,10 @@ export class AgentBridge {
     this.pendingApprovals();
     this.pendingUserInputs();
     await this.reconcileQueueDeliveries(providerId);
-    if (result?.status === "success") this.notifySessionCatalogueChange();
+    if (result?.status === "success") {
+      this.notifySessionCatalogueChange();
+      this.reconcileGoalContinuations(providerId);
+    }
   }
 
   /**
@@ -1260,8 +1263,18 @@ export class AgentBridge {
     this.#goals.delete(globalSessionId);
     this.#goals.set(globalSessionId, goal);
     this.#goalGenerations.set(globalSessionId, generation + 1);
+    const pendingContinuation = this.#goalContinuations.get(globalSessionId);
+    if (pendingContinuation !== undefined) {
+      clearTimeout(pendingContinuation.timer);
+      this.#goalContinuations.delete(globalSessionId);
+    }
     await this.persistGoals();
     this.appendGoalEvent("session.goal_updated", globalSessionId, providerId, goal);
+    if (goal.status === "active" && previous?.source === "tethoq"
+      && (previous.status !== "active" || pendingContinuation !== undefined)) {
+      if (previous.status !== "active") await this.resumeStoppedSession(globalSessionId);
+      this.scheduleGoalContinuation(globalSessionId);
+    }
     return goal;
   }
 
@@ -1464,6 +1477,7 @@ export class AgentBridge {
     }
     await Promise.all([...this.#adapters.values()].map((adapter) => this.releaseProviderIfIdle(adapter)));
     if (result.providers.some((provider) => provider.status === "success")) this.notifySessionCatalogueChange();
+    for (const provider of result.providers) if (provider.status === "success") this.reconcileGoalContinuations(provider.providerId);
     return { ...result, sessions: this.sessions() };
   }
 
@@ -1508,6 +1522,7 @@ export class AgentBridge {
     this.pendingUserInputs();
     this.reconcileDelegationTimer();
     this.scheduleInitialCatalogueReconciliation();
+    for (const provider of result.providers) if (provider.status === "success") this.reconcileGoalContinuations(provider.providerId);
     recordStartupProfile({ type: "sessions-bootstrap", phase: "end", sessionCount: this.sessions().length });
     return { ...result, sessions: this.sessions() };
   }
@@ -5218,7 +5233,14 @@ export class AgentBridge {
       if (helperId !== undefined) targets.add(helperId);
     }
     for (const id of targets) this.markSessionStopped(id);
-    const results = await Promise.allSettled([...targets].map(async (id) => await this.interruptSession(id)));
+    const results = await Promise.allSettled([...targets].map(async (id) => {
+      try {
+        const goal = this.#goals.get(id);
+        if (goal?.source === "tethoq" && goal.status === "active") await this.setSessionGoal(id, { status: "paused" });
+      } finally {
+        await this.interruptSession(id);
+      }
+    }));
     const failures = results.flatMap((result, index) => result.status === "rejected"
       ? [`${this.#cache.get([...targets][index]!)?.title ?? [...targets][index]}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`]
       : []);
@@ -5592,7 +5614,10 @@ export class AgentBridge {
     this.restoreSessionTransferLinks();
     this.linkObservedExternalSessions(this.#pendingExternalLaunches);
     this.reconcileDelegationTimer();
-    if (result.status === "success") this.notifySessionCatalogueChange();
+    if (result.status === "success") {
+      this.notifySessionCatalogueChange();
+      this.reconcileGoalContinuations(result.providerId);
+    }
     // Publish the completed provider catalogue before slower relationship
     // restoration. The renderer can paint every newly loaded task immediately;
     // auxiliary child/link discovery remains off that visibility path.
@@ -5755,7 +5780,7 @@ export class AgentBridge {
     this.#earsHelperCreations.clear();
     this.#earsTranscriptionTails.clear();
     this.#earsJobs.clear();
-    for (const timer of this.#goalContinuations.values()) clearTimeout(timer);
+    for (const continuation of this.#goalContinuations.values()) clearTimeout(continuation.timer);
     this.#goalContinuations.clear();
     this.#goals.clear();
     this.#goalGenerations.clear();
@@ -6053,6 +6078,16 @@ export class AgentBridge {
     }
     if (globalSessionId !== undefined && providerEventEndsActiveTurn(event)) {
       this.#locallyOwnedActiveTurns.delete(globalSessionId);
+      const goal = this.#goals.get(globalSessionId);
+      if (goal?.source === "tethoq" && goal.status === "active"
+        && (event.type === "agent.interrupted" || event.type === "agent.error" || event.payload.state === "failed")) {
+        void this.setSessionGoal(globalSessionId, { status: event.type === "agent.interrupted" ? "paused" : "blocked" }).catch(() => undefined);
+      }
+      const completed = event.type === "agent.completed"
+        || ((event.type === "session.status_changed" || event.type === "session.updated")
+          && (event.payload.state === "idle" || event.payload.state === "completed"));
+      const continuation = this.#goalContinuations.get(globalSessionId);
+      if (completed && continuation?.sending) continuation.completedDuringSend = true;
       // Leave serial provider event feeds free to deliver compaction progress.
       const afterCompaction = event.type === "agent.completed"
         ? this.maybeAutoCompact(globalSessionId, compactionTurnGeneration)
@@ -6061,7 +6096,7 @@ export class AgentBridge {
         void this.pumpQueue(globalSessionId);
         void this.pumpCrossSessionInbox(globalSessionId);
         void this.pumpDelegationsForSession(globalSessionId);
-        if (event.type === "agent.completed") this.scheduleGoalContinuation(globalSessionId);
+        if (completed) this.scheduleGoalContinuation(globalSessionId);
         void this.releaseProviderIfIdle(this.requireAdapter(event.providerId));
       });
     } else if (globalSessionId !== undefined && (event.type === "session.status_changed" || event.type === "session.updated")) {
@@ -6751,12 +6786,24 @@ export class AgentBridge {
     await this.#onGoalsChange?.(Object.fromEntries([...this.#goals].filter(([, goal]) => goal.source === "tethoq")));
   }
 
-  private canContinueGoal(sessionId: string, goal: SessionGoal): boolean {
+  private reconcileGoalContinuations(providerId: string): void {
+    for (const [sessionId, goal] of this.#goals) {
+      if (this.#cache.get(sessionId)?.providerId === providerId && this.goalAwaitsContinuation(sessionId, goal)) {
+        this.scheduleGoalContinuation(sessionId);
+      }
+    }
+  }
+
+  private goalAwaitsContinuation(sessionId: string, goal: SessionGoal): boolean {
     const session = this.#cache.get(sessionId);
     return !this.#disposed && goal.source === "tethoq" && goal.status === "active"
       && this.#goals.get(sessionId) === goal
       && (session?.state === "idle" || session?.state === "completed")
-      && !this.sessionHoldsFollowUpQueue(sessionId)
+      && !this.sessionIsStopped(sessionId);
+  }
+
+  private canContinueGoal(sessionId: string, goal: SessionGoal): boolean {
+    return this.goalAwaitsContinuation(sessionId, goal) && !this.sessionHoldsFollowUpQueue(sessionId)
       && !this.hasPendingUserQueue(sessionId) && !this.#queuePumps.has(sessionId)
       && !this.#crossSessionPumps.has(sessionId) && !this.#pendingProviderSends.has(sessionId);
   }
@@ -6766,11 +6813,12 @@ export class AgentBridge {
     if (goal?.source !== "tethoq" || goal.status !== "active" || this.#disposed
       || this.#goalContinuations.has(sessionId) || this.#clientTooling === undefined) return;
     // Let the provider settle its final idle event, and let user queues run first.
-    const timer = setTimeout(() => {
+    const continuation = { sending: false, completedDuringSend: false, timer: setTimeout(() => {
       void (async () => {
         if (!this.canContinueGoal(sessionId, goal)) return;
         const session = this.#cache.get(sessionId)!;
         try {
+          continuation.sending = true;
           const result = await this.sendMessageInternal(sessionId, {
             requestId: `goal_continue_${randomUUID()}`,
             content: hiddenProviderControlContent("continue"),
@@ -6779,16 +6827,27 @@ export class AgentBridge {
             ...(session.reasoningEffort !== undefined ? { reasoningEffort: session.reasoningEffort } : {}),
           }, false, undefined, goal);
           if (!result.accepted) throw new Error("Goal continuation was not accepted");
-          if (this.#cache.get(sessionId) === session) this.#cache.updateState(sessionId, "working", false);
+          // Selection updates can replace the cached object during acceptance.
+          // Only an actual terminal event should keep a fast turn completed.
+          if (this.goalAwaitsContinuation(sessionId, goal)
+            && !continuation.completedDuringSend) {
+            this.#cache.updateState(sessionId, "working", false);
+          }
         } catch {
           if (this.canContinueGoal(sessionId, goal)) {
             await this.setSessionGoal(sessionId, { status: "blocked" });
           }
         }
-      })().catch(() => undefined).finally(() => this.#goalContinuations.delete(sessionId));
-    }, 750);
-    timer.unref();
-    this.#goalContinuations.set(sessionId, timer);
+      })().catch(() => undefined).finally(() => {
+        if (this.#goalContinuations.get(sessionId) !== continuation) return;
+        this.#goalContinuations.delete(sessionId);
+        // Idle can precede provider cleanup, and a fast successor can finish
+        // before send acceptance returns. Neither should lose the active goal.
+        if (this.goalAwaitsContinuation(sessionId, goal)) this.scheduleGoalContinuation(sessionId);
+      });
+    }, 750) };
+    continuation.timer.unref();
+    this.#goalContinuations.set(sessionId, continuation);
   }
 
   private rememberCompactionThreshold(globalSessionId: string, threshold: number): void {
