@@ -8721,6 +8721,7 @@ test("OpenCode's installed goal tool persists terminal states, publishes them, a
       await waitFor(() => provider.requests.length === 2, "goal status check after a normal turn");
       assert.match(provider.lastRequest!.developerInstructions!, /^Check the active goal's status against your latest response before doing more work/);
       assert.match(provider.lastRequest!.developerInstructions!, /not new user input, approval, or a change that removes a blocker/);
+      assert.match(provider.lastRequest!.developerInstructions!, /give a brief final acknowledgement and end this turn/);
       assert.equal(JSON.parse(await execute({})).status, "active");
       assert.deepEqual(JSON.parse(await execute({ status })), { status });
       assert.equal(persisted[session.id]?.status, status, "the successful tool result must be durable");
