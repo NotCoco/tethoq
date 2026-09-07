@@ -129,7 +129,14 @@ try {
     const footer = row.querySelector('.message-footer'), next = row.nextElementSibling;
     if (footer && next) check(next.getBoundingClientRect().top - footer.getBoundingClientRect().bottom >= 8, "Main transcript footer overlaps its next row");
   }
+  // Goal activation arrives before the response/idle events. Wait for the
+  // completed turn before testing a direct follow-up; an earlier click is
+  // correctly queued, and this fixture does not run the bridge's queue pump.
+  await waitFor(() => document.querySelector('.conversation')?.textContent.includes("The documentation is ready.")
+    && document.getElementById("composer-message")?.placeholder === "Continue this task…"
+    && !document.querySelector('.send-button')?.classList.contains('stop-button'), "completed goal response");
   await write("Explain the result");
+  await waitFor(() => document.querySelector('.send-button')?.disabled === false, "follow-up send control");
   document.querySelector('.send-button').click();
   await waitFor(() => sends.length === 3, "ordinary follow-up");
   check(sends[2].goal === undefined, "Goal mode applied itself to every future message");
@@ -148,5 +155,11 @@ try {
   check(sends[3].sessionId === created.id && sends[3].goal.objective === "Complete the new task" && sends[3].content === "Complete the new task", "New task goal lost its route or plain prompt");
   window.__goalResult = { ok: true };
 } catch (error) {
-  window.__goalResult = { ok: false, error: error instanceof Error ? error.stack : String(error) };
+  const button = document.querySelector('.send-button');
+  window.__goalResult = { ok: false, error: `${error instanceof Error ? error.stack : String(error)}\n${JSON.stringify({
+    sends: sends.length,
+    recentRequests: calls.slice(-12).map(({ type }) => type),
+    draft: document.getElementById('composer-message')?.value,
+    sendButton: { label: button?.getAttribute('aria-label'), disabled: button?.disabled, classes: button?.className },
+  })}` };
 }
