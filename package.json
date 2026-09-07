@@ -1,6 +1,6 @@
 {
   "name": "tethoq",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Provider-neutral local and remote workspace for coding agents.",
@@ -23,7 +23,8 @@
     "release:bridge:win": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release/build-bridge-portable.ps1",
     "start:bridge": "node dist/apps/agent_bridge/src/main.js",
     "phone:pair": "node dist/apps/agent_bridge/src/main.js --phone-pair",
-    "start:relay": "node dist/services/relay/src/main.js"
+    "start:relay": "node dist/services/relay/src/main.js",
+    "release:android": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release/build-android.ps1"
   },
   "engines": {
     "node": ">=22.13.0"

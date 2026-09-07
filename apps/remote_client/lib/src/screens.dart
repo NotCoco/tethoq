@@ -976,6 +976,15 @@ class _PairingScreenState extends State<PairingScreen> {
                     'available on that computer.',
                   ),
                   const SizedBox(height: 20),
+                  Text('Windows installer',
+                      style: Theme.of(sheetContext).textTheme.labelLarge),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Open Tethoq Bridge from the Start menu and choose Pair '
+                    'phone. The Desktop installer includes Bridge. Keep it '
+                    'running in the tray while using your phone.',
+                  ),
+                  const SizedBox(height: 20),
                   Text('Development setup',
                       style: Theme.of(sheetContext).textTheme.labelLarge),
                   const SizedBox(height: 8),
@@ -4605,6 +4614,7 @@ class _SessionScreenState extends State<SessionScreen>
   bool _preparingSubmission = false;
   bool _sending = false;
   bool _interruptingCurrentWork = false;
+  RemoteSession? _preparedSubmissionOrigin;
   bool _stickToBottom = true;
   bool _readerScrollActive = false;
   bool _transcriptPointerDown = false;
@@ -4871,6 +4881,10 @@ class _SessionScreenState extends State<SessionScreen>
     return store.sessions.where(belongs).firstOrNull ??
         (store.selectedSession != null && belongs(store.selectedSession!)
             ? store.selectedSession
+            : null) ??
+        (_preparedSubmissionOrigin != null &&
+                belongs(_preparedSubmissionOrigin!)
+            ? _preparedSubmissionOrigin
             : null);
   }
 
@@ -6627,6 +6641,12 @@ class _SessionScreenState extends State<SessionScreen>
     if (_scrollController.hasClients) {
       _stickToBottom = _isAtPhysicalBottom(_scrollController.position);
     }
+    // Creation retires the local draft before the first delivery finishes.
+    // Retain this route's origin through that handoff, including the outgoing
+    // route animation. Host changes still invalidate it normally.
+    _preparedSubmissionOrigin = store.isPreparedSession(widget.sessionId)
+        ? _routeSession(store)
+        : null;
     _setComposerValue(TextEditingValue.empty);
     setState(() {
       _preparingSubmission = false;
@@ -6642,6 +6662,7 @@ class _SessionScreenState extends State<SessionScreen>
     // text entered while the request is pending receives a newer revision.
     var outcome = _ComposerSubmissionOutcome.accepted;
     String? createdSessionIdForNavigation;
+    var replacingPreparedRoute = false;
     try {
       if (submittedMeshTargets.isNotEmpty) {
         await store.startDelegation(
@@ -6676,7 +6697,11 @@ class _SessionScreenState extends State<SessionScreen>
       }
       if (mounted &&
           createdSessionIdForNavigation != null &&
+          store.sessions.any((session) =>
+              session.id == createdSessionIdForNavigation &&
+              (submittedHostId == null || session.hostId == submittedHostId)) &&
           submissionOriginIsCurrent()) {
+        replacingPreparedRoute = true;
         unawaited(Navigator.of(context).pushReplacement(
             sessionScreenRoute(createdSessionIdForNavigation)));
       }
@@ -6708,6 +6733,7 @@ class _SessionScreenState extends State<SessionScreen>
         outcome = _ComposerSubmissionOutcome.originLost;
       }
     } finally {
+      if (!replacingPreparedRoute) _preparedSubmissionOrigin = null;
       if (mounted) setState(() => _sending = false);
     }
     return outcome;

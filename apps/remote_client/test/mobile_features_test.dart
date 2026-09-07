@@ -347,6 +347,63 @@ void main() {
     );
   });
 
+  for (final switchHost in <bool>[false, true]) {
+    testWidgets('prepared first message handoff preserves route ownership (switch host: $switchHost)',
+        (tester) async {
+      tester.view.physicalSize = const Size(430, 900);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final store = _PreparedSubmissionFeatureStore()
+        ..connectionState = BridgeConnectionState.online
+        ..activeHost = _testHost('host-a');
+      store.providers.add(_provider('codex'));
+      final prepared = store.prepareSession('codex', workingDirectory: r'C:\work');
+      final navigator = GlobalKey<NavigatorState>();
+      addTearDown(store.dispose);
+      await tester.pumpWidget(StoreScope(
+        store: store,
+        child: MaterialApp(
+          navigatorKey: navigator,
+          home: const Scaffold(body: Text('Task list')),
+        ),
+      ));
+      unawaited(navigator.currentState!.push(MaterialPageRoute<void>(
+        builder: (_) => SessionScreen(
+          sessionId: prepared.id,
+          dictationRecorder: _NoopRecorder(),
+        ),
+      )));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byKey(const Key('session-composer')), 'First message');
+      await tester.pump();
+      await tester.tap(find.byKey(const Key('send-instruction')));
+      for (var attempt = 0; attempt < 20 && !store.submitted; attempt += 1) {
+        await tester.pump(const Duration(milliseconds: 10));
+      }
+      expect(store.submitted, isTrue);
+      await tester.pump(const Duration(milliseconds: 400));
+      expect(find.byType(SessionScreen), findsOneWidget,
+          reason: 'Retiring the local draft must not dismiss its pending submission.');
+      if (switchHost) {
+        store.activeHost = _testHost('host-b');
+        store.sessions.clear();
+        store.selectedSession = null;
+        store.notifyListeners();
+      }
+      store.deliveryGate.complete();
+      await tester.pumpAndSettle();
+      if (switchHost) {
+        expect(find.byType(SessionScreen), findsNothing);
+        expect(find.text('Task list'), findsOneWidget);
+      } else {
+        expect(tester.widget<SessionScreen>(find.byType(SessionScreen)).sessionId,
+            'created-first-message');
+      }
+      expect(tester.takeException(), isNull);
+    });
+  }
+
   testWidgets(
       'attachment source menu opens above plus and preserves draft on every dismissal',
       (tester) async {
@@ -6971,6 +7028,31 @@ class _FeatureStore extends RemoteAppStore {
         ),
       ],
     );
+  }
+}
+
+class _PreparedSubmissionFeatureStore extends _FeatureStore {
+  final Completer<void> deliveryGate = Completer<void>();
+  bool submitted = false;
+
+  @override
+  Future<String?> submitMessage(
+    String sessionId,
+    String content, {
+    String deliveryMode = 'queue',
+    String? modelId,
+    String? reasoningEffort,
+    List<RemoteAttachment> attachments = const <RemoteAttachment>[],
+    SimplifySettings? simplify,
+  }) async {
+    final created = _session('created-first-message', providerId: 'codex', hostId: 'host-a');
+    discardPreparedSession(sessionId);
+    sessions.add(created);
+    selectedSession = created;
+    submitted = true;
+    notifyListeners();
+    await deliveryGate.future;
+    return created.id;
   }
 }
 

@@ -417,16 +417,20 @@ async function exerciseOpenCodeReasoningReconciliation() {
         buttons: buttons.length,
         groups: root?.querySelectorAll('.reasoning-group').length ?? 0,
         workingPulses: root?.querySelectorAll('.working-pulse').length ?? 0,
+        pulseAfterReasoning: Boolean(buttons[0] && root?.querySelector('.working-pulse') && (buttons[0].compareDocumentPosition(root.querySelector('.working-pulse')) & Node.DOCUMENT_POSITION_FOLLOWING)),
+        headerRunning: buttons[0]?.classList.contains('reasoning-running'),
         activities: root?.querySelectorAll('.activity-disclosure').length ?? 0,
         expanded: buttons[0]?.getAttribute('aria-expanded'),
         bodies,
         transcript: root?.innerText ?? '',
       };
     })()`);
-    return state.controls === 1
+    return state.controls === 2
       && state.buttons === 1
-      && state.groups === 1
-      && state.workingPulses === 0
+      && state.groups === 2
+      && state.workingPulses === 1
+      && state.pulseAfterReasoning
+      && state.headerRunning === false
       && state.expanded === 'true'
       && state.bodies.length === 1
       && state.bodies[0] === 'Checking the'
@@ -1001,11 +1005,27 @@ async function gracefulQuit() {
   if (!appPid) return;
   const available = await cdp.evaluate('typeof window.tethoqDesktop.quitForSmoke === "function"');
   assert.equal(available, true, 'The env-guarded packaged smoke quit hook was not exposed.');
-  await cdp.evaluate('void window.tethoqDesktop.quitForSmoke()');
-  // An open debugging connection can retain Electron after its quit event.
-  cdp.close();
-  cdp = undefined;
-  await waitFor(() => !processCommandLines().some((process) => process.ProcessId === appPid), 'graceful packaged app shutdown', 15_000);
+  // Register before requesting quit. Synchronous PowerShell process polling blocks
+  // this test's provider server and delays delivery of the child's actual exit.
+  const child = appProcess;
+  assert.equal(child.exitCode, null, 'The packaged app exited before the quit request.');
+  let onExit;
+  let timer;
+  const exited = new Promise((resolve) => { onExit = resolve; child.once('exit', onExit); });
+  try {
+    await cdp.evaluate('void window.tethoqDesktop.quitForSmoke()');
+    // An open debugging connection can retain Electron after its quit event.
+    cdp.close();
+    cdp = undefined;
+    const code = await Promise.race([
+      exited,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Graceful packaged app shutdown timed out')), 15_000); }),
+    ]);
+    assert.equal(code, 0, 'The packaged app did not exit cleanly.');
+  } finally {
+    clearTimeout(timer);
+    child.removeListener('exit', onExit);
+  }
 }
 
 async function launchPackagedApp() {
