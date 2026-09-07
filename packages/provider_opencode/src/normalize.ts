@@ -19,6 +19,28 @@ export function asJsonObject(value: unknown): JsonObject {
   return JSON.parse(JSON.stringify(value)) as JsonObject;
 }
 
+/** Read the documented error message, never transport bodies, headers or metadata. */
+export function normalizeOpenCodeError(value: unknown): { message: string; code: string; recovery?: "compact_context" } {
+  const error = isRecord(value) ? value : {};
+  const data = isRecord(error.data) ? error.data : {};
+  const raw = [data.message, error.message, value].find((item): item is string => typeof item === "string" && item.trim().length > 0);
+  const code = typeof error.name === "string" ? error.name : "ProviderError";
+  const imageLimit = raw?.match(/request contains (\d+) images, exceeding the maximum of (\d+) allowed per request/iu);
+  if (code === "APIError" && (data.statusCode === 400 || data.statusCode === 413) && imageLimit
+    && Number.isSafeInteger(Number(imageLimit[1])) && Number.isSafeInteger(Number(imageLimit[2]))
+    && Number(imageLimit[2]) > 0 && Number(imageLimit[1]) > Number(imageLimit[2])) {
+    return {
+      code: "IMAGE_LIMIT_EXCEEDED",
+      message: `The conversation contains ${imageLimit[1]} images, but this provider allows ${imageLimit[2]} per request. Compact the older context before continuing; the conversation and original files will remain available.`,
+      recovery: "compact_context",
+    };
+  }
+  const message = raw?.replace(/Bearer\s+\S+|\bsk-[\w-]+/giu, "[redacted]")
+    .replace(/data:[^\s]+/giu, "[attachment]").replace(/https?:\/\/[^\s]+/giu, "[provider URL]")
+    .replace(/\s+/gu, " ").trim().slice(0, 2_000);
+  return { code, message: message || "OpenCode could not complete this response." };
+}
+
 function milliseconds(value: unknown, fallback = Date.now()): string {
   return new Date(typeof value === "number" && Number.isFinite(value) ? value : fallback).toISOString();
 }
@@ -567,6 +589,10 @@ export function normalizeOpenCodeMessages(hostId: string, providerSessionId: str
       const text = stripProviderPromptGuidance(part.text);
       return [...(text.trim() ? [{ ...part, text }] : []), ...workflows];
     });
+    if (info.error !== undefined) {
+      const error = normalizeOpenCodeError(info.error);
+      parts.push({ type: "error", message: error.message, code: error.code });
+    }
     const time = isRecord(info.time) ? info.time : {};
     const createdAt = milliseconds(time.created);
     messages.push({

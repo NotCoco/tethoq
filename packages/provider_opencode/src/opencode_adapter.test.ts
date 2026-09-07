@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ProviderEvent } from "../../provider_contract/src/index.js";
-import type { RemoteSession } from "../../protocol/src/index.js";
+import type { JsonObject, RemoteSession } from "../../protocol/src/index.js";
 import { type FetchLike } from "./http_client.js";
 import type { OpenCodeActivityReadOptions, OpenCodeActivityReader } from "./activity.js";
 import { OpenCodeAdapter } from "./opencode_adapter.js";
@@ -3613,8 +3613,10 @@ test("a genuine session error releases the owned prompt", async (t) => {
   });
   t.after(() => adapter.dispose());
   const errors: string[] = [];
+  const readableErrors: JsonObject[] = [];
   await adapter.subscribe(null, (event) => {
     if (event.type !== "agent.error") return;
+    readableErrors.push(event.payload);
     const error = event.payload.error;
     errors.push(typeof error === "object" && error !== null && !Array.isArray(error) && typeof error.name === "string" ? error.name : "unknown");
   });
@@ -3623,11 +3625,14 @@ test("a genuine session error releases the owned prompt", async (t) => {
   assert.equal(adapter.hasActiveTurn("ses_real_error"), true);
   events.push({ payload: { type: "session.error", properties: {
     sessionID: "ses_real_error",
-    error: { name: "APIError", data: { message: "provider failed", isRetryable: false } },
+    error: { name: "APIError", data: { message: "provider failed", isRetryable: false,
+      responseBody: "private transport", metadata: { url: "https://private.example" } } },
   } } });
   await waitFor(() => errors.length === 1, "the genuine provider error must remain visible");
 
   assert.deepEqual(errors, ["APIError"]);
+  assert.equal(readableErrors[0]?.message, "provider failed");
+  assert.doesNotMatch(JSON.stringify(readableErrors), /private|responseBody|metadata/);
   assert.equal(adapter.hasActiveTurn("ses_real_error"), false, "a failed prompt cannot keep the queue held forever");
 });
 
@@ -5874,6 +5879,43 @@ test("OpenCode compaction is not cut off by the ordinary request timeout", async
   assert.equal(summarizeCalls, 1);
 });
 
+test("OpenCode compaction history cannot replace the ordinary model and reasoning selection", async (t) => {
+  const events: ProviderEvent[] = [];
+  const adapter = new OpenCodeAdapter({ hostId: "host", baseUrl: "http://localhost/",
+    fetch: async (input, init) => requestUrl(input).pathname === "/global/event"
+      ? new SseFixture().response(init?.signal ?? undefined)
+      : jsonResponse([
+          { info: { id: "ordinary", role: "assistant", providerID: "opencode-go", modelID: "muse", variant: "xhigh", time: { created: 1 } }, parts: [] },
+          { info: { id: "marker", role: "user", model: { providerID: "other", modelID: "summary-model" }, time: { created: 2 } }, parts: [{ type: "compaction" }] },
+          { info: { id: "summary", role: "assistant", parentID: "marker", summary: true, mode: "compaction", providerID: "other", modelID: "summary-model", time: { created: 3 } }, parts: [] },
+        ]),
+  });
+  t.after(() => adapter.dispose());
+  await adapter.subscribe(null, (event) => { events.push(event); });
+  await adapter.getMessages("session");
+  const selection = events.find((event) => event.type === "session.updated");
+  assert.equal(selection?.payload.modelId, "opencode-go/muse");
+  assert.equal(selection?.payload.reasoningEffort, "xhigh");
+});
+
+test("OpenCode marks both snapshot and incremental compaction text before it reaches the renderer", async (t) => {
+  const stream = new SseFixture();
+  const deltas: ProviderEvent[] = [];
+  const adapter = new OpenCodeAdapter({ hostId: "host", baseUrl: "http://localhost/",
+    fetch: async (input, init) => requestUrl(input).pathname === "/global/event"
+      ? stream.response(init?.signal ?? undefined) : jsonResponse([]),
+  });
+  t.after(() => adapter.dispose());
+  await adapter.subscribe(null, (event) => { if (event.type === "message.delta") deltas.push(event); });
+  for (const [id, summary] of [["summary", true], ["ordinary", false]] as const) {
+    stream.push({ payload: { type: "message.updated", properties: { info: { id, sessionID: "session", role: "assistant", summary } } } });
+    stream.push({ payload: { type: "message.part.updated", properties: { part: { id: `${id}-part`, sessionID: "session", messageID: id, type: "text", text: "## Objective" } } } });
+    stream.push({ payload: { type: "message.part.delta", properties: { sessionID: "session", messageID: id, partID: `${id}-part`, field: "text", delta: "\nNext steps" } } });
+  }
+  await waitFor(() => deltas.length === 4, "both live text routes");
+  assert.deepEqual(deltas.map(event => event.payload.compaction), [true, true, undefined, undefined]);
+});
+
 function openCodeCompactionHistory(error?: unknown): unknown[] {
   return [
     { info: { id: "new-marker", role: "user" }, parts: [{ type: "compaction" }] },
@@ -5906,6 +5948,51 @@ test("OpenCode compaction waits for new history after HTTP acknowledgment and sh
   await Promise.all([pending, duplicate]);
   assert.equal(settled, true);
 });
+
+for (const newerPrompt of [false, true]) {
+  test(`OpenCode error recovery waits for runner cleanup and respects newer work (${newerPrompt})`, async (t) => {
+    const events = new SseFixture();
+    let summarizeCalls = 0;
+    let errorSeen = false;
+    let summarized = false;
+    const adapter = new OpenCodeAdapter({
+      hostId: "host", baseUrl: "http://localhost/", compactionTimeoutMs: 5000,
+      activityReader: new SequenceActivityReader(new Set()), activityPollIntervalMs: 60_000,
+      fetch: async (input, init) => {
+        const path = requestUrl(input).pathname;
+        if (path === "/global/event") return events.response(init?.signal ?? undefined);
+        if (path.endsWith("/prompt_async")) return new Response(null, { status: 204 });
+        if (path.endsWith("/message")) return jsonResponse([
+          { info: { role: "assistant", providerID: "test", modelID: "test" } },
+          ...(summarized ? openCodeCompactionHistory() : []),
+        ]);
+        if (path.endsWith("/summarize")) {
+          assert.equal(JSON.parse(String(init?.body)).auto, false, "only Tethoq schedules the next goal turn");
+          summarizeCalls++;
+          summarized = true;
+          return jsonResponse({});
+        }
+        throw new Error(`Unexpected request: ${path}`);
+      },
+    });
+    t.after(() => adapter.dispose());
+    await adapter.subscribe(null, (event) => { if (event.type === "agent.error") errorSeen = true; });
+    await adapter.sendMessage("session", { requestId: "failed-turn", content: "Review images" });
+    events.push({ payload: { type: "session.error", properties: { sessionID: "session", error: {
+      name: "APIError", data: { statusCode: 400, message: "request contains 51 images, exceeding the maximum of 50 allowed per request" },
+    } } } });
+    await waitFor(() => errorSeen, "provider failure");
+    const compaction = adapter.compactSession("session");
+    const outcome = compaction.then(() => "completed", () => "rejected");
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(summarizeCalls, 0, "error publication precedes native runner cleanup");
+    if (newerPrompt) await adapter.sendMessage("session", { requestId: "newer-turn", content: "New user instruction" });
+    events.push({ payload: { type: "session.idle", properties: { sessionID: "session" } } });
+    assert.equal(await outcome, newerPrompt ? "rejected" : "completed");
+    assert.equal(summarizeCalls, newerPrompt ? 0 : 1);
+    if (newerPrompt) assert.equal(adapter.hasActiveTurn("session"), true, "recovery cannot take over a newer prompt");
+  });
+}
 
 for (const failure of ["error", "cancelled", "request-failed", "disconnect", "dispose", "timeout"] as const) {
   test(`OpenCode compaction rejects ${failure} without reporting success`, async (t) => {

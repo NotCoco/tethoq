@@ -1064,6 +1064,16 @@ test("compaction is a non-terminal row while the same turn keeps producing work"
   assert.equal(helpers.sessionPresentsLiveTurn({ state: "completed" }, completedTurn), false);
 });
 
+test("a native compaction summary and its adjacent completion receipt share one disclosure", () => {
+  const summary = { id: "summary", messageId: "summary-message", kind: "assistant", title: "Compaction", body: "## Objective\nPreserve the task", state: "completed", timestamp: "2026-09-07T11:00:00.000Z" };
+  const receipt = { id: "receipt", kind: "assistant", title: "System", body: "Session compacted", state: "completed", timestamp: "2026-09-07T11:03:00.000Z" };
+  const rows = timelineHelpers.coalesceCompactionCopies([summary, receipt]);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].detail, summary.body);
+  assert.equal(timelineHelpers.timelineBoundaryLabel(rows[0]), "Session compacted");
+  assert.equal(timelineHelpers.coalesceCompactionCopies([{ ...summary, title: undefined }, receipt]).length, 2, "ordinary summaries are not silently folded into compaction");
+});
+
 test("a Codex compaction handoff final is not a terminal answer", () => {
   const handoff = [
     { id: "user-live", kind: "user", state: "completed", body: "Keep working" },

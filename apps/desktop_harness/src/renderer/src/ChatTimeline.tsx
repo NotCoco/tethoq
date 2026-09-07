@@ -165,6 +165,10 @@ function adjacentCompactionSummary(timeline: readonly TimelineItem[], start: num
   if (candidateIndex < start) return null;
   const candidate = timeline[candidateIndex];
   const compaction = timeline[compactionIndex];
+  // The native summary is already a collapsed disclosure. Tethoq's adjacent
+  // completion receipt belongs inside that same entry, even for long summaries.
+  if (candidate?.kind === "assistant" && candidate.title === "Compaction" && compaction?.body === "Session compacted"
+    && compaction.title === "System" && !compaction.detail) return candidateIndex;
   if (!candidate || !compaction || candidate.kind !== "assistant" || candidate.phase !== "final_answer") return null;
   if (timelineBoundaryLabel(candidate) === "Session compacted") return null;
   const candidateAt = Date.parse(candidate.timestamp);
@@ -1186,7 +1190,8 @@ function StandaloneReasoningGroup({ item, onLinkOpen }: { item: TimelineItem; on
   />;
 }
 
-const CompactionDisclosure = memo(function CompactionDisclosure({ item, label, nested = false }: { item: TimelineItem; label: string; nested?: boolean }) {
+const CompactionDisclosure = memo(function CompactionDisclosure({ item, label: completedLabel, nested = false }: { item: TimelineItem; label: string; nested?: boolean }) {
+  const label = item.state === "running" ? "Compacting context…" : item.state === "failed" ? "Compaction stopped" : completedLabel;
   const [open, setOpen] = useState(false);
   const rawDetail = compactionDetailText(item, label);
   const detail = (rawDetail.replace(compactionSummaryNotice, "").trim() || rawDetail);
