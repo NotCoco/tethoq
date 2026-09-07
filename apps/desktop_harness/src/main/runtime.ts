@@ -147,6 +147,7 @@ export class DesktopRuntime {
       ...(openCodeCommand !== undefined ? { command: openCodeCommand } : {}),
       statePath: join(dirname(this.#configPath), stateFile),
       environment: { ...process.env, UAR_MESH_RUNTIME: this.#meshRuntimePath },
+      hasActiveWork: () => (this.#bridge?.providerActiveSessions("opencode").length ?? 0) > 0,
     };
   }
 

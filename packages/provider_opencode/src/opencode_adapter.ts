@@ -752,7 +752,11 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   }
 
   public async getSessionContext(providerSessionId: string): Promise<Omit<SessionContextState, "sessionId" | "compactionThresholdTokens" | "minimumThresholdTokens" | "supportsThreshold" | "isCompacting" | "compactionKind">> {
-    const value = await this.rawMessages(providerSessionId);
+    // Context heartbeats need message metadata only. Downloading hundreds of
+    // image/tool parts every time can saturate the local server's event loop
+    // and make its health checks and prompt delivery fail on long tasks.
+    const value = await this.#sessionIndexReader.readMessageInfo?.(providerSessionId, 500).catch(() => undefined)
+      ?? await this.rawMessages(providerSessionId);
     const entries = Array.isArray(value) ? value : [];
     const assistants = entries
       .map((entry) => isRecord(entry) && isRecord(entry.info) ? entry.info : isRecord(entry) ? entry : null)
