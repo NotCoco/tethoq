@@ -691,6 +691,7 @@ export class AgentBridge {
   readonly #providerCompactionTurnGenerations = new Map<string, Map<string, number>>();
   readonly #compactedTurnGenerations = new Map<string, Set<number>>();
   readonly #goals = new Map<string, SessionGoal>();
+  readonly #goalContinuations = new Map<string, ReturnType<typeof setTimeout>>();
   /** Local generations make delayed get/set/clear replies unable to clobber a newer event. */
   readonly #goalGenerations = new Map<string, number>();
   /** Provider ordering tokens are optional, but valuable when timestamps tie. */
@@ -2857,6 +2858,15 @@ export class AgentBridge {
     this.assertSessionNotStopped(parentSessionId);
     this.assertSessionHost(parentSessionId);
     if (this.#cache.get(parentSessionId) === undefined) throw new Error("Parent session is not loaded on this bridge");
+    if (tool === "tethoq_goal") {
+      const goal = this.#goals.get(parentSessionId);
+      if (goal?.source !== "tethoq") throw new TaskNotOwnedHereError();
+      if (input.status === undefined) return { objective: goal.objective, status: goal.status };
+      if (input.status !== "complete" && input.status !== "blocked") throw new Error("Goal status must be complete or blocked");
+      if (goal.status !== "active") throw new Error("This goal is no longer active");
+      const updated = await this.setSessionGoal(parentSessionId, { status: input.status });
+      return { status: updated.status };
+    }
     if (tool === "mesh_dispatch_delegation") {
       const delegationId = requiredMeshString(input, "delegation_id", 256);
       const assignments = parentDelegationAssignments(input);
@@ -3913,6 +3923,7 @@ export class AgentBridge {
     request: SendMessageRequest,
     allowDuringDispose = false,
     queueDelivery?: QueueDeliveryRecord,
+    goalContinuation?: SessionGoal,
   ): Promise<SendMessageResult> {
     this.assertActive(allowDuringDispose);
     const stopGeneration = this.#stopGenerations.get(globalSessionId) ?? 0;
@@ -3923,10 +3934,10 @@ export class AgentBridge {
     const prepared = withSimplifyResponseGuidance(request);
     // Automatic inspection can take a full helper turn. Keep retries and later
     // messages behind it so they cannot duplicate the send or replace its images.
-    if (request.metadata?.tethoqGoalObjective !== undefined || this.#visionProxies.has(globalSessionId) || this.#sessionDispatchTails.has(globalSessionId)
+    if (goalContinuation !== undefined || request.metadata?.tethoqGoalObjective !== undefined || this.#visionProxies.has(globalSessionId) || this.#sessionDispatchTails.has(globalSessionId)
       || this.pendingContextHandoff(globalSessionId) !== undefined || this.pendingBranchBootstrap(globalSessionId) !== undefined) {
       return await this.withSessionDispatchLock(globalSessionId, async () =>
-        await this.dispatchMessage(globalSessionId, prepared, queueDelivery, stopGeneration));
+        await this.dispatchMessage(globalSessionId, prepared, queueDelivery, stopGeneration, goalContinuation));
     }
     return await this.dispatchMessage(globalSessionId, prepared, queueDelivery, stopGeneration);
   }
@@ -3963,7 +3974,7 @@ export class AgentBridge {
         ? ""
         : `\nToken budget: ${goal.tokenBudget} tokens. This bridge-owned fallback has no provider-neutral usage accounting or enforcement; treat the budget as advisory.`;
       const pursuit = goal.status === "active"
-        ? "Work toward this objective across turns. Complete the necessary work before concluding, or explain what blocks further progress. Do not claim success without evidence."
+        ? "Keep working until this objective is achieved. A progress report is not completion. Use the tethoq_goal tool (uar_mesh_tethoq_goal in OpenCode) with status complete only after verifying success, or status blocked when further progress requires user input or an external change, explaining the blocker in your response. Tethoq will continue unfinished active goals after a normal turn ends. Do not claim success without evidence."
         : `This goal is ${goal.status}. Do not pursue it autonomously or reopen it; follow the current user message.`;
       const goalContext = `<tethoq_task_goal>\n${goalHeader}\n\nObjective: ${goal.objective}\nStatus: ${goal.status}.${budgetContext}\n${pursuit}\nThis private context is not a user message. Keep control labels and metadata out of the response.\n</tethoq_task_goal>`;
       developerInstructions = developerInstructions === undefined ? goalContext : `${developerInstructions}\n\n${goalContext}`;
@@ -4005,6 +4016,7 @@ export class AgentBridge {
     request: SendMessageRequest,
     queueDelivery?: QueueDeliveryRecord,
     stopGeneration = this.#stopGenerations.get(globalSessionId) ?? 0,
+    goalContinuation?: SessionGoal,
   ): Promise<SendMessageResult> {
     const previous = this.#sendLedger.get(request.requestId);
     if (previous !== undefined) return previous;
@@ -4062,7 +4074,12 @@ export class AgentBridge {
     const compactionGenerationBeforeSend = this.#compactionTurnGenerations.get(globalSessionId)?.generation;
     const reportedSelectionGenerationBeforeSend = this.#cache.reportedSelectionGeneration(globalSessionId);
     let result: SendMessageResult;
-    try { this.assertSessionNotStopped(globalSessionId, stopGeneration); }
+    try {
+      this.assertSessionNotStopped(globalSessionId, stopGeneration);
+      if (goalContinuation !== undefined && !this.canContinueGoal(globalSessionId, goalContinuation)) {
+        throw new Error("Goal continuation was superseded by a task or goal change");
+      }
+    }
     catch (error) {
       await this.markQueueDeliveryRejected(delivery, error);
       throw error;
@@ -5736,6 +5753,8 @@ export class AgentBridge {
     this.#earsHelperCreations.clear();
     this.#earsTranscriptionTails.clear();
     this.#earsJobs.clear();
+    for (const timer of this.#goalContinuations.values()) clearTimeout(timer);
+    this.#goalContinuations.clear();
     this.#goals.clear();
     this.#goalGenerations.clear();
     this.#nativeGoalRevisions.clear();
@@ -6027,6 +6046,7 @@ export class AgentBridge {
         void this.pumpQueue(globalSessionId);
         void this.pumpCrossSessionInbox(globalSessionId);
         void this.pumpDelegationsForSession(globalSessionId);
+        if (event.type === "agent.completed") this.scheduleGoalContinuation(globalSessionId);
         void this.releaseProviderIfIdle(this.requireAdapter(event.providerId));
       });
     } else if (globalSessionId !== undefined && (event.type === "session.status_changed" || event.type === "session.updated")) {
@@ -6714,6 +6734,46 @@ export class AgentBridge {
 
   private async persistGoals(): Promise<void> {
     await this.#onGoalsChange?.(Object.fromEntries([...this.#goals].filter(([, goal]) => goal.source === "tethoq")));
+  }
+
+  private canContinueGoal(sessionId: string, goal: SessionGoal): boolean {
+    const session = this.#cache.get(sessionId);
+    return !this.#disposed && goal.source === "tethoq" && goal.status === "active"
+      && this.#goals.get(sessionId) === goal
+      && (session?.state === "idle" || session?.state === "completed")
+      && !this.sessionHoldsFollowUpQueue(sessionId)
+      && !this.hasPendingUserQueue(sessionId) && !this.#queuePumps.has(sessionId)
+      && !this.#crossSessionPumps.has(sessionId) && !this.#pendingProviderSends.has(sessionId);
+  }
+
+  private scheduleGoalContinuation(sessionId: string): void {
+    const goal = this.#goals.get(sessionId);
+    if (goal?.source !== "tethoq" || goal.status !== "active" || this.#disposed
+      || this.#goalContinuations.has(sessionId) || this.#clientTooling === undefined) return;
+    // Let the provider settle its final idle event, and let user queues run first.
+    const timer = setTimeout(() => {
+      void (async () => {
+        if (!this.canContinueGoal(sessionId, goal)) return;
+        const session = this.#cache.get(sessionId)!;
+        try {
+          const result = await this.sendMessageInternal(sessionId, {
+            requestId: `goal_continue_${randomUUID()}`,
+            content: hiddenProviderControlContent("continue"),
+            developerInstructions: "Continue the active goal from the current work and previous results. Make the next concrete improvement; do not repeat the previous progress report. This is an internal continuation, not a new user message.",
+            ...(session.modelId !== undefined ? { modelId: session.modelId } : {}),
+            ...(session.reasoningEffort !== undefined ? { reasoningEffort: session.reasoningEffort } : {}),
+          }, false, undefined, goal);
+          if (!result.accepted) throw new Error("Goal continuation was not accepted");
+          if (this.#cache.get(sessionId) === session) this.#cache.updateState(sessionId, "working", false);
+        } catch {
+          if (this.canContinueGoal(sessionId, goal)) {
+            await this.setSessionGoal(sessionId, { status: "blocked" });
+          }
+        }
+      })().catch(() => undefined).finally(() => this.#goalContinuations.delete(sessionId));
+    }, 750);
+    timer.unref();
+    this.#goalContinuations.set(sessionId, timer);
   }
 
   private rememberCompactionThreshold(globalSessionId: string, threshold: number): void {

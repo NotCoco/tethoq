@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { CURRENT_PROTOCOL_VERSION, createDeviceIdentity, createHostIdentity, earsModelKey, makeGlobalSessionId, parseGlobalSessionId, type DelegationTask, type JsonObject, type ProviderCapabilities, type RemoteMessage, type RemoteModel, type RemoteSession, type SessionContextState, type SessionGoal } from "../../../packages/protocol/src/index.js";
 import { FakeProviderAdapter } from "../../../packages/provider_fake/src/index.js";
-import { ProviderAdapterError } from "../../../packages/provider_contract/src/index.js";
+import { ProviderAdapterError, stripProviderPromptGuidance } from "../../../packages/provider_contract/src/index.js";
 import { AgentBridge, maxLocalQueuedAttachmentBytes, maxLocalQueuedMessages, messageAnchorCursor, messagePage, visionProxyAvailabilityInstructions } from "./bridge.js";
 import { AttachmentUploadManager } from "./attachment_uploads.js";
 import { SessionCache } from "./session_cache.js";
@@ -222,8 +223,19 @@ class TerminalAttentionFakeProvider extends FakeProviderAdapter {
 
 class GoalCapturingFakeProvider extends FakeProviderAdapter {
   public lastRequest: SendMessageRequest | undefined;
+  public readonly requests: SendMessageRequest[] = [];
+  #sink: ProviderEventSink | undefined;
+  public override async subscribe(providerSessionId: string | null, sink: ProviderEventSink): Promise<Subscription> {
+    this.#sink = sink;
+    return await super.subscribe(providerSessionId, sink);
+  }
+  public async finish(providerSessionId: string, type: ProviderEvent["type"] = "agent.completed"): Promise<void> {
+    await this.#sink?.({ eventId: `goal-end-${randomUUID()}`, providerId: this.providerId, providerSessionId,
+      type, occurredAt: new Date().toISOString(), payload: {} });
+  }
   public override async sendMessage(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
     this.lastRequest = request;
+    this.requests.push(request);
     return { accepted: true, providerTurnId: `goal-turn-${providerSessionId}`, details: [] };
   }
 }
@@ -8593,6 +8605,58 @@ test("Tethoq goals support the full lifecycle on a provider with no native goal 
   assert.ok(persisted.length >= 7);
   assert.deepEqual(persisted.at(-1), {});
   await bridge.dispose();
+});
+
+test("active fallback goals continue privately and stop when the model completes the goal", async (t) => {
+  const hostId = "host-goal-continuation";
+  const provider = new GoalCapturingFakeProvider({ hostId, sessionCount: 1 });
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider]);
+  bridge.configureClientTooling(testClientTooling());
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  await bridge.refresh();
+  const session = bridge.sessions()[0]!;
+  await bridge.setSessionGoal(session.id, { objective: "Finish the requested repair" });
+  await bridge.sendMessage(session.id, { requestId: "start-goal", content: "Repair it", modelId: "fake-model", reasoningEffort: "high" });
+  await provider.finish(session.providerSessionId);
+  await provider.finish(session.providerSessionId);
+  await waitFor(() => provider.requests.length === 2, "one automatic goal continuation");
+  assert.equal(stripProviderPromptGuidance(provider.lastRequest!.content), "", "automatic control text is hidden from the conversation");
+  assert.match(provider.lastRequest!.developerInstructions!, /next concrete improvement/);
+  assert.match(provider.lastRequest!.developerInstructions!, /tethoq_goal/);
+  assert.equal(provider.lastRequest!.modelId, "fake-model");
+  assert.equal(provider.lastRequest!.reasoningEffort, "high");
+  assert.deepEqual(await bridge.executeClientTool(session.id, "tethoq_goal", {}), { objective: "Finish the requested repair", status: "active" });
+  await assert.rejects(bridge.executeClientTool(session.id, "tethoq_goal", { status: "active" }), /complete or blocked/);
+  assert.deepEqual(await bridge.executeClientTool(session.id, "tethoq_goal", { status: "complete" }), { status: "complete" });
+  await provider.finish(session.providerSessionId);
+  await new Promise((resolve) => setTimeout(resolve, 850));
+  assert.equal(provider.requests.length, 2);
+  await assert.rejects(bridge.executeClientTool(session.id, "tethoq_goal", { status: "complete" }), /no longer active/);
+});
+
+test("fallback goal continuations yield to pause, clear, stop, errors, and newer user instructions", async (t) => {
+  for (const action of ["paused", "clear", "stop", "error", "queued", "blocked"] as const) {
+    await t.test(action, async (t) => {
+      const hostId = `host-goal-cancel-${action}`;
+      const provider = new GoalCapturingFakeProvider({ hostId, sessionCount: 1 });
+      const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider]);
+      bridge.configureClientTooling(testClientTooling());
+      t.after(() => bridge.dispose());
+      await bridge.start();
+      await bridge.refresh();
+      const session = bridge.sessions()[0]!;
+      await bridge.setSessionGoal(session.id, { objective: "Keep working only while this goal is active" });
+      await provider.finish(session.providerSessionId, action === "error" ? "agent.error" : "agent.completed");
+      if (action === "paused") await bridge.setSessionGoal(session.id, { status: "paused" });
+      if (action === "clear") await bridge.clearSessionGoal(session.id);
+      if (action === "stop") await bridge.interrupt(session.id);
+      if (action === "blocked") await bridge.executeClientTool(session.id, "tethoq_goal", { status: "blocked" });
+      if (action === "queued") await bridge.enqueueMessage(session.id, { requestId: "user-priority", content: "Follow this newer instruction first" });
+      await new Promise((resolve) => setTimeout(resolve, 850));
+      assert.equal(provider.requests.some((request) => request.requestId.startsWith("goal_continue_")), false);
+    });
+  }
 });
 
 test("goal RPCs route get/set/clear without a model turn and reject malformed payloads", async (t) => {

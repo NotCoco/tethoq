@@ -485,7 +485,7 @@ test("dictation exposes a persistent microphone picker and a compact wide MP3 wi
   assert.match(composer, /recording \|\| audioFinalizing \? null : <Popover label="Choose dictation source"/u, "recording must give the whole lower pill to Stop instead of leaving a source-menu interception zone");
   assert.match(composer, /const recordingStripHeight = audioStripHost\.current\?\.clientHeight \?\? 0;[\s\S]*?composerLimit - attachmentHeight - recordingStripHeight - 20[\s\S]*?composerEntryRow\.current\?\.getBoundingClientRect\(\)\.bottom[\s\S]*?target\.getBoundingClientRect\(\)\.height - Math\.ceil\(overflow\)/u);
   assert.doesNotMatch(composer, /--dictation-connector-height/u, "recording layout must not retain geometry for the removed decorative connector");
-  assert.match(composer, /\[attachments, content, dictationPhase, meshTargets, resizeTextarea, workflowAttachments\]/u, "recording and Mesh target changes must recompute the bounded textarea height");
+  assert.match(composer, /\[attachments, content, dictationPhase, goalIndicatorVisible, meshTargets, resizeTextarea, workflowAttachments\]/u, "recording, goal, and Mesh target changes must recompute the bounded textarea height");
   assert.match(composer, /composer-recording/u);
   assert.match(composer, /onSettled\?\.\(committed\);\s*setAudioFinalizing\(false\);\s*setPhase\("idle"\)/u);
   assert.match(recorder, /public async start\(inputStream\?: MediaStream\)/u);

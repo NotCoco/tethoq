@@ -39,6 +39,15 @@ interface GatewayResponse {
 
 export const meshToolDefinitions: readonly ClientToolDefinition[] = [
   {
+    name: "tethoq_goal",
+    description: "Read this task's active Tethoq goal, or mark it complete after verifying the objective, or blocked when progress requires user input or an external change. Use only for the goal in private Tethoq instructions; never create or reopen a goal.",
+    inputSchema: {
+      type: "object",
+      properties: { status: { type: "string", enum: ["complete", "blocked"] } },
+      additionalProperties: false,
+    },
+  },
+  {
     name: "mesh_list_sessions",
     description: "Find other indexed Tethoq tasks on this host. Results are bounded and exclude this task, side chats, and internal helper sessions.",
     inputSchema: {
