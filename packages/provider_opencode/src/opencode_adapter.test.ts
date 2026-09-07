@@ -1554,7 +1554,7 @@ test("OpenCode retries an unavailable change discovery without another filesyste
     ? events.response(init?.signal ?? undefined)
     : new Response("not found", { status: 404 });
   const reader = new SequenceActivityReader(new Set(), undefined, new Set(["recovered-external-task"]));
-  let clockOffsetMs = 0;
+  let nowMs = Date.now();
   const adapter = new OpenCodeAdapter({
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
@@ -1562,7 +1562,7 @@ test("OpenCode retries an unavailable change discovery without another filesyste
     activityReader: reader,
     activityPollIntervalMs: 60_000,
     activityDiscoveryIntervalMs: 250,
-    now: () => new Date(Date.now() + clockOffsetMs),
+    now: () => new Date(nowMs),
   });
   t.after(() => adapter.dispose());
   const states: string[] = [];
@@ -1578,11 +1578,14 @@ test("OpenCode retries an unavailable change discovery without another filesyste
     }
   });
   await waitFor(() => reader.reads === 1, "startup discovery must finish before the changed commit");
-  clockOffsetMs = 5_000;
+  nowMs += 5_000;
 
   reader.signalChange();
   await waitFor(() => reader.reads >= 2, "the changed commit must trigger its first discovery attempt");
   assert.equal(states.length, 0, "an unavailable read is not working evidence");
+  // The real retry timer still enforces the cadence checked below. Advance the
+  // injected clock so a slightly early timer cannot produce an unrelated exact read.
+  nowMs += 250;
   await waitFor(
     () => states.includes("working") && catalogueSignals.length === 1,
     "the pending discovery must retry without a second filesystem event",
