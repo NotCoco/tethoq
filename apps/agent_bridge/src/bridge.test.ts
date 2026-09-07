@@ -5094,6 +5094,22 @@ test("client history preserves display phase while stripping provider diagnostic
   assert.deepEqual(page.messages[0]?.nativeMetadata, { phase: "final_answer" });
 });
 
+test("client history preserves only the assistant compaction display marker", () => {
+  const message: RemoteMessage = {
+    id: "summary", sessionId: "host/opencode/session", providerMessageId: "native-summary",
+    role: "assistant", createdAt: "2026-09-07T11:00:00.000Z", status: "completed",
+    parts: [{ type: "text", text: "## Objective\nContinue the task." }], nativeMetadata: {},
+  };
+  for (const marker of [{ summary: true }, { mode: "compaction" }, { agent: "compaction" }]) {
+    const marked = { ...message, nativeMetadata: { ...marker, providerTrace: "private", path: { cwd: "private" } } };
+    const assistant = clientMessagePage([marked], null).messages[0]!;
+    assert.deepEqual(assistant.nativeMetadata, { summary: true });
+    assert.deepEqual(assistant.parts, message.parts);
+    assert.deepEqual(clientMessagePage([{ ...marked, role: "user" }], null).messages[0]?.nativeMetadata, {});
+  }
+  assert.deepEqual(clientMessagePage([message], null).messages[0]?.nativeMetadata, {});
+});
+
 test("large inline history images are retrieved through bounded authenticated chunks", async (t) => {
   const hostId = "host-image-history";
   const provider = new LargeImageFakeProvider({ hostId, providerId: "image", sessionCount: 1 });

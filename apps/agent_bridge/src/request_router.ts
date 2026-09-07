@@ -393,7 +393,12 @@ function clipText(value: string | undefined, maximum = 24_000): string | undefin
 /** Keep only presentation semantics; provider diagnostics remain private. */
 function clientMessageMetadata(message: RemoteMessage): JsonObject {
   const phase = message.nativeMetadata.phase;
-  return phase === "commentary" || phase === "final_answer" ? { phase } : {};
+  const compaction = message.role === "assistant" && (message.nativeMetadata.summary === true
+    || message.nativeMetadata.mode === "compaction" || message.nativeMetadata.agent === "compaction");
+  return {
+    ...(phase === "commentary" || phase === "final_answer" ? { phase } : {}),
+    ...(compaction ? { summary: true } : {}),
+  };
 }
 
 function compactMessage(
