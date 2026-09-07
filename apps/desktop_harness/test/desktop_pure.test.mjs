@@ -277,6 +277,46 @@ test("OpenCode keeps a confirmed external server through transient health misses
   assert.equal(spawned, false);
 });
 
+test("OpenCode watchdog preserves an active runner through repeated failed probes while explicit restart still works", async () => {
+  let healthy = false;
+  const children = [];
+  const supervisor = new openCode.OpenCodeSupervisor({
+    hasActiveWork: () => true,
+    canBindPort: async () => true,
+    fetchHealth: async () => new Response(null, { status: healthy ? 200 : 503 }),
+    spawnProcess: () => {
+      healthy = true;
+      const child = new EventEmitter();
+      child.exitCode = null;
+      child.killed = false;
+      child.kill = () => { child.killed = true; child.exitCode = 0; child.emit("close", 0); return true; };
+      children.push(child);
+      return child;
+    },
+  });
+  try {
+    assert.equal((await supervisor.ensureRunning()).state, "managed");
+    healthy = false;
+    for (let index = 0; index < 7; index += 1) await supervisor.ensureRunning();
+    assert.equal(children.length, 1);
+    assert.equal(children[0].killed, false, "a missing health response cannot cancel a running tool");
+    assert.match(supervisor.status().message, /active tasks were left running/u);
+    healthy = true;
+    assert.equal((await supervisor.ensureRunning()).message, undefined, "a successful probe clears the warning");
+    healthy = false;
+    assert.equal((await supervisor.restart()).state, "managed");
+    assert.equal(children[0].killed, true);
+    assert.equal(children.length, 2);
+    children[1].exitCode = 1;
+    children[1].emit("close", 1);
+    healthy = false;
+    assert.equal((await supervisor.ensureRunning()).state, "managed");
+    assert.equal(children.length, 3, "a confirmed process exit still allows automatic recovery");
+  } finally {
+    await supervisor.dispose();
+  }
+});
+
 test("OpenCode explicit restart bypasses the running health grace", async () => {
   let healthy = true;
   let bindChecks = 0;

@@ -6800,7 +6800,13 @@ export class AgentBridge {
 
   private reconcileGoalContinuations(providerId: string): void {
     for (const [sessionId, goal] of this.#goals) {
-      if (this.#cache.get(sessionId)?.providerId === providerId && this.goalAwaitsContinuation(sessionId, goal)) {
+      if (this.#cache.get(sessionId)?.providerId !== providerId) continue;
+      if (goal.source === "tethoq" && goal.status === "active" && [...this.#queueDeliveries.values()].some((delivery) =>
+        delivery.sessionId === sessionId && delivery.state === "unknown")) {
+        // A restored or dismissed delivery still needs reconciliation. It is
+        // not permission to silently resume an autonomous goal after restart.
+        void this.setSessionGoal(sessionId, { status: "blocked" }).catch(() => undefined);
+      } else if (this.goalAwaitsContinuation(sessionId, goal)) {
         this.scheduleGoalContinuation(sessionId);
       }
     }
@@ -7326,6 +7332,13 @@ export class AgentBridge {
       error: failure,
     };
     this.#queueDeliveries.set(delivery.messageId, unknown);
+    const goal = this.#goals.get(delivery.sessionId);
+    if (goal?.source === "tethoq" && goal.status === "active") {
+      // Delivery uncertainty stops automation even if a disconnected provider
+      // still owns the turn. That ownership must not keep the goal active or
+      // let a later idle/reconnect replay a possibly accepted instruction.
+      await this.setSessionGoal(delivery.sessionId, { status: "blocked" }).catch(() => undefined);
+    }
     const current = this.#queuedMessages.get(delivery.messageId);
     const tombstone = this.queueDeliveryTombstone(unknown);
     this.#queuedMessages.set(delivery.messageId, tombstone);

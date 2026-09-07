@@ -18,6 +18,7 @@ import type { AuthStatus, CreateSessionOptions, EnqueueProviderMessageRequest, L
 import { defaultTranscriptionSourceRegistry, type DictationTranscriber } from "./dictation.js";
 import type { SessionTransferRecord } from "./session_transfer_store.js";
 import type { PersistedVisionProxy } from "./vision_proxy_store.js";
+import type { QueueDeliveryRecord } from "./queue_delivery_store.js";
 import {
   BridgeOwnedClientToolFailureStore,
   durableClientToolCallId,
@@ -8679,6 +8680,61 @@ test("active fallback goals continue privately and stop when the model completes
   await new Promise((resolve) => setTimeout(resolve, 850));
   assert.equal(provider.requests.length, 2);
   await assert.rejects(bridge.executeClientTool(session.id, "tethoq_goal", { status: "complete" }), /no longer active/);
+});
+
+test("uncertain goal delivery blocks automation even when the provider disconnects before rejecting", async (t) => {
+  for (const mode of ["direct", "automatic"] as const) {
+    await t.test(mode, async (t) => {
+      const hostId = `goal-delivery-${mode}`;
+      class DisconnectedProvider extends GoalCapturingFakeProvider {
+        override async sendMessage(id: string, request: SendMessageRequest): Promise<SendMessageResult> {
+          await super.sendMessage(id, request);
+          await this.finish(id, "session.status_changed", { state: "disconnected" });
+          throw new Error("OpenCode request failed: fetch failed");
+        }
+      }
+      const provider = new DisconnectedProvider({ hostId, providerId: "opencode", sessionCount: 1 });
+      let persisted: Readonly<Record<string, SessionGoal>> = {};
+      let deliveries: readonly QueueDeliveryRecord[] = [];
+      const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider], {
+        onGoalsChange: (goals) => { persisted = goals; },
+        onQueueDeliveriesChange: (records) => { deliveries = records; },
+      });
+      bridge.configureClientTooling(testClientTooling());
+      t.after(() => bridge.dispose());
+      await bridge.start();
+      await bridge.refresh();
+      const session = bridge.sessions()[0]!;
+      await bridge.setSessionGoal(session.id, { objective: "Finish the repair once delivery is reliable" });
+      if (mode === "direct") {
+        await assert.rejects(bridge.sendMessage(session.id, { requestId: "uncertain-goal-prompt", content: "Continue the repair" }), /Delivery could not be confirmed/);
+      } else {
+        await provider.finish(session.providerSessionId);
+      }
+      await waitFor(() => persisted[session.id]?.status === "blocked", "uncertain delivery must stop the active goal");
+      assert.equal((await bridge.sessionGoal(session.id))?.status, "blocked");
+      const event = bridge.eventReplaySince(0).events.filter((event) => event.type === "session.goal_updated").at(-1)!;
+      assert.equal((event.payload.goal as unknown as SessionGoal).status, "blocked");
+      await provider.finish(session.providerSessionId);
+      await new Promise((resolve) => setTimeout(resolve, 850));
+      assert.equal(provider.requests.length, 1, "reconnection must not replay an ambiguous instruction or resume the goal");
+      await bridge.dispose();
+      const restoredProvider = new GoalCapturingFakeProvider({ hostId, providerId: "opencode", sessionCount: 1 });
+      const restored = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [restoredProvider], {
+        // Older installations persisted this inconsistent combination. Dismissing
+        // the delivery warning must not make it safe to continue after restart.
+        goals: { [session.id]: { ...persisted[session.id]!, status: "active" } },
+        queueDeliveries: deliveries.map((delivery) => ({ ...delivery, dismissedAt: new Date().toISOString() })),
+      });
+      t.after(() => restored.dispose());
+      restored.configureClientTooling(testClientTooling());
+      await restored.start();
+      await restored.refresh();
+      assert.equal((await restored.sessionGoal(session.id))?.status, "blocked");
+      await new Promise((resolve) => setTimeout(resolve, 850));
+      assert.equal(restoredProvider.requests.length, 0);
+    });
+  }
 });
 
 test("OpenCode's installed goal tool persists terminal states, publishes them, and stops automatic prompts", async (t) => {

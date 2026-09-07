@@ -11,6 +11,40 @@ import {
 import type { FetchLike } from "./http_client.js";
 import { OpenCodeAdapter } from "./opencode_adapter.js";
 
+test("OpenCode context polling reads local usage without downloading transcript parts and falls back on schema errors", async (t) => {
+  const { directory, databasePath, database } = await createDatabase("uar-opencode-context-");
+  database.exec("CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT)");
+  const insert = database.prepare("INSERT INTO message VALUES (?, ?, ?, ?)");
+  const info = (input: number) => ({ role: "assistant", providerID: "test", modelID: "model", tokens: { input, output: 3 }, cost: 0.1 });
+  for (let index = 0; index < 510; index += 1) {
+    insert.run(`msg_${index}`, "ses_context", index, JSON.stringify(info(index + 1)));
+  }
+  insert.run("msg_unfinished", "ses_context", 510, JSON.stringify({ role: "assistant", providerID: "test", modelID: "model" }));
+  insert.run("msg_other", "ses_other", 1000, JSON.stringify(info(900_000)));
+  let historyReads = 0;
+  const adapter = new OpenCodeAdapter({
+    hostId: "context-test", localActivity: { databasePath },
+    fetch: async (input) => {
+      if (new URL(String(input)).pathname === "/provider") {
+        return new Response(JSON.stringify({ connected: ["test"], all: [{ id: "test", models: { model: { id: "model", limit: { context: 1000 } } } }] }));
+      }
+      historyReads += 1;
+      return new Response(JSON.stringify([{ info: info(42) }]));
+    },
+  });
+  t.after(async () => { await adapter.dispose(); database.close(); await rm(directory, { recursive: true, force: true }); });
+  const context = await adapter.getSessionContext("ses_context");
+  assert.equal(context.usedTokens, 513, "an unfinished tail must retain the latest recorded occupancy");
+  assert.equal(context.usage?.inputTokens, (12 + 510) * 499 / 2, "keep the same latest-500-message accounting window");
+  assert.equal(context.contextWindowTokens, 1000);
+  assert.equal(historyReads, 0, "context heartbeats must not fetch text, images, or tool output");
+  database.prepare("UPDATE message SET data = ? WHERE id = 'msg_unfinished'").run(JSON.stringify(info(700)));
+  assert.equal((await adapter.getSessionContext("ses_context")).usedTokens, 703, "the next reading observes newly committed usage");
+  database.exec("DROP TABLE message");
+  assert.equal((await adapter.getSessionContext("ses_context")).usedTokens, 45, "unsupported local schemas use authoritative HTTP data");
+  assert.equal(historyReads, 1);
+});
+
 test("OpenCode SQLite catalogue pages roots and children with filters and minimal metadata", async (context) => {
   const { directory, databasePath, database } = await createDatabase("uar-opencode-catalogue-");
   const insert = database.prepare(`
