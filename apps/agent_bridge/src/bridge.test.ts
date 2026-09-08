@@ -8707,16 +8707,25 @@ test("Tethoq goals support the full lifecycle on a provider with no native goal 
   let goal = await bridge.setSessionGoal(session.id, { objective: "Make goals reliable for every model", tokenBudget: 24_000 });
   assert.equal(goal.status, "active");
   assert.equal(goal.source, "tethoq");
+  const firstActivation = goal.activationId;
+  assert.ok(firstActivation);
+  goal = await bridge.setSessionGoal(session.id, { tokenBudget: 24_000 });
+  assert.equal(goal.activationId, firstActivation, "budget edits keep delivery ownership");
   goal = await bridge.setSessionGoal(session.id, { status: "paused" });
   assert.equal(goal.status, "paused");
+  assert.equal(goal.activationId, firstActivation);
   goal = await bridge.setSessionGoal(session.id, { status: "active", objective: "Make goals reliable across restarts" });
   assert.equal(goal.objective, "Make goals reliable across restarts");
+  assert.notEqual(goal.activationId, firstActivation);
+  const resumedActivation = goal.activationId;
   goal = await bridge.setSessionGoal(session.id, { status: "blocked" });
   assert.equal(goal.status, "blocked");
   goal = await bridge.setSessionGoal(session.id, { status: "complete" });
   assert.equal(goal.status, "complete");
+  assert.equal(goal.activationId, resumedActivation);
   goal = await bridge.setSessionGoal(session.id, { status: "active" });
   assert.equal(goal.status, "active", "completed goals can be reopened");
+  assert.notEqual(goal.activationId, resumedActivation);
   assert.deepEqual(await provider.getMessages(session.providerSessionId), beforeMessages, "goal mutations never start a model turn");
 
   await bridge.sendMessage(session.id, { requestId: "goal-context-turn", content: "Continue" });
@@ -8838,6 +8847,204 @@ test("uncertain goal delivery blocks automation even when the provider disconnec
       assert.equal((await restored.sessionGoal(session.id))?.status, "blocked");
       await new Promise((resolve) => setTimeout(resolve, 850));
       assert.equal(restoredProvider.requests.length, 0);
+    });
+  }
+});
+
+test("historical delivery failures cannot stall a newly started goal on refresh or restart", async (t) => {
+  for (const dismissed of [false, true]) {
+    await t.test(dismissed ? "dismissed" : "visible", async (t) => {
+      const hostId = `goal-historical-delivery-${dismissed}`;
+      class FailedProvider extends GoalCapturingFakeProvider {
+        override async sendMessage(id: string, request: SendMessageRequest): Promise<SendMessageResult> {
+          await super.sendMessage(id, request);
+          throw new Error("OpenCode request failed: fetch failed");
+        }
+      }
+      let deliveries: readonly QueueDeliveryRecord[] = [];
+      const failed = new FailedProvider({ hostId, providerId: "opencode", sessionCount: 1 });
+      const old = new AgentBridge({ ...config(hostId), enabledProviders: [failed.providerId] }, [failed], {
+        onQueueDeliveriesChange: (records) => { deliveries = records; },
+      });
+      t.after(() => old.dispose());
+      await old.start();
+      await old.refresh();
+      const session = old.sessions()[0]!;
+      await assert.rejects(old.sendMessage(session.id, { requestId: "old-send", content: "Yesterday's instruction" }), /Delivery could not be confirmed/);
+      await old.dispose();
+      const historical = deliveries.map((delivery) => ({
+        ...delivery,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:01.000Z",
+        ...(dismissed ? { dismissedAt: "2026-01-01T00:00:02.000Z" } : {}),
+      }));
+      const provider = new GoalCapturingFakeProvider({ hostId, providerId: "opencode", sessionCount: 1 });
+      let goals: Readonly<Record<string, SessionGoal>> = {};
+      const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider], {
+        queueDeliveries: historical,
+        onGoalsChange: (records) => { goals = records; },
+        onQueueDeliveriesChange: (records) => { deliveries = records; },
+      });
+      t.after(() => bridge.dispose());
+      bridge.configureClientTooling(testClientTooling());
+      await bridge.start();
+      await bridge.refresh();
+      await bridge.sendMessage(session.id, {
+        requestId: "new-goal-send", content: "Start today's repair",
+        metadata: { tethoqGoalObjective: "Finish today's repair" },
+      });
+      await bridge.refresh();
+      assert.equal((await bridge.sessionGoal(session.id))?.status, "active", "an unrelated old error must not stall a successful new goal");
+      await provider.finish(session.providerSessionId);
+      await waitFor(() => provider.requests.length === 2, "new goal continues despite historical uncertainty");
+      await assert.rejects(bridge.sendMessage(session.id, { requestId: "old-replay", content: "Yesterday's instruction" }), /fetch failed|Delivery could not be confirmed/);
+      await bridge.dispose();
+      const restartedProvider = new GoalCapturingFakeProvider({ hostId, providerId: "opencode", sessionCount: 1 });
+      const restarted = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [restartedProvider], {
+        goals, queueDeliveries: deliveries,
+      });
+      t.after(() => restarted.dispose());
+      restarted.configureClientTooling(testClientTooling());
+      await restarted.start();
+      await restarted.refresh();
+      assert.equal((await restarted.sessionGoal(session.id))?.status, "active");
+      await restartedProvider.finish(session.providerSessionId);
+      await waitFor(() => restartedProvider.requests.length === 1, "goal resumes after restart without replaying the original prompt");
+      assert.equal(stripProviderPromptGuidance(restartedProvider.lastRequest!.content), "");
+    });
+  }
+});
+
+test("explicitly resumed goals can send fresh continuations after an uncertain automatic prompt", async (t) => {
+  const hostId = "goal-resume-uncertain-continuation";
+  class FailOnceProvider extends GoalCapturingFakeProvider {
+    override async sendMessage(id: string, request: SendMessageRequest): Promise<SendMessageResult> {
+      const result = await super.sendMessage(id, request);
+      if (this.requests.length === 2) {
+        await this.finish(id, "session.status_changed", { state: "disconnected" });
+        throw new Error("OpenCode request failed: fetch failed");
+      }
+      return result;
+    }
+  }
+  const provider = new FailOnceProvider({ hostId, providerId: "opencode", sessionCount: 1 });
+  let goals: Readonly<Record<string, SessionGoal>> = {};
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider], {
+    onGoalsChange: (records) => { goals = records; },
+  });
+  t.after(() => bridge.dispose());
+  bridge.configureClientTooling(testClientTooling());
+  await bridge.start();
+  await bridge.refresh();
+  const session = bridge.sessions()[0]!;
+  await bridge.setSessionGoal(session.id, { objective: "Finish the repair" });
+  await bridge.sendMessage(session.id, { requestId: "start-repair", content: "Repair this once" });
+  await provider.finish(session.providerSessionId);
+  await waitFor(() => goals[session.id]?.status === "blocked", "current uncertain continuation stalls automation");
+  await provider.finish(session.providerSessionId);
+  await bridge.setSessionGoal(session.id, { status: "active" });
+  await bridge.refresh();
+  assert.equal((await bridge.sessionGoal(session.id))?.status, "active", "explicit resume supersedes the old failed run");
+  await provider.finish(session.providerSessionId);
+  await waitFor(() => provider.requests.length === 3, "a fresh continuation after explicit resume");
+  assert.equal(stripProviderPromptGuidance(provider.lastRequest!.content), "");
+  await bridge.executeClientTool(session.id, "tethoq_goal", { status: "complete" });
+  await provider.finish(session.providerSessionId);
+  await new Promise((resolve) => setTimeout(resolve, 850));
+  assert.equal(provider.requests.length, 3, "completion still stops the resumed goal");
+});
+
+test("a late delivery failure cannot block a replacement goal", async (t) => {
+  const hostId = "goal-late-delivery-failure";
+  let rejectSend!: (error: Error) => void;
+  class DeferredProvider extends GoalCapturingFakeProvider {
+    override async sendMessage(id: string, request: SendMessageRequest): Promise<SendMessageResult> {
+      await super.sendMessage(id, request);
+      return await new Promise<SendMessageResult>((_resolve, reject) => { rejectSend = reject; });
+    }
+  }
+  const provider = new DeferredProvider({ hostId, providerId: "opencode", sessionCount: 1 });
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider]);
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  await bridge.refresh();
+  const session = bridge.sessions()[0]!;
+  await bridge.setSessionGoal(session.id, { objective: "Old goal" });
+  const sending = assert.rejects(bridge.sendMessage(session.id, { requestId: "delayed-old-send", content: "Old instruction" }), /Delivery could not be confirmed/);
+  await waitFor(() => provider.requests.length === 1, "old send started");
+  await bridge.setSessionGoal(session.id, { objective: "Replacement goal", status: "active" });
+  rejectSend(new Error("OpenCode request failed: fetch failed"));
+  await sending;
+  assert.equal((await bridge.sessionGoal(session.id))?.status, "active", "late failure belongs to the old goal");
+  await bridge.refresh();
+  assert.equal((await bridge.sessionGoal(session.id))?.status, "active");
+});
+
+test("queued goal prompts bind delivery failures to the goal created at dispatch", async (t) => {
+  const hostId = "queued-goal-delivery-owner";
+  class FailedProvider extends GoalCapturingFakeProvider {
+    override async sendMessage(id: string, request: SendMessageRequest): Promise<SendMessageResult> {
+      await super.sendMessage(id, request);
+      throw new Error("OpenCode request failed: fetch failed");
+    }
+  }
+  const provider = new FailedProvider({ hostId, providerId: "opencode", sessionCount: 1 });
+  let goals: Readonly<Record<string, SessionGoal>> = {};
+  let deliveries: readonly QueueDeliveryRecord[] = [];
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider], {
+    onGoalsChange: (records) => { goals = records; },
+    onQueueDeliveriesChange: (records) => { deliveries = records; },
+  });
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  await bridge.refresh();
+  const session = bridge.sessions()[0]!;
+  await bridge.setSessionGoal(session.id, { objective: "Existing goal", status: "paused" });
+  const queued = await bridge.enqueueMessage(session.id, {
+    requestId: "queued-new-goal", content: "Start the new repair",
+    metadata: { tethoqGoalObjective: "Queued replacement goal" },
+  });
+  assert.equal((await bridge.sessionGoal(session.id))?.objective, "Existing goal", "queuing must not activate the next goal early");
+  await provider.finish(session.providerSessionId);
+  await waitFor(() => goals[session.id]?.status === "blocked", "uncertain first queued send blocks its new goal");
+  const goal = (await bridge.sessionGoal(session.id))!;
+  const delivery = deliveries.find((record) => record.messageId === queued.id)!;
+  assert.equal(goal.objective, "Queued replacement goal");
+  assert.ok(goal.activationId);
+  assert.equal(delivery.goalActivationId, goal.activationId);
+  assert.equal(delivery.state, "unknown");
+});
+
+test("legacy goal recovery distinguishes older failures from uncertainty during that objective", async (t) => {
+  for (const current of [false, true]) {
+    await t.test(current ? "current uncertainty" : "older failure", async (t) => {
+      const hostId = `legacy-goal-delivery-${current}`;
+      let goals: Readonly<Record<string, SessionGoal>> = {};
+      let deliveries: readonly QueueDeliveryRecord[] = [];
+      const provider = new GoalCapturingFakeProvider({ hostId, providerId: "opencode", sessionCount: 1 });
+      const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider], {
+        onGoalsChange: (records) => { goals = records; },
+        onQueueDeliveriesChange: (records) => { deliveries = records; },
+      });
+      t.after(() => bridge.dispose());
+      await bridge.start();
+      await bridge.refresh();
+      const session = bridge.sessions()[0]!;
+      await bridge.setSessionGoal(session.id, { objective: "Legacy objective" });
+      await bridge.sendMessage(session.id, { requestId: "legacy-send", content: "Legacy instruction" });
+      await bridge.dispose();
+      const { activationId: _goalActivation, ...legacyGoal } = goals[session.id]!;
+      const { goalActivationId: _deliveryActivation, ...legacyDelivery } = deliveries[0]!;
+      const restoredProvider = new GoalCapturingFakeProvider({ hostId, providerId: "opencode", sessionCount: 1 });
+      const restored = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [restoredProvider], {
+        goals: { [session.id]: { ...legacyGoal, createdAt: "2026-01-02T00:00:00.000Z" } },
+        queueDeliveries: [{ ...legacyDelivery, state: "unknown", dismissedAt: "2026-01-04T00:00:00.000Z",
+          createdAt: current ? "2026-01-03T00:00:00.000Z" : "2026-01-01T00:00:00.000Z" }],
+      });
+      t.after(() => restored.dispose());
+      await restored.start();
+      await restored.refresh();
+      assert.equal((await restored.sessionGoal(session.id))?.status, current ? "blocked" : "active");
     });
   }
 });
