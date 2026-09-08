@@ -1829,6 +1829,19 @@ export function reconcileSubagentTimeline(parentSessionId: string, timeline: rea
 
 export function eventToTimeline(event: AgentEvent): TimelineItem | null {
   const sessionId = event.sessionId ?? "host";
+  if (event.type === "message.remote_received") {
+    const envelope = object(event.payload.envelope);
+    if (event.payload.state !== "delivered" || envelope.version !== 1 || envelope.targetSessionId !== sessionId) return null;
+    const origin = timelineOrigin({ kind: "cross_session", envelopeId: envelope.id, sourceSessionId: envelope.sourceSessionId, sourceTitle: envelope.sourceTitle });
+    if (!origin || typeof envelope.content !== "string" || !envelope.content.trim()) return null;
+    // Delivery already contains the verified body. Do not wait for a history
+    // reload (which can lose its race with a continuously streaming answer).
+    return {
+      id: `${sessionId}:remote:${envelope.id}`,
+      timestamp: event.occurredAt,
+      kind: "user", origin, body: envelope.content, state: "completed",
+    };
+  }
   if (event.type === "context.compaction_failed") {
     return { id: `${sessionId}:compaction:${event.eventId}`, timestamp: event.occurredAt, kind: "assistant", title: "System", body: "Compaction could not be completed. You can try again.", state: "completed" };
   }

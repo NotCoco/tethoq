@@ -8,6 +8,12 @@ import { visibleContextTransferText } from "../../../../../packages/protocol/src
  * already shown. Providers that resend the whole message replace it instead.
  */
 export function mergeTimeline(existing: TimelineItem[], incoming: TimelineItem): TimelineItem[] {
+  if (incoming.kind === "user" && incoming.origin?.kind === "cross_session") {
+    const origin = incoming.origin;
+    const remoteIndex = existing.findIndex((item) => item.kind === "user" && item.origin?.kind === "cross_session"
+      && item.origin.envelopeId === origin.envelopeId && item.origin.sourceSessionId === origin.sourceSessionId);
+    if (remoteIndex >= 0) return existing.map((item, index) => index === remoteIndex ? adoptCanonicalUserEcho(item, incoming) : item);
+  }
   if (incoming.kind === "user" && incoming.mesh && incoming.delegationId) {
     const meshIndex = existing.findIndex((item) => item.kind === "user" && item.delegationId === incoming.delegationId);
     if (meshIndex >= 0) return existing.map((item, index) => index === meshIndex ? adoptCanonicalUserEcho(item, incoming) : item);
@@ -382,6 +388,7 @@ function echoedBackIndex(
   return nearest;
 }
 function timelineSemanticKey(item: TimelineItem): string | null {
+  if (item.kind === "user" && item.origin?.kind === "cross_session") return `cross_session:${item.origin.sourceSessionId}:${item.origin.envelopeId}`;
   if (item.messageId && (item.kind === "user" || item.kind === "assistant" || item.kind === "reasoning")) return `${item.kind}:${item.messageId}`;
   if (item.kind === "command" && item.messageId) return `command:${item.messageId}`;
   if (item.kind === "tool" && item.detail) return `tool:${item.detail}`;
@@ -410,6 +417,11 @@ function persistedUserAttachmentsCompatible(left: TimelineItem, right: TimelineI
 }
 
 function samePersistedUserAction(left: TimelineItem, right: TimelineItem): boolean {
+  if (left.origin?.kind === "cross_session" || right.origin?.kind === "cross_session") {
+    return left.kind === "user" && right.kind === "user"
+      && left.origin?.kind === "cross_session" && right.origin?.kind === "cross_session"
+      && left.origin.envelopeId === right.origin.envelopeId && left.origin.sourceSessionId === right.origin.sourceSessionId;
+  }
   if (left.kind !== "user" || right.kind !== "user" || composerEchoRow.test(left.id) || composerEchoRow.test(right.id)) return false;
   if (sentBody(left) !== sentBody(right) || !persistedUserAttachmentsCompatible(left, right)) return false;
   const leftTurnId = left.turnId?.trim();
