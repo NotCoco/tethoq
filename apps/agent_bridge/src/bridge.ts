@@ -1250,11 +1250,15 @@ export class AgentBridge {
     }
     if (previous === undefined && objective === undefined) throw new Error("Set a goal objective before changing its state");
     const now = new Date().toISOString();
+    const activationId = previous === undefined || replacingObjective || update.status === "active"
+      ? randomUUID()
+      : previous.activationId;
     const goal: SessionGoal = {
       sessionId: globalSessionId,
       objective: objective ?? previous!.objective,
       status: update.status ?? previous?.status ?? "active",
       source: "tethoq",
+      ...(activationId !== undefined ? { activationId } : {}),
       tokenBudget: update.tokenBudget !== undefined ? update.tokenBudget : previous?.tokenBudget ?? null,
       tokensUsed: replacingObjective ? 0 : previous?.tokensUsed ?? 0,
       timeUsedSeconds: replacingObjective ? 0 : previous?.timeUsedSeconds ?? 0,
@@ -4138,8 +4142,13 @@ export class AgentBridge {
       providerSessionId,
       routedRequest,
       request.content,
+      goalContinuation,
     );
-    if (delivery.state !== "in_flight") delivery = await this.markQueueDeliveryInFlight(delivery);
+    // A queued prompt can start/replace its goal while resolving instructions,
+    // after the queue pump first journals it. Bind ownership at actual dispatch.
+    if (delivery.state !== "in_flight" || delivery.goalActivationId !== this.activeGoalActivationId(globalSessionId)) {
+      delivery = await this.markQueueDeliveryInFlight(delivery);
+    }
     const providerRequest = delivery.requestId === routedRequest.requestId
       ? routedRequest
       : { ...routedRequest, requestId: delivery.requestId };
@@ -6872,14 +6881,28 @@ export class AgentBridge {
     for (const [sessionId, goal] of this.#goals) {
       if (this.#cache.get(sessionId)?.providerId !== providerId) continue;
       if (goal.source === "tethoq" && goal.status === "active" && [...this.#queueDeliveries.values()].some((delivery) =>
-        delivery.sessionId === sessionId && delivery.state === "unknown")) {
-        // A restored or dismissed delivery still needs reconciliation. It is
-        // not permission to silently resume an autonomous goal after restart.
+        delivery.sessionId === sessionId && delivery.state === "unknown" && this.deliveryBelongsToGoal(delivery, goal))) {
+        // Preserve uncertainty within this activation across restart/dismissal,
+        // without letting an older send veto a new or explicitly resumed goal.
         void this.setSessionGoal(sessionId, { status: "blocked" }).catch(() => undefined);
       } else if (this.goalAwaitsContinuation(sessionId, goal)) {
         this.scheduleGoalContinuation(sessionId);
       }
     }
+  }
+
+  private activeGoalActivationId(sessionId: string): string | undefined {
+    const goal = this.#goals.get(sessionId);
+    return goal?.source === "tethoq" && goal.status === "active" ? goal.activationId : undefined;
+  }
+
+  private deliveryBelongsToGoal(delivery: QueueDeliveryRecord, goal: SessionGoal): boolean {
+    if (goal.activationId !== undefined || delivery.goalActivationId !== undefined) {
+      return goal.activationId === delivery.goalActivationId;
+    }
+    // Older persisted goals/deliveries have no activation IDs. Keep their
+    // current-run uncertainty, but exclude sends predating the objective.
+    return Date.parse(delivery.createdAt) >= Date.parse(goal.createdAt);
   }
 
   private goalAwaitsContinuation(sessionId: string, goal: SessionGoal): boolean {
@@ -7181,11 +7204,12 @@ export class AgentBridge {
   }
 
   private queueDeliveryTombstone(delivery: QueueDeliveryRecord): QueuedMessageRecord {
+    const displayContent = delivery.displayContent ?? delivery.content;
     return {
       view: {
         id: delivery.messageId,
         sessionId: delivery.sessionId,
-        content: delivery.displayContent ?? delivery.content,
+        content: displayContent === hiddenProviderControlContent("continue") ? "Continue task" : displayContent,
         mode: "queue",
         state: "failed",
         createdAt: delivery.queuedCreatedAt,
@@ -7267,10 +7291,11 @@ export class AgentBridge {
     return prepared;
   }
 
-  private assertNoUncertainDeliveryContent(sessionId: string, displayContent: string): void {
+  private assertNoUncertainDeliveryContent(sessionId: string, displayContent: string, goalContinuation?: SessionGoal): void {
     const displayContentHash = queueDeliveryContentHash(displayContent);
     const unresolved = [...this.#queueDeliveries.values()].find((delivery) =>
       delivery.sessionId === sessionId
+      && (goalContinuation === undefined || this.deliveryBelongsToGoal(delivery, goalContinuation))
       && queueDeliveryContentHash(delivery.displayContent ?? delivery.content) === displayContentHash
       && (delivery.state === "unknown" || delivery.state === "in_flight"));
     if (unresolved !== undefined) {
@@ -7284,8 +7309,11 @@ export class AgentBridge {
     providerSessionId: string,
     request: SendMessageRequest,
     displayContent: string,
+    goalContinuation?: SessionGoal,
   ): Promise<QueueDeliveryRecord> {
-    this.assertNoUncertainDeliveryContent(sessionId, displayContent);
+    // Hidden continuation controls share text across runs. Explicit resume may
+    // send a fresh control; ordinary user instructions keep global replay protection.
+    this.assertNoUncertainDeliveryContent(sessionId, displayContent, goalContinuation);
     const requestMatch = [...this.#queueDeliveries.values()].find((delivery) => delivery.requestId === request.requestId);
     if (requestMatch?.state === "confirmed") {
       throw new ProviderAdapterError(providerId, "DELIVERY_ALREADY_CONFIRMED", "Provider history already contains this instruction", false);
@@ -7366,8 +7394,11 @@ export class AgentBridge {
   }
 
   private async markQueueDeliveryInFlight(delivery: QueueDeliveryRecord): Promise<QueueDeliveryRecord> {
+    const { goalActivationId: _previousActivationId, ...withoutGoalActivation } = delivery;
+    const goalActivationId = this.activeGoalActivationId(delivery.sessionId);
     const inFlight: QueueDeliveryRecord = {
-      ...delivery,
+      ...withoutGoalActivation,
+      ...(goalActivationId !== undefined ? { goalActivationId } : {}),
       state: "in_flight",
       updatedAt: new Date().toISOString(),
     };
@@ -7408,7 +7439,7 @@ export class AgentBridge {
     };
     this.#queueDeliveries.set(delivery.messageId, unknown);
     const goal = this.#goals.get(delivery.sessionId);
-    if (goal?.source === "tethoq" && goal.status === "active") {
+    if (goal?.source === "tethoq" && goal.status === "active" && this.deliveryBelongsToGoal(delivery, goal)) {
       // Delivery uncertainty stops automation even if a disconnected provider
       // still owns the turn. That ownership must not keep the goal active or
       // let a later idle/reconnect replay a possibly accepted instruction.

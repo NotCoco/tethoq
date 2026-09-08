@@ -33,6 +33,8 @@ export interface SessionGoal {
   readonly objective: string;
   readonly status: SessionGoalStatus;
   readonly source: "native" | "tethoq";
+  /** Identifies one explicit start/resume of a Tethoq goal across process restarts. */
+  readonly activationId?: string;
   readonly tokenBudget: number | null;
   readonly tokensUsed: number;
   readonly timeUsedSeconds: number;

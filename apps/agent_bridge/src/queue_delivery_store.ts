@@ -22,6 +22,8 @@ export interface QueueDeliveryRecord {
   readonly providerId: string;
   readonly providerSessionId: string;
   readonly providerOwned: boolean;
+  /** Goal activation that owned the send, rather than whichever goal exists when it settles. */
+  readonly goalActivationId?: string;
   readonly providerMessageId?: string;
   readonly mode: "send" | "steer";
   /** User-authored text shown by a direct-send tombstone when provider bootstrap text differs. */
@@ -158,6 +160,7 @@ function delivery(value: unknown, expectedHostId?: string): QueueDeliveryRecord 
     providerId,
     providerSessionId,
     providerOwned: value.providerOwned,
+    ...(value.goalActivationId !== undefined ? { goalActivationId: boundedString(value.goalActivationId, "goal activation ID", 256)! } : {}),
     ...(value.providerMessageId !== undefined ? { providerMessageId: boundedString(value.providerMessageId, "provider message ID", 4_096)! } : {}),
     mode,
     ...(value.displayContent !== undefined
