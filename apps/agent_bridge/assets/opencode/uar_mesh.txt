@@ -240,7 +240,7 @@ export const wait = tool({
   description: "Optionally wait for selected delegated children when the current response needs their result. Children remain tracked if the parent finishes first.",
   args: {
     child_session_ids: tool.schema.array(tool.schema.string()).optional(),
-    timeout_seconds: tool.schema.number().int().min(1).max(300).optional(),
+    timeout_seconds: tool.schema.number().int().min(1).max(900).optional(),
   },
   async execute(args, context) {
     return await call(context.sessionID, "mesh_wait", args)

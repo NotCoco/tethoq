@@ -6814,6 +6814,8 @@ for (const providerId of ["opencode", "grok"]) {
     const server = gateway.mcpServer(providerId, parent.providerSessionId, "provider");
     await client.connect(new StdioClientTransport({ command: server.command, args: [...server.args], env: { ...server.env }, stderr: "pipe" }));
     assert.ok((await client.listTools()).tools.some((tool) => tool.name === "mesh_dispatch_delegation"), "the provider's bound MCP server must actually advertise dispatch");
+    const alreadyIdle = await client.callTool({ name: "mesh_wait", arguments: { child_session_ids: [], timeout_seconds: 900 } });
+    assert.notEqual(alreadyIdle.isError, true, "the bound MCP schema must accept a 15-minute wait");
     const assignments = {
       delegation_id: sent.requestId, assignments: [{ target_index: 0, instruction: "Review the completed work and return feedback only." }],
     };
@@ -7408,7 +7410,7 @@ test("a parent can wait for and read a parent-orchestrated Mesh result when its 
   let waitSettled = false;
   const waiting = bridge.executeMeshTool(parent.id, "mesh_wait", {
     child_session_ids: [childRecordId, childId],
-    timeout_seconds: 3,
+    timeout_seconds: 900,
   }).finally(() => { waitSettled = true; });
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.equal(waitSettled, false, "mesh_wait stays pending while the selected child is still working");
@@ -7417,6 +7419,7 @@ test("a parent can wait for and read a parent-orchestrated Mesh result when its 
   const waited = await waiting;
   assert.equal(waited.timedOut, false);
   assert.deepEqual(waited.children, [{ sessionId: childId, state: "completed" }]);
+  await assert.rejects(bridge.executeMeshTool(parent.id, "mesh_wait", { child_session_ids: [childId], timeout_seconds: 901 }), /1 to 900/);
 
   const result = await bridge.executeMeshTool(parent.id, "mesh_read_result", {
     child_session_id: childRecordId,

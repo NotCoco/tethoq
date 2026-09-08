@@ -1444,7 +1444,7 @@ test("browser chrome exposes live download management and Ctrl L address focus",
 
   assert.match(app, /notice\.action === "focus-address"[\s\S]*?setBrowserAddressFocusToken/);
   assert.match(app, /addressInput\.current\?\.focus\(\)[\s\S]*?addressInput\.current\?\.select\(\)/);
-  assert.match(main, /notice\.type === "focus-address"\) window\.webContents\.focus\(\)/);
+  assert.match(main, /notice\.type === "focus-address" \|\| notice\.type === "workspace-closed"\) window\.webContents\.focus\(\)/);
   assert.match(app, /type: "clear-download-history"/);
   assert.match(app, /action: download\.paused \? "resume" : "pause"/);
   assert.match(app, /action: "cancel"/);

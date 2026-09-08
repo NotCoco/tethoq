@@ -2993,7 +2993,7 @@ export class AgentBridge {
     }
     if (tool === "mesh_wait") {
       const children = this.meshChildIds(parentSessionId, input.child_session_ids);
-      const timeoutSeconds = optionalMeshInteger(input.timeout_seconds, 120, 1, 300);
+      const timeoutSeconds = optionalMeshInteger(input.timeout_seconds, 120, 1, 900);
       const deadline = Date.now() + timeoutSeconds * 1_000;
       while (Date.now() < deadline && children.some((id) => this.#cache.get(id)?.state === "working")) {
         await new Promise((resolve) => setTimeout(resolve, 250));

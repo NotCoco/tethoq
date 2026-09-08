@@ -124,7 +124,7 @@ export const meshToolDefinitions: readonly ClientToolDefinition[] = [
       type: "object",
       properties: {
         child_session_ids: { type: "array", items: { type: "string" }, description: "Copy child_session_ids from mesh_dispatch_delegation, or childSessionId from mesh_list_children. Omit to wait for all children." },
-        timeout_seconds: { type: "integer", minimum: 1, maximum: 300, default: 120 },
+        timeout_seconds: { type: "integer", minimum: 1, maximum: 900, default: 120 },
       },
       additionalProperties: false,
     },
