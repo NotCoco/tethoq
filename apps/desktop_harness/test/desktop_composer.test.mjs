@@ -1887,6 +1887,10 @@ test("timeline groups execution detail under reasoning and removes wrapper metad
   assert.equal(timelineHelpers.activityLabel(timeline[1]), "Read");
   assert.equal(timelineHelpers.activityLabel(item("inspected", "tool", "Inspected application UI", "visible controls")), "Read");
   assert.equal(timelineHelpers.activityLabel(timeline[2]), "Run");
+  assert.equal(timelineHelpers.activityLabel(unlabelledActivity[2]), "Write", "a failed agent tool retains its action identity");
+  assert.equal(timelineHelpers.activityLabel({ ...item("failed-edit", "tool", "Edit src/geo/mats.ts", "Could not find oldString"), state: "failed" }), "Edit");
+  assert.equal(timelineHelpers.activityLabel({ ...timeline[2], state: "failed" }), "Run");
+  assert.equal(timelineHelpers.activityLabel(orphanError), "Issue", "runtime errors remain distinct from failed tool attempts");
   const browserRead = item("browser", "tool", "js", '<a node_id="1" href="https://example.test">Example</a>');
   assert.equal(timelineHelpers.activityLabel(browserRead), "Read");
   assert.equal(timelineHelpers.activityTarget(browserRead), "");
