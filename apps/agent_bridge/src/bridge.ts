@@ -4474,6 +4474,7 @@ export class AgentBridge {
     const { providerId, providerSessionId } = this.assertSessionHost(globalSessionId);
     const session = this.#cache.get(globalSessionId);
     if (session === undefined) throw new Error("Session is not loaded on this bridge");
+    this.assertNoUncertainDeliveryContent(globalSessionId, prepared.content);
     const adapter = this.requireAdapter(providerId);
     const consumption = (input.attachmentIds?.length ?? 0) > 0
       ? this.#attachmentUploads.consume(input.attachmentIds ?? [])
@@ -4606,6 +4607,7 @@ export class AgentBridge {
         sessionId: record.view.sessionId,
         payload: { messageId, reason: "delivery_tombstone_dismissed" },
       });
+      void this.pumpQueue(record.view.sessionId);
       return true;
     }
     if (record.providerOwned) {
@@ -4644,6 +4646,7 @@ export class AgentBridge {
           false,
         );
       }
+      this.assertNoUncertainDeliveryContent(record.view.sessionId, normalized);
       if (record.providerOwned) {
         const { providerId, providerSessionId } = this.assertSessionHost(record.view.sessionId);
         const adapter = this.requireAdapter(providerId);
@@ -7219,6 +7222,7 @@ export class AgentBridge {
     if (existing?.state === "confirmed") {
       throw new ProviderAdapterError(providerId, "DELIVERY_ALREADY_CONFIRMED", "Provider history already contains this queued instruction", false);
     }
+    this.assertNoUncertainDeliveryContent(record.view.sessionId, record.view.content);
     const attachments = record.view.attachments.map(({ name, mimeType, byteLength, durationSeconds }) => ({
       name,
       mimeType,
@@ -7263,6 +7267,17 @@ export class AgentBridge {
     return prepared;
   }
 
+  private assertNoUncertainDeliveryContent(sessionId: string, displayContent: string): void {
+    const displayContentHash = queueDeliveryContentHash(displayContent);
+    const unresolved = [...this.#queueDeliveries.values()].find((delivery) =>
+      delivery.sessionId === sessionId
+      && queueDeliveryContentHash(delivery.displayContent ?? delivery.content) === displayContentHash
+      && (delivery.state === "unknown" || delivery.state === "in_flight"));
+    if (unresolved !== undefined) {
+      throw new ProviderAdapterError(unresolved.providerId, "DELIVERY_UNKNOWN", unresolved.error ?? queueDeliveryUnknownMessage, false);
+    }
+  }
+
   private async prepareDirectDelivery(
     sessionId: string,
     providerId: string,
@@ -7270,14 +7285,7 @@ export class AgentBridge {
     request: SendMessageRequest,
     displayContent: string,
   ): Promise<QueueDeliveryRecord> {
-    const displayContentHash = queueDeliveryContentHash(displayContent);
-    const unresolved = [...this.#queueDeliveries.values()].find((delivery) =>
-      delivery.sessionId === sessionId
-      && queueDeliveryContentHash(delivery.displayContent ?? delivery.content) === displayContentHash
-      && (delivery.state === "unknown" || delivery.state === "in_flight"));
-    if (unresolved !== undefined) {
-      throw new ProviderAdapterError(providerId, "DELIVERY_UNKNOWN", unresolved.error ?? queueDeliveryUnknownMessage, false);
-    }
+    this.assertNoUncertainDeliveryContent(sessionId, displayContent);
     const requestMatch = [...this.#queueDeliveries.values()].find((delivery) => delivery.requestId === request.requestId);
     if (requestMatch?.state === "confirmed") {
       throw new ProviderAdapterError(providerId, "DELIVERY_ALREADY_CONFIRMED", "Provider history already contains this instruction", false);
@@ -7509,6 +7517,9 @@ export class AgentBridge {
       });
       this.invalidateMessageSnapshot(sessionId);
     }
+    // The provider may already be idle: history confirmation must release the
+    // queue itself instead of waiting for a terminal event that already passed.
+    void this.pumpQueue(sessionId);
   }
 
   private syncProviderQueue(providerId: string, source: readonly unknown[]): void {
@@ -7629,8 +7640,11 @@ export class AgentBridge {
   private async pumpQueue(globalSessionId: string): Promise<void> {
     if (this.#queuePumps.has(globalSessionId) || this.#disposed) return;
     if (this.sessionHoldsFollowUpQueue(globalSessionId)) return;
+    // Dismissal retains duplicate-delivery evidence for that instruction, not a
+    // hidden permanent hold on every subsequent user-authored queue entry.
     if ([...this.#queueDeliveries.values()].some((delivery) =>
-      delivery.sessionId === globalSessionId && (delivery.state === "unknown" || delivery.state === "in_flight"))) return;
+      delivery.sessionId === globalSessionId
+      && (delivery.state === "in_flight" || (delivery.state === "unknown" && delivery.dismissedAt === undefined)))) return;
     const next = [...this.#queuedMessages.values()]
       .filter((record) => !record.providerOwned
         && !this.#queueMutations.has(record.view.id)
