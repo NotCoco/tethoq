@@ -419,7 +419,7 @@ export class BrowserWorkspaceManager {
         () => tab.view.webContents.stop(),
       );
     } catch (error: unknown) {
-      if (!isAbortedNavigationError(error)) throw error;
+      if (this.#tabs.has(tabId) && !isAbortedNavigationError(error)) throw error;
     }
     return this.#tabState(tab);
   }
