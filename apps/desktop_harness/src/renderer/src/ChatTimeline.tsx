@@ -499,7 +499,7 @@ export function activityLabel(item: TimelineItem): "Read" | "Write" | "Edit" | "
   if (item.kind === "tool" && cleanTitle(item.title ?? "") === "Question") return "Activity";
   if (item.kind === "command") return "Run";
   if (item.kind === "subagent") return "Delegate";
-  if (item.kind === "error" || item.state === "failed") return "Issue";
+  if (item.kind === "error") return "Issue";
   if (item.kind === "tool" && (/<(?:a|button|input|select|textarea)\b[^>]*\bnode_id=/iu.test(item.body) || /"(?:url|title)"\s*:/u.test(item.body))) return "Read";
   const value = `${item.title ?? ""} ${item.kind}`.toLowerCase();
   if (/\b(read|inspect(?:ed|ing)?|open(?:ed|ing)?|fetch(?:ed|ing)?|find|found|list(?:ed|ing)?|view(?:ed|ing)?|search(?:ed|ing)?|browse(?:d|ing)?|scan(?:ned|ning)?)\b/u.test(value)) return "Read";
@@ -710,7 +710,8 @@ const ActivityDisclosure = memo(function ActivityDisclosure({ item }: { item: Ti
   const [enlarged, setEnlarged] = useState(false);
   const toggle = (): void => setExpanded((current) => !current);
   const label = activityLabel(item);
-  const visibleLabel = item.kind === "subagent" ? "Spawned sub-agent" : label;
+  const actionLabel = item.kind === "subagent" ? "Spawned sub-agent" : label;
+  const visibleLabel = item.state === "failed" ? `${actionLabel} failed` : actionLabel;
   const target = activityTarget(item);
   const body = readableActivityBody(item.body);
   const long = body.length > 1_600 || body.split("\n").length > 22;
