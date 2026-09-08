@@ -2111,6 +2111,26 @@ test("verified cross-task sender attribution survives live echoes and history re
   const history = bridge.mapMessages([message]);
   assert.equal(history.length, 1);
   assert.deepEqual(history[0].origin, origin);
+  const deliveredEvent = {
+    sequence: 1, hostId: "desktop_test", sessionId: "session-1", eventId: "remote-delivery",
+    type: "message.remote_received", occurredAt: "2026-09-06T12:00:02.000Z",
+    payload: { state: "delivered", envelope: {
+      version: 1, id: origin.envelopeId, sourceSessionId: origin.sourceSessionId, sourceTitle: origin.sourceTitle,
+      targetSessionId: "session-1", content: message.parts[0].text,
+    } },
+  };
+  const delivered = bridge.eventToTimeline(deliveredEvent);
+  assert.equal(delivered.kind, "user", "accepted coordination paints without a history read");
+  assert.equal(delivered.body, message.parts[0].text);
+  assert.deepEqual(delivered.origin, origin);
+  assert.equal(timelineMerge.mergeTimeline([delivered], delivered).length, 1);
+  assert.equal(timelineMerge.reconcileTimelinePage(history, [delivered]).length, 1, "canonical IDs and timestamps may differ from the delivery event");
+  assert.equal(bridge.eventToTimeline({ ...deliveredEvent, payload: { ...deliveredEvent.payload, state: "pending" } }), null);
+  assert.equal(bridge.eventToTimeline({ ...deliveredEvent, payload: { ...deliveredEvent.payload,
+    envelope: { ...deliveredEvent.payload.envelope, targetSessionId: "another-task" } } }), null);
+  const separate = bridge.eventToTimeline({ ...deliveredEvent, eventId: "remote-delivery-2", payload: { ...deliveredEvent.payload,
+    envelope: { ...deliveredEvent.payload.envelope, id: "remote_verified_2" } } });
+  assert.equal(timelineMerge.mergeTimeline([delivered], separate).length, 2, "separate messages with identical wording remain distinct");
   for (const type of ["message.started", "message.completed"]) {
     const echo = bridge.eventToTimeline({
       sequence: 1,
@@ -2125,6 +2145,8 @@ test("verified cross-task sender attribution survives live echoes and history re
     assert.equal(echo.kind, "user");
     assert.equal(echo.body, message.parts[0].text);
     assert.deepEqual(echo.origin, origin);
+    assert.equal(timelineMerge.mergeTimeline([delivered], echo).length, 1, "a late native echo adopts the delivered row");
+    assert.equal(timelineMerge.mergeTimeline([echo], delivered).length, 1, "acceptance may arrive after the native echo");
     const merged = timelineMerge.reconcileTimelinePage(history, [echo]);
     assert.equal(merged.length, 1);
     assert.deepEqual(merged[0].origin, origin);

@@ -5458,6 +5458,7 @@ export class AgentBridge {
       sessionId,
       payload: { state, reason },
     });
+    if (state === "working") void this.pumpCrossSessionInbox(sessionId);
     return state;
   }
 
@@ -6185,6 +6186,10 @@ export class AgentBridge {
       });
     } else if (globalSessionId !== undefined && (event.type === "session.status_changed" || event.type === "session.updated")) {
       void this.pumpDelegationsForSession(globalSessionId);
+    }
+    if (globalSessionId !== undefined && (event.type === "message.started"
+      || ((event.type === "session.status_changed" || event.type === "session.updated") && event.payload.state === "working"))) {
+      void this.pumpCrossSessionInbox(globalSessionId);
     }
     if (globalSessionId !== undefined && event.type === "tool.completed"
       && this.#goalContextRecoveries.get(globalSessionId)?.pending === false
@@ -6916,6 +6921,8 @@ export class AgentBridge {
   private canContinueGoal(sessionId: string, goal: SessionGoal): boolean {
     return this.goalAwaitsContinuation(sessionId, goal) && !this.sessionHoldsFollowUpQueue(sessionId)
       && !this.hasPendingUserQueue(sessionId) && !this.#queuePumps.has(sessionId)
+      && ![...this.#crossSessionMessages.values()].some((message) => message.envelope.targetSessionId === sessionId
+        && (message.state === "pending" || message.state === "sending"))
       && !this.#crossSessionPumps.has(sessionId) && !this.#pendingProviderSends.has(sessionId);
   }
 
@@ -7805,31 +7812,45 @@ export class AgentBridge {
     }
   }
 
+  private crossSessionDeliveryMode(targetSessionId: string, supportsSteering: boolean): "send" | "steer" | undefined {
+    if (this.#disposed || this.sessionIsStopped(targetSessionId)
+      || this.#goalContextRecoveries.get(targetSessionId)?.pending === true
+      || this.#compactingSessions.has(targetSessionId) || this.#autoCompactions.has(targetSessionId)
+      || this.hasPendingUserQueue(targetSessionId) || this.#queuePumps.has(targetSessionId)) return undefined;
+    const target = this.#cache.get(targetSessionId);
+    if (target === undefined || !this.isCrossSessionTask(target)) return undefined;
+    // Coordination must reach a long-running goal at the provider's normal
+    // steering boundary; waiting for the whole task can strand it for hours.
+    if (target.state === "working") return supportsSteering ? "steer" : undefined;
+    return this.sessionHoldsFollowUpQueue(targetSessionId) ? undefined : "send";
+  }
+
   private async pumpCrossSessionInbox(targetSessionId: string): Promise<void> {
     if (this.#crossSessionPumps.has(targetSessionId) || this.#disposed) return;
-    if (this.sessionHoldsFollowUpQueue(targetSessionId)) return;
     const target = this.#cache.get(targetSessionId);
     if (target === undefined || !this.isCrossSessionTask(target)) return;
-    if (target.state === "working" || target.state === "needs_approval" || target.state === "needs_input"
-      || target.state === "disconnected" || target.state === "unknown") return;
     if (this.hasPendingUserQueue(targetSessionId) || this.#queuePumps.has(targetSessionId)) return;
     const next = [...this.#crossSessionMessages.values()]
       .filter((message) => message.envelope.targetSessionId === targetSessionId && message.state === "pending")
-      .sort((left, right) => left.envelope.createdAt.localeCompare(right.envelope.createdAt) || left.envelope.id.localeCompare(right.envelope.id))[0];
+      .sort((left, right) => left.envelope.createdAt.localeCompare(right.envelope.createdAt))[0];
     if (next === undefined) return;
     this.#crossSessionPumps.add(targetSessionId);
-    const sending: CrossSessionMessage = {
-      ...next,
-      state: "sending",
-      attemptCount: next.attemptCount + 1,
-      updatedAt: new Date().toISOString(),
-    };
-    this.#crossSessionMessages.set(next.envelope.id, sending);
+    let shouldRepump = false;
     try {
+      const adapter = this.requireAdapter(target.providerId);
+      const supportsSteering = adapter.steerMessage !== undefined && (await adapter.getCapabilities()).steering;
+      if (this.crossSessionDeliveryMode(targetSessionId, supportsSteering) === undefined) return;
+      const sending: CrossSessionMessage = {
+        ...next,
+        state: "sending",
+        attemptCount: next.attemptCount + 1,
+        updatedAt: new Date().toISOString(),
+      };
+      this.#crossSessionMessages.set(next.envelope.id, sending);
       await this.persistCrossSessionMessages();
-      // A user can enqueue while the durable state write is in flight. Recheck
-      // immediately before provider dispatch so user-authored work stays first.
-      if (this.hasPendingUserQueue(targetSessionId) || this.#queuePumps.has(targetSessionId)) {
+      // Stop, attention, compaction and user queues can change during persistence.
+      const mode = this.crossSessionDeliveryMode(targetSessionId, supportsSteering);
+      if (mode === undefined) {
         this.#crossSessionMessages.set(next.envelope.id, { ...sending, state: "pending", updatedAt: new Date().toISOString() });
         await this.persistCrossSessionMessages();
         return;
@@ -7839,7 +7860,7 @@ export class AgentBridge {
         throw new Error("Cross-task delivery envelope no longer matches its persisted inbox record");
       }
       const deliveryRequestId = crossSessionDeliveryRequestId(next.envelope.id);
-      const result = await this.sendMessageInternal(targetSessionId, {
+      const request: SendMessageRequest = {
         requestId: deliveryRequestId,
         content: crossSessionDispatchContent(next.envelope),
         metadata: {
@@ -7848,7 +7869,21 @@ export class AgentBridge {
           tethoqEnvelopeId: next.envelope.id,
           tethoqSourceSessionId: next.envelope.sourceSessionId,
         },
-      });
+      };
+      let result: SendMessageResult;
+      try {
+        result = mode === "steer"
+          ? await this.steerMessage(targetSessionId, request)
+          : await this.sendMessageInternal(targetSessionId, request);
+      } catch (error) {
+        // A definitive no-active-turn rejection is safe to retry at idle. A
+        // timeout or ambiguous acceptance must never send a second instruction.
+        if (mode !== "steer" || !(error instanceof ProviderAdapterError) || error.code !== "NO_ACTIVE_TURN") throw error;
+        this.#crossSessionMessages.set(next.envelope.id, { ...sending, state: "pending", updatedAt: new Date().toISOString() });
+        await this.persistCrossSessionMessages();
+        shouldRepump = this.crossSessionDeliveryMode(targetSessionId, supportsSteering) === "send";
+        return;
+      }
       if (!result.accepted) throw new Error(result.details.join(" ") || "The target harness did not accept the cross-task message");
       const deliveredAt = new Date().toISOString();
       const delivered: CrossSessionMessage = {
@@ -7867,11 +7902,12 @@ export class AgentBridge {
         sessionId: targetSessionId,
         payload: delivered as unknown as JsonObject,
       });
+      shouldRepump = true;
     } catch (error) {
       const current = this.#crossSessionMessages.get(next.envelope.id);
       if (current?.state !== "delivered") {
         const failed: CrossSessionMessage = {
-          ...(current ?? sending),
+          ...(current ?? next),
           state: "failed",
           updatedAt: new Date().toISOString(),
           error: error instanceof Error ? error.message.slice(0, 2_000) : String(error).slice(0, 2_000),
@@ -7881,6 +7917,7 @@ export class AgentBridge {
       }
     } finally {
       this.#crossSessionPumps.delete(targetSessionId);
+      if (shouldRepump) void this.pumpCrossSessionInbox(targetSessionId);
     }
   }
 
@@ -7973,7 +8010,7 @@ export class AgentBridge {
 
   private async persistCrossSessionMessages(): Promise<void> {
     await this.#onCrossSessionMessagesChange?.([...this.#crossSessionMessages.values()]
-      .sort((left, right) => left.envelope.createdAt.localeCompare(right.envelope.createdAt) || left.envelope.id.localeCompare(right.envelope.id)));
+      .sort((left, right) => left.envelope.createdAt.localeCompare(right.envelope.createdAt)));
   }
 
   private requirePrimarySession(sessionId: string): RemoteSession {

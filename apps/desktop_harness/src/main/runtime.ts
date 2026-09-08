@@ -772,6 +772,9 @@ export class DesktopRuntime {
     const through = events.at(-1)?.sequence ?? replay.latestSequence;
     this.#latestSequence = through;
     this.#onEvents({ events, latestSequence: through, replayGap: replay.replayGap });
+    // A burst can exceed one bounded IPC batch. Drain the rest on the next
+    // event-loop turn instead of leaving its final text/status on the heartbeat.
+    if (replay.events.length > events.length) this.queueEventFlush();
   }
 
   private scheduleEventPoll(): void {
