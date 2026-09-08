@@ -9399,7 +9399,7 @@ function foreignSubagentInstruction(): string {
     foreignSubagentMarker,
     "This Tethoq session is allowed to delegate work to subagents that run on a different coding tool (harness) than your own.",
     'To find a candidate task on another tool, call mesh_list_sessions with an optional "query" search string and a "limit" from 1 to 25; it returns tasks with their stable session IDs and harness names.',
-    'To send a subagent request to that task, call mesh_message_session with "target_session_id" (a session ID from mesh_list_sessions), "message" (the work request), and "request_id" (a stable unique ID for this send; reuse it only when retrying the same target and message). The other task receives the request through its own inbox after its user-authored work.',
+    'To send a subagent request to that task, call mesh_message_session with "target_session_id" (a session ID from mesh_list_sessions), "message" (the work request), and "request_id" (a stable unique ID for this send; reuse it only when retrying the same target and message). The other task receives the request through its own inbox after any queued user messages, using native steering during active work when supported.',
     'Manage existing delegated child sessions with mesh_list_children, mesh_message_child ("child_session_id", "message"), mesh_wait ("child_session_ids", "timeout_seconds"), and mesh_read_result ("child_session_id").',
     "This capability is per session. When it is off for a session you must not spawn or message foreign subagents with these tools; say plainly that cross-tool subagents are disabled for this task instead of working around the restriction.",
   ].join("\n");

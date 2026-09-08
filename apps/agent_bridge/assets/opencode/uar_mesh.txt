@@ -200,7 +200,7 @@ export const list_sessions = tool({
 })
 
 export const message_session = tool({
-  description: "Send a message to another indexed Tethoq task through its isolated inbox. This never steers or changes its user queue.",
+  description: "Send a message to another indexed Tethoq task. Steers active work when supported or waits for idle; queued user messages run first.",
   args: {
     target_session_id: tool.schema.string(),
     message: tool.schema.string().max(32000),

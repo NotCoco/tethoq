@@ -28,7 +28,7 @@ server.registerTool("mesh_list_sessions", {
 
 server.registerTool("mesh_message_session", {
   title: "Message Tethoq task",
-  description: "Send an isolated, queue-safe message to another indexed Tethoq task.",
+  description: "Send a message to another indexed Tethoq task. Steers active work when supported or waits for idle; queued user messages run first.",
   inputSchema: {
     target_session_id: z.string().min(1).max(16_384),
     message: z.string().min(1).max(32_000),

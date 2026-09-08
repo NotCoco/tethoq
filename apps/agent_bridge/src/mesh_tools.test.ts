@@ -14,7 +14,8 @@ test("mesh tools expose bounded task discovery and isolated cross-task messaging
   const turnSupport = meshToolDefinitions.find((tool) => tool.name === "tethoq_turn_support");
   assert.equal(discovery?.inputSchema.additionalProperties, false);
   assert.deepEqual(messaging?.inputSchema.required, ["target_session_id", "message", "request_id"]);
-  assert.match(messaging?.description ?? "", /never steers/i);
+  assert.match(messaging?.description ?? "", /native steering when supported/i);
+  assert.match(messaging?.description ?? "", /queued user messages always run first/i);
   const dispatchSchema = dispatch?.inputSchema as { readonly required?: unknown; readonly properties?: Record<string, unknown> } | undefined;
   assert.deepEqual(dispatchSchema?.required, ["delegation_id", "assignments"]);
   assert.deepEqual(Object.keys(dispatchSchema?.properties ?? {}), ["delegation_id", "assignments"]);

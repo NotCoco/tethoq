@@ -61,7 +61,7 @@ export const meshToolDefinitions: readonly ClientToolDefinition[] = [
   },
   {
     name: "mesh_message_session",
-    description: "Send a message to another indexed Tethoq task through its separate inbox. It never steers active work or changes that task's user-authored queue; queued user messages always run first.",
+    description: "Send a message to another indexed Tethoq task through its separate inbox. Active tasks receive it through native steering when supported; otherwise it waits for idle. Queued user messages always run first.",
     inputSchema: {
       type: "object",
       properties: {
