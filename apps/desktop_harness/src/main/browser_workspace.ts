@@ -196,6 +196,7 @@ export type BrowserWorkspaceNotice =
   | { readonly type: "blocked-popup"; readonly tabId: string; readonly url: string }
   | { readonly type: "tab-limit" }
   | { readonly type: "focus-address"; readonly tabId: string }
+  | { readonly type: "workspace-closed" }
   | { readonly type: "permission-blocked"; readonly tabId: string; readonly permission: string; readonly origin: string }
   | { readonly type: "permission-expired"; readonly requestId: string }
   | { readonly type: "download-started"; readonly downloadId: string }
@@ -393,7 +394,12 @@ export class BrowserWorkspaceManager {
       const next = nextId === undefined ? undefined : this.#tabs.get(nextId);
       if (next !== undefined) this.#activate(next);
     }
-    if (this.#tabs.size === 0) await this.createTab({ url: this.#initialUrl }, true);
+    if (this.#tabs.size === 0) {
+      const returnToChat = this.#requestedVisible;
+      if (this.#activeSessionId !== null) this.#sessionSnapshots.delete(this.#activeSessionId);
+      this.setVisible(false);
+      if (returnToChat) this.#onNotice?.({ type: "workspace-closed" });
+    }
     this.#emitSoon();
     return this.getState();
   }

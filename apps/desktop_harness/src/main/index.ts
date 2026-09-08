@@ -150,7 +150,7 @@ async function startApplication(): Promise<void> {
     onState: (state) => { if (!window.isDestroyed()) window.webContents.send(IPC_CHANNELS.browserState, state); },
     onNotice: (notice) => {
       if (window.isDestroyed()) return;
-      if (notice.type === "focus-address") window.webContents.focus();
+      if (notice.type === "focus-address" || notice.type === "workspace-closed") window.webContents.focus();
       window.webContents.send(IPC_CHANNELS.browserNotice, browserNoticeMessage(notice));
     },
   });
@@ -650,6 +650,7 @@ function browserNoticeMessage(notice: BrowserWorkspaceNotice): BrowserNotice {
     case "blocked-popup": return { tone: "info", message: "A popup was blocked." };
     case "tab-limit": return { tone: "info", message: "Close a browser tab before opening another." };
     case "focus-address": return { tone: "info", message: "Address bar focused.", action: "focus-address", tabId: notice.tabId };
+    case "workspace-closed": return { tone: "info", message: "", action: "return-to-chat" };
     case "permission-blocked": return { tone: "info", message: `${notice.permission} access was blocked.` };
     case "permission-expired": return { tone: "info", message: "The browser permission request expired." };
     case "download-started": return { tone: "info", message: "Download started." };

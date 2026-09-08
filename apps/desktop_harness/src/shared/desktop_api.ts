@@ -253,7 +253,7 @@ export interface BrowserWorkspaceState {
 export interface BrowserNotice {
   readonly tone: "info" | "error";
   readonly message: string;
-  readonly action?: "focus-address";
+  readonly action?: "focus-address" | "return-to-chat";
   readonly tabId?: string;
 }
 export type BrowserAction =

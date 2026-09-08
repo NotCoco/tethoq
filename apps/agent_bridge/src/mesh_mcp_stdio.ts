@@ -77,7 +77,7 @@ server.registerTool("mesh_wait", {
   description: "Wait until selected delegated children stop working, need attention, or the timeout expires.",
   inputSchema: {
     child_session_ids: z.array(z.string().min(1)).optional(),
-    timeout_seconds: z.number().int().min(1).max(300).optional(),
+    timeout_seconds: z.number().int().min(1).max(900).optional(),
     parent_session_id: z.string().optional(),
   },
 }, async ({ child_session_ids, timeout_seconds, parent_session_id }) => result(await call(parent_session_id, "mesh_wait", {

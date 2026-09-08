@@ -1195,6 +1195,13 @@ function App() {
         setBrowserAddressFocusToken((current) => current + 1);
         return;
       }
+      if (notice.action === "return-to-chat") {
+        if (viewRef.current === "browser") {
+          setView(selectedSessionIdRef.current ? "workspace" : "dashboard");
+          requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>("#composer-message")?.focus());
+        }
+        return;
+      }
       notify(notice.message, notice.tone === "error" ? "error" : undefined);
     });
     const removeRecorder = window.tethoqDesktop.onRecorderState((state) => { setRecorder(state); if (state.phase === "staged") setSaveWorkflowOpen(true); });
