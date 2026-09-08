@@ -1197,8 +1197,8 @@ function App() {
       }
       if (notice.action === "return-to-chat") {
         if (viewRef.current === "browser") {
-          setView(selectedSessionIdRef.current ? "workspace" : "dashboard");
-          requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>("#composer-message")?.focus());
+          flushSync(() => setView(selectedSessionIdRef.current ? "workspace" : "dashboard"));
+          document.querySelector<HTMLTextAreaElement>("#composer-message")?.focus();
         }
         return;
       }
