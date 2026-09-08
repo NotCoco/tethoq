@@ -7204,11 +7204,12 @@ export class AgentBridge {
   }
 
   private queueDeliveryTombstone(delivery: QueueDeliveryRecord): QueuedMessageRecord {
+    const displayContent = delivery.displayContent ?? delivery.content;
     return {
       view: {
         id: delivery.messageId,
         sessionId: delivery.sessionId,
-        content: delivery.displayContent ?? delivery.content,
+        content: displayContent === hiddenProviderControlContent("continue") ? "Continue task" : displayContent,
         mode: "queue",
         state: "failed",
         createdAt: delivery.queuedCreatedAt,

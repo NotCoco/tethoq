@@ -8827,6 +8827,10 @@ test("uncertain goal delivery blocks automation even when the provider disconnec
       }
       await waitFor(() => persisted[session.id]?.status === "blocked", "uncertain delivery must stop the active goal");
       assert.equal((await bridge.sessionGoal(session.id))?.status, "blocked");
+      if (mode === "automatic") {
+        assert.equal(bridge.queuedMessages(session.id)[0]?.content, "Continue task", "failed controls must not expose internal markup");
+        assert.match(deliveries[0]!.content, /tethoq_hidden_control_turn/, "the journal retains the actual payload for reconciliation");
+      }
       const event = bridge.eventReplaySince(0).events.filter((event) => event.type === "session.goal_updated").at(-1)!;
       assert.equal((event.payload.goal as unknown as SessionGoal).status, "blocked");
       await provider.finish(session.providerSessionId);
