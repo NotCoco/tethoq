@@ -10,7 +10,7 @@ test("OpenCode image-limit failures expose actionable text in live and persisted
     responseBody: "private transport body", responseHeaders: { authorization: "private header" }, metadata: { url: "https://private.example" } } };
   const error = normalizeOpenCodeError(failure);
   assert.equal(error.code, "IMAGE_LIMIT_EXCEEDED");
-  assert.equal(error.recovery, "compact_context");
+  assert.equal(error.recovery, undefined);
   assert.match(error.message, /51 images.*50 per request/);
   const [message] = normalizeOpenCodeMessages("host", "session", [{ info: { id: "failed", role: "assistant", error: failure }, parts: [] }]);
   assert.equal(message?.status, "failed");
@@ -20,7 +20,17 @@ test("OpenCode image-limit failures expose actionable text in live and persisted
     { ...failure.data, statusCode: 429 },
     { ...failure.data, message: "API key rejected" },
     { ...failure.data, message: "request contains 4 images, exceeding the maximum of 50 allowed per request" },
+    { ...failure.data, message: "Too many images in request: 30 > 30" },
+    { ...failure.data, message: "Too many images in request: 31 > 0" },
+    { ...failure.data, message: "Too many images in request: 99999999999999999 > 30" },
   ]) assert.equal(normalizeOpenCodeError({ name: "APIError", data }).recovery, undefined);
+  for (const statusCode of [400, 413]) {
+    const glmError = normalizeOpenCodeError({ name: "APIError", data: { statusCode,
+      message: "Error from provider (Console Go): Upstream request failed: [invalid_request_error] Too many images in request: 31 > 30" } });
+    assert.equal(glmError.code, "IMAGE_LIMIT_EXCEEDED");
+    assert.equal(glmError.recovery, undefined);
+    assert.match(glmError.message, /31 images.*30 per request/);
+  }
   assert.deepEqual(normalizeOpenCodeError({ name: "APIError", data: { message: "Authentication failed for sk-secret-token at https://provider.example/?key=secret" } }),
     { code: "APIError", message: "Authentication failed for [redacted] at [provider URL]" });
 });
@@ -192,6 +202,72 @@ test("OpenCode leaves unrelated synthetic Read echoes and genuine Read tools vis
   assert.match(messages[0]?.parts[1]?.type === "text" ? messages[0].parts[1].text : "", /Tethoq extracted this text/u);
   assert.equal(messages[1]?.parts[0]?.type, "tool");
   assert.equal(messages[1]?.parts[0]?.type === "tool" ? messages[1].parts[0].providerPartId : undefined, "genuine_read_tool");
+});
+
+function overflowingCompactionReplay() {
+  const original = {
+    info: { id: "original", role: "user", agent: "build", model: { providerID: "route", modelID: "model", variant: "max" },
+      tools: { read: true }, system: "Task instructions", time: { created: 10 } },
+    parts: [
+      { id: "prompt", type: "text", text: "Use this reference image and document to improve the result." },
+      { id: "image", type: "file", mime: "image/png", filename: "reference.png", url: "data:image/png;base64,aW1hZ2U=" },
+      { id: "pdf", type: "file", mime: "application/pdf", filename: "spec.pdf", url: "data:application/pdf;base64,cGRm" },
+      { id: "notes", type: "file", mime: "text/plain", filename: "notes.txt", url: "file:///work/notes.txt" },
+    ],
+  };
+  const marker = { info: { id: "marker", role: "user", time: { created: 20 } },
+    parts: [{ id: "compact", type: "compaction", auto: true, overflow: true }] };
+  const summary = { info: { id: "summary", role: "assistant", parentID: "marker", summary: true, agent: "compaction",
+    finish: "stop", time: { created: 21, completed: 30 } }, parts: [{ type: "text", text: "Internal context summary" }] };
+  const replay = { info: { ...original.info, id: "native_replay", time: { created: 37 } }, parts: [
+    { id: "copy_prompt", type: "text", text: original.parts[0]!.text },
+    { id: "copy_image", type: "text", text: "[Attached image/png: reference.png]" },
+    { id: "copy_pdf", type: "text", text: "[Attached application/pdf: spec.pdf]" },
+    { ...original.parts[3]!, id: "copy_notes" },
+  ] };
+  const answer = { info: { id: "continued", role: "assistant", parentID: "native_replay", finish: "stop",
+    time: { created: 40, completed: 50 } }, parts: [{ type: "text", text: "The work continued." }] };
+  return { original, marker, summary, replay, answer };
+}
+
+test("OpenCode hides overflow-compaction prompt replays while preserving the original attachments and continuation", () => {
+  const { original, marker, summary, replay, answer } = overflowingCompactionReplay();
+  for (let count = 0; count <= replay.parts.length; count += 1) {
+    const history = [original, marker, summary, { ...replay, parts: replay.parts.slice(0, count) }, answer];
+    const before = structuredClone(history);
+    const messages = normalizeOpenCodeMessages("host", "session", history);
+    assert.equal(messages.some((message) => message.providerMessageId === "native_replay"), false, `persisted replay prefix ${count}`);
+    assert.deepEqual(messages[0]?.parts.map((part) => part.type), ["text", "image", "file", "file"]);
+    assert.equal(messages[0]?.parts[1]?.type === "image" ? messages[0].parts[1].uri : undefined, original.parts[1]!.url);
+    assert.equal(messages.at(-1)?.providerMessageId, "continued");
+    const continued = messages.at(-1)?.parts[0];
+    assert.equal(continued?.type === "text" ? continued.text : undefined, "The work continued.");
+    assert.deepEqual(history, before, "presentation must not alter the provider's stored model input");
+  }
+});
+
+test("OpenCode preserves repeated user messages when compaction replay evidence is absent or contradictory", () => {
+  const { original, marker, summary, replay } = overflowingCompactionReplay();
+  const scenarios = [
+    { name: "ordinary repeated prompt", history: [original, replay] },
+    { name: "original outside history page", history: [marker, summary, replay] },
+    { name: "manual compaction", history: [original, { ...marker, parts: [{ ...marker.parts[0], auto: false }] }, summary, replay] },
+    { name: "non-overflow compaction", history: [original, { ...marker, parts: [{ ...marker.parts[0], overflow: false }] }, summary, replay] },
+    { name: "unfinished summary", history: [original, marker, { ...summary, info: { ...summary.info, time: { created: 21 } } }, replay] },
+    { name: "failed summary", history: [original, marker, { ...summary, info: { ...summary.info, error: { name: "APIError" } } }, replay] },
+    { name: "unrelated summary", history: [original, marker, { ...summary, info: { ...summary.info, parentID: "other" } }, replay] },
+    { name: "later repeat", history: [original, marker, summary, { ...replay, info: { ...replay.info, time: { created: 3_000 } } }] },
+    { name: "different model", history: [original, marker, summary, { ...replay, info: { ...replay.info, model: { ...replay.info.model, modelID: "other" } } }] },
+    { name: "changed prompt", history: [original, marker, summary, { ...replay, parts: [{ ...replay.parts[0], text: "A new request." }] }] },
+    { name: "different attachment", history: [original, marker, summary, { ...replay, parts: [replay.parts[0], { type: "text", text: "[Attached image/png: other.png]" }] }] },
+    { name: "another user intervened", history: [original, marker, summary, { ...original, info: { ...original.info, id: "new_user" }, parts: [{ type: "text", text: "New instructions" }] }, replay] },
+  ];
+  for (const { name, history } of scenarios) {
+    assert.equal(normalizeOpenCodeMessages("host", "session", history).some((message) => message.providerMessageId === "native_replay"), true, name);
+  }
+  const submittedAgain = { ...replay, info: { ...replay.info, id: "msg_0123456789abcdef0123456789abcdef" } };
+  assert.equal(normalizeOpenCodeMessages("host", "session", [original, marker, summary, submittedAgain])
+    .some((message) => message.providerMessageId === submittedAgain.info.id), true, "a genuine Tethoq submission must stay visible even immediately after compaction");
 });
 
 test("OpenCode history preserves distinct native identities for repeated reasoning parts", () => {
@@ -595,6 +671,15 @@ test("OpenCode SSE parser yields every documented global event fixture", async (
     const payload = event.payload;
     return typeof payload === "object" && payload !== null && "type" in payload ? payload.type : undefined;
   }), ["server.connected", "message.part.updated", "permission.updated"]);
+});
+
+test("an already-cancelled OpenCode request cannot dispatch or wait for another timeout", async () => {
+  let requests = 0;
+  const client = new OpenCodeHttpClient({ fetch: async () => { requests += 1; return new Response(null, { status: 204 }); } });
+  const controller = new AbortController();
+  controller.abort(new Error("cancelled before dispatch"));
+  await assert.rejects(client.request("POST", "/session/task/prompt_async", { signal: controller.signal, body: {} }), { code: "HTTP_REQUEST_FAILED" });
+  assert.equal(requests, 0);
 });
 
 test("OpenCode HTTP errors do not expose upstream response content", async () => {

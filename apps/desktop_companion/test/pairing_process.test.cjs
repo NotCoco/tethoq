@@ -76,6 +76,7 @@ test('manager starts one persistent engine with an opaque environment token', as
   const spawns = [];
   const requests = [];
   const manager = new PairingProcessManager({
+    shutdownGraceMs: 0,
     executable: 'node.exe',
     entrypoint: 'C:\\bridge\\main.js',
     cloudflaredPath: 'C:\\bridge\\cloudflared.exe',
@@ -114,6 +115,7 @@ test('pairing commands reuse the persistent child and sanitize the local QR page
   const requests = [];
   const expiry = new Date(Date.now() + 60_000).toISOString();
   const manager = new PairingProcessManager({
+    shutdownGraceMs: 0,
     executable: 'electron.exe',
     entrypoint: 'C:\\bridge\\main.js',
     electronRuntime: true,
@@ -140,11 +142,13 @@ test('pairing commands reuse the persistent child and sanitize the local QR page
   await manager.shutdown();
 });
 
-test('authenticated status polling promotes a ready pairing to paired', async () => {
+test('authenticated status polling promotes a ready pairing to paired', { timeout: 2_000 }, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   const child = fakeChild();
   let paired = false;
   const expiry = new Date(Date.now() + 60_000).toISOString();
   const states = [];
+  const pairedState = Promise.withResolvers();
   const manager = new PairingProcessManager({
     executable: 'node.exe',
     entrypoint: 'C:\\bridge\\main.js',
@@ -155,12 +159,19 @@ test('authenticated status polling promotes a ready pairing to paired', async ()
     },
     fetchPage: async () => fakePage(),
     stopProcess: async () => {},
-    onStateChange: (status) => states.push(status.state),
+    onStateChange: (status) => {
+      states.push(status.state);
+      if (status.state === 'paired') pairedState.resolve();
+    },
+    shutdownGraceMs: 0,
   });
   await boot(manager, child);
   await manager.start();
   paired = true;
-  await new Promise((resolve) => setTimeout(resolve, 1_100));
+  t.mock.timers.tick(999);
+  assert.equal(manager.status().state, 'ready');
+  t.mock.timers.tick(1);
+  await pairedState.promise;
   assert.deepEqual(manager.status(), { state: 'paired' });
   assert.ok(states.includes('paired'));
   await manager.shutdown();
@@ -170,6 +181,7 @@ test('unexpected exit schedules one bounded restart and never spawns duplicates'
   const children = [fakeChild(1), fakeChild(2)];
   const spawns = [];
   const manager = new PairingProcessManager({
+    shutdownGraceMs: 0,
     executable: 'node.exe',
     entrypoint: 'C:\\bridge\\main.js',
     spawnProcess: (...args) => { spawns.push(args); return children[spawns.length - 1]; },

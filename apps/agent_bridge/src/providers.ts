@@ -61,6 +61,7 @@ export function createConfiguredProviders(
     adapters.push(new OpenCodeAdapter({
       hostId: config.hostId,
       baseUrl: tethoqEnvironmentValue(environment, "TETHOQ_OPENCODE_URL") ?? "http://127.0.0.1:4096/",
+      imagePolicy: {},
       ...(username !== undefined ? { username } : {}),
       ...(password !== undefined ? { password } : {}),
       ...(directory !== undefined ? { directory } : {}),

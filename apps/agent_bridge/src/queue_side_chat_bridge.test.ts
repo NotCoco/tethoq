@@ -729,6 +729,7 @@ test("side-chat promotion uses transcript bootstrap while ordinary branching rem
   t.after(() => bridge.dispose());
   await bridge.start();
   const parent = (await bridge.refresh()).sessions[0]!;
+  await bridge.interrupt(parent.id);
 
   const ordinaryBranch = await bridge.branchSession(parent.id);
   assert.equal(ordinaryBranch.strategy, "native");

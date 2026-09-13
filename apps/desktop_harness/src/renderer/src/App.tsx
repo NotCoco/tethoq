@@ -13,7 +13,6 @@ import {
   isBrowserPreview,
   isDeliveryUnknownError,
   loadInitialSnapshot,
-  listChildSessions,
   listSessions,
   loadProviderModels,
   loadSessionContext,
@@ -43,7 +42,7 @@ import { HarnessConnections } from "./HarnessConnections";
 import { Composer, DictationSettings, ResponseAnnotationEditor, SideChatPanel, buildContextHandoffInstruction, clearScheduledDraftContent, formatDraftScheduleLocalTime, mergeFailedComposerDraft, mergeFailedSideChatDraft, parsedVisionStatus, persistRecentModelUsesFromSessions, remainingMeshTargetsAfterSchedule, type ComposerAttachment, type ComposerDraftSnapshot, type ComposerTaskAction, type DelegationDraft, type DraftModelSelection, type DraftSessionMaterializeInput, type DraftSessionScheduleAttemptState, type DraftSessionScheduleInput, type DraftSessionSendInput, type MeshTarget, type PendingComposerAction, type QueuedNewTaskPresentation, type SideChatDraft } from "./Composer";
 import { canonicalSessionWorkingBoundary, captureSessionWorkingBoundary, isAmbiguousSelectionValue, isPersistedCodexFinalAnswer, latestTurnHasCompletedFinal, modelAcceptsDirectAudio, parentSessionIdForBack, presentedSessionState, providerAcceptsDirectAudio, quietCatchUpDue, quietCatchUpIntervalMs, resolveConcreteModelSelection, selectedSessionLastDeltaAt, sessionBoundaryNeedsVisibleEnding, sessionHoldsFollowUpQueue, sessionNeedsTranscriptCatchUp, sessionPresentsLiveTurn, shouldApplySessionState, terminalSessionNeedsCanonicalHistory, terminalStateEventAction, type SessionWorkingBoundary, type TerminalStateEventAction, unownedTurnFollowMs, unownedTurnSilenceMs } from "./composer_helpers";
 import { anchoredTimelineRevealStart, mergeAcceptedComposerRow, mergeTimeline, mergeTimelineImageHydration, reconcileTimelinePage, rollbackOptimisticComposerRow, settleRunningTimeline, settleTimelineImagePlaceholders, timelineRevealAnchorKey } from "./timeline_merge";
-import { mergeAuthoritativeOpenedSession, mergeRefreshedSessions, sameSessionContext, scheduledTaskEventSchedule, scheduledTaskFailureCanRetractPresentation, scheduledTaskPresentationState, scheduledTaskScheduleAfterProviderEvidence, withoutRetiredScheduledSessions } from "./session_refresh";
+import { applyConfirmedInterruption, mergeAuthoritativeOpenedSession, mergeRefreshedSessions, sameSessionContext, scheduledTaskEventSchedule, scheduledTaskFailureCanRetractPresentation, scheduledTaskPresentationState, scheduledTaskScheduleAfterProviderEvidence, withoutRetiredScheduledSessions } from "./session_refresh";
 import { parseResponseAnnotations, visibleResponseAnnotationBody, type ResponseAnnotation } from "./response_annotations";
 import { visibleToastFeedback } from "./toast_feedback";
 import { LiveSessionPanel } from "./LiveSession";
@@ -55,6 +54,7 @@ import { LocalOpenHandlerGlyph, LocalOpenProvider, WorkspaceLocalOpenControl, pr
 import { maximumUiSearchCharacters, normalizeUiSearchQuery } from "./search_helpers";
 import { compareOrganizedSessions, isHiddenByArchive, matchesProviderFilters, organizeSessions } from "./task_organization";
 import { beginModelHydration, mergeLatestModelCatalogues } from "./model_hydration";
+import { childSessionCache, maintainSessionMetadata, reconcileSessionMetadata, sideChatCache, useSessionMetadata, useTaskChildren } from "./session_metadata";
 import { isSideChatSession, sessionsForTaskListMode, sideChatParentSessionId } from "./session_projects";
 import { HISTORY_PAGE_LIMIT, anchoredScrollTop, clampScrollTop, distanceFromEnd, firstScrollMemberToken, historyPageNeedsRebase, isAtPhysicalBottom, isHistoryPageExpired, movedOffEnd, readerReturnedToEnd, retainedHistoryCursor, scrollAnchorMatches, shouldRequestOlder } from "./conversation_scroll";
 import { timelinePresentationSignature } from "./timeline_presentation";
@@ -240,6 +240,7 @@ interface DraftScheduleAttemptRecord {
   input: DraftSessionScheduleInput;
   inFlight: Promise<void> | null;
   failure: string | null;
+  latestTask?: unknown;
 }
 
 function replaceSession(sessions: Session[], sessionId: string, update: SessionUpdate): Session[] {
@@ -295,13 +296,17 @@ export async function resolveTimelineSubagentSession(
   parentSessionId: string,
   childSessionId: string,
   cachedSessions: readonly Session[],
-  loadChildren: ChildSessionLoader = listChildSessions,
+  loadChildren: ChildSessionLoader = childSessionCache.load,
 ): Promise<Session | null> {
   const exactChildSessionId = childSessionId.trim();
   if (!parentSessionId || !exactChildSessionId) return null;
-  const cached = cachedSessions.find((candidate) => isExactSubagentChild(candidate, parentSessionId, exactChildSessionId));
+  const cached = cachedSessions.find((candidate) => isExactSubagentChild(candidate, parentSessionId, exactChildSessionId))
+    ?? (loadChildren === childSessionCache.load
+      ? childSessionCache.getSnapshot(parentSessionId).data?.find((candidate) => isExactSubagentChild(candidate, parentSessionId, exactChildSessionId))
+      : undefined);
   if (cached) return cached;
-  const children = await loadChildren(parentSessionId);
+  // A newly spawned child can be absent from an otherwise fresh cached list.
+  const children = await (loadChildren === childSessionCache.load ? childSessionCache.load(parentSessionId, true) : loadChildren(parentSessionId));
   return children.find((candidate) => isExactSubagentChild(candidate, parentSessionId, exactChildSessionId)) ?? null;
 }
 
@@ -347,6 +352,7 @@ function derivedSession(value: Record<string, unknown>, source: Session): Sessio
       : typeof value.variantId === "string" ? value.variantId : source.effort,
     ...(providerStatus ? { providerStatus } : {}),
     ...(contextSummary !== undefined ? { contextSummary } : {}),
+    ...(state === "idle" && typeof metadata.tethoqInterruptedAt === "string" ? { interruptedAt: metadata.tethoqInterruptedAt } : {}),
   };
 }
 
@@ -415,19 +421,36 @@ function materializedDraftSession(value: unknown, input: DraftSessionMaterialize
   };
 }
 
+function latestScheduledTask(response: unknown, event: unknown): unknown {
+  const order = (value: unknown): readonly [number, number] => {
+    if (!value || typeof value !== "object") return [-1, -1];
+    const task = value as Record<string, unknown>;
+    const time = Date.parse(String(task.cancelledAt ?? task.startedAt ?? task.failedAt ?? task.dispatchingAt ?? task.createdAt));
+    const status = ["pending", "dispatching", "started", "failed", "cancelled"].indexOf(String(task.status));
+    return [Number.isFinite(time) ? time : -1, status];
+  };
+  const [responseTime, responseStatus] = order(response);
+  const [eventTime, eventStatus] = order(event);
+  return eventTime > responseTime || eventTime === responseTime && eventStatus >= responseStatus ? event : response;
+}
+
 function createdScheduledSession(taskValue: unknown, input: DraftSessionScheduleInput): Session {
-  const scheduled = mapActiveScheduledTask(taskValue);
-  if (scheduled === null || scheduled.session.providerId !== input.providerId) {
+  const task = taskValue && typeof taskValue === "object" && !Array.isArray(taskValue)
+    ? taskValue as Record<string, unknown> : {};
+  const terminal = task.status === "started" || task.status === "cancelled";
+  const scheduled = mapActiveScheduledTask(terminal ? { ...task, status: "pending" } : task);
+  if (scheduled === null || scheduled.session.providerId !== input.providerId || scheduled.schedule.id !== input.requestId) {
     throw new Error("Bridge returned an invalid scheduled task.");
   }
+  const { schedule: _schedule, ...session } = scheduled.session;
   return {
-    ...scheduled.session,
+    ...session,
     title: input.title,
-    state: "idle",
+    state: task.status === "started" ? "working" : scheduled.session.state,
     preview: input.preview,
     model: input.modelId,
     effort: input.effort,
-    schedule: scheduled.schedule,
+    ...(!terminal ? { schedule: { ...scheduled.schedule, content: input.content } } : {}),
   };
 }
 
@@ -523,6 +546,7 @@ const initialDesktopPreferences: DesktopPreferencesState = {
   taskListMode: "recent",
   savedProjectDirectories: isBrowserPreview ? demoProjectDirectories : [],
   localOpenHandlerId: "system",
+  openLinksInApp: false,
   closeAction: "tray",
   launchAtLogin: "off",
   alerts: "all",
@@ -598,6 +622,7 @@ function App() {
   const settingsOpener = useRef<HTMLElement | null>(null);
   const [selectedProvider, setSelectedProvider] = useState<ProviderFilterSelection>("all");
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  useEffect(maintainSessionMetadata, []);
   const lastLiveDeltaAt = useRef(0);
   const lastLiveDeltaBySession = useRef(new Map<string, number>());
   // A latest-history request may begin while the stream is quiet, then resolve
@@ -1191,15 +1216,13 @@ function App() {
     const removePreferences = window.tethoqDesktop.onPreferencesState(setPreferences);
     const removeBrowser = window.tethoqDesktop.onBrowserState(setBrowser);
     const removeBrowserNotice = window.tethoqDesktop.onBrowserNotice((notice) => {
-      if (notice.action === "focus-address") {
-        setBrowserAddressFocusToken((current) => current + 1);
+      if (notice.action === "return-to-task") {
+        setView((current) => current === "browser" ? selectedSessionIdRef.current ? "workspace" : "dashboard" : current);
+        requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>("#composer-message")?.focus());
         return;
       }
-      if (notice.action === "return-to-chat") {
-        if (viewRef.current === "browser") {
-          flushSync(() => setView(selectedSessionIdRef.current ? "workspace" : "dashboard"));
-          document.querySelector<HTMLTextAreaElement>("#composer-message")?.focus();
-        }
+      if (notice.action === "focus-address") {
+        setBrowserAddressFocusToken((current) => current + 1);
         return;
       }
       notify(notice.message, notice.tone === "error" ? "error" : undefined);
@@ -1226,6 +1249,10 @@ function App() {
 
   const openTimelineLink = useCallback(async (url: string) => {
     try {
+      if (!preferences.openLinksInApp) {
+        await window.tethoqDesktop.openExternalUrl(url);
+        return;
+      }
       setView("browser");
       let next = await window.tethoqDesktop.browserAction({ type: "set-visible", visible: true, ...(selectedSessionId ? { sessionId: selectedSessionId } : {}) });
       const active = next.tabs.find((tab) => tab.id === next.activeTabId);
@@ -1236,7 +1263,7 @@ function App() {
     } catch (error) {
       notify(error instanceof Error ? error.message : String(error), "error");
     }
-  }, [notify, selectedSessionId]);
+  }, [notify, preferences.openLinksInApp, selectedSessionId]);
 
   const refreshAll = useCallback(async (showToast = true) => {
     if (refreshInFlight.current) {
@@ -1656,6 +1683,7 @@ function App() {
       }
       if (unseenEvents.length !== batch.events.length) batch = { ...batch, events: unseenEvents };
       if (batch.events.length === 0 && !batch.replayGap) return;
+      reconcileSessionMetadata(batch);
       // Advance this synchronously, before React applies the rows, so a history
       // promise resolving in the same turn can already see that its page is stale.
       const visibleTimelineSessionIds = visibleTimelineSessionIdsRef.current;
@@ -1773,6 +1801,12 @@ function App() {
       const remotelyUpdatedSessionIds = [...new Set(batch.events.flatMap((event) => event.type === "message.remote_received" && event.sessionId ? [event.sessionId] : []))];
       const scheduledSessionRemaps = batch.events.flatMap((event) => {
         if ((event.type !== "scheduled_task.created" && event.type !== "scheduled_task.updated") || !event.sessionId) return [];
+        const task = event.payload.task;
+        if (task && typeof task === "object" && !Array.isArray(task)) {
+          for (const attempt of Object.values(composerScheduleAttempts.current)) {
+            if (attempt.input.requestId === task.requestId) attempt.latestTask = task;
+          }
+        }
         const previous = event.payload.previousTargetSessionId;
         return typeof previous === "string" && previous !== event.sessionId
           ? [{ previous, current: event.sessionId }]
@@ -2933,7 +2967,11 @@ function App() {
         ...modelFields,
         ...(input.meshTargets.length ? { meshTargets: input.meshTargets.map(meshTargetRoute) } : {}),
       }, input.requestId);
-      const scheduled = createdScheduledSession(response.task, input);
+      // A schedule may already have materialized or finished while its save
+      // response was in flight. Live transitions own its identity and status.
+      const taskValue = latestScheduledTask(response.task, record.latestTask);
+      const scheduled = createdScheduledSession(taskValue, input);
+      const cancelled = (taskValue as { status?: unknown }).status === "cancelled";
       const previousContent = composerDrafts.current[input.draftSessionId] ?? "";
       const retainedContent = clearScheduledDraftContent(previousContent, input.scheduledComposerContent);
       const retainedMeshTargets = moveMeshTargets(previousContent, retainedContent, remainingMeshTargetsAfterSchedule(
@@ -2982,13 +3020,22 @@ function App() {
         const draftTimeline = timelines[input.draftSessionId] ?? [];
         const providerTimeline = timelines[scheduled.id] ?? [];
         delete timelines[input.draftSessionId];
-        timelines[scheduled.id] = providerTimeline.reduce((combined, item) => mergeTimeline(combined, item), [...draftTimeline]);
+        if (!cancelled) timelines[scheduled.id] = providerTimeline.reduce((combined, item) => mergeTimeline(combined, item), [...draftTimeline]);
+        else delete timelines[scheduled.id];
         if (retainedSession) timelines[retainedSession.id] = [];
+        const observed = current.sessions.find((item) => item.id === scheduled.id);
+        const { schedule: _observedSchedule, ...observedSession } = observed ?? scheduled;
+        const resolvedSchedule = scheduled.schedule && scheduledTaskScheduleAfterProviderEvidence(observed, providerTimeline, scheduled.schedule);
+        const status = (taskValue as { status?: unknown }).status;
+        const resolvedState = status === "dispatching" || status === "started" || status === "failed"
+          ? scheduledTaskPresentationState(observed, providerTimeline, status, input.requestId)
+          : undefined;
+        const resolved = { ...observedSession, ...(resolvedState ? { state: resolvedState } : {}), ...(resolvedSchedule ? { schedule: resolvedSchedule } : {}) };
         return {
           ...current,
           sessions: [
             ...(retainedSession ? [retainedSession] : []),
-            scheduled,
+            ...(!cancelled ? [resolved] : []),
             ...current.sessions.filter((item) => item.id !== input.draftSessionId && item.id !== scheduled.id && item.id !== retainedSession?.id),
           ],
           timelines,
@@ -3001,12 +3048,13 @@ function App() {
       setTimelineWindows((current) => {
         const next = { ...current };
         delete next[input.draftSessionId];
-        next[scheduled.id] = { nextCursor: null, revealStart: 0, revealAnchorKey: null, loadingOlder: false };
+        if (!cancelled) next[scheduled.id] ??= { nextCursor: null, revealStart: 0, revealAnchorKey: null, loadingOlder: false };
+        else delete next[scheduled.id];
         if (retainedSession) next[retainedSession.id] = { nextCursor: null, revealStart: 0, revealAnchorKey: null, loadingOlder: false };
         return next;
       });
       if (shouldNavigate) {
-        setSelectedSessionId(retainedSession?.id ?? scheduled.id);
+        setSelectedSessionId(retainedSession?.id ?? (cancelled ? null : scheduled.id));
         setView("workspace");
       }
       if (composerScheduleAttempts.current[input.draftSessionId] === record) {
@@ -4179,10 +4227,12 @@ export function TaskDetailsControl({ session, providers, liveVisionStatus, readL
 }) {
   const localOpen = useLocalOpen();
   const [open, setOpen] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [childrenError, setChildrenError] = useState(false);
-  const [children, setChildren] = useState<readonly Session[]>([]);
-  const [sideChats, setSideChats] = useState<readonly { id: string; title: string; providerId: string; state: string; updatedAt: string; preview?: string }[]>([]);
+  const childMetadata = useTaskChildren(session, true, open);
+  const sideChatMetadata = useSessionMetadata(sideChatCache, session.id, true, open);
+  const children = childMetadata.data ?? [];
+  const sideChats = sideChatMetadata.data ?? [];
+  const loading = (childMetadata.data === undefined || (children.length === 0 && (session.childCount ?? 0) > 0 && childMetadata.loading)) && !childMetadata.error;
+  const childrenError = childMetadata.data === undefined && Boolean(childMetadata.error);
   const [eyesTargets, setEyesTargets] = useState<readonly VisionProxyTarget[]>([]);
   const [eyes, setEyes] = useState<VisionProxyStatus | null>(null);
   const [eyesChoice, setEyesChoice] = useState("");
@@ -4220,19 +4270,11 @@ export function TaskDetailsControl({ session, providers, liveVisionStatus, readL
     const eyesRevision = ++eyesRequestRevision.current;
     const isCurrent = () => refreshRevision.current === revision && activeSessionId.current === requestedSessionId;
     const isCurrentEyes = () => isCurrent() && eyesRequestRevision.current === eyesRevision;
-    setLoading(true);
-    setChildrenError(false);
     setEyesError("");
     setEyesCatalogueWarning("");
     if (!eyesTargets.length) setEyesDiscovery("loading");
     if (!eyes) setEyesStatusDiscovery("loading");
-    const childRequest = listChildSessions(requestedSessionId).then((result) => {
-      if (isCurrent()) setChildren(result);
-    }).catch(() => {
-      if (isCurrent()) setChildrenError(true);
-    }).finally(() => {
-      if (isCurrent()) setLoading(false);
-    });
+    const childRequest = childSessionCache.load(requestedSessionId);
     const targetRequest = request("vision.targets", {}).then((available) => {
       if (!Array.isArray(available.targets)) throw new Error("invalid targets");
       if (!isCurrentEyes()) return;
@@ -4265,9 +4307,7 @@ export function TaskDetailsControl({ session, providers, liveVisionStatus, readL
     });
     // Side chats are nested rather than listed, so a finished one is otherwise
     // unreachable. Opening one reads it; it is not resumed from here.
-    const sideChatRequest = request("session.side_chats", { sessionId: requestedSessionId }).then((result) => {
-      if (isCurrent()) setSideChats(Array.isArray(result.sessions) ? result.sessions as unknown as typeof sideChats : []);
-    }).catch(() => undefined);
+    const sideChatRequest = sideChatCache.load(requestedSessionId);
     await Promise.allSettled([childRequest, targetRequest, statusRequest, sideChatRequest]);
   }, [eyes, readLiveVisionStatus, session.id]);
   const configureEyes = useCallback(async (value: string) => {
@@ -4342,10 +4382,6 @@ export function TaskDetailsControl({ session, providers, liveVisionStatus, readL
     eyesSaveRevision.current += 1;
     eyesSaveInFlight.current = false;
     setOpen(false);
-    setLoading(false);
-    setChildrenError(false);
-    setChildren([]);
-    setSideChats([]);
     setEyesTargets([]);
     setEyes(null);
     setEyesChoice("");
@@ -4620,8 +4656,10 @@ function Workspace({ snapshot, session, workingBoundary, stopPresentationActive,
   // Context and goal heartbeats rerender Workspace even when the transcript has
   // not changed. Keep the visible slice stable so ChatTimeline's expensive
   // normalization memo is not defeated by a fresh array on every heartbeat.
+  // History supplies paging metadata, but live rows are already renderable.
+  // Waiting for that read hides received chunks while the sidebar streams them.
   const visibleTimeline = useMemo(
-    () => hasTimelineWindow ? presentationTimeline?.slice(resolvedRevealStart) : undefined,
+    () => hasTimelineWindow || presentationTimeline?.length ? presentationTimeline?.slice(resolvedRevealStart) : undefined,
     [hasTimelineWindow, presentationTimeline, resolvedRevealStart],
   );
   const annotateTimelineSelection = useCallback((text: string, anchor: { x: number; y: number }) => {
@@ -4636,6 +4674,9 @@ function Workspace({ snapshot, session, workingBoundary, stopPresentationActive,
   const interruptSession = async () => {
     try {
       await request("session.interrupt", { sessionId: session.id });
+      onStopPresentation(session.id, true);
+      const interruptedAt = new Date().toISOString();
+      updateSnapshot(current => current ? applyConfirmedInterruption(current, session.id, interruptedAt) : current);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       notify(message, "error");
@@ -4880,6 +4921,9 @@ function ScheduledTaskNotice({ session, updateSnapshot }: {
       const mapped = action === "cancel" ? null : mapActiveScheduledTask(response.task);
        updateSnapshot((current) => {
          if (!current) return current;
+         // Provider events or a refreshed schedule may have settled this action
+         // before its response arrived. Never restore the older pending state.
+         if (current.sessions.find((candidate) => candidate.id === session.id)?.schedule !== schedule) return current;
          if (action === "cancel" && isScheduledTaskPlaceholderId(session.id)) {
            const timelines = { ...current.timelines };
            delete timelines[session.id];
@@ -5550,6 +5594,7 @@ function SettingsPage({ snapshot, runtimeConnectionState, bootstrap, recorder, w
       <div><dt>Alerts</dt><dd><select aria-label="Alerts" value={preferences.alerts} disabled={isBrowserPreview} title="Windows notifications while the Tethoq window is not in focus." onChange={(event) => void onSetDesktopBehavior({ type: "set-alerts", value: event.target.value === "attention" ? "attention" : event.target.value === "off" ? "off" : "all" })}><option value="all">Everything</option><option value="attention">Only when I’m needed</option><option value="off">Off</option></select></dd></div>
       <div><dt>Startup</dt><dd><select aria-label="Startup" value={preferences.launchAtLogin} disabled={isBrowserPreview} title="Starting with Windows keeps your agents reachable after a restart." onChange={(event) => void onSetDesktopBehavior({ type: "set-launch-at-login", value: event.target.value === "window" ? "window" : event.target.value === "tray" ? "tray" : "off" })}><option value="off">Launch manually</option><option value="window">Start with Windows</option><option value="tray">Start hidden in tray</option></select></dd></div>
       <div><dt>Reasoning display</dt><dd><select aria-label="Reasoning display" value={preferences.reasoningDisplay} disabled={isBrowserPreview} title="Expanded streams every thought in full as it is written and shows tool calls as their own expandable rows. It does not change model effort." onChange={(event) => void onSetReasoningDisplay(event.target.value === "expanded" ? "expanded" : "compact")}><option value="compact">Compact</option><option value="expanded">Expanded</option></select></dd></div>
+      <div><dt>Open links in app</dt><dd><button type="button" className={`settings-toggle ${preferences.openLinksInApp ? "on" : ""}`} role="switch" aria-checked={preferences.openLinksInApp} aria-label="Open links in app" title="Open chat links in Tethoq instead of your default browser." disabled={isBrowserPreview} onClick={() => void onSetDesktopBehavior({ type: "set-open-links-in-app", enabled: !preferences.openLinksInApp })}><i /></button></dd></div>
     </dl></details></div>
     <section className="settings-block experimental-features-block"><header><h2>Experimental features</h2><span className="settings-info" tabIndex={0} data-tooltip="Optional capabilities that may change. Disabled by default."><InfoIcon /></span></header><div className="settings-list"><article><span><strong>Enable experimental features</strong><small>Enables optional capabilities that may change, including instant sessions and sub-agents from other coding tools.</small></span><button type="button" className={`settings-toggle ${preferences.experimentalFeatures ? "on" : ""}`} role="switch" aria-checked={preferences.experimentalFeatures} aria-label="Enable experimental features" disabled={isBrowserPreview} onClick={() => void onSetExperimentalFeatures(!preferences.experimentalFeatures)}><i /></button></article></div></section>
     {reviewing ? <ConnectorReviewModal connector={reviewing} busy={busy === reviewing.fingerprint} onClose={() => setReviewing(null)} onApprove={() => void connectorAction("approve", reviewing.fingerprint)} /> : null}

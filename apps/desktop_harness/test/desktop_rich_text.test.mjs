@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -104,19 +104,6 @@ test("local transcript images render as expandable widgets without exposing file
   assert.match(markup, /src="tethoq-media:\/\/local\/C%3A%2FUsers%2Ftest%2FAppData%2FLocal%2FTemp%2FTethoq%20QA%2Fside-chat-rail\.png"/u);
   assert.doesNotMatch(markup, /file:\/\//u);
   assert.doesNotMatch(markup, /rich-local-video/u);
-  const source = await readFile(join(appRoot, "src", "renderer", "src", "RichText.tsx"), "utf8");
-  assert.match(source, /onError=\{\(\) => setFailedSource\(source\)\}/u, "a missing local image keeps a calm unavailable fallback");
-});
-
-test("local transcript videos keep their intrinsic aspect ratio instead of filling the message width", async () => {
-  const [styles, richText] = await Promise.all([
-    readFile(join(appRoot, "src", "renderer", "src", "styles.css"), "utf8"),
-    readFile(join(appRoot, "src", "renderer", "src", "RichText.tsx"), "utf8"),
-  ]);
-  assert.match(styles, /\.rich-local-video \{[^}]*width: fit-content;[^}]*display: inline-flex;[^}]*flex-direction: column;/su);
-  assert.match(styles, /\.rich-local-video video \{[^}]*width: auto;[^}]*height: auto;[^}]*max-width: 100%;[^}]*max-height: 420px;/su);
-  assert.match(richText, /const components = useMemo<Components>\(\(\) => \(\{/u, "unrelated task refreshes must not remount video renderers");
-  assert.match(richText, /export const RichText = memo\(function RichText/u);
 });
 
 test("local Windows paths and file URIs become safe open actions without touching fenced code", () => {

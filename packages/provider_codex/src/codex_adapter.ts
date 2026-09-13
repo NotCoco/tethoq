@@ -339,7 +339,8 @@ export class CodexAdapter implements AgentProviderAdapter {
   public readonly sendMessageToExternalOwner?: (providerSessionId: string, request: SendMessageRequest) => Promise<SendMessageResult>;
   public readonly restoreQueuedMessage?: (providerSessionId: string, request: RestoreProviderMessageRequest) => Promise<ProviderQueuedMessage>;
   public readonly updateQueuedMessage?: (providerSessionId: string, messageId: string, content: string) => Promise<ProviderQueuedMessage | null>;
-  public readonly cancelQueuedMessage?: (providerSessionId: string, messageId: string) => Promise<boolean>;
+  public readonly cancelQueuedMessage?: (providerSessionId: string, messageId: string, expectedContent?: string) => Promise<boolean>;
+  public readonly readQueuedMessage?: (providerSessionId: string, messageId: string) => Promise<SendMessageRequest | null>;
   public readonly steerQueuedMessage?: (providerSessionId: string, messageId: string, request: SendMessageRequest) => Promise<SendMessageResult>;
   readonly #events = new ProviderEventHub();
   readonly #pendingServerRequests = new Map<string, PendingServerRequest>();
@@ -440,7 +441,8 @@ export class CodexAdapter implements AgentProviderAdapter {
       };
       this.restoreQueuedMessage = async (providerSessionId, request) => await desktopQueue.restore(providerSessionId, request);
       this.updateQueuedMessage = async (providerSessionId, messageId, content) => await desktopQueue.update(providerSessionId, messageId, content);
-      this.cancelQueuedMessage = async (providerSessionId, messageId) => await desktopQueue.cancel(providerSessionId, messageId);
+      this.cancelQueuedMessage = async (providerSessionId, messageId, expectedContent) => await desktopQueue.cancel(providerSessionId, messageId, expectedContent);
+      this.readQueuedMessage = async (providerSessionId, messageId) => await desktopQueue.readMessage(providerSessionId, messageId);
       this.steerQueuedMessage = async (providerSessionId, messageId, request) => await desktopQueue.steerQueuedMessage(providerSessionId, messageId, request);
     }
   }

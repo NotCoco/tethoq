@@ -10,6 +10,13 @@ export interface OpenCodeHttpClientOptions {
   readonly requestTimeoutMs?: number;
 }
 
+interface OpenCodeHttpRequestOptions {
+  readonly body?: unknown;
+  readonly query?: Readonly<Record<string, string | number | boolean | undefined>>;
+  readonly signal?: AbortSignal;
+  readonly timeoutMs?: number;
+}
+
 export class OpenCodeHttpClient {
   readonly #baseUrl: URL;
   readonly #fetch: FetchLike;
@@ -32,14 +39,23 @@ export class OpenCodeHttpClient {
   public async request<T>(
     method: string,
     path: string,
-    options: { readonly body?: unknown; readonly query?: Readonly<Record<string, string | number | boolean | undefined>>; readonly signal?: AbortSignal; readonly timeoutMs?: number } = {},
+    options: OpenCodeHttpRequestOptions = {},
   ): Promise<T> {
+    return (await this.requestWithHeaders<T>(method, path, options)).data;
+  }
+
+  public async requestWithHeaders<T>(
+    method: string,
+    path: string,
+    options: OpenCodeHttpRequestOptions = {},
+  ): Promise<{ readonly data: T; readonly headers: Headers }> {
     const url = this.url(path, options.query);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error("OpenCode request timed out")), options.timeoutMs ?? this.#requestTimeoutMs);
     const forwardAbort = () => controller.abort(options.signal?.reason);
     options.signal?.addEventListener("abort", forwardAbort, { once: true });
     try {
+      options.signal?.throwIfAborted();
       const headers: Record<string, string> = { Accept: "application/json" };
       if (this.#authorization !== undefined) headers.Authorization = this.#authorization;
       if (options.body !== undefined) headers["Content-Type"] = "application/json";
@@ -53,9 +69,9 @@ export class OpenCodeHttpClient {
         await response.body?.cancel().catch(() => undefined);
         throw new ProviderAdapterError("opencode", `HTTP_${response.status}`, `OpenCode returned ${response.status}`, response.status >= 500 || response.status === 429);
       }
-      if (response.status === 204) return undefined as T;
+      if (response.status === 204) return { data: undefined as T, headers: response.headers };
       const text = await response.text();
-      return (text ? JSON.parse(text) : undefined) as T;
+      return { data: (text ? JSON.parse(text) : undefined) as T, headers: response.headers };
     } catch (error) {
       if (error instanceof ProviderAdapterError) throw error;
       throw new ProviderAdapterError("opencode", "HTTP_REQUEST_FAILED", `OpenCode request failed: ${error instanceof Error ? error.message : String(error)}`, true, { cause: error });

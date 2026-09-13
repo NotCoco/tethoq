@@ -71,6 +71,7 @@ export function shouldDiscoverOpenCodeServer(options: {
   readonly hasManagedChild: boolean;
 }): boolean {
   return options.envUrl === undefined
+    && options.status.reason !== "unresponsive"
     && !(options.status.state === "managed" && !options.hasManagedChild);
 }
 
@@ -114,6 +115,7 @@ export interface OpenCodeFallbackCycleResult {
  */
 export function resolveFailedOpenCodeFallback(options: FailedOpenCodeFallbackOptions): OpenCodeEndpointDecision | undefined {
   if (options.envUrl !== undefined || options.status.state === "managed" || options.status.state === "external") return undefined;
+  if (options.status.reason === "unresponsive") return undefined;
   // A fallback selected moments ago can be claimed before OpenCode binds it.
   // Stay in the fallback range so a retry never oscillates back to 4096.
   if (isOpenCodePortInUseStatus(options.status)) {

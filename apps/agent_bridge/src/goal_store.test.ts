@@ -23,16 +23,12 @@ test("goal store persists only validated Tethoq-owned goals", async (t) => {
     revision: 1,
   };
   const writer = new GoalStore(path);
-  const activatedSessionId = "host/fake/activated";
-  const activated = { ...goal, sessionId: activatedSessionId, activationId: "persisted-goal-activation" };
   await writer.write({
     [sessionId]: goal,
-    [activatedSessionId]: activated,
     "host/codex/native": { ...goal, sessionId: "host/codex/native", source: "native" },
     "host/fake/fractional": { ...goal, sessionId: "host/fake/fractional", tokensUsed: 0.5 },
-    "host/fake/invalid-activation": { ...goal, sessionId: "host/fake/invalid-activation", activationId: " " },
   });
   await writer.flush();
   const restored = await new GoalStore(path).read();
-  assert.deepEqual(restored.goals, { [sessionId]: goal, [activatedSessionId]: activated });
+  assert.deepEqual(restored.goals, { [sessionId]: goal });
 });

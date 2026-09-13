@@ -162,6 +162,8 @@ export interface SessionMcpBinding {
 export type ClientToolLifecycleOwner = "bridge" | "provider";
 
 export interface ClientToolExecutionContext {
+  /** Local transport cancellation; never supplied by a model or serialized on the wire. */
+  readonly signal?: AbortSignal;
   /** Stable provider-side identity for this one tool call. */
   readonly callId?: string;
   /** Provider means its adapter publishes the visible tool lifecycle itself; omission is Bridge-owned. */
@@ -333,7 +335,10 @@ export interface AgentProviderAdapter {
   getRecentMessages?(providerSessionId: string): Promise<RecentProviderMessages>;
   /** Returns an expanded snapshot, or a pageOnly older delta for the client to prepend. */
   getOlderMessages?(providerSessionId: string, cursor: string): Promise<RecentProviderMessages>;
-  getMessages(providerSessionId: string): Promise<readonly RemoteMessage[]>;
+  /** Providers that support a limit return the most recent messages in chronological order. */
+  getMessages(providerSessionId: string, options?: { readonly limit?: number }): Promise<readonly RemoteMessage[]>;
+  /** Reads one durable message for delivery reconciliation without loading the transcript. */
+  getMessage?(providerSessionId: string, providerMessageId: string): Promise<RemoteMessage | undefined>;
   /** Reads durable provider activity for explicit launches of another provider. */
   getExternalSessionLaunches?(providerSessionId: string, since: string): Promise<readonly ObservedExternalSessionLaunch[]>;
 
@@ -355,17 +360,21 @@ export interface AgentProviderAdapter {
   /** Attaches (url) or detaches (undefined) the secondary server feed. */
   setSecondaryBaseUrl?(url: string | undefined): void;
   listQueuedMessages?(): Promise<readonly ProviderQueuedMessage[]>;
+  /** Reads the original composition, including full attachment bytes, without removing it. */
+  readQueuedMessage?(providerSessionId: string, messageId: string): Promise<SendMessageRequest | null>;
   enqueueQueuedMessage?(providerSessionId: string, request: EnqueueProviderMessageRequest): Promise<ProviderQueuedMessage>;
   /** Restores the original identity, time, and position after a failed move out of the provider queue. */
   restoreQueuedMessage?(providerSessionId: string, request: RestoreProviderMessageRequest): Promise<ProviderQueuedMessage>;
   /** Replaces one queued message in place without changing its order or identity. */
   updateQueuedMessage?(providerSessionId: string, messageId: string, content: string): Promise<ProviderQueuedMessage | null>;
-  cancelQueuedMessage?(providerSessionId: string, messageId: string): Promise<boolean>;
+  cancelQueuedMessage?(providerSessionId: string, messageId: string, expectedContent?: string): Promise<boolean>;
   /** Atomically removes and steers a provider-owned queue item through its external owner. */
   steerQueuedMessage?(providerSessionId: string, messageId: string, request: SendMessageRequest): Promise<SendMessageResult>;
   steerMessage?(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult>;
   editMessage?(providerSessionId: string, request: EditMessageRequest): Promise<SendMessageResult>;
   interrupt?(providerSessionId: string): Promise<void>;
+  /** Direct native subagents for cancellation, including children never opened by a client. No transcript or status hydration. */
+  listSubagentSessionIds?(providerSessionId: string): Promise<readonly string[]>;
 
   subscribe(providerSessionId: string | null, sink: ProviderEventSink): Promise<Subscription>;
   respondToApproval?(response: ProviderApprovalResponse): Promise<void>;

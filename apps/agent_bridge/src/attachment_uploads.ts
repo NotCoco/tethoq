@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { maxMessageAttachments } from "../../../packages/protocol/src/attachments.js";
 import type { MessageAttachment } from "../../../packages/provider_contract/src/index.js";
 
 export const maxAttachmentBytes = 25 * 1024 * 1024;
 export const maxAttachmentChunkBytes = 192 * 1024;
 export const maxPendingAttachmentUploads = 32;
-export const maxMessageAttachments = 12;
+export { maxMessageAttachments };
 export const maxMessageAttachmentBytes = 50 * 1024 * 1024;
 
 interface Upload {

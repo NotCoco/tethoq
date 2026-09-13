@@ -415,8 +415,13 @@ svg.refresh-icon { width: 20px !important; height: 20px !important; stroke-width
 .task-details-trigger { width: 30px; height: 30px; display: grid; place-items: center; padding: 0; color: #929792; border: 0; border-radius: 6px; background: transparent; }
 .task-details-trigger:hover, .task-details-trigger:focus-visible, .task-details-open .task-details-trigger { color: #e4e7e4; background: #242422; }
 .task-details-trigger svg { width: 17px; height: 17px; }
-.task-details-popover { position: absolute; z-index: 82; isolation: isolate; top: calc(100% + 7px); right: 0; width: 310px; overflow: hidden; color: #c8ccc8; border: 1px solid #3b3b38; border-radius: 9px; background-color: #181817; background-image: linear-gradient(#181817,#181817); box-shadow: 0 18px 55px rgba(0,0,0,.58); opacity: 1; backdrop-filter: none; }
-.task-details-popover > header { min-height: 42px; display: flex; align-items: center; justify-content: space-between; padding: 7px 9px 7px 13px; border-bottom: 1px solid #30302e; }
+.task-details-popover { position: absolute; z-index: 82; isolation: isolate; top: calc(100% + 7px); right: 0; width: 310px; max-height: calc(100dvh - 112px); overflow-x: hidden; overflow-y: auto; scroll-padding-top: 44px; color: #c8ccc8; border: 1px solid #3b3b38; border-radius: 9px; background-color: #181817; background-image: linear-gradient(#181817,#181817); box-shadow: 0 18px 55px rgba(0,0,0,.58); opacity: 1; backdrop-filter: none; }
+.task-details-popover, .session-subagents-popover { overscroll-behavior: contain; scrollbar-gutter: stable; scrollbar-color: #55554f transparent; }
+.task-details-popover::-webkit-scrollbar, .session-subagents-popover::-webkit-scrollbar { width: 10px; }
+.task-details-popover::-webkit-scrollbar-thumb, .session-subagents-popover::-webkit-scrollbar-thumb { min-height: 34px; border: 0; border-radius: 5px; background: #55554f; }
+.task-details-popover::-webkit-scrollbar-thumb:hover, .session-subagents-popover::-webkit-scrollbar-thumb:hover { background: #8a8a83; }
+.task-details-popover::-webkit-scrollbar-thumb:active, .session-subagents-popover::-webkit-scrollbar-thumb:active { background: #aaa9a1; }
+.task-details-popover > header { position: sticky; top: 0; z-index: 1; min-height: 42px; display: flex; align-items: center; justify-content: space-between; padding: 7px 9px 7px 13px; border-bottom: 1px solid #30302e; background: #181817; }
 .task-details-popover > header strong { color: #eceeeb; font-size: 14px; font-weight: 650; }
 .task-details-popover > header button { width: 28px; height: 28px; display: grid; place-items: center; padding: 0; color: #858a85; border-radius: 5px; background: transparent; }
 .task-details-popover > header button:hover, .task-details-popover > header button:focus-visible { color: #eff1ee; background: #272725; }
@@ -570,7 +575,7 @@ svg.refresh-icon { width: 20px !important; height: 20px !important; stroke-width
 .timeline-copy-button { width: 24px; height: 24px; display: grid; place-items: center; padding: 0; color: #858a85; border: 0; border-radius: 5px; background: transparent; }
 .timeline-copy-button:hover, .timeline-copy-button:focus-visible { color: #eef1ee; background: #242422; }
 .timeline-copy-button svg { width: 13px; height: 13px; }
-.activity-failed .activity-glyph, .activity-failed .activity-row strong { color: #969b96; }
+.activity-failed .activity-glyph, .activity-failed .activity-row strong { color: var(--danger); }
 .spawned-subagent-row { width: min(100%,720px); min-height: 42px; display: grid; grid-template-columns: var(--assistant-icon-column,28px) minmax(0,1fr) auto 13px; align-items: center; column-gap: var(--assistant-column-gap,9px); margin: 4px 0 7px; padding: 3px 0; color: #aeb3ae; border: 0; border-radius: 6px; background: transparent; text-align: left; }
 .spawned-subagent-row:hover, .spawned-subagent-row:focus-visible { color: #e0e3e0; background: #191918; }
 .spawned-subagent-glyph { width: var(--assistant-icon-column,28px); height: 24px; display: grid; place-items: center; color: #a2a7a2; }

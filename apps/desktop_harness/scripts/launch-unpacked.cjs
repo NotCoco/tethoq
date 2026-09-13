@@ -2,6 +2,13 @@ const { spawn, spawnSync } = require("node:child_process");
 const path = require("node:path");
 const { stopTethoq } = require("./stop-unpacked.cjs");
 
+// A direct launch must refresh the same executable as the build command. The
+// sync script uses --synced only after installing and verifying that output.
+if (!process.argv.includes("--synced")) {
+  const result = spawnSync(process.execPath, [path.join(__dirname, "sync-unpacked.cjs"), "--launch"], { stdio: "inherit", windowsHide: true });
+  process.exit(result.status ?? 1);
+}
+
 const exe = path.join(__dirname, "..", "release", "win-unpacked", "Tethoq.exe");
 const timeoutMs = 20_000;
 

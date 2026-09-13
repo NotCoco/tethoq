@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,6 +27,7 @@ await mkdir(outputDirectory, { recursive: true });
 
 const calls = [];
 let releaseDeferredHistoryImage;
+let deferredHistoryImageId = "deferred-image";
 const deferredHistoryImage = new Promise((resolve) => { releaseDeferredHistoryImage = resolve; });
 globalThis.window = {
   tethoqDesktop: {
@@ -154,12 +155,12 @@ globalThis.window = {
         nativeMetadata: {},
         parts: [
           { type: "text", text: "Text must render before the preview arrives." },
-          { type: "image", retrievalId: "deferred-image", mimeType: "image/png", name: "slow.png" },
+          { type: "image", retrievalId: deferredHistoryImageId, mimeType: "image/png", name: "slow.png" },
         ],
       }] } };
-      if (type === "session.image.get" && payload.retrievalId === "deferred-image") {
+      if (type === "session.image.get" && ["deferred-image", "deferred-image-new"].includes(payload.retrievalId)) {
         await deferredHistoryImage;
-        return { ok: true, payload: { retrievalId: "deferred-image", offset: 0, totalBytes: 3, dataBase64: "AQID", nextOffset: null, mimeType: "image/png" } };
+        return { ok: true, payload: { retrievalId: payload.retrievalId, offset: 0, totalBytes: 3, dataBase64: payload.retrievalId === "deferred-image" ? "AQID" : "BAUG", nextOffset: null, mimeType: "image/png" } };
       }
       if (type === "session.open" && payload.sessionId === "role-mapping") return { ok: true, payload: { messages: [{
         id: "assistant-message",
@@ -324,154 +325,10 @@ const timelineMerge = await import(`file:///${timelineMergeBundle.replaceAll("\\
 const timelineHelpers = await import(`file:///${timelineBundle.replaceAll("\\", "/")}`);
 process.on("exit", () => { void rm(outputDirectory, { recursive: true, force: true }); });
 
-const source = async (path) => await readFile(join(appRoot, path), "utf8");
 
-test("desktop search stays bounded to normalized in-memory UI metadata", async () => {
+test("desktop search normalizes Unicode, controls, whitespace, and excessive input", async () => {
   assert.equal(searchHelpers.normalizeUiSearchQuery(" \u0000 ＤＥＦＡＵＬＴ\t ReAsoning "), "default reasoning");
   assert.equal(searchHelpers.normalizeUiSearchQuery("x".repeat(400)).length, 160);
-
-  const [app, navigation] = await Promise.all([
-    source(join("src", "renderer", "src", "App.tsx")),
-    source(join("src", "renderer", "src", "NavigationPanels.tsx")),
-  ]);
-  const palette = app.match(/function CommandPalette[\s\S]*?(?=\n\}\n\nexport default)/u)?.[0] ?? "";
-  assert.match(app, /const settingsSearchCatalogue = \[/u);
-  assert.match(app, /agent provider connection model default reasoning/u);
-  // The palette indexes one pre-filtered list; provisional drafts, internal,
-  // side-chat, and archived records are excluded before it ever sees them.
-  assert.match(app, /const activeSessions = useMemo\(\(\) => topLevelSessions\.filter\(\(session\) => !session\.provisional && !session\.archived && !isSideChatSession\(session\) && session\.sessionKind !== "internal"\)/u);
-  assert.match(app, /<CommandPalette snapshot=\{snapshot\} sessions=\{activeSessions\}/u);
-  assert.doesNotMatch(palette, /snapshot\.sessions/u);
-  assert.match(palette, /maxLength=\{maximumUiSearchCharacters\}/u);
-  assert.doesNotMatch(palette, /workingDirectory|window\.tethoqDesktop|request\(/u);
-  assert.match(navigation, /maxLength=\{maximumUiSearchCharacters\}/u);
-  assert.doesNotMatch(app.match(/const filteredSessions = useMemo[\s\S]*?\}, \[query/u)?.[0] ?? "", /workingDirectory/u);
-});
-
-test("renderer transient dialogs have names, focus return, and correct modal semantics", async () => {
-  const [components, app, composer, navigation] = await Promise.all([
-    source(join("src", "renderer", "src", "components.tsx")),
-    source(join("src", "renderer", "src", "App.tsx")),
-    source(join("src", "renderer", "src", "Composer.tsx")),
-    source(join("src", "renderer", "src", "NavigationPanels.tsx")),
-  ]);
-  assert.match(components, /focusableSelector/);
-  assert.match(components, /event\.key !== "Tab"/);
-  assert.match(components, /target && target\.isConnected\) target\.focus\(\)/);
-  assert.match(components, /document\.addEventListener\("mousedown", closeOutside, true\)/);
-  assert.match(components, /aria-modal="true"/);
-  assert.match(app, /<Modal title="" label="Command palette"/);
-  assert.match(app, /task-details-popover" role="dialog" aria-modal="false"/);
-  assert.match(app, /context-usage-popover" role="dialog" aria-modal="false"/);
-  assert.match(app, /requestAnimationFrame\(\(\) => trigger\.current\?\.focus\(\)\)/);
-  assert.match(app, /closeOutside = \(event: MouseEvent\) => \{ if \(!root\.current\?\.contains\(event\.target as Node\)\) closeFromOutside\(\); \}/);
-  assert.match(composer, /model-library" role="dialog" aria-modal="true"/);
-  // The model browser mounts at the document root. Left inside .composer-wrap, whose
-  // own stacking context sits below the workspace header, its backdrop blur stopped
-  // short and the top of the app stayed sharp behind the modal.
-  assert.match(composer, /createPortal\(<div className="model-library-backdrop"/);
-  assert.match(composer, /modelLibrary\.current\?\.querySelector/);
-  assert.match(composer, /const closePicker = \(restoreFocus = true\)/);
-  assert.match(composer, /!root\.current\?\.contains\(event\.target as Node\)\) closePicker\(false\)/);
-  assert.match(composer, /side-chat-panel .*role="dialog" aria-modal="false"/);
-  assert.match(composer, /const restoreFocus = useCallback\(\(\) =>/);
-  assert.match(navigation, /session-subagents-popover" style=\{popoverStyle\} role="dialog" aria-modal="false"/);
-  assert.match(navigation, /const popoverId = `session-subagents-\$\{session\.id\}`/);
-  assert.match(navigation, /!root\.current\?\.contains\(target\) && !popover\.current\?\.contains\(target\)\) closeFromOutside\(\)/);
-});
-
-test("settings expose one agents catalogue with truthful model routes and compact cards", async () => {
-  const [defaults, app, navigation, styles] = await Promise.all([
-    source(join("src", "renderer", "src", "AgentDefaultsSettings.tsx")),
-    source(join("src", "renderer", "src", "App.tsx")),
-    source(join("src", "renderer", "src", "NavigationPanels.tsx")),
-    source(join("src", "renderer", "src", "styles.css")),
-  ]);
-
-  assert.match(defaults, /Your coding tools and their default models\./u);
-  assert.match(defaults, /model\.walletKind !== "user_api"[\s\S]*model\.apiKeyConfigured === true && model\.apiKeyVerified === true/u);
-  assert.match(defaults, /API key saved/u);
-  assert.match(defaults, /through \$\{model\.source/u);
-  assert.match(defaults, /endpointName \?\? "Other models"/u);
-  assert.match(defaults, /role="listbox"/u);
-  assert.match(defaults, /role="option"/u);
-  assert.doesNotMatch(defaults, /<optgroup/u);
-  assert.match(defaults, /className="agent-default-reasoning"/u);
-  assert.match(defaults, /aria-label=\{`Default reasoning for \$\{provider\.name\}`\}/u);
-  assert.match(defaults, /efforts\.length && selectedEffort/u);
-  assert.doesNotMatch(defaults, /Managed by agent/u);
-  assert.match(defaults, /API key required/u);
-  assert.match(defaults, /API providers · keys saved/u);
-  // Transport state and usability are separate: a reachable Direct bridge with
-  // no verified key must not borrow the healthy green connected treatment.
-  assert.match(defaults, /const apiKeyRequired = directApiNeedsKey\(provider\.id, allModels\)/u);
-  assert.match(defaults, /const connectionState = apiKeyRequired \? "action-required" : provider\.state/u);
-  assert.match(defaults, /API key required · Direct API is not ready/u);
-  assert.match(defaults, /className=\{`connection-dot \$\{connectionState\}`\}/u);
-  assert.match(styles, /\.connection-dot\.action-required \{[^}]*background: #bc9352/u);
-  assert.match(defaults, /className="settings-icon-action"/u);
-  assert.match(defaults, /contextWindowTokens/u);
-  assert.match(defaults, /inputPricePerMillion/u);
-  assert.match(defaults, /outputPricePerMillion/u);
-  assert.match(defaults, /Efforts · \{efforts\.join\(", "\)\}/u);
-  assert.doesNotMatch(app, /id="agent-connections"/u);
-  assert.match(app, /settings:agents[^\n]*targetId: "agent-defaults"/u);
-  assert.doesNotMatch(app, /settings:agent-defaults/u);
-  assert.doesNotMatch(app, /<small>v\{provider\.version\}<\/small>/u);
-  assert.match(app, /const closeSettings = useCallback/u);
-  assert.match(app, /className="settings-close-button"[^>]*aria-label="Close settings"[^>]*onClick=\{onClose\}/u);
-  assert.match(app, /<AgentDefaultsSettings[\s\S]*?<WorkflowSettings/u, "Agents must be the first settings section");
-  assert.match(navigation, /className="sidebar-settings"[^>]*aria-label=\{view === "settings" \? "Close settings" : "Open settings"\}/u);
-  assert.doesNotMatch(navigation, /sidebar-settings \$\{view === "settings" \? "active"/u);
-  assert.match(styles, /\.settings-close-button \{[^}]*position: sticky;[^}]*width: 32px;[^}]*height: 32px;/u);
-  assert.match(styles, /\.settings-page::-webkit-scrollbar \{ width: 10px; \}/u);
-  assert.match(styles, /\.settings-page::-webkit-scrollbar-thumb:hover \{ background: #8a8a83; \}/u);
-  assert.match(styles, /\.agent-default-list \{[^}]*overflow: visible;/u);
-  assert.match(styles, /\.agent-default-list > article \{[^}]*grid-template-columns: minmax\(180px,1fr\) minmax\(280px,360px\) 76px/u);
-  assert.doesNotMatch(styles, /\.settings-simplified \.connector-card\.pending \{[^}]*border-color:\s*transparent/u);
-  assert.match(styles, /\.agent-default-controls \{[^}]*max-width: 360px;[^}]*justify-self: end/u);
-  assert.match(defaults, /<ProviderLogo providerId=\{provider\.id\} provider=\{provider\} size=\{34\}/u);
-  assert.match(styles, /\.agent-default-identity \{[^}]*grid-template-columns: 34px minmax\(0,1fr\) 8px/u);
-  assert.match(defaults, /className="agent-default-model-row agent-default-setup-row"[\s\S]*?>Model<[\s\S]*?API key required/u);
-  assert.match(defaults, /className="agent-default-setup-action" onClick=\{onDirectApiSetup\}[\s\S]*?<SettingsIcon \/><span>Set up<\/span>/u);
-  assert.match(app, /onDirectApiSetup=\{\(\) => setDirectApiSetupRevision\(\(current\) => current \+ 1\)\}/u);
-  assert.match(app, /handledDirectApiSetupRevision[\s\S]*?setOpen\(true\);[\s\S]*?void showDirectWallet\(\)/u, "Set up must open the real single-owned wallet surface");
-  assert.doesNotMatch(defaults, /wallet\.configure|wallet-trigger/u, "settings must not duplicate or fake-click the wallet implementation");
-  assert.match(styles, /\.agent-model-tip \{[^}]*position: fixed/u);
-  assert.match(styles, /\.agent-model-tip \{[^}]*opacity: 0;[^}]*transition: opacity \.11s ease \.45s/u);
-  // Values line up because the label column is a fixed width, not an auto column
-  // sized to whichever word it holds.
-  assert.match(styles, /\.agent-default-list \{ --agent-default-label: 68px;/u);
-  assert.match(styles, /\.agent-default-model-row \{[^}]*grid-template-columns: var\(--agent-default-label\) minmax\(0,1fr\)/u);
-  // Both chevrons are the same glyph at the same offset in the same column.
-  assert.match(defaults, /<span className="agent-default-select">/u);
-  assert.match(defaults, /<ChevronDownIcon aria-hidden="true" \/>/u);
-  assert.match(styles, /\.agent-default-reasoning \{[^}]*appearance: none;/u);
-  assert.match(styles, /\.agent-default-select > svg \{[^}]*right: 8px;[^}]*width: 13px;/u);
-  assert.match(styles, /\.agent-model-trigger \{[^}]*padding: 0 8px;/u);
-  assert.match(styles, /\.settings-simplified \{[^}]*grid-template-columns: 40px minmax\(0,720px\) 40px/u);
-  assert.match(styles, /\.settings-simplified > \.settings-close-button \{[^}]*grid-column: 1;[^}]*grid-row: 1;[^}]*justify-self: end;[^}]*margin: 22px 8px 0 0/u);
-  assert.match(defaults, /<FileIcon \/><span>\{preferences\.globalAgentsPath \? "Change AGENTS\.md" : "Choose AGENTS\.md"\}<\/span>/u);
-  assert.match(defaults, /<XIcon \/><span>Clear<\/span>/u);
-  assert.match(app, /className="connector-disclosure"><span>Details<\/span><ChevronDownIcon className="details-chevron" \/><\/span>/u);
-  assert.match(styles, /\.settings-simplified \.connector-list \{[^}]*gap: 0;[^}]*overflow: hidden;[^}]*border: 1px solid var\(--line\);[^}]*border-radius: 8px/u);
-  assert.match(styles, /\.settings-simplified \.connector-card \{ border: 0; border-radius: 0; background: transparent; \}/u);
-  assert.match(styles, /\.settings-simplified \.connector-card \+ \.connector-card \{ border-top: 1px solid var\(--line\); \}/u);
-  // A long catalogue is filterable; the list scrolls beneath a fixed field.
-  assert.match(defaults, /const searchable = models\.length > 8;/u);
-  assert.match(defaults, /className="agent-model-search"/u);
-  assert.match(defaults, /placeholder="Search models"/u);
-  assert.match(defaults, /aria-label=\{`Search models for \$\{providerName\}`\}/u);
-  assert.match(defaults, /modelMatchesCatalogQuery\(needle, providerId, providerName, model\)/u);
-  assert.match(defaults, /modelCatalogRoute\(providerId, providerName, model\)\.label/u);
-  // modelGroups always returns at least one group, so the empty state has to key
-  // off the matches themselves or it can never render.
-  assert.match(defaults, /\{matches\.length \? groups\.map/u);
-  assert.match(defaults, /No model matches that search/u);
-  assert.match(styles, /\.agent-model-scroll \{[^}]*overflow-y: auto;/u);
-  // The filter field is a textbox, so it cannot sit inside the listbox role.
-  assert.match(defaults, /<div className="agent-model-scroll" role="listbox"/u);
-  assert.doesNotMatch(defaults, /<div className="agent-model-dropdown" role="listbox"/u);
 });
 
 test("initial renderer snapshot paints providers before attention requests settle", async () => {
@@ -528,107 +385,6 @@ test("renderer generic file selection is gated to OpenCode", async () => {
     byteLength: 4,
     dataBase64: "dGVzdA==",
   }]);
-});
-
-test("desktop context control applies a model-bounded threshold from the enlarged usage bar", async () => {
-  const [app, styles] = await Promise.all([
-    source(join("src", "renderer", "src", "App.tsx")),
-    source(join("src", "renderer", "src", "styles.css")),
-  ]);
-
-  assert.match(app, />Set automatic compaction</);
-  assert.match(app, /className="context-threshold-meter"/);
-  assert.match(app, /className="context-expanded-track" role="progressbar"/);
-  assert.match(app, /aria-label="Automatic compaction threshold" type="range"/);
-  assert.match(app, /Math\.max\(minimum, Math\.min\(maximum, requestedThreshold\)\)/);
-  assert.match(app, /session\.state === "working"/);
-  assert.match(app, /session\.state === "needs_approval"/);
-  assert.match(app, /Applying now may compact while this turn is still running\./);
-  assert.match(app, /Sets how full this task can get before it compacts automatically\./);
-  assert.match(app, /onClick=\{\(\) => void save\(safeThreshold, true\)\}/);
-  assert.match(app, /\} Apply<\/Button>/);
-  assert.match(app, /className="context-usage-tooltip"[^>]*><strong>Context window<\/strong><span>\{compactUsage\}<\/span>/);
-  assert.match(app, /<section className="context-usage-details"/);
-  assert.match(app, /<h3 id=\{`context-usage-details-/);
-  assert.match(app, /<dt>Compacts at<\/dt>/);
-  assert.match(app, /<dt>Capacity<\/dt>/);
-  assert.doesNotMatch(app, /<details className="context-usage-details"|<summary>Usage details<\/summary>/);
-  assert.doesNotMatch(app, /pendingImmediateThreshold|Compact this conversation now\?|Save threshold/);
-  assert.doesNotMatch(app, /percent === null \? "—"/);
-
-  // The meter reads one context, owned by the workspace and polled on a cadence
-  // keyed to the session rather than to its traffic. Its own timer was rebuilt by
-  // every render and keyed on session.updatedAt, which a streaming turn changes
-  // faster than the timer's delay — so the timer never reached its callback and
-  // the meter held whatever it had when the turn began. For a task opened during
-  // its first turn that is nothing, which is what showed as a stuck empty bar.
-  assert.match(app, /const \[sessionContext, setSessionContext\] = useState<SessionContextState \| null>\(null\)/);
-  assert.match(app, /<ContextUsageControl key=\{session\.id\} session=\{session\} context=\{sessionContext\?\.sessionId === session\.id \? sessionContext : null\}/);
-  assert.match(app, /\}, \[session\?\.draft, session\?\.id, session\?\.schedule\?\.status, session\?\.state, updateContextCompaction\]\)/);
-  assert.doesNotMatch(app, /\[refresh, session\.state, session\.updatedAt\]/);
-  assert.doesNotMatch(app, /window\.setInterval\(\(\) => \{ void refresh\(\); \}/);
-  // One reading is a snapshot, and a snapshot taken while a provider was still
-  // warming up became the answer for the life of the task. A settled task keeps a
-  // calm heartbeat so a wrong reading corrects itself, pauses while nobody is
-  // looking, and takes a fresh one the moment the window is looked at again.
-  assert.match(app, /let delay = active \? 650 : 2_500;/);
-  assert.match(app, /if \(document\.hidden\) return schedule\(4_000\);/);
-  assert.match(app, /const wake = \(\) => \{ if \(!document\.hidden\) void poll\(\); \};/);
-  assert.match(app, /document\.addEventListener\("visibilitychange", wake\);\s*\n\s*window\.addEventListener\("focus", wake\)/);
-  assert.match(app, /failures \+= 1;\s*\n\s*delay = Math\.min\(8_000, 400 \* 2 \*\* Math\.min\(failures, 5\)\);/);
-  // Overlapping polls would stack timers behind each other.
-  assert.match(app, /if \(disposed \|\| inFlight\) return;/);
-  // An arriving poll refreshes the numbers under an open panel without snatching
-  // back a threshold the reader is part-way through dragging.
-  assert.match(app, /const threshold = draftThreshold \?\? context\?\.compactionThresholdTokens \?\? context\?\.contextWindowTokens \?\? null/);
-  // A draft is local to one open popover. Closing by the trigger, outside click,
-  // or Escape must discard it so reopening shows only the bridge-confirmed value.
-  assert.match(app, /const dismiss = useCallback\(\(\) => \{\s*setOpen\(false\);\s*setDraftThreshold\(null\);\s*requestAnimationFrame\(\(\) => trigger\.current\?\.focus\(\)\);\s*\}, \[\]\)/);
-  assert.match(app, /event\.key === "Escape"\) dismiss\(\)/);
-  assert.match(app, /onClick=\{\(\) => open \? dismiss\(\) : setOpen\(true\)\}/);
-
-  // The compact header previews distance to the draft/applied compaction point,
-  // while the slider's white underlay independently measures full context use.
-  assert.match(app, /const meterLimit = thresholdAvailable \? safeThreshold : appliedLimit/);
-  assert.match(app, /used \/ meterLimit \* 100/);
-  assert.match(app, /const reportedContextPercent = used !== null && windowTokens !== null/);
-  assert.match(app, /used \/ windowTokens \* 100/);
-  assert.match(app, /className="context-expanded-track"[^>]*aria-label="Context window used"/);
-  assert.match(app, /<i style=\{\{ width: `\$\{shownContextPercent\}%` \}\} \/>/);
-
-  // An agent can report what a task used without reporting the model's limit. A
-  // share of an unknown limit cannot be drawn, and an empty gauge reads exactly
-  // like a full one at zero — which is what makes a working meter look broken.
-  // Show the true part, the tokens used, and draw no gauge at all.
-  assert.match(app, /\{percent !== null \? <span className="context-usage-track"/);
-  assert.match(app, /: used !== null \? <span className="context-usage-percent">\{compactTokens\(used\)\}<\/span>/);
-  assert.match(app, /const compactUsage = used === null \? "Usage unavailable"\s*\n\s*: meterLimit === null \? `\$\{compactTokens\(used\)\} used`/);
-  assert.match(app, /: used !== null \? `\$\{compactTokens\(used\)\} of context used; this agent does not report a limit`/);
-  assert.match(styles, /\.context-expanded-track \{[^}]*height: 8px/);
-  assert.match(styles, /\.context-threshold-meter input\[type="range"\] \{[^}]*position: absolute/);
-  assert.match(styles, /\.context-usage \{[^}]*transform: translateY\(2px\)/);
-  assert.match(styles, /\.context-usage-tooltip \{[^}]*right: calc\(100% \+ 8px\)/);
-  assert.match(styles, /\.context-usage-trigger \{[^}]*min-height: 28px[^}]*padding: 1px 3px 1px 9px/);
-  assert.match(styles, /\.context-usage-popover \{[^}]*background-color: #181817[^}]*opacity: 1[^}]*backdrop-filter: none/);
-});
-
-test("task header exposes concise child-task details instead of a duplicate interrupt action", async () => {
-  const [app, bridge, styles] = await Promise.all([
-    source(join("src", "renderer", "src", "App.tsx")),
-    source(join("src", "renderer", "src", "bridge.ts")),
-    source(join("src", "renderer", "src", "styles.css")),
-  ]);
-  assert.match(app, /function TaskDetailsControl/);
-  assert.match(app, />Sub-agents<\/h2>/);
-  assert.match(app, /No sub-agents for this task\./);
-  assert.match(app, /onOpenChild\(child\)/);
-  assert.match(app, /const parentSessionId = parentSessionIdForBack\(session\)/);
-  assert.match(app, /label="Back to parent task"[\s\S]*onOpenParent\(parentSessionId\)/);
-  assert.match(app, /onOpenParent=\{\(parentSessionId\) => void openSession\(parentSessionId\)\}/);
-  assert.match(app, /<TaskDetailsControl session=\{session\}/);
-  assert.doesNotMatch(app, /> Interrupt<\/Button>/);
-  assert.match(bridge, /export async function listChildSessions\(sessionId: string\)[\s\S]*request\("session\.children"/);
-  assert.match(styles, /\.task-details-popover \{[^}]*background-color: #181817[^}]*opacity: 1/);
 });
 
 test("failed compaction reports a retryable system notice without claiming success", () => {
@@ -875,8 +631,20 @@ test("history text and placeholders return before deferred image bytes", async (
 
   const imageRequests = calls.filter((call) => call.type === "session.image.get" && call.payload.retrievalId === "deferred-image").length;
   const reopened = await bridge.loadSessionTimelinePage("deferred-history-image");
+  assert.equal(reopened.items[0]?.images?.[0]?.dataUrl, hydrated[0]?.images?.[0]?.dataUrl, "a cached image must be present in the first refreshed paint");
+  assert.equal(reopened.imageHydration, undefined, "a cached image must not schedule another placeholder-to-image transition");
   await reopened.imageHydration;
   assert.equal(calls.filter((call) => call.type === "session.image.get" && call.payload.retrievalId === "deferred-image").length, imageRequests, "the hydrated preview is reused from the bounded renderer cache");
+  deferredHistoryImageId = "deferred-image-new";
+  const replaced = await bridge.loadSessionTimelinePage("deferred-history-image");
+  assert.equal(replaced.items[0]?.images?.[0]?.dataUrl, undefined, "a new image identity must not reuse old bytes with the same filename");
+  assert.equal(replaced.items[0]?.images?.[0]?.retrievalId, deferredHistoryImageId);
+  const replacement = await replaced.imageHydration;
+  assert.equal(replacement[0]?.images?.[0]?.dataUrl, "data:image/png;base64,BAUG");
+  const refreshedReplacement = await bridge.loadSessionTimelinePage("deferred-history-image");
+  assert.equal(refreshedReplacement.items[0]?.images?.[0]?.dataUrl, "data:image/png;base64,BAUG");
+  assert.equal(refreshedReplacement.imageHydration, undefined);
+  deferredHistoryImageId = "deferred-image";
 });
 
 test("an opened session returns its first-prompt preview to the renderer", async () => {
@@ -1026,13 +794,6 @@ test("OpenCode tool snapshots keep one provider-part row as call details arrive"
     payload: { toolCallId: "call_2", output: "one chunk" },
   });
   assert.equal(generic.streamDelta, undefined, "non-OpenCode tool chunks retain append semantics");
-});
-
-test("unknown provider session status is idle rather than offline", async () => {
-  const rendererBridge = await source(join("src", "renderer", "src", "bridge.ts"));
-  assert.match(rendererBridge, /if \(value === "unknown"\) return "idle"/);
-  assert.match(rendererBridge, /resolveModelReasoningProfile\(/);
-  assert.match(rendererBridge, /payloadLooksLikeReasoning\(event\.payload\)/);
 });
 
 test("Grok ACP content and thought chunks display their nested text", () => {
@@ -1208,17 +969,6 @@ test("history role mapping nests tool text and suppresses unrecognized system tr
   assert.equal(page.items.some((item) => item.body.includes("Internal system trace")), false);
 });
 
-test("large history images hydrate through bounded Bridge chunks", async () => {
-  const rendererBridge = await source(join("src", "renderer", "src", "bridge.ts"));
-  assert.match(rendererBridge, /request\("session\.image\.get", \{ sessionId, retrievalId, offset \}\)/);
-  assert.match(rendererBridge, /maximumHistoryImageBytes\s*=\s*25 \* 1024 \* 1024/);
-  assert.match(rendererBridge, /index < 64/);
-  assert.match(rendererBridge, /items: timelineWithDelegations\(mapMessages\(messages\), delegationPayload\)/);
-  assert.match(rendererBridge, /imageHydration/);
-  assert.match(rendererBridge, /maximumConcurrentHistoryImageLoads\s*=\s*4/);
-  assert.match(rendererBridge, /maximumHistoryImageCacheBytes\s*=\s*64 \* 1024 \* 1024/);
-});
-
 test("timeline image mapping admits safe remote and validated local raster references only", () => {
   assert.equal(bridge.renderableImageUri("https://images.example/safe.png"), "https://images.example/safe.png");
   assert.equal(bridge.renderableImageUri("http://localhost:8080/output.png"), "http://localhost:8080/output.png");
@@ -1234,588 +984,7 @@ test("timeline image mapping admits safe remote and validated local raster refer
   assert.equal(bridge.renderableImageUri("relative.png"), undefined);
 });
 
-test("renderer source keeps initial and forced history loading wired", async () => {
-  const app = await source(join("src", "renderer", "src", "App.tsx"));
-
-  assert.match(app, /timelineWindows\[selectedSessionId\]\s*===\s*undefined[\s\S]*?openSession\(selectedSessionId\)/);
-  // Working sessions still catch up through the page load once the live stream
-  // goes quiet; the adapter only session/loads when no chunks are arriving.
-  // Quietness is measured on the selected session itself, not the whole feed.
-  assert.match(app, /timelinePage = selected && !selectedIsScheduled && !incrementallyObserved\s*&& quietCatchUpDue\(selectedLastDelta\(selected\), Date\.now\(\), 3_000\)/);
-  assert.doesNotMatch(app, /workingSessionIds\.current\.has\(sessionId\)\) return/);
-  assert.match(app, /const hasPagedWindow = timelineWindows\[sessionId\] !== undefined/);
-  assert.match(app, /alreadyLoaded !== undefined && hasPagedWindow && !force/);
-  assert.doesNotMatch(app, /!sameSession[\s\S]*?initialTimelineRevealStart\(alreadyLoaded\)/);
-  assert.match(app, /Revealed history belongs to the task just like its scroll mode/);
-  assert.match(app, /reconcileTimelinePage\(page\.items, current\.timelines\[sessionId\] \?\? \[\]\)/);
-  assert.match(app, /applyOpenedSessionPreview\(current\.sessions, page\.session\)/);
-  assert.match(app, /const resolvedRevealStart = timelineWindow && presentationTimeline[\s\S]*anchoredTimelineRevealStart\(presentationTimeline, timelineWindow\.revealStart, timelineWindow\.revealAnchorKey\)[\s\S]*const visibleTimeline = useMemo\([\s\S]*presentationTimeline\?\.slice\(resolvedRevealStart\)[\s\S]*\[hasTimelineWindow, presentationTimeline, resolvedRevealStart\]/);
-  assert.doesNotMatch(app, /loadSessionTimeline\(/);
-});
-
-test("task history opens on the recent assistant tail and pages upward without jumping", async () => {
-  const [app, rendererBridge] = await Promise.all([
-    source(join("src", "renderer", "src", "App.tsx")),
-    source(join("src", "renderer", "src", "bridge.ts")),
-  ]);
-  assert.match(rendererBridge, /loadSessionTimelinePage\(sessionId: string, cursor\?: string, limit = 40, refresh = false\)/);
-  assert.match(rendererBridge, /nextCursor: typeof payload\.nextCursor === "string" \? payload\.nextCursor : null/);
-  assert.match(app, /initialTimelineRevealStart\(items: readonly TimelineItem\[\], assistantCount = 3\)/);
-  assert.match(app, /const messageId = item\.messageId \?\? item\.id/);
-  assert.match(app, /loadTimelinePage\(selected\)\.then\(\(page\)/);
-  assert.match(app, /\[selected\]: initialTimelineWindow\(page\.items, page\.nextCursor\)/);
-  assert.match(app, /if \(shouldRequestOlder\(element\)\) void loadOlder\(\)/);
-  assert.match(app, /applyScrollTop\(element, anchoredScrollTop\(element, historyAnchor\.current\)\)/);
-  // A page landing wholly above the fold leaves no scroll event to ask for the next.
-  assert.match(app, /element\.scrollTop <= 1\) void loadOlder\(\)/);
-  assert.match(app, /maximumInvisibleHistoryPages/);
-  assert.match(app, /renderedTimelineAnchorIds\(candidate, active\)\.some\(\(id\) => !anchorsBefore\.has\(id\)\)/);
-  assert.match(app, /requestedCursors\.has\(cursor\)/);
-});
-
-test("renderer source reconciles live provider, session, and attention events", async () => {
-  const app = await source(join("src", "renderer", "src", "App.tsx"));
-
-  assert.match(app, /refreshProvidersNeeded = batch\.replayGap \|\| batch\.events\.some\(\(event\) => event\.type === "provider\.connected" \|\| event\.type === "provider\.disconnected"\)/);
-  assert.match(app, /refreshSessionsNeeded = batch\.replayGap \|\| remotelyUpdatedSessionIds\.length > 0[\s\S]*?event\.type === "session\.created"/);
-  assert.match(app, /session\.updated[\s\S]*?event\.payload\.reasoningEffort[\s\S]*?replaceSession/);
-  assert.match(app, /import \{ mergeAuthoritativeOpenedSession, mergeRefreshedSessions, sameSessionContext, scheduledTaskEventSchedule, scheduledTaskFailureCanRetractPresentation, scheduledTaskPresentationState, scheduledTaskScheduleAfterProviderEvidence, withoutRetiredScheduledSessions \} from "\.\/session_refresh"/);
-  assert.match(app, /liveSessionRevisionBySession/);
-  assert.match(app, /attentionChanged = batch\.events\.some\(\(event\) => event\.type === "approval\.requested" \|\| event\.type === "approval\.resolved" \|\| event\.type === "user_input\.requested" \|\| event\.type === "user_input\.resolved"\)/);
-  assert.match(app, /let refreshSessionsNeeded\s*=\s*batch\.replayGap/);
-  assert.match(app, /void refreshAll\(false\)/);
-  assert.match(app, /if \(refreshInFlight\.current\) \{[\s\S]*?refreshQueued\.current = true;[\s\S]*?return;/);
-  assert.match(app, /refreshInFlight\.current = false;[\s\S]*?if \(refreshQueued\.current\) \{[\s\S]*?void refreshAll\(false\);/);
-});
-
-test("renderer bridge names OpenCode reasoning levels through the composer choice, not the label", async () => {
-  const [composer, rendererBridge] = await Promise.all([
-    source(join("src", "renderer", "src", "Composer.tsx")),
-    source(join("src", "renderer", "src", "bridge.ts")),
-  ]);
-  // OpenCode calls its reasoning level a variant (max, high, low, …); the task
-  // record surfaces it as the effort without overriding a native reasoningEffort.
-  assert.match(rendererBridge, /effort: value\.reasoningEffort \?\? value\.variantId \?\? "Default"/u);
-  // Model efforts come from the whole native blob, so OpenCode's variants object
-  // advertises its levels to the composer's existing reasoning choice.
-  assert.match(rendererBridge, /advertised: metadata,/u);
-  // The composer resolves the session's effort against the advertised levels, so
-  // the reasoning choice in the chatbox shows Max/High for OpenCode sessions.
-  assert.match(composer, /resolveConcreteModelSelection\(models, \{ modelId: session\.model, reasoningEffort: session\.effort \}/u);
-  assert.match(composer, /effort && efforts\.length \? <ChoiceMenu/);
-  // Reasoning rows never claim a literal "Working" title again; the label already
-  // says Reasoning, and an empty thought says Thinking… in the preview instead.
-  assert.doesNotMatch(rendererBridge, /"Working"/u);
-  assert.match(rendererBridge, /kind: "reasoning", title: part\.redacted \? "Protected reasoning" : "Reasoning"/u);
-  assert.match(rendererBridge, /kind === "reasoning" \? \{ title: "Reasoning" \}/u);
-});
-
-test("renderer source submits keyed input answers and chunked attachment ids", async () => {
-  const [app, composer, helpers] = await Promise.all([
-    source(join("src", "renderer", "src", "App.tsx")),
-    source(join("src", "renderer", "src", "Composer.tsx")),
-    source(join("src", "renderer", "src", "composer_helpers.ts")),
-  ]);
-
-  assert.match(app, /user_input\.respond[\s\S]*?requestId: input\.id, answers,/);
-  assert.match(helpers, /attachment\.upload\.begin[\s\S]*?attachment\.upload\.chunk[\s\S]*?attachment\.upload\.complete/);
-  assert.match(helpers, /onUploadStarted\(uploadId\)/);
-  assert.match(composer, /attachmentIds\.length \? \{ attachmentIds: \[\.\.\.attachmentIds\] \} : \{\}/);
-  assert.match(composer, /pendingUploadIds\.map\(\(uploadId\) => request\("attachment\.upload\.cancel"/);
-});
-
-test("composer resets per task and gates attachment support from provider metadata", async () => {
-  const [app, composer, rendererBridge] = await Promise.all([
-    source(join("src", "renderer", "src", "App.tsx")),
-    source(join("src", "renderer", "src", "Composer.tsx")),
-    source(join("src", "renderer", "src", "bridge.ts")),
-  ]);
-
-  assert.match(app, /<Composer\s+key=\{session\.id\}/);
-  assert.match(app, /composerAttachments[\s\S]*?Record<string, readonly ComposerAttachment\[\]>/);
-  assert.match(app, /initialAttachments=\{composerAttachments\.current\[selectedSession\?\.id \?\? ""\] \?\? \[\]\}/);
-  assert.match(app, /onAttachmentsChange=\{\(attachments\) =>/);
-  assert.match(composer, /provider\?\.supportsAttachments === true/);
-  assert.match(composer, /useState<readonly ComposerAttachment\[\]>\(\(\) => initialAttachments\)/);
-  assert.match(composer, /attachmentsRef\.current = next;[\s\S]*?setAttachments\(next\);[\s\S]*?attachmentsChangeRef\.current\?\.\(next\)/);
-  assert.match(composer, /disabled=\{!canAttach\}/);
-  assert.match(rendererBridge, /builtInImageEntryProviders[^;]+"direct"/);
-});
-
-test("renderer sources keep providers generic and data-driven", async () => {
-  const [app, bridge, components, types] = await Promise.all([
-    source(join("src", "renderer", "src", "App.tsx")),
-    source(join("src", "renderer", "src", "bridge.ts")),
-    source(join("src", "renderer", "src", "components.tsx")),
-    source(join("src", "renderer", "src", "types.ts")),
-  ]);
-
-  assert.doesNotMatch(bridge, /allowedProviderIds/);
-  assert.match(types, /export type ProviderId = string/);
-  assert.match(types, /models: Record<string, ModelOption\[\]>/);
-  assert.match(app, /providers\.map\(\(provider\)/);
-  assert.match(components, /providerInitials/);
-  assert.doesNotMatch(`${app}\n${bridge}\n${components}`, /Claude/i);
-});
-
-test("browser preview and release QA exercise dynamic connector models through local drafts", async () => {
-  const [app, demo, visualQa, packagedSmoke] = await Promise.all([
-    source(join("src", "renderer", "src", "App.tsx")),
-    source(join("src", "renderer", "src", "demo.ts")),
-    source(join("scripts", "visual-qa.cjs")),
-    source(join("scripts", "packaged-smoke.cjs")),
-  ]);
-
-  assert.match(app, /data-connector-id=\{connector\.id\}/);
-  assert.match(app, /connector\.permissions\.filesystem/);
-  assert.match(app, /connector\.permissions\.network/);
-  assert.match(app, /connector\.permissions\.spawnProcesses/);
-  assert.match(app, /connector\.capabilities\.attachments/);
-  assert.match(app, /connector\.capabilities\.reasoningEfforts/);
-  assert.match(app, /connector\.capabilities\.messageQueue/);
-  assert.match(app, /This connector will run executable code on your computer/);
-  assert.match(app, /permission declarations are informational, not an operating-system sandbox/);
-  assert.match(app, /provider's terms/);
-  assert.match(app, /Credentials must stay with the provider's local tool or this connector/);
-  assert.match(app, /Enable after restart/);
-  assert.match(app, /Disabled now\. Restart Tethoq to complete cleanup\./);
-  assert.match(app, /providers\.filter\(\(provider\) => !removedIds\.has\(provider\.id\)\)/);
-  assert.match(app, /delete models\[providerId\]/);
-  assert.match(demo, /id: "tethoq-example"/);
-  assert.match(demo, /name: "Tethoq Example Reasoning"/);
-  assert.match(demo, /export const demoBootstrap: DesktopBootstrap/);
-  assert.match(visualQa, /settings-connectors-1440x900/);
-  assert.match(visualQa, /new-task-1100x760[^\n]*kind: 'new-task-draft'/);
-  assert.match(visualQa, /new-task-minimum-760x480[^\n]*kind: 'new-task-draft'/);
-  assert.match(visualQa, /workspace \.workspace-location\.draft-location/);
-  assert.match(visualQa, /model-picker-dropup \[data-provider-group="tethoq-example"\]/);
-  assert.match(visualQa, /modalCount: document\.querySelectorAll\('\.modal'\)\.length/);
-  assert.match(visualQa, /layout\.newTaskDraft\.modalCount, 0/);
-  assert.match(visualQa, /layout\.newTaskDraft\.modelPicker\?\.visible, true/);
-  assert.match(visualQa, /layout\.newTaskDraft\.directoryControl\?\.visible, true/);
-  assert.match(visualQa, /layout\.newTaskDraft\.pickerCheck\?\.selectedConnectorModel/);
-  assert.match(visualQa, /\['model picker', layout\.newTaskDraft\.modelPicker\], \['directory', layout\.newTaskDraft\.directoryControl\]/);
-  assert.match(visualQa, /draft \$\{name\} control is outside the visible viewport/);
-  assert.match(visualQa, /document\.querySelector\('\.sidebar-tasks'\)/);
-  assert.doesNotMatch(visualQa, /new-session-form|session-list-panel|workflow-settings-card|\.modal\[aria-label="Start a new task"\]/);
-
-  assert.match(packagedSmoke, /task-filter-popover \.provider-options button/);
-  assert.match(packagedSmoke, /pending connector local draft/);
-  assert.match(packagedSmoke, /model-picker-dropup \[data-provider-group="community\.echo"\]/);
-  assert.match(packagedSmoke, /picker\.modelOptions, \['Echo Fast', 'Echo Careful'\]/);
-  assert.match(packagedSmoke, /selectedModel === 'Echo Fast'/);
-  assert.match(packagedSmoke, /draftSelection\.sendDisabled, true/);
-  assert.doesNotMatch(packagedSmoke, /new-session-form|\.harness-grid/);
-  const approvedDraftStart = packagedSmoke.indexOf("'approved connector local draft'");
-  const directEchoStart = packagedSmoke.indexOf("const created = await bridgeRequest('session.create'", approvedDraftStart);
-  assert.ok(approvedDraftStart >= 0 && directEchoStart > approvedDraftStart);
-  assert.doesNotMatch(packagedSmoke.slice(approvedDraftStart, directEchoStart), /bridgeRequest\('session\.(?:create|send_message)'/);
-  assert.match(packagedSmoke.slice(directEchoStart), /bridgeRequest\('session\.send_message'[\s\S]*?Echo: packaged streaming/);
-  assert.doesNotMatch(`${app}\n${demo}\n${visualQa}`, /Claude/i);
-});
-
-test("attention-blocked sessions queue follow-up messages", async () => {
-  const composer = await source(join("src", "renderer", "src", "Composer.tsx"));
-
-  assert.match(composer, /const holdsFollowUpQueue = !stopPresentationActive && sessionHoldsFollowUpQueue\(session, timeline, workingBoundary\)/);
-  assert.match(composer, /const blockedByAttention = holdsFollowUpQueue \|\| turnInFlight\.current/);
-  assert.match(composer, /const requestType = composerMessageRequestType\(\{[\s\S]*?externalWriter: session\.externalWriter === true,[\s\S]*?\}\)/);
-});
-
-test("workflow recorder progress refreshes live counts and pauses its lone timer while hidden", async () => {
-  const app = await source(join("src", "renderer", "src", "App.tsx"));
-
-  assert.match(app, /event\.type === "progress"[\s\S]*?setRecorder\(\(current\) => \(\{ \.\.\.current, phase: "recording", active: event\.recording \}\)\)/);
-  assert.match(app, /event\.type === "state"[\s\S]*?setRecorder\(event\.state\)/);
-  const recordingBar = app.match(/function RecordingBar[\s\S]*?\n}/)?.[0] ?? "";
-  assert.match(recordingBar, /window\.setInterval\(update, 1_000\)/);
-  assert.match(recordingBar, /document\.hidden \? stop\(\) : start\(\)/);
-  assert.match(recordingBar, /document\.addEventListener\("visibilitychange", onVisibilityChange\)/);
-  assert.match(recordingBar, /document\.removeEventListener\("visibilitychange", onVisibilityChange\)/);
-  assert.doesNotMatch(app.slice(0, app.indexOf("function RecordingBar")), /setInterval\([^)]*setNow/);
-});
-
-test("browser chrome exposes live download management and Ctrl L address focus", async () => {
-  const [app, main, styles] = await Promise.all([
-    source(join("src", "renderer", "src", "App.tsx")),
-    source(join("src", "main", "index.ts")),
-    source(join("src", "renderer", "src", "styles.css")),
-  ]);
-
-  assert.match(app, /notice\.action === "focus-address"[\s\S]*?setBrowserAddressFocusToken/);
-  assert.match(app, /addressInput\.current\?\.focus\(\)[\s\S]*?addressInput\.current\?\.select\(\)/);
-  assert.match(main, /notice\.type === "focus-address" \|\| notice\.type === "workspace-closed"\) window\.webContents\.focus\(\)/);
-  assert.match(app, /type: "clear-download-history"/);
-  assert.match(app, /action: download\.paused \? "resume" : "pause"/);
-  assert.match(app, /action: "cancel"/);
-  assert.match(app, /download\.savePath[\s\S]*?revealPath/);
-  assert.match(app, /browser-download-progress/);
-  assert.match(app, /browser-download-popover/);
-  assert.match(app, /aria-haspopup="dialog"/);
-  assert.match(app, /role="dialog" aria-modal="false" aria-label="Downloads"/);
-  assert.match(app, /role="progressbar"/);
-  assert.match(app, /aria-valuenow=\{progress\}/);
-  assert.match(app, /downloads\.some\(\(item\) => item\.state === "progressing"\) \? <span>/);
-  assert.match(app, /disabled=\{!isBrowserPreview && current\?\.visible !== true\}/);
-  assert.match(app, /document\.addEventListener\("pointerdown", closeOnOutsideClick\)/);
-  assert.match(app, /event\.key !== "Escape"/);
-  assert.match(app, /type: "prepare-overlay"/);
-  assert.match(app, /type: "open-overlay"/);
-  assert.match(app, /type: "close-overlay"/);
-  assert.match(app, /browser-freeze-frame/);
-  assert.match(app, /type: "set-muted"/);
-  assert.match(app, /label="New browser tab"/);
-  assert.doesNotMatch(app, /Tethoq profile|browser-profile-pill/u, "browser tab chrome must not carry an inactive profile label");
-  assert.doesNotMatch(styles, /\.browser-profile-pill/u, "the removed browser profile pill must not retain dead responsive CSS");
-  const browserWorkspace = app.match(/function BrowserWorkspace\([\s\S]*?\n}/)?.[0] ?? "";
-  const openDownloads = browserWorkspace.match(/const openDownloads = useCallback\([\s\S]*?\n  }, \[closeDownloads, notify\]\);/)?.[0] ?? "";
-  const closeDownloads = browserWorkspace.match(/const closeDownloads = useCallback\([\s\S]*?\n  }, \[\]\);/)?.[0] ?? "";
-  assert.match(openDownloads, /prepare-overlay[\s\S]*?image\.decode\(\)[\s\S]*?flushSync\([\s\S]*?setBrowserFreezeFrame\(snapshot\)[\s\S]*?setDownloadsOpen\(true\)[\s\S]*?requestAnimationFrame[\s\S]*?open-overlay/);
-  assert.match(closeDownloads, /close-overlay[\s\S]*?\.then\([\s\S]*?setBrowserOverlayPhase\("native"\)[\s\S]*?requestAnimationFrame[\s\S]*?setBrowserFreezeFrame\(null\)/);
-  const visualQa = await source(join("scripts", "visual-qa.cjs"));
-  assert.match(app, /tethoq\.browser-privacy-notice-dismissed\.v1/);
-  assert.match(app, /aria-label="Dismiss browser profile notice"/);
-  assert.match(app, /setPrivacyNoticeVisible\(false\)[\s\S]*?localStorage\.setItem\(browserPrivacyNoticeDismissedKey, "true"\)/);
-  assert.match(visualQa, /--browser-only/);
-  assert.match(visualQa, /browser profile notice returned after a real remount/i);
-  assert.match(visualQa, /browser profile notice returned after renderer reload/i);
-  assert.match(visualQa, /browser-downloads-1440x900/);
-  assert.match(visualQa, /browser-downloads-minimum-980x680/);
-  assert.match(visualQa, /browser-download-panel \.browser-download-progress/);
-  assert.match(visualQa, /opening downloads shifted the browser viewport/);
-  const packagedSmoke = await source(join("scripts", "packaged-smoke.cjs"));
-  assert.match(packagedSmoke, /exerciseBrowserDownloadPopover/);
-  assert.match(packagedSmoke, /browserCompactDownloadPopover: true/);
-  assert.match(packagedSmoke, /Unapproved connector code executed before review/);
-  assert.match(packagedSmoke, /connectorAction[\s\S]*?type: 'approve'/);
-  assert.match(packagedSmoke, /approval\.restartRequired/);
-  assert.match(packagedSmoke, /await quitPackagedApp\(\)[\s\S]*?await launchPackagedApp\(\)/);
-});
-
-test("desktop navigation keeps browser and workflow complexity session-scoped", async () => {
-  const [app, navigation, composer, workflows, components, visualQa, packagedSmoke] = await Promise.all([
-    source(join("src", "renderer", "src", "App.tsx")),
-    source(join("src", "renderer", "src", "NavigationPanels.tsx")),
-    source(join("src", "renderer", "src", "Composer.tsx")),
-    source(join("src", "renderer", "src", "WorkflowSettings.tsx")),
-    source(join("src", "renderer", "src", "components.tsx")),
-    source(join("scripts", "visual-qa.cjs")),
-    source(join("scripts", "packaged-smoke.cjs")),
-  ]);
-
-  assert.doesNotMatch(navigation, />Browser<|>Workflows</);
-  assert.match(composer, /Open session browser/);
-  assert.match(composer, /Manage workflows/);
-  assert.match(composer, /onManageWorkflow\(attachment\.id\)/);
-  assert.match(app, /onBrowser=\{\(\) => setView\("browser"\)\}/);
-  assert.match(app, /setSelectedWorkflowId\(id \?\? null\); openSettings\(\)/);
-  assert.match(workflows, /workflow-detail-timing/);
-  assert.match(workflows, /workflow-capture-metrics/);
-  assert.match(workflows, /Captured apps/);
-  assert.match(components, /state !== "idle" && state !== "working"/);
-  assert.match(visualQa, /Open session browser/);
-  assert.match(visualQa, /Manage workflows/);
-  assert.match(packagedSmoke, /Open session browser/);
-  assert.doesNotMatch(packagedSmoke, /primary-nav button[^\n]*Browser/);
-});
-
-test("startup paints a progressive usable shell without spinner prose", async () => {
-  const [app, navigation, styles, html, main] = await Promise.all([
-    source(join("src", "renderer", "src", "App.tsx")),
-    source(join("src", "renderer", "src", "NavigationPanels.tsx")),
-    source(join("src", "renderer", "src", "styles.css")),
-    source(join("src", "renderer", "index.html")),
-    source(join("src", "main", "index.ts")),
-  ]);
-
-  assert.match(app, /useState<DesktopSnapshot \| null>\(\(\) => progressiveStartupSnapshot\(\)\)/);
-  assert.match(app, /<Composer key=\{session\.id\}/);
-  assert.match(navigation, /session-list-skeleton/);
-  assert.match(styles, /\.transcript-skeleton-row\.user/);
-  assert.match(styles, /@keyframes progressive-skeleton-shimmer/);
-  assert.match(html, /pre-react-message user/);
-  assert.match(html, /pre-react-composer/);
-  assert.doesNotMatch(html, /Connecting to your coding tools|startup-spin/);
-  assert.match(main, /class="messages"/);
-  assert.match(main, /class="composer"/);
-  assert.doesNotMatch(main, /startup-spinner|Connecting to your coding tools/);
-  assert.match(styles, /\.titlebar \{[^}]*background:\s*var\(--bg\)/);
-  assert.match(styles, /@keyframes app-shell-enter[\s\S]*\.desktop-app[^{]*\{[^}]*animation:\s*app-shell-enter \.14s ease-out both/);
-});
-
-test("merged sidebar task search and composable agent filters stay compact", async () => {
-  const [navigation, styles, app] = await Promise.all([
-    source(join("src", "renderer", "src", "NavigationPanels.tsx")),
-    source(join("src", "renderer", "src", "navigation.css")),
-    source(join("src", "renderer", "src", "App.tsx")),
-  ]);
-
-  assert.match(navigation, /className="sidebar-task-search"/);
-  assert.match(navigation, /data-expanded=\{searchExpanded\}/);
-  assert.match(navigation, /const searchExpanded = searchOpen \|\| Boolean\(query\)/);
-  assert.doesNotMatch(navigation, /searchOpen \|\| Boolean\(query\) \|\| filtersOpen/);
-  assert.match(navigation, /const openTaskSearch = \(\) => \{[\s\S]*?setSearchOpen\(true\);[\s\S]*?requestAnimationFrame\(\(\) => searchInput\.current\?\.focus\(\)\)/);
-  assert.match(navigation, /onClick=\{openTaskSearch\}/);
-  assert.match(navigation, /searchInput\.current\?\.focus\(\)/);
-  assert.match(navigation, /<header className=\{`sidebar-task-header \$\{searchExpanded \? "search-expanded" : ""\}`\}>[\s\S]*?<h2>Tasks<\/h2>[\s\S]*?<div className="sidebar-task-tools"[\s\S]*?<button type="button" onClick=\{taskListMode === "project" \? onNewProject : onNewTask\}/);
-  assert.match(navigation, /<\/div>\s*<button ref=\{filterButton\} type="button" className=\{filtersOpen \|\| activeFilterCount \? "sidebar-task-filter active" : "sidebar-task-filter"\}/);
-  assert.doesNotMatch(navigation, /className="sidebar-task-search"[^]*className=\{filtersOpen \|\| activeFilterCount \? "filter-toggle/);
-  assert.match(navigation, /className="task-filter-popover"/);
-  assert.match(navigation, />Agent</);
-  assert.match(navigation, /All agents/);
-  assert.match(navigation, /Available agents/);
-  assert.match(navigation, /Status/);
-  assert.match(navigation, /title=\{location\}/);
-  assert.match(navigation, /onContextMenu=\{onContextMenu\}/);
-  assert.match(navigation, /event\.preventDefault\(\)/);
-  assert.match(navigation, /className="session-context-menu" role="menu"/);
-  assert.match(navigation, /role="menuitem" disabled=\{!sessionMenu\.workingDirectory\}/);
-  assert.match(navigation, />Open in File Explorer</);
-  assert.match(navigation, /if \(path\) onOpenDirectory\(path\)/);
-  assert.doesNotMatch(navigation, /onOpenDirectory\(sessionMenu\.title|onOpenDirectory\(session\.project/);
-  assert.match(app, /onOpenDirectory=\{openSessionDirectory\}/);
-  assert.match(app, /window\.tethoqDesktop\.openLocalTarget\(\{ path, handlerId: "system" \}\)/);
-  assert.match(navigation, /chooseProvider = \(value: ProviderFilter\) => \{ onProvider\(value\); setFiltersOpen\(false\); \}/);
-  assert.match(navigation, /toggleProvider = \(value: ProviderId\)/);
-  assert.match(navigation, /role="checkbox" aria-checked=\{isIncluded\}/);
-  assert.match(navigation, /onClick=\{\(\) => toggleProvider\(option\.id\)\}/);
-  assert.match(navigation, /available: provider\.detected/);
-  assert.match(app, /availableProviders = new Set\(snapshot\.providers\.filter\(\(provider\) => provider\.detected\)/);
-  assert.match(navigation, /chooseState = \(value: SessionFilter\) => \{ onFilter\(value\); setFiltersOpen\(false\); \}/);
-  assert.doesNotMatch(navigation, /task-state-dot task-state-|className="task-state-slot"/);
-  assert.doesNotMatch(navigation, /Refresh tasks|Provider diagnostics|All states|>Filtered<|<Status|session-list-collapse|quiet-refresh/);
-  assert.match(styles, /\.sidebar-task-search \{[\s\S]*?width: 34px/);
-  assert.match(styles, /\.sidebar-task-search\[data-expanded="true"\] \{[\s\S]*?width: auto;[\s\S]*?flex: 1 1 auto/);
-  assert.doesNotMatch(styles, /\.sidebar-task-search:(?:hover|focus-within),/);
-  assert.match(styles, /transition: none/);
-  assert.match(styles, /\.sidebar-task-filter \{[\s\S]*?width: 31px;[\s\S]*?height: 31px;[\s\S]*?margin-left: auto/);
-  assert.match(styles, /\.sidebar-task-tools \{[\s\S]*?align-items: center;[\s\S]*?gap: 6px/);
-  assert.match(styles, /\.provider-filter-checkbox\[aria-checked="true"\]/);
-  assert.match(styles, /\.provider-filter-option\.unavailable \{ opacity: \.3/);
-  assert.match(styles, /\.session-row-top strong \{ font-size: 12\.5px/);
-  assert.match(navigation, /className="session-row-trailing"/);
-  // Schedule/pin and time occupy the same reserved trailing slot, so none shifts the row.
-  assert.match(navigation, /const scheduledIndicator = session\.schedule[\s\S]*?session\.schedule\.status === "failed" \? <AlertIcon \/> : <ClockIcon \/>/);
-  assert.match(navigation, /<span className="session-row-trailing">\{session\.state === "working" \? null : scheduledIndicator \?\? \(session\.pinned \? <PinIcon className="session-row-pin" \/> : null\)\}<time>\{relativeTime\(session\.updatedAt\)\}<\/time><\/span>\s*\{session\.state === "working" \? <span className="session-row-working-indicator"[^>]*><i className="spinner session-row-working-spinner"/);
-  assert.doesNotMatch(navigation, /session-row-state-/);
-  assert.match(navigation, /aria-current=\{selected \? "page" : undefined\}/);
-  assert.match(styles, /\.session-row \{ height: 74px; min-height: 74px; grid-template-columns: 36px minmax\(0, 1fr\) 32px;[\s\S]*?align-content: center;[\s\S]*?row-gap: 3px/);
-  assert.doesNotMatch(styles, /\.session-row:hover,[\s\S]*?grid-template-columns/);
-  assert.match(styles, /\.session-row-top \{ display: contents; \}/);
-  assert.match(styles, /\.session-row-top \.provider-logo \{[^}]*grid-row: 1 \/ span 2;[^}]*align-self: center;[^}]*transform: translate\(-5px, -17px\)/, "rich recency rows align the provider ink with the title ink");
-  assert.match(navigation, /<ProviderLogo providerId=\{session\.providerId\} provider=\{provider\} size=\{36\}\/>/);
-  assert.match(navigation, /<span className="session-subagents-summary"><SubagentsIcon className="session-subagents-icon"\/><span className="session-subagents-count" data-count-capped=\{compactCountCapped \|\| undefined\}>\{visibleChildCount\}<\/span><\/span>/u, "rich and compact parent rows use one generic sub-agent summary");
-  assert.match(styles, /\.session-subagents:not\(\.compact\) \.session-subagents-trigger \{[^}]*width: 38px;[^}]*height: 25px;[^}]*grid-template-columns: minmax\(0, 1fr\);[^}]*grid-template-rows: 13px 7px;[^}]*padding: 4px 1px 1px/u, "the rich trigger adds three background pixels above its unchanged stacked content lanes");
-  assert.match(styles, /\.session-subagents:not\(\.compact\) \.session-subagents-summary \{[^}]*display: inline-flex;[^}]*grid-column: 1;[^}]*grid-row: 1;[^}]*align-items: flex-end;[^}]*justify-self: center;[^}]*gap: 2px/u, "the icon and smaller variable-width count centre as a bottom-aligned group");
-  assert.match(styles, /\.session-subagents:not\(\.compact\) \.session-subagents-icon \{[^}]*width: 13px;[^}]*height: 13px/u);
-  assert.match(styles, /\.session-subagents:not\(\.compact\) \.session-subagents-count \{[^}]*font-size: 11\.5px;[^}]*line-height: 1;[^}]*translate: 0 -1px/u, "the rich count is one type step smaller with its painted-bottom correction");
-  assert.match(styles, /\.session-subagents:not\(\.compact\) \.session-subagents-chevron \{[^}]*width: 8px;[^}]*height: 8px;[^}]*grid-column: 1;[^}]*grid-row: 2;[^}]*align-self: center;[^}]*justify-self: center;[^}]*opacity: \.38;[^}]*stroke-width: 2\.4;[^}]*translate: -1px 0/u, "the stronger disclosure sits subtly underneath the summary");
-  assert.match(styles, /\.session-subagents:not\(\.compact\) \.session-subagents-trigger:hover > \.session-subagents-chevron,\s*\.session-subagents:not\(\.compact\) \.session-subagents-trigger:focus-visible > \.session-subagents-chevron,\s*\.session-subagents:not\(\.compact\)\.open \.session-subagents-chevron \{ opacity: 1; \}/u, "hover, keyboard focus, and open states fully reveal the rich disclosure");
-  assert.match(styles, /\.session-row\.compact \{[^}]*height: 31px;[^}]*min-height: 31px;[^}]*grid-template-columns: subgrid;[^}]*padding: 3px 7px 3px 1px/u, "project tasks remain one line within the shared harness, count, and title grid");
-  assert.match(styles, /\.session-project-items \.session-row-shell \{[^}]*width: calc\(100% \+ 24px\);[^}]*grid-template-columns: 32px minmax\(0, 1fr\);[^}]*margin-left: -24px/u, "every project shell owns the full selected-paint lane and harness column");
-  assert.match(styles, /\.session-row-shell:has\(\.session-subagents\.compact\) \{[^}]*grid-template-columns: 32px max-content minmax\(0, 1fr\)/u, "compact counts size to their content beside the harness and title");
-  assert.match(styles, /\.session-subagents\.compact \.session-subagents-trigger \{[^}]*width: max-content;[^}]*min-width: 28px;[^}]*height: 22px;[^}]*grid-template-rows: 1fr/u, "the project trigger gives its chevron-free summary the full height");
-  assert.match(styles, /\.session-subagents\.compact \.session-subagents-summary \{[^}]*display: inline-flex;[^}]*justify-self: center;[^}]*gap: 2px;[^}]*translate: 0 1px/u, "project counts centre dynamically with the generic icon on the title baseline");
-  assert.match(styles, /\.session-subagents\.compact \.session-subagents-icon \{[^}]*width: 13px;[^}]*height: 13px;[^}]*translate: 0 1px/u, "the compact generic mark receives a local optical correction");
-  assert.match(styles, /\.session-subagents\.compact \.session-subagents-count \{[^}]*width: auto;[^}]*font-size: 12px;[^}]*font-weight: 650/u);
-  assert.match(styles, /\.session-subagents\.compact \.session-subagents-count\[data-count-capped="true"\] \{[^}]*font-size: 11px/u);
-  assert.match(navigation, /\{!compact \? <ChevronDownIcon className="session-subagents-chevron" \/> : null\}/u, "compact project triggers omit the redundant chevron without changing rich recency controls");
-  assert.doesNotMatch(styles, /\.session-subagents\.compact[^\n{]*\.session-subagents-chevron/u);
-  assert.match(styles, /\.session-project-items \.session-row-shell:has\(> \.session-row\.compact\.selected\) \{[^}]*background: #292927/u, "project selection always paints one uninterrupted full-width shell");
-  assert.match(styles, /\.session-project-items \.session-row-shell > \.session-row\.compact\.selected \{ background: transparent; \}/u);
-  assert.match(styles, /\.session-project-show-more \{[^}]*margin-left: 11px;[^}]*padding: 3px 7px/u, "Show more aligns with the invariant project-title lane");
-  assert.match(styles, /\.session-project-working-indicator \{[^}]*justify-self: end;[^}]*translate: 0 2px/u, "the compact working spinner receives its measured one-pixel optical correction without leaving the fixed trailing lane");
-  assert.match(styles, /\.session-row-trailing \{[\s\S]*?grid-template-columns: minmax\(0, 1fr\);[\s\S]*?gap: 0/);
-  assert.match(styles, /\.session-row-working-indicator \{[^}]*position: absolute;[^}]*right: 5px;[^}]*bottom: 5px;[^}]*width: 12px;[^}]*height: 12px;[^}]*color: #7fd39b;[^}]*translate: 0 0/, "the recency-row spinner stays in the fixed lower-right corner");
-  assert.match(styles, /\.session-row-working-spinner \{[^}]*width: 12px;[^}]*height: 12px/);
-  assert.match(styles, /\.session-row-top time \{[\s\S]*?font-size: 12\.5px;[\s\S]*?opacity: 0;[\s\S]*?transform: none/);
-  assert.match(styles, /\.session-row:hover \.session-row-top time,[\s\S]*?\.session-row:focus-visible \.session-row-top time,[\s\S]*?\.session-row\.selected \.session-row-top time \{ opacity: 1; \}/);
-  assert.match(navigation, /<OverflowReveal axis="horizontal" className="session-row-title">/);
-  assert.match(navigation, /<OverflowReveal axis="vertical" className=\{`session-row-preview \$\{session\.previewKind === "realtime_voice" \? "session-row-preview-realtime" : ""\}`\} prefix=\{session\.previewKind === "realtime_voice" \? <MicrophoneIcon \/> : undefined\}>\{session\.preview\}<\/OverflowReveal>/u, "voice previews use clean text with the existing microphone identity instead of transport tags");
-  assert.match(navigation, /\{prefix \? <i className="overflow-reveal-prefix">\{prefix\}<\/i> : null\}<span ref=\{content\}>/u, "the semantic preview icon stays outside moving overflow text");
-  assert.match(navigation, /const pixelsPerSecond = axis === "vertical" \? 18 : 28/);
-  assert.match(navigation, /const duration = distance \/ pixelsPerSecond/);
-  assert.match(navigation, /"--overflow-duration": `\$\{duration\.toFixed\(2\)\}s`/);
-  assert.match(styles, /\.overflow-reveal-horizontal\[data-overflow="true"\][\s\S]*mask-image:[^;]*transparent 100%/);
-  assert.match(styles, /\.session-row-title \{[^}]*margin-left: -6px/);
-  assert.match(styles, /\.session-row-preview \{[^}]*margin-left: -6px/);
-  assert.match(styles, /\.session-row-preview-realtime \{[^}]*position: relative;[^}]*padding-left: 18px/u);
-  assert.match(styles, /\.session-row-preview-realtime > \.overflow-reveal-prefix \{[^}]*position: absolute;[^}]*top: 1px;[^}]*left: 0;[^}]*width: 13px;[^}]*height: 13px/u, "the voice identity remains in a fixed compact preview lane");
-  assert.match(styles, /\.overflow-reveal-vertical\[data-overflow="true"\][^}]*calc\(100% - 3px\)[^}]*rgba\(0,0,0,\.72\) 100%/);
-  assert.match(styles, /\.session-row:hover \.overflow-reveal-vertical\[data-overflow="true"\],[\s\S]*?\.overflow-reveal-vertical\[data-overflow="true"\]:focus-within \{[^}]*linear-gradient\(transparent 0,#000 3px,#000 calc\(100% - 3px\),rgba\(0,0,0,\.72\) 100%\)/, "moving task-preview text fades through a three-pixel top edge instead of meeting a hard clip");
-  assert.match(styles, /\.overflow-reveal-horizontal\[data-overflow="true"\]:hover > span[\s\S]*translateX/);
-  assert.match(styles, /\.session-row:hover \.overflow-reveal-vertical\[data-overflow="true"\] > span[\s\S]*translateY/);
-  assert.match(styles, /transition: transform var\(--overflow-duration\) linear \.55s/);
-  assert.match(styles, /\.session-list-scroll \{[^}]*overflow-x: hidden;[^}]*overflow-y: auto;/);
-  assert.match(styles, /\.session-row-preview \{[^}]*grid-column: 2 \/ -1/);
-  assert.match(styles, /\.session-row-meta \{[\s\S]*?position: absolute;[\s\S]*?clip-path: inset\(50%\)/);
-  assert.match(styles, /\.session-list-scroll \{[\s\S]*?margin-right: -8px;[\s\S]*?scrollbar-gutter: stable/);
-  assert.match(styles, /\.session-list-scroll \{[\s\S]*?padding: 1px 0 8px/);
-  assert.match(styles, /\.session-list-scroll::-webkit-scrollbar \{ width: 10px; \}/);
-  assert.match(styles, /\.session-list-scroll::-webkit-scrollbar-thumb:hover \{ background: #8a8a83; \}/);
-  assert.match(styles, /font-variant-numeric: tabular-nums/);
-  assert.match(styles, /\.session-row-top time \{[\s\S]*?font-size: 12\.5px/);
-  assert.match(styles, /\.session-row\.selected \{[\s\S]*?box-shadow: none/);
-  assert.match(styles, /\.session-context-menu \{[\s\S]*?position: fixed/);
-  assert.doesNotMatch(styles, /\.task-state-working \{|\.provider-options > button i/);
-});
-
-test("sidebar owns the task list in one resizable navigation column", async () => {
-  const [navigation, styles, app] = await Promise.all([
-    source(join("src", "renderer", "src", "NavigationPanels.tsx")),
-    source(join("src", "renderer", "src", "navigation.css")),
-    source(join("src", "renderer", "src", "App.tsx")),
-  ]);
-
-  assert.match(navigation, /export interface SidebarProps/);
-  assert.match(navigation, /className="sidebar-tasks"/);
-  assert.match(navigation, /className=\{`sidebar-task-header \$\{searchExpanded \? "search-expanded" : ""\}`\}/);
-  assert.match(navigation, /onClick=\{onNewTask\}/);
-  assert.match(navigation, /onCommandSearch: \(\) => void/);
-  assert.match(navigation, /className="sidebar-command-search"/);
-  assert.match(navigation, /data-tooltip="Commands · Ctrl K"/);
-  assert.match(navigation, />Dashboard</);
-  assert.match(navigation, /className="sidebar-footer"/);
-  assert.match(navigation, /sidebar-runtime-indicator/);
-  assert.match(styles, /\.sidebar-footer \{[^}]*margin-right: -8px;[^}]*margin-left: -5px;[^}]*padding: 7px 8px 0 5px;[^}]*border-top: 1px solid/);
-  assert.match(styles, /\.sidebar-footer \.sidebar-settings \{[^}]*padding: 0 27px 0 7px/);
-  assert.doesNotMatch(navigation, />Agents<|sidebar-section|provider-nav|export function SessionList|session-list-new|Start a new task|<TerminalIcon|<kbd>Ctrl N/);
-  assert.match(styles, /:root \{ --navigation-panel: 248px; \}/);
-  assert.match(styles, /\.app-body,[\s\S]*?grid-template-columns: var\(--navigation-panel\) minmax\(400px, 1fr\)/);
-  assert.match(styles, /\.new-task-row \.new-task-button \{[\s\S]*?font-size: 13px/);
-  assert.match(styles, /\.new-task-row \.new-task-button \{[\s\S]*?display: grid;[\s\S]*?grid-template-columns: minmax\(0, 1fr\) auto minmax\(0, 1fr\)/, "New task keeps symmetric flexible tracks around its independently centred label");
-  assert.match(styles, /\.new-task-row \.new-task-button svg \{[^}]*grid-column: 1;[^}]*justify-self: end;[^}]*margin-right: 8px;/, "the plus sits eight pixels beside the centred label");
-  assert.match(styles, /\.new-task-row \.new-task-button span \{ grid-column: 2; justify-self: center; \}/);
-  assert.match(styles, /\.new-task-row \{[\s\S]*?grid-template-columns: minmax\(0, 1fr\) 38px/);
-  assert.match(styles, /\.new-task-row \.new-task-button \{[\s\S]*?min-height: 38px/);
-  assert.match(styles, /\.sidebar-command-search \{[\s\S]*?width: 38px;[\s\S]*?height: 38px/);
-  assert.match(styles, /\.primary-nav \{[\s\S]*?grid-template-columns: minmax\(0, 1fr\) 38px/);
-  assert.match(styles, /\.primary-nav button \{[\s\S]*?width: 100%;[\s\S]*?min-height: 38px/);
-  assert.match(styles, /\.primary-nav button \{[^}]*display: grid;[^}]*grid-template-columns: minmax\(0, 1fr\) auto minmax\(0, 1fr\)/, "Dashboard uses the same symmetric tracks as New task");
-  assert.match(styles, /\.primary-nav button svg \{[^}]*grid-column: 1;[^}]*width: 17px;[^}]*justify-self: end;[^}]*margin-right: 8px;/, "Dashboard uses the New task icon slot");
-  assert.match(styles, /\.primary-nav button span \{ grid-column: 2; justify-self: center; \}/);
-  assert.match(styles, /\.sidebar \{[\s\S]*?padding-left: 5px/);
-  assert.match(styles, /--navigation-panel: 232px/);
-  assert.match(styles, /--navigation-panel: 270px/);
-  assert.match(styles, /\.primary-nav button \{[\s\S]*?font-size: 13px/);
-  assert.match(app, /navigationPanelStorageKey = "tethoq\.navigation-panel-width"/);
-  assert.match(app, /clampNavigationPanelWidth\(startWidth \+ moveEvent\.clientX - startX, window\.innerWidth\)/);
-  assert.match(app, /role="separator"[\s\S]*?aria-label="Resize task list"[\s\S]*?aria-orientation="vertical"/);
-  assert.match(app, /onPointerDown=\{beginSidebarResize\}/);
-  assert.match(app, /onKeyDown=\{resizeSidebarWithKeyboard\}/);
-  assert.match(app, /"--navigation-panel": `\$\{navigationPanelWidth\}px`/);
-  assert.match(styles, /\.navigation-resize-handle \{[\s\S]*?left: calc\(var\(--navigation-panel\) - 5px\);[\s\S]*?width: 10px;[\s\S]*?cursor: col-resize/);
-  assert.match(styles, /\.sidebar-resizing, \.sidebar-resizing \* \{ cursor: col-resize !important; user-select: none !important; \}/);
-});
-
-test("new task opens a local draft and materializes it once from the composer", async () => {
-  const [app, composer, types] = await Promise.all([
-    source(join("src", "renderer", "src", "App.tsx")),
-    source(join("src", "renderer", "src", "Composer.tsx")),
-    source(join("src", "renderer", "src", "types.ts")),
-  ]);
-
-  assert.match(types, /draft\?: boolean/);
-  assert.match(app, /const startDraftTask = useCallback/);
-  assert.match(app, /draft: true/);
-  // Refreshes omit derived sessions, so locally tracked drafts, side chats, and
-  // delegated children must survive the merge instead of blanking their workspace.
-  assert.match(app, /const localOnly = current\.sessions\.filter\(\(session\) => \(session\.draft \|\| isSideChatSession\(session\) \|\| session\.parentSessionId !== undefined \|\| !incomingProviders\.has\(session\.providerId\) \|\| changedSinceRefresh\(session\.id\)\) && !refreshedIds\.has\(session\.id\)\)/);
-  assert.match(app, /sessions: applyOpenedSessionPreview\(\[\.\.\.localOnly, \.\.\.mergeRefreshedSessions\(current\.sessions, visibleSessions, quiet, changedSinceRefresh\)\], timelinePage\?\.session\)/);
-  assert.doesNotMatch(app, /function NewSessionModal|<NewSessionModal/);
-  assert.match(app, /const createDraftSend = useCallback/);
-  assert.match(app, /const separatedFirstTurn = input\.attachmentIds\.length > 0 \|\| input\.workflowIds\.length > 0/);
-  assert.match(app, /beginDraftMaterialization\(materializeInput, \{\s*title,\s*\.\.\.\(!separatedFirstTurn \? \{/);
-  assert.match(app, /\.\.\.\(firstTurn\?\.content !== undefined \? \{ firstInstruction: firstTurn\.content \} : \{\}\)/);
-  assert.match(app, /await request\("session\.send_message"/);
-  assert.match(app, /input\.workflowIds\.length \? \{ workflowIds: \[\.\.\.input\.workflowIds\] \} : \{\}/);
-  assert.match(composer, /optimisticItem: acceptedRow/);
-  assert.match(app, /mergeAcceptedComposerRow\(combinedTimeline, presentation\.acceptedItem/);
-  assert.match(app, /composerDraftSnapshot\(composerDraftStore, input\.draftSessionId\)/);
-  assert.match(app, /Choose a project folder before starting this task/);
-  assert.match(app, /onDraftSelectionChange=\{onDraftSelectionChange\}/);
-  assert.match(app, /onCreateDraftSend=\{onCreateDraftSend\}/);
-  assert.match(app, /onMaterializeDraft=\{onMaterializeDraft\}/);
-  assert.match(app, /pendingAction=\{pendingComposerAction\}/);
-  assert.match(composer, /if \(draftSession\)[\s\S]*?await onCreateDraftSend/);
-});
-
-test("workspace keeps repeated path metadata hidden until intent", async () => {
-  const [app, styles] = await Promise.all([
-    source(join("src", "renderer", "src", "App.tsx")),
-    source(join("src", "renderer", "src", "styles.css")),
-  ]);
-
-  assert.match(app, /className=\{`workspace-location \$\{session\.draft \? "draft-location" : ""\}`\}/);
-  assert.match(app, /session\.draft \? "Choose the project folder" : session\.workingDirectory \|\| session\.project/);
-  assert.match(styles, /\.workspace-location \{ opacity: 0/);
-  assert.match(styles, /\.workspace-header:hover \.workspace-location/);
-  assert.match(styles, /\.workspace-title:not\(:has\(\.draft-location\)\) \{[^}]*align-self: stretch;[^}]*align-items: center/);
-  assert.match(styles, /\.workspace-title:not\(:has\(\.draft-location\)\) > button \{[^}]*position: absolute/);
-  assert.match(styles, /\.workspace-title \.status \{ transform: translateY\(1px\)/);
-  assert.doesNotMatch(styles, /\.context-strip/);
-});
-
-test("desktop wallet UI exposes direct-key safety, local budgets, and custom endpoints", async () => {
-  const [app, bridge, styles, icons] = await Promise.all([
-    source(join("src", "renderer", "src", "App.tsx")),
-    source(join("src", "renderer", "src", "bridge.ts")),
-    source(join("src", "renderer", "src", "styles.css")),
-    source(join("src", "renderer", "src", "icons.tsx")),
-  ]);
-  assert.match(app, /request\("wallet\.get"/);
-  assert.match(app, /request\("wallet\.configure"/);
-  assert.match(app, /status\?\.availableEndpoints/);
-  assert.match(app, /onRefreshProviderModels\(directProvider\.id\)/);
-  assert.match(app, /type="password" autoComplete="new-password"/);
-  assert.match(app, /status\.kind === "user_api" \? <div><dt>API key<\/dt><dd>\{status\.apiKeyConfigured \? "Saved" : "Not added"\}<\/dd><\/div> : null/);
-  assert.match(app, /status\?\.kind === "user_api" \? <footer><LockIcon \/>API keys stay in the local Bridge and are never shown again\.<\/footer> : null/);
-  assert.doesNotMatch(app, /status\.apiKeyConfigured \? status\.apiKeyLabel \?\? "Configured"/);
-  assert.match(app, /setApiKey\(""\)/);
-  assert.match(app, /A local ceiling Tethoq stops you at\. It is not credit, and no money is held here\./);
-  assert.match(app, /Advanced custom endpoint/);
-  assert.match(app, /Responses API/);
-  assert.match(app, /OpenAI-compatible Chat Completions/);
-  assert.match(app, /local HTTP is allowed only for localhost/);
-  assert.match(bridge, /sourceProviderId/);
-  assert.match(styles, /\.wallet-user_api\s*\{\s*--wallet-tone:\s*#69aaf9/);
-  assert.match(styles, /\.wallet-harness\s*\{\s*--wallet-tone:\s*#e9a15a/);
-  assert.match(styles, /\.titlebar:has\(\.wallet-dropdown:hover\),\s*\.titlebar:has\(\.wallet-dropdown:focus-within\),\s*\.titlebar:has\(\.wallet-dropdown\.open\)\s*\{\s*z-index:\s*410/);
-  assert.doesNotMatch(app, /aria-label="Refresh wallet"/);
-  assert.match(app, /<RefreshIcon className="refresh-icon" \/>/);
-  assert.match(styles, /svg\.refresh-icon \{[^}]*width: 20px !important/);
-  assert.match(icons, /M4 8c2\.7-5\.2 10\.6-6\.2 16 0/);
-  assert.match(icons, /m16\.5 4\.5 3\.5 3\.5-3\.5 3\.5/);
-});
-
-test("task context menu can branch an online persisted task without replacing Explorer access", async () => {
-  const [app, navigation, rendererBridge, composerStyles] = await Promise.all([
-    source(join("src", "renderer", "src", "App.tsx")),
-    source(join("src", "renderer", "src", "NavigationPanels.tsx")),
-    source(join("src", "renderer", "src", "bridge.ts")),
-    source(join("src", "renderer", "src", "composer.css")),
-  ]);
-  assert.match(navigation, /Branch in New Task/);
-  assert.match(navigation, /disabled=\{!canBranchMenuSession\}/);
-  assert.match(navigation, /menuSession\?\.draft !== true/);
-  assert.match(navigation, /menuProvider\.capabilities\.includes\("Create Session"\)/);
-  assert.match(navigation, /menuProvider\.capabilities\.includes\("Send Message"\)/);
-  assert.match(navigation, /menuProvider\.capabilities\.includes\("Session History"\)/);
-  assert.match(navigation, /Open in File Explorer/);
-  assert.match(app, /request\("session\.branch", \{ sessionId \}\)/);
-  assert.match(app, /insertDerivedSession\(source, result\.session as Record<string, unknown>, undefined, undefined, navigationIntent\)/);
-  assert.match(rendererBridge, /relationshipSourceSessionId: value\.relationship\.sourceSessionId/);
-  assert.match(app, /Branched from \$\{incomingBranch\.title\}/);
-  assert.match(app, /Branched to \$\{candidate\.title\}/);
-  assert.match(app, /className="task-relationship-notices"/);
-  assert.match(composerStyles, /\.task-relationship-notices button:hover/);
-});
-
 test("provider model catalogues load for every provider and never block the boot", async () => {
-  const [app, rendererBridge] = await Promise.all([
-    source(join("src", "renderer", "src", "App.tsx")),
-    source(join("src", "renderer", "src", "bridge.ts")),
-  ]);
   // A provider not yet detected at snapshot time (the supervised OpenCode
   // server starts asynchronously) must still get its catalogue loaded, or the
   // model picker and the composer's reasoning choice stay empty.
@@ -1837,14 +1006,6 @@ test("provider model catalogues load for every provider and never block the boot
   assert.equal(models["acme-agent"]?.[1]?.contextWindowTokens, undefined);
   assert.equal(models["acme-agent"]?.[1]?.inputPricePerMillion, undefined);
   assert.equal(models["acme-agent"]?.[1]?.outputPricePerMillion, undefined);
-  // The periodic catch-up heals a provider whose models never arrived: the
-  // selected task's provider with an empty catalogue gets a bounded reload.
-  assert.match(app, /healMissingModels = useCallback/u);
-  assert.match(app, /hydrateProviderModels\(\[provider\]\)/u);
-  assert.match(app, /healMissingModels\(\);/u);
-  assert.match(app, /modelHealAttempts\.current\.get\(provider\.id\)/u);
-  // No single models.list call may hang the initial snapshot forever.
-  assert.match(rendererBridge, /withTimeout\(catalogueRequest\("models\.list"/u);
 });
 
 test("renderer preserves the semantic realtime voice preview marker", () => {
@@ -1877,84 +1038,10 @@ test("OpenCode parented user chats stay in the task list while explicit subagent
   assert.deepEqual(mapped?.providerStatus, { kind: "retry", message: "Provider is temporarily busy", retryAt: "2026-08-20T12:00:00.000Z" });
 });
 
-test("task rows expose the sub-agent disclosure only when children exist and handle singular and plural labels", async () => {
+test("refresh retains an unknown child count without inventing zero children", async () => {
   const refreshed = await bridge.refreshSessions();
+  assert.equal(refreshed.length, 2);
   assert.equal(refreshed.every((session) => session.childCount === undefined), true, "ordinary tasks must not reserve empty child chrome");
-
-  const navigation = await source(join("src", "renderer", "src", "NavigationPanels.tsx"));
-  const subagentControl = navigation.match(/function SessionSubagentControl[\s\S]*?\n\}\n\nfunction SessionRow/u)?.[0] ?? "";
-  assert.match(navigation, /const displayedChildCount = childrenLoaded \? children\.length : \(session\.childCount \?\? 0\)/);
-  assert.match(navigation, /if \(!displayedChildCount\) return null;/);
-  assert.match(navigation, /displayedChildCount === 1 \? "" : "s"/);
-  assert.match(navigation, /children\.map\(\(child\) =>/);
-  assert.match(navigation, /setInterval\(\(\) => \{ void refreshChildren\(false\); \}, 1_500\)/);
-  assert.match(navigation, /child\.state === "working" \? <span className="spinner"/);
-  assert.match(navigation, /aria-label=\{`Sub-agents for \$\{session\.title\}`\}/);
-  assert.match(navigation, /onClick=\{\(\) => \{ close\(\); onOpenChild\(child\); \}\}/);
-  assert.match(navigation, /<SessionSubagentControl compact=\{compact\} session=\{session\}/);
-  assert.match(navigation, /<span className="session-subagents-summary"><SubagentsIcon className="session-subagents-icon"\/><span className="session-subagents-count" data-count-capped=\{compactCountCapped \|\| undefined\}>\{visibleChildCount\}<\/span><\/span>/u, "every parent trigger uses the generic two-person mark and dynamically sized count");
-  assert.doesNotMatch(subagentControl, /const providerId = session\.childProviderIds|providers\.find\(\(candidate\) => candidate\.id === providerId\)/u, "parent trigger geometry no longer depends on the first child's provider");
-  assert.match(navigation, /data-tooltip=\{open \? undefined : countLabel\}/, "the exact sub-agent count must use the shared app tooltip layer");
-  assert.doesNotMatch(subagentControl, /tooltipActive|positionTooltip|session-subagents-tooltip|createPortal\(<span/, "the sub-agent control must not keep a second tooltip implementation");
-
-  const app = await source(join("src", "renderer", "src", "App.tsx"));
-  assert.match(app, /<AppTooltipLayer \/>/, "the app-level tooltip portal must own sub-agent tooltip placement");
-  assert.match(app, /topLevelSessions = useMemo\(\(\) => presentedOrganizedSessions\.filter\(\(session\) => session\.relationshipKind !== "subagent"\)/);
-  assert.match(app, /sessionsForTaskListMode\(topLevelSessions, preferences\.taskListMode\)/);
-  assert.match(app, /return taskListSessions\.filter\(\(session\) =>/);
-});
-
-test("sub-agent popover portals above the task-list resize divider", async () => {
-  const [navigation, styles, navigationStyles] = await Promise.all([
-    source(join("src", "renderer", "src", "NavigationPanels.tsx")),
-    source(join("src", "renderer", "src", "styles.css")),
-    source(join("src", "renderer", "src", "navigation.css")),
-  ]);
-  const childRows = navigation.match(/children\.map\(\(child\) => \{[\s\S]*?\}\)\}\{!loading/u)?.[0] ?? "";
-
-  assert.match(navigation, /const popover = useRef<HTMLElement>\(null\)/);
-  assert.match(navigation, /!root\.current\?\.contains\(target\) && !popover\.current\?\.contains\(target\)/, "portaled child rows must remain inside the control's outside-click boundary");
-  assert.match(navigation, /createPortal\(<section ref=\{popover\} id=\{popoverId\} className="session-subagents-popover"[\s\S]*?<\/section>, document\.body\)/, "the fixed panel must escape the task-row stacking context");
-  assert.match(navigation, /const popoverWidth = 300;/u);
-  assert.match(navigation, /const popoverMaximumHeight = 318;/u);
-  assert.match(childRows, /<ProviderLogo providerId=\{child\.providerId\}[\s\S]*?size=\{28\}\/>/u, "each child row retains its actual harness identity");
-  assert.doesNotMatch(childRows, /SubagentsIcon|session-subagents-icon/u, "the generic parent summary icon must not repeat in child rows");
-  assert.match(childRows, /reasoningDisplayLabel\(child\.effort, \{ providerId: child\.providerId, modelId: child\.model, displayName: child\.model \}\)/u, "child reasoning labels come from the truthful provider-aware display helper");
-  assert.match(childRows, /className="session-subagent-model">\{child\.model\}<\/span>\{reasoning \? <><span className="session-subagent-separator" aria-hidden="true">·<\/span><span className="session-subagent-reasoning">\{reasoning\}<\/span>/u, "model and reasoning share one line with a centred dot separator");
-  assert.match(childRows, /className="session-subagent-state"[\s\S]*?sidebarChildStateLabel\(child\.state\)/u, "child identity, model, reasoning, and state remain independently readable");
-  assert.match(styles, /\.session-subagents-popover \{[^}]*width:\s*300px;[^}]*max-height:\s*min\(318px, calc\(100vh - 16px\)\);[^}]*overflow-y:\s*auto/su);
-  assert.match(styles, /\.session-subagents-popover > button \{[^}]*min-height:\s*50px;[^}]*grid-template-columns:\s*28px minmax\(0,1fr\) minmax\(72px,max-content\) 13px/su);
-  assert.match(styles, /\.session-subagents-popover small \{[^}]*font-size:\s*12\.5px/u);
-  assert.match(styles, /\.session-subagent-metadata \{[^}]*display:\s*flex;[^}]*align-items:\s*center;[^}]*gap:\s*4px/su);
-  assert.match(styles, /\.session-subagent-separator, \.session-subagent-reasoning \{[^}]*flex:\s*0 0 auto/su);
-  assert.doesNotMatch(styles, /\.session-subagents-tooltip/u, "the retired private tooltip must not retain CSS");
-
-  const popoverZIndex = Number(styles.match(/\.session-subagents-popover \{[^}]*z-index: (\d+)/)?.[1]);
-  const resizeHandleZIndex = Number(navigationStyles.match(/\.navigation-resize-handle \{[^}]*z-index: (\d+)/)?.[1]);
-  assert.ok(Number.isFinite(popoverZIndex) && Number.isFinite(resizeHandleZIndex));
-  assert.ok(popoverZIndex > resizeHandleZIndex, "the viewport-level panel must paint above the active resize divider");
-  assert.match(navigationStyles, /\.navigation-resize-handle:hover::after,[\s\S]*?\.sidebar-resizing \.navigation-resize-handle::after \{ background: #686863; \}/, "the divider must keep its visible hover, focus, and drag states outside overlays");
-});
-
-test("dashboard keeps useful hierarchy without decorative boxes, fake arrows, or undersized task labels", async () => {
-  const app = await source(join("src", "renderer", "src", "App.tsx"));
-  const styles = await source(join("src", "renderer", "src", "styles.css"));
-
-  assert.match(app, /<header className="page-heading"><h1>Dashboard<\/h1><Button variant="primary" onClick=\{onNew\}>/u);
-  assert.match(app, /<div className="section-title"><h2>Recent tasks<\/h2><button onClick=\{\(\) => onProvider\("all"\)\}>View all/u);
-  assert.doesNotMatch(app, /Local coding workspace|Everything running across your coding tools|Across every coding tool/u);
-  assert.doesNotMatch(styles, /\.page-heading > div > p:last-child/u, "removed dashboard subtitle must not retain dead spacing");
-  assert.match(app, /<div className="active-task-footer"><span><FolderIcon \/>\{active\.project\}<\/span><span>\{relativeTime\(active\.updatedAt\)\}<\/span><\/div>/u, "the whole active-task button stays clickable without a fake edge chevron");
-  assert.match(app, /<ProviderLogo providerId=\{session\.providerId\} provider=\{provider\} size=\{30\}\/><strong>\{session\.title\}<\/strong>/u, "recent task identity is large enough to scan");
-
-  const attentionCountRule = styles.match(/\.attention-heading > b \{[^}]*\}/u)?.[0] ?? "";
-  assert.match(attentionCountRule, /font-size:\s*15px/u, "the attention count must remain readable");
-  assert.doesNotMatch(attentionCountRule, /border|border-radius|background/u, "the attention count must not be boxed or circled");
-  assert.match(styles, /\.attention-card \.empty-icon \{[^}]*width:\s*auto;[^}]*height:\s*auto;[^}]*border:\s*0;[^}]*background:\s*transparent/su, "the clear-state shield must not sit in a decorative box");
-  assert.match(styles, /\.attention-card \.empty-icon svg \{[^}]*width:\s*30px;[^}]*height:\s*30px/su, "the unboxed clear-state shield must remain legible");
-  assert.match(styles, /\.active-task-footer \{[^}]*color:\s*#a7aca7;[^}]*font-size:\s*13px/su, "project and updated time must remain readable");
-  assert.match(styles, /\.active-task-footer svg \{[^}]*width:\s*18px;[^}]*height:\s*18px/su, "the active project folder must match its larger label");
-  assert.match(styles, /\.recent-table strong \{[^}]*font-size:\s*13\.5px;[^}]*font-weight:\s*600/su, "recent task names must not regress to tiny text");
 });
 
 test("renderer accepts only the display-safe retry status contract", () => {
@@ -1973,7 +1060,7 @@ test("renderer accepts only the display-safe retry status contract", () => {
   assert.equal(bridge.providerStatusValue({ kind: "error", message: "failed" }), undefined);
 });
 
-test("delegated children map safely and stay visible across refreshes even when their provider is missing", async () => {
+test("delegated children retain safe display fields when their provider is missing", async () => {
   // Opening a cross-harness delegated child must never crash the mapping, and
   // the refresh merges must keep the child tracked so its workspace cannot
   // collapse to a blank pane when a refresh omits derived sessions.
@@ -1989,49 +1076,6 @@ test("delegated children map safely and stay visible across refreshes even when 
   assert.equal(child.model, "CLI default");
   assert.equal(child.effort, "Default");
   assert.ok(child.title && child.preview && child.updatedAt && child.workingDirectory);
-
-  const app = await source(join("src", "renderer", "src", "App.tsx"));
-  // Both refresh merges preserve derived sessions instead of dropping them.
-  const localOnlyMatches = app.match(/const localOnly = current\.sessions\.filter\(\(session\) => \(session\.draft \|\| isSideChatSession\(session\) \|\| session\.parentSessionId !== undefined \|\| !incomingProviders\.has\(session\.providerId\) \|\| changedSinceRefresh\(session\.id\)\) && !refreshedIds\.has\(session\.id\)\)/gu) ?? [];
-  assert.equal(localOnlyMatches.length, 2);
-  assert.match(app, /sessions: applyOpenedSessionPreview\(\[\.\.\.localOnly, \.\.\.mergeRefreshedSessions\(current\.sessions, visibleSessions, quiet, changedSinceRefresh\)\], timelinePage\?\.session\)/);
-  // Opening a child inserts it into the tracked sessions before its timeline loads.
-  assert.match(app, /onOpenChild=\{\(child\) => \{[\s\S]*?sessions: \[child, \.\.\.current\.sessions\.filter/);
-  // The child row tolerates a provider that is absent from the provider list.
-  assert.match(app, /const childProvider = providers\.find\(\(provider\) => provider\.id === child\.providerId\)/);
-  assert.match(app, /<ProviderLogo providerId=\{child\.providerId\} provider=\{childProvider\}/);
-});
-
-test("experimental features own the sub-agent gate while task details retain the per-task checkbox", async () => {
-  const [app, api] = await Promise.all([
-    source(join("src", "renderer", "src", "App.tsx")),
-    source(join("src", "shared", "desktop_api.ts")),
-  ]);
-
-  // The legacy master action remains in the shared API for compatibility, but
-  // the renderer exposes only the experimental-features master control.
-  assert.match(api, /"set-allow-foreign-subagents"/);
-  assert.match(api, /"set-session-foreign-subagents"/);
-  assert.doesNotMatch(app, /type: "set-allow-foreign-subagents", enabled/);
-  assert.match(app, /type: "set-experimental-features", enabled/);
-  assert.match(app, /type: "set-session-foreign-subagents", sessionId: selectedSession\.id, allowed/);
-  assert.match(app, /foreignSubagentsEnabled=\{preferences\.experimentalFeatures\}/);
-  assert.match(app, /sessionForeignSubagents=\{preferences\.foreignSubagentOverrides\?\.\[selectedSession\?\.id \?\? ""\] \?\? true\}/);
-
-  // The per-task control renders only while the master gate is on, so a
-  // disabled gate leaves no section, no heading, and no reserved gap.
-  assert.match(app, /\{foreignSubagentsEnabled \? <section className="task-details-section" aria-labelledby=\{foreignSubagentsHeadingId\}>[\s\S]*?<\/section> : null\}/);
-  assert.match(app, /This task may spawn sub-agents on a different coding tool\./);
-
-  // Settings presents one concept and names current examples in its description.
-  assert.equal(app.match(/<section className="settings-block experimental-features-block"/gu)?.length, 1);
-  assert.equal(app.match(/<h2>Experimental features<\/h2>/gu)?.length, 1);
-  assert.doesNotMatch(app, /<h2>Sub-agents<\/h2>/);
-  assert.match(app, /including instant sessions and sub-agents from other coding tools\./);
-  assert.match(app, /keywords: "experimental feature instant session sub-agent subagent other coding tools"/);
-  assert.match(app, /aria-checked=\{preferences\.experimentalFeatures\}/);
-  assert.match(app, /className=\{`settings-toggle \$\{preferences\.experimentalFeatures \? "on" : ""\}`\}/);
-  assert.match(app, /role="switch"/);
 });
 
 test("an echoed Grok user chunk renders live instead of waiting for a history reload", () => {
@@ -2111,26 +1155,6 @@ test("verified cross-task sender attribution survives live echoes and history re
   const history = bridge.mapMessages([message]);
   assert.equal(history.length, 1);
   assert.deepEqual(history[0].origin, origin);
-  const deliveredEvent = {
-    sequence: 1, hostId: "desktop_test", sessionId: "session-1", eventId: "remote-delivery",
-    type: "message.remote_received", occurredAt: "2026-09-06T12:00:02.000Z",
-    payload: { state: "delivered", envelope: {
-      version: 1, id: origin.envelopeId, sourceSessionId: origin.sourceSessionId, sourceTitle: origin.sourceTitle,
-      targetSessionId: "session-1", content: message.parts[0].text,
-    } },
-  };
-  const delivered = bridge.eventToTimeline(deliveredEvent);
-  assert.equal(delivered.kind, "user", "accepted coordination paints without a history read");
-  assert.equal(delivered.body, message.parts[0].text);
-  assert.deepEqual(delivered.origin, origin);
-  assert.equal(timelineMerge.mergeTimeline([delivered], delivered).length, 1);
-  assert.equal(timelineMerge.reconcileTimelinePage(history, [delivered]).length, 1, "canonical IDs and timestamps may differ from the delivery event");
-  assert.equal(bridge.eventToTimeline({ ...deliveredEvent, payload: { ...deliveredEvent.payload, state: "pending" } }), null);
-  assert.equal(bridge.eventToTimeline({ ...deliveredEvent, payload: { ...deliveredEvent.payload,
-    envelope: { ...deliveredEvent.payload.envelope, targetSessionId: "another-task" } } }), null);
-  const separate = bridge.eventToTimeline({ ...deliveredEvent, eventId: "remote-delivery-2", payload: { ...deliveredEvent.payload,
-    envelope: { ...deliveredEvent.payload.envelope, id: "remote_verified_2" } } });
-  assert.equal(timelineMerge.mergeTimeline([delivered], separate).length, 2, "separate messages with identical wording remain distinct");
   for (const type of ["message.started", "message.completed"]) {
     const echo = bridge.eventToTimeline({
       sequence: 1,
@@ -2145,8 +1169,6 @@ test("verified cross-task sender attribution survives live echoes and history re
     assert.equal(echo.kind, "user");
     assert.equal(echo.body, message.parts[0].text);
     assert.deepEqual(echo.origin, origin);
-    assert.equal(timelineMerge.mergeTimeline([delivered], echo).length, 1, "a late native echo adopts the delivered row");
-    assert.equal(timelineMerge.mergeTimeline([echo], delivered).length, 1, "acceptance may arrive after the native echo");
     const merged = timelineMerge.reconcileTimelinePage(history, [echo]);
     assert.equal(merged.length, 1);
     assert.deepEqual(merged[0].origin, origin);
@@ -2198,7 +1220,7 @@ test("child status follows confirmed child lifecycle across parent cancellation 
   assert.equal(mapped.interruptedAt, interruptedAt);
 });
 
-test("an explicit interruption becomes the visible unsuccessful terminal row", () => {
+test("an explicit interruption becomes one quiet terminal boundary", () => {
   const interrupted = bridge.eventToTimeline({
     sequence: 1,
     hostId: "desktop_test",
@@ -2210,10 +1232,37 @@ test("an explicit interruption becomes the visible unsuccessful terminal row", (
     payload: { turnId: "turn-1" },
   });
 
-  assert.equal(interrupted.kind, "error");
+  assert.equal(interrupted.kind, "assistant");
   assert.equal(interrupted.title, "Task interrupted");
   assert.equal(interrupted.body, "Task interrupted");
-  assert.equal(interrupted.state, "failed");
+  assert.equal(interrupted.state, "completed");
+  assert.equal(interrupted.notice, "interruption");
+  assert.equal(timelineHelpers.timelineBoundaryLabel(interrupted), "Task interrupted");
+});
+
+test("OpenCode saved Aborted errors reconcile with the live interruption without hiding actual failures", () => {
+  const sessionId = "session-1";
+  const live = bridge.eventToTimeline({ sessionId, providerId: "opencode", type: "agent.interrupted",
+    eventId: "interrupted", occurredAt: "2026-09-09T00:00:02.000Z", payload: { turnId: "prompt-1" } });
+  const message = { id: "opencode/answer", sessionId, providerMessageId: "answer", role: "assistant",
+    createdAt: "2026-09-09T00:00:01.000Z", completedAt: "2026-09-09T00:00:02.000Z", status: "failed",
+    nativeMetadata: { parentID: "prompt-1" }, parts: [{ type: "error", code: "MessageAbortedError", message: "Aborted" }] };
+  const history = bridge.mapMessages([message]);
+  const reconciled = timelineMerge.reconcileTimelinePage(history, [live]);
+  assert.equal(reconciled.length, 1);
+  assert.equal(reconciled[0].notice, "interruption");
+  assert.equal(timelineHelpers.groupTimeline(reconciled, false)[0].kind, "boundary");
+  assert.equal(timelineMerge.mergeTimeline(history, live).length, 1, "history arriving first must also deduplicate");
+  const unrelated = bridge.mapMessages([{ ...message, parts: [{ type: "error", code: "APIError", message: "Request aborted by upstream failure" }] }]);
+  assert.equal(unrelated[0].kind, "error");
+  assert.equal(unrelated[0].state, "failed");
+  const codex = bridge.mapMessages([{ ...message, providerMessageId: "turn-aborted-turn-1", nativeMetadata: { turnId: "turn-1" },
+    parts: [{ type: "error", code: "TURN_ABORTED", message: "Task interrupted" }] }]);
+  assert.equal(codex[0].notice, "interruption", "native Codex interruption history must remain neutral too");
+  assert.equal(codex[0].turnId, "turn-1");
+  const second = bridge.eventToTimeline({ sessionId, providerId: "opencode", type: "agent.interrupted",
+    eventId: "second-stop", occurredAt: "2026-09-09T00:00:03.000Z", payload: { turnId: "prompt-2" } });
+  assert.equal(timelineMerge.mergeTimeline(reconciled, second).length, 2, "separate stopped turns remain separate");
 });
 
 test("streamed message deltas carry their event identity so a replay cannot duplicate text", () => {

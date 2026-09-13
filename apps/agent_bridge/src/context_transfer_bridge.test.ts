@@ -6,6 +6,7 @@ import {
   ProviderAdapterError,
   type SendMessageRequest,
   type SendMessageResult,
+  type RecentProviderMessages,
 } from "../../../packages/provider_contract/src/index.js";
 import type { BridgeConfig } from "./config.js";
 import { AgentBridge } from "./bridge.js";
@@ -186,6 +187,12 @@ test("generic branch fallback bootstraps the full normalized transcript and tags
     sourceSessionId: source.id,
     strategy: "transcript_bootstrap",
   });
+  assert.equal(result.session.state, "idle");
+  assert.equal(result.session.nativeMetadata.tethoqUserStopped, true);
+  assert.equal(result.prompt, "Take an independent approach.");
+  assert.deepEqual(provider.sentContents, [], "creating a branch must not send even an optional prompt");
+  assert.deepEqual(await provider.getMessages(result.session.providerSessionId), []);
+  await bridge.sendMessage(result.session.id, { requestId: "explicit-branch-send", content: result.prompt! });
   const createdMessages = await provider.getMessages(result.session.providerSessionId);
   const text = createdMessages.flatMap((message) => message.parts).find((part) => part.type === "text");
   assert.equal(text?.type, "text");
@@ -269,11 +276,12 @@ test("native branch adapters are preferred and do not receive a transcript boots
   t.after(() => bridge.dispose());
   await bridge.start();
   await bridge.refresh();
-  const source = bridge.sessions()[0];
-  assert.ok(source);
+  const source = await bridge.createSession(provider.providerId, { workingDirectory: "C:/workspace", title: "Stopped source" });
 
   const result = await bridge.branchSession(source.id);
   assert.equal(result.strategy, "native");
+  assert.equal(result.session.state, "idle");
+  assert.equal(result.session.nativeMetadata.tethoqUserStopped, true);
   assert.deepEqual(provider.branchCalls, [source.providerSessionId]);
   assert.deepEqual(await provider.getMessages(result.session.providerSessionId), []);
   assert.deepEqual(result.session.relationship, {
@@ -312,6 +320,10 @@ test("request router exposes the handoff and branch wire responses and reports v
   assert.equal(branch.payload.strategy, "transcript_bootstrap");
   assert.equal(branch.payload.copiedMessageCount, 1);
   assert.equal(typeof branch.payload.session, "object");
+  const branchSession = branch.payload.session as JsonObject;
+  assert.equal(branchSession.state, "idle");
+  assert.equal(typeof (branchSession.nativeMetadata as JsonObject).tethoqInterruptedAt, "string");
+  assert.equal((branchSession.nativeMetadata as JsonObject).tethoqBranchBootstrap, undefined);
 
   const invalid = await router.handle(request(hostId, "branch-invalid", "session.branch", { sessionId: source.id, prompt: " " }));
   assert.equal(invalid.ok, false);
@@ -353,6 +365,9 @@ test("persisted transfer records restore visible context and the pending first-s
   const reopenedHandoff = await restartedRouter.handle(request(hostId, "restart-handoff-open", "session.open", { sessionId: handoff.session.id }));
   assert.equal((reopenedHandoff.payload.session as JsonObject).contextHandoffSummary, handoff.summary);
   const restoredBranch = await restarted.openSession(branch.session.id);
+  assert.equal(restoredBranch.session.state, "idle");
+  assert.equal(restoredBranch.session.nativeMetadata.tethoqUserStopped, true);
+  assert.equal(provider.sentContents.length, 0);
   assert.match(JSON.stringify(restoredBranch.messages), /Seed message for fixture 1/);
 
   await restarted.sendMessage(handoff.session.id, { requestId: "restart-handoff-send", content: "Continue after restart." });
@@ -361,4 +376,121 @@ test("persisted transfer records restore visible context and the pending first-s
   assert.ok(provider.sentContents.some((content) => content.includes("TETHOQ_BRANCH_TRANSCRIPT_BOOTSTRAP_V1")));
   assert.equal(afterRestart.find((record) => record.sessionId === handoff.session.id)?.pending, false);
   assert.equal(afterRestart.find((record) => record.sessionId === branch.session.id)?.pending, false);
+  assert.notEqual(afterRestart.find((record) => record.sessionId === branch.session.id)?.paused, true);
+});
+
+class SnapshotBranchProvider extends NativeBranchFakeProvider {
+  public sourceId = "";
+  public history: readonly RemoteMessage[] = [];
+  public incompleteCursor = false;
+  public requireSnapshot = false;
+  public override async getMessages(providerSessionId: string) {
+    return providerSessionId === this.sourceId ? this.history : await super.getMessages(providerSessionId);
+  }
+  public async getRecentMessages(providerSessionId: string): Promise<RecentProviderMessages> {
+    const messages = await this.getMessages(providerSessionId);
+    return providerSessionId === this.sourceId
+      ? { messages: messages.slice(-2), complete: false, olderCursor: "older" }
+      : { messages, complete: true };
+  }
+  public async getOlderMessages(): Promise<RecentProviderMessages> {
+    return { messages: this.history, complete: !this.incompleteCursor, ...(this.incompleteCursor ? { olderCursor: "older" } : {}) };
+  }
+  public override async branchSession(providerSessionId: string) {
+    if (this.requireSnapshot) throw new ProviderAdapterError(this.providerId, "BRANCH_SNAPSHOT_REQUIRED", "Need current snapshot", true);
+    return await super.branchSession(providerSessionId);
+  }
+}
+
+test("branch freezes the newest exchange, all older pages and tool state without starting or modifying the source", async (t) => {
+  const provider = new SnapshotBranchProvider({ hostId: "snapshot", providerId: "snapshot", sessionCount: 1 });
+  const bridge = new AgentBridge(bridgeConfig("snapshot", provider.providerId), [provider]);
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  const source = (await bridge.refresh()).sessions[0]!;
+  provider.sourceId = source.providerSessionId;
+  provider.history = Array.from({ length: 504 }, (_, index): RemoteMessage => ({
+    id: `source-${index}`, sessionId: source.id, providerMessageId: `source-${index}`,
+    role: index % 2 === 0 ? "user" : "assistant", createdAt: new Date(index * 1000).toISOString(),
+    status: index === 503 ? "streaming" : "completed",
+    parts: [{ type: "text", text: `Message ${index}` }, ...(index === 503 ? [{ type: "tool" as const, name: "command", status: "running" as const, output: "Latest partial output" }] : [])],
+    nativeMetadata: {},
+  }));
+  const before = structuredClone(provider.history);
+  const [first, duplicate] = await Promise.all([bridge.branchSession(source.id), bridge.branchSession(source.id)]);
+  assert.equal(first.session.id, duplicate.session.id, "concurrent duplicate actions created two children");
+  assert.equal(first.strategy, "transcript_bootstrap");
+  assert.equal(first.copiedMessageCount, 504);
+  assert.deepEqual(provider.branchCalls, []);
+  assert.deepEqual(provider.sentSessionIds, []);
+  assert.deepEqual(provider.history, before, "branching changed the source");
+  const all: RemoteMessage[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await bridge.openSession(first.session.id, cursor);
+    all.push(...page.messages);
+    cursor = page.nextCursor ?? undefined;
+  } while (cursor);
+  assert.equal(all.length, 504);
+  assert.equal(new Set(all.map((message) => message.id)).size, 504);
+  assert.match(JSON.stringify(all), /Message 502/);
+  assert.match(JSON.stringify(all), /Message 503/);
+  assert.ok(all.every((message) => message.status !== "streaming"));
+  assert.ok(all.flatMap((message) => message.parts).every((part) => part.type !== "tool" || part.status !== "running"));
+  provider.history = [...provider.history, { ...before[0]!, id: "later", providerMessageId: "later", parts: [{ type: "text", text: "Source continued later" }] }];
+  const nested = await bridge.branchSession(first.session.id);
+  assert.equal(nested.copiedMessageCount, 504, "the copy followed later source changes or lost its inherited history");
+  assert.equal(nested.strategy, "transcript_bootstrap");
+  assert.deepEqual(provider.sentSessionIds, []);
+  await bridge.continueSession(first.session.id, { requestId: "explicit-continue" });
+  assert.deepEqual(provider.sentSessionIds, [first.session.providerSessionId]);
+});
+
+test("unsafe native boundaries fall back to the newest snapshot; incomplete pagination fails before creating a child", async (t) => {
+  const provider = new SnapshotBranchProvider({ hostId: "boundary", providerId: "boundary", sessionCount: 1 });
+  const bridge = new AgentBridge(bridgeConfig("boundary", provider.providerId), [provider]);
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  const source = (await bridge.refresh()).sessions[0]!;
+  provider.history = await provider.getMessages(source.providerSessionId);
+  provider.sourceId = source.providerSessionId;
+  provider.incompleteCursor = true;
+  await assert.rejects(bridge.branchSession(source.id), /complete conversation/);
+  assert.equal(bridge.sessions().length, 1);
+  provider.incompleteCursor = false;
+  provider.requireSnapshot = true;
+  const branch = await bridge.branchSession(source.id);
+  assert.equal(branch.strategy, "transcript_bootstrap");
+  assert.equal(branch.copiedMessageCount, provider.history.length);
+  assert.deepEqual(provider.sentSessionIds, []);
+});
+
+test("branch waits for an already submitted source message to be saved before copying", async (t) => {
+  let entered!: () => void;
+  let release!: () => void;
+  const writing = new Promise<void>((resolve) => { entered = resolve; });
+  const receipt = new Promise<void>((resolve) => { release = resolve; });
+  class DelayedProvider extends ObservedSendFakeProvider {
+    public override async sendMessage(id: string, request: SendMessageRequest) {
+      entered();
+      await receipt;
+      return await super.sendMessage(id, request);
+    }
+  }
+  const provider = new DelayedProvider({ hostId: "saving", providerId: "saving", sessionCount: 1 });
+  const bridge = new AgentBridge(bridgeConfig("saving", provider.providerId), [provider]);
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  const source = (await bridge.refresh()).sessions[0]!;
+  const send = bridge.sendMessage(source.id, { requestId: "latest-source-message", content: "The newest submitted instruction" });
+  await writing;
+  let branched = false;
+  const copy = bridge.branchSession(source.id).then((result) => { branched = true; return result; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(branched, false);
+  release();
+  await send;
+  const branch = await copy;
+  assert.match(JSON.stringify((await bridge.openSession(branch.session.id)).messages), /The newest submitted instruction/);
+  assert.equal(provider.sentContents.length, 1, "branch dispatched another prompt");
 });

@@ -20,6 +20,7 @@ class AppShell extends StatefulWidget {
 
 class _AppShellState extends State<AppShell> {
   int _index = 0;
+  final Set<int> _visitedTabs = <int>{0};
   RemoteAppStore? _store;
   String _selectedProviderId = 'codex';
 
@@ -65,6 +66,9 @@ class _AppShellState extends State<AppShell> {
 
   @override
   Widget build(BuildContext context) {
+    final store = StoreScope.read(context);
+    final routeActive = TickerMode.valuesOf(context).enabled;
+    _visitedTabs.add(_index);
     final visual = providerVisualThemeFor(_selectedProviderId);
     final wide = MediaQuery.sizeOf(context).width >= 760;
     final pages = <Widget>[
@@ -79,7 +83,13 @@ class _AppShellState extends State<AppShell> {
       children: pages.indexed
           .map((entry) => TickerMode(
                 enabled: entry.$1 == _index,
-                child: entry.$2,
+                child: StoreScope(
+                  store: store,
+                  listenToChanges: routeActive && entry.$1 == _index,
+                  child: _visitedTabs.contains(entry.$1)
+                      ? entry.$2
+                      : const SizedBox.shrink(),
+                ),
               ))
           .toList(growable: false),
     );

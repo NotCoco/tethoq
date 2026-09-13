@@ -17,6 +17,7 @@ import {
   type ProviderEventSink,
   type ProviderSessionPermissions,
   type ProviderUserInputResponse,
+  type RecentProviderMessages,
   type SendMessageRequest,
   type SendMessageResult,
   type Subscription,
@@ -30,6 +31,7 @@ import {
 } from "./catalogue.js";
 import { asJsonObject, isContinuingOpenCodeToolPart, isOpenCodeEyesTool, isRecord, normalizeOpenCodeError, normalizeOpenCodeMessages, normalizeOpenCodeProviderStatus, normalizeOpenCodeSession, normalizeOpenCodeToolEventPayload, normalizeStatus } from "./normalize.js";
 import { extractedPdfTextAttachment, isPdfAttachment } from "./pdf_fallback.js";
+import { OpenCodeImagePolicy, type OpenCodeImagePolicyOptions } from "./image_policy.js";
 
 export interface OpenCodeAdapterOptions extends OpenCodeHttpClientOptions {
   readonly hostId: string;
@@ -42,7 +44,7 @@ export interface OpenCodeAdapterOptions extends OpenCodeHttpClientOptions {
   readonly activityPollIntervalMs?: number;
   /** How often the small session catalogue is sampled for external activity. */
   readonly activityDiscoveryIntervalMs?: number;
-  /** How often the owning OpenCode server's provider-wide status map is sampled. */
+  /** How often the owning OpenCode server's active directory status maps are sampled. */
   readonly nativeStatusPollIntervalMs?: number;
   /**
    * A second server whose live events keep streaming while the desktop hands
@@ -57,9 +59,10 @@ export interface OpenCodeAdapterOptions extends OpenCodeHttpClientOptions {
    */
   readonly activeTurnSettleMs?: number;
   readonly compactionTimeoutMs?: number;
+  readonly imagePolicy?: OpenCodeImagePolicyOptions;
 }
 
-function openCodeMessageId(requestId: string): string {
+export function openCodeMessageId(requestId: string): string {
   // OpenCode persists the caller-supplied message ID. Deriving it from the
   // bridge request identity lets a safe retry target the same native message
   // instead of appending a duplicate user turn after a lost HTTP response.
@@ -162,7 +165,7 @@ interface TerminalCleanupGeneration {
 }
 
 type TerminalConfirmation =
-  | { readonly kind: "terminal"; readonly assistantId: string }
+  | { readonly kind: "terminal"; readonly assistantId: string; readonly error?: ReturnType<typeof normalizeOpenCodeError> }
   | { readonly kind: "continuing" }
   | { readonly kind: "unavailable" };
 
@@ -178,6 +181,7 @@ interface SessionListSnapshot {
 
 interface NativeStatusSnapshot {
   readonly statuses: Record<string, unknown>;
+  readonly directories: ReadonlySet<string | undefined>;
   readonly nativeEventRevisionAtStart: number;
   readonly connectionGenerationAtStart: number;
 }
@@ -247,8 +251,11 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   } as const;
   readonly #client: OpenCodeHttpClient;
   readonly #compactionTimeoutMs: number;
+  readonly #imagePolicy: OpenCodeImagePolicy | undefined;
+  readonly #promptReceiptTimeoutMs: number;
   readonly #hostId: string;
   readonly #directory: string | undefined;
+  readonly #sessionDirectories = new Map<string, string>();
   readonly #now: () => Date;
   readonly #events = new ProviderEventHub();
   readonly #permissions = new Map<string, PendingPermission>();
@@ -259,6 +266,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   #nextQuestionRecoveryAt = 0;
   #questionDiscovery: Promise<void> | undefined;
   readonly #abort = new AbortController();
+  readonly #pendingPromptRequests = new Map<string, AbortController>();
   readonly #activityReader: OpenCodeActivityReader;
   readonly #sessionIndexReader: OpenCodeSessionIndexReader;
   readonly #activityPollIntervalMs: number;
@@ -272,6 +280,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   readonly #partTypes = new Map<string, string>();
   readonly #messageRoles = new Map<string, string>();
   readonly #compactionMessageIds = new Set<string>();
+  readonly #nativeContextRecoveries = new Set<string>();
   readonly #reportedSelections = new Map<string, { readonly key: string; readonly messageCreatedAt?: number }>();
   readonly #activePromptMessageIds = new Map<string, string>();
   readonly #compactionLifecycleWaiters = new Map<string, Set<() => void>>();
@@ -300,6 +309,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   #guardActivityEpoch = 0;
   #activityLoop: Promise<void> | null = null;
   #nativeStatusLoop: Promise<void> | null = null;
+  #terminalRecovery: Promise<void> | undefined;
   #nextActivityDiscoveryAt = 0;
   #nextActivitySafetyDiscoveryAt = 0;
   #activityRefreshRequested = false;
@@ -317,7 +327,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   #activeSettleDeadlines = new Map<string, number>();
   #nativeStates = new Map<string, RemoteSession["state"]>();
   #nativeStatuses = new Map<string, unknown>();
-  #nativeStatusRead: Promise<NativeStatusSnapshot> | undefined;
+  readonly #nativeStatusReads = new Map<string | undefined, Promise<NativeStatusSnapshot>>();
   #nativeStatusReconcileTail: Promise<void> = Promise.resolve();
   #nativeEventRevision = 0;
   readonly #nativeEventRevisionBySession = new Map<string, number>();
@@ -348,6 +358,8 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   public constructor(options: OpenCodeAdapterOptions) {
     this.#client = new OpenCodeHttpClient(options);
     this.#compactionTimeoutMs = options.compactionTimeoutMs ?? compactionRequestTimeoutMs;
+    this.#imagePolicy = options.imagePolicy === undefined ? undefined : new OpenCodeImagePolicy(options.imagePolicy);
+    this.#promptReceiptTimeoutMs = options.requestTimeoutMs ?? 30_000;
     this.#hostId = options.hostId;
     this.#directory = options.directory;
     this.#questionDirectories.add(options.directory);
@@ -530,6 +542,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       return undefined;
     }
     if (indexed === undefined) return undefined;
+    for (const entry of indexed.entries) this.rememberSessionDirectory(entry);
     const statusSnapshot = await this.sessionStatuses().catch((): undefined => undefined);
     if (statusSnapshot !== undefined) await this.reconcileNativeStatusSnapshot(statusSnapshot);
     const sessions = indexed.entries.map((entry) => {
@@ -550,7 +563,8 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
    * OpenCode sessions can show up empty. Walking `/project` is the only way to
    * see the rest. Individual sessions have no such problem: `/session/{id}` and
    * its message history answer identically with or without the parameter, so
-   * only the listing needs to fan out.
+   * only the listing needs to fan out for metadata. Runner state and control
+   * operations still belong to each session's directory.
    *
    * Sessions the server files under the catch-all "global" project stay out of
    * reach unless its worktree is a real path: `directory=/` matches nothing,
@@ -633,7 +647,10 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
             : await this.fetchSessionList(options.workingDirectory, snapshotLimit)
         ));
     const [all, statusSnapshot] = await Promise.all([
-      listing,
+      listing.then((entries) => {
+        for (const entry of entries) this.rememberSessionDirectory(entry);
+        return entries;
+      }),
       this.sessionStatuses().catch((): undefined => undefined),
     ]);
     // A live event can clear or replace provider status while these independent
@@ -704,10 +721,9 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   public async getSession(providerSessionId: string): Promise<RemoteSession> {
     if (this.#applyingPersistedWorking === undefined) await this.awaitInitialActivitySnapshot();
     const persistedWorking = this.#applyingPersistedWorking ?? this.#persistedWorking;
-    const [session, statusSnapshot] = await Promise.all([
-      this.#client.request<unknown>("GET", `/session/${encodeURIComponent(providerSessionId)}`, { query: this.query() }),
-      this.sessionStatuses().catch((): undefined => undefined),
-    ]);
+    const session = await this.#client.request<unknown>("GET", `/session/${encodeURIComponent(providerSessionId)}`, { query: this.sessionQuery(providerSessionId) });
+    this.rememberSessionDirectory(session);
+    const statusSnapshot = await this.sessionStatuses(this.#sessionDirectories.get(providerSessionId)).catch((): undefined => undefined);
     if (this.#eventLoop !== null && isRecord(session) && typeof session.directory === "string") {
       this.#questionDirectories.add(session.directory);
       void this.recoverPendingQuestions("primary", session.directory);
@@ -722,9 +738,41 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     return state === normalized.state ? normalized : { ...normalized, state };
   }
 
-  public async getMessages(providerSessionId: string): Promise<readonly RemoteMessage[]> {
-    const value = await this.rawMessages(providerSessionId);
-    if (Array.isArray(value)) {
+  public async getMessages(providerSessionId: string, options: { readonly limit?: number } = {}): Promise<readonly RemoteMessage[]> {
+    const limit = options.limit === undefined || !Number.isFinite(options.limit) ? 500 : Math.min(500, Math.max(1, Math.floor(options.limit)));
+    const value = await this.rawMessages(providerSessionId, limit);
+    return await this.normalizeHistory(providerSessionId, value, true);
+  }
+
+  public getRecentMessages(providerSessionId: string): Promise<RecentProviderMessages> {
+    return this.historyPage(providerSessionId);
+  }
+
+  public getOlderMessages(providerSessionId: string, cursor: string): Promise<RecentProviderMessages> {
+    return this.historyPage(providerSessionId, cursor);
+  }
+
+  private async historyPage(providerSessionId: string, before?: string): Promise<RecentProviderMessages> {
+    // Tool output can make a few hundred messages hundreds of megabytes. Use
+    // the native cursor so opening/refreshing a task never loads that whole
+    // history just to display its last page, or competes with an incoming send.
+    const { data, headers } = await this.#client.requestWithHeaders<unknown>(
+      "GET", `/session/${encodeURIComponent(providerSessionId)}/message`, {
+        query: { ...this.sessionQuery(providerSessionId), limit: 40, before }, signal: this.#abort.signal,
+      },
+    );
+    const olderCursor = headers.get("x-next-cursor") || undefined;
+    return {
+      messages: await this.normalizeHistory(providerSessionId, data, before === undefined),
+      complete: olderCursor === undefined,
+      ...(olderCursor !== undefined ? { olderCursor } : {}),
+      ...(before !== undefined ? { pageOnly: true } : {}),
+    };
+  }
+
+  private async normalizeHistory(providerSessionId: string, value: unknown, reportSelection: boolean): Promise<readonly RemoteMessage[]> {
+    // Older pages describe historical settings, not the model selected now.
+    if (reportSelection && Array.isArray(value)) {
       let latestSelectionInfo: Record<string, unknown> | undefined;
       let latestSelection: OpenCodeMessageSelection | undefined;
       for (const entry of value) {
@@ -748,15 +796,29 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
         await this.publishReportedSelection(providerSessionId, latestSelectionInfo, { source: "history" });
       }
     }
+    await this.#imagePolicy?.hydrateHistory(value);
     return normalizeOpenCodeMessages(this.#hostId, providerSessionId, value);
   }
 
+  public async getMessage(providerSessionId: string, providerMessageId: string): Promise<RemoteMessage | undefined> {
+    if (this.#abort.signal.aborted) return undefined;
+    let value: unknown;
+    try {
+      value = await this.#client.request<unknown>("GET", `/session/${encodeURIComponent(providerSessionId)}/message/${encodeURIComponent(providerMessageId)}`, {
+        query: this.sessionQuery(providerSessionId), signal: this.#abort.signal, timeoutMs: Math.min(this.#promptReceiptTimeoutMs, 2_000),
+      });
+    } catch (error) {
+      if (error instanceof ProviderAdapterError && error.code === "HTTP_404") return undefined;
+      throw error;
+    }
+    if (!isRecord(value) || !isRecord(value.info) || value.info.id !== providerMessageId
+      || (value.info.sessionID !== undefined && value.info.sessionID !== providerSessionId)) return undefined;
+    await this.#imagePolicy?.hydrateHistory([value]);
+    return normalizeOpenCodeMessages(this.#hostId, providerSessionId, [value])[0];
+  }
+
   public async getSessionContext(providerSessionId: string): Promise<Omit<SessionContextState, "sessionId" | "compactionThresholdTokens" | "minimumThresholdTokens" | "supportsThreshold" | "isCompacting" | "compactionKind">> {
-    // Context heartbeats need message metadata only. Downloading hundreds of
-    // image/tool parts every time can saturate the local server's event loop
-    // and make its health checks and prompt delivery fail on long tasks.
-    const value = await this.#sessionIndexReader.readMessageInfo?.(providerSessionId, 500).catch(() => undefined)
-      ?? await this.rawMessages(providerSessionId);
+    const value = await this.rawMessages(providerSessionId);
     const entries = Array.isArray(value) ? value : [];
     const assistants = entries
       .map((entry) => isRecord(entry) && isRecord(entry.info) ? entry.info : isRecord(entry) ? entry : null)
@@ -815,6 +877,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   }
 
   private async performCompaction(providerSessionId: string): Promise<void> {
+    const query = await this.resolveSessionQuery(providerSessionId);
     const cleanup = this.#terminalCleanupGenerations.get(providerSessionId);
     if (cleanup !== undefined) await this.waitForTerminalCleanupGeneration(providerSessionId, cleanup);
     if (this.hasActiveTurn(providerSessionId) || (cleanup !== undefined && !cleanup.cleanupObserved)
@@ -837,29 +900,49 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     if (providerID === undefined || modelID === undefined) throw new Error("OpenCode has not selected a model for this session yet");
     const previousMarkers = openCodeCompactionMarkerIds(entries);
     const requestAbort = new AbortController();
-    let requestOutcome: { readonly kind: "completed" } | { readonly kind: "failed"; readonly error: unknown } | undefined;
-    const request = this.#client.request("POST", `/session/${encodeURIComponent(providerSessionId)}/summarize`, {
-      query: this.query(),
+    let requestOutcome: { readonly kind: "completed"; readonly at: number } | { readonly kind: "failed"; readonly error: unknown } | undefined;
+    const summarize = () => this.#client.request("POST", `/session/${encodeURIComponent(providerSessionId)}/summarize`, {
+      query,
       body: { providerID, modelID, auto: false },
       signal: AbortSignal.any([requestAbort.signal, signal]),
       timeoutMs,
     }).then(() => {
-      requestOutcome = { kind: "completed" };
+      requestOutcome = { kind: "completed", at: Date.now() };
       this.signalCompactionLifecycle(providerSessionId);
     }, (error: unknown) => {
       requestOutcome = { kind: "failed", error };
       this.signalCompactionLifecycle(providerSessionId);
     });
+    let request = summarize();
+    let retriedUnstartedSummary = false;
     try {
       while (!signal.aborted) {
         const recent = await this.rawMessages(providerSessionId, 20, signal);
         if (Array.isArray(recent)) {
           const newMarkers = openCodeCompactionMarkerIds(recent, previousMarkers);
           const outcome = openCodeCompactionOutcome(recent, newMarkers);
-          if (outcome === "completed") return;
+          if (outcome === "completed") {
+            return;
+          }
           if (outcome === "failed") throw new ProviderAdapterError(
             "opencode", "COMPACTION_FAILED", "OpenCode compaction failed or was interrupted", true,
           );
+          // Native idle can precede runner teardown. In that gap summarize
+          // saves its marker but joins the failed runner instead of starting a
+          // summary. Retry once only after the HTTP call has finished and the
+          // marker still has no assistant; never restart an actual summary.
+          const summaryStarted = recent.some(row => isRecord(row) && isRecord(row.info)
+            && row.info.role === "assistant" && typeof row.info.parentID === "string" && newMarkers.has(row.info.parentID));
+          if (!retriedUnstartedSummary && requestOutcome?.kind === "completed"
+            && Date.now() - requestOutcome.at >= compactionCompletionPollIntervalMs
+            && newMarkers.size > 0 && !summaryStarted && !this.hasActiveTurn(providerSessionId)) {
+            if (this.#activePromptMessageIds.has(providerSessionId)) throw new ProviderAdapterError(
+              "opencode", "COMPACTION_SESSION_BUSY", "Newer work superseded context compaction", true,
+            );
+            retriedUnstartedSummary = true;
+            requestOutcome = undefined;
+            request = summarize();
+          }
         }
         // HTTP success only accepts the request. Require a new, parent-linked
         // completed summary, including when the marker appears after the ack.
@@ -895,6 +978,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
           ? { permission: [{ permission: "*", pattern: "*", action: "deny" }] } : {}),
       },
     });
+    this.rememberSessionDirectory(value);
     const session = normalizeOpenCodeSession(this.#hostId, value);
     if (options.metadata?.internalPurpose === "vision_proxy") this.#visionSessions.add(session.providerSessionId);
     if (options.firstInstruction !== undefined) {
@@ -911,6 +995,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
 
   public async branchSession(providerSessionId: string): Promise<RemoteSession> {
     return await this.withSessionLifecycleLock(providerSessionId, async () => {
+      const query = await this.resolveSessionQuery(providerSessionId);
       const history = await this.rawMessages(providerSessionId);
       if (!Array.isArray(history)) {
         throw new ProviderAdapterError(
@@ -921,18 +1006,19 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
         );
       }
       const branchBody = completedOpenCodeBranchBody(history);
-      if (history.length > 0 && branchBody === undefined) {
+      if (history.length > 0 && (branchBody === undefined || "messageID" in branchBody)) {
         throw new ProviderAdapterError(
           "opencode",
-          "NO_COMPLETED_BRANCH_BOUNDARY",
-          "OpenCode does not expose a completed response boundary that is safe to branch from yet",
+          "BRANCH_SNAPSHOT_REQUIRED",
+          "The current OpenCode conversation needs a paused snapshot to preserve its latest messages",
           true,
         );
       }
       const value = await this.#client.request<unknown>("POST", `/session/${encodeURIComponent(providerSessionId)}/fork`, {
-        query: this.query(),
+        query,
         body: branchBody ?? {},
       });
+      this.rememberSessionDirectory(value);
       return normalizeOpenCodeSession(this.#hostId, value);
     });
   }
@@ -943,6 +1029,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
 
   public async sendMessage(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
     return await this.withSessionLifecycleLock(providerSessionId, async () => {
+      const query = await this.resolveSessionQuery(providerSessionId);
       if (request.metadata?.internalPurpose === "vision_proxy") this.#visionSessions.add(providerSessionId);
       const model = request.modelId === undefined ? undefined : parseModel(request.modelId);
       const messageID = openCodeMessageId(request.requestId);
@@ -952,7 +1039,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
           existing = await this.#client.request<unknown>(
             "GET",
             `/session/${encodeURIComponent(providerSessionId)}/message/${encodeURIComponent(messageID)}`,
-            { query: this.query() },
+            { query },
           );
         } catch (error) {
           if (!(error instanceof ProviderAdapterError) || error.code !== "HTTP_404") throw error;
@@ -967,10 +1054,25 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
               true,
             );
           }
+          if (!this.isCompletePromptReceipt(existing, providerSessionId, messageID, request.attachments ?? [])) {
+            await this.waitForPromptReceipt(providerSessionId, messageID, request.attachments ?? []);
+          }
           return { accepted: true, providerTurnId: messageID, details: ["OpenCode already accepted this scheduled prompt."] };
         }
       }
       const attachments = await this.preparePromptAttachments(request.modelId, request.attachments);
+      if (this.#imagePolicy !== undefined) {
+        try {
+          const paths = query?.directory === undefined ? await this.#client.request<{ directory: string }>("GET", "/path") : undefined;
+          const directory = query?.directory ?? paths?.directory;
+          if (typeof directory !== "string" || !directory) throw new Error("Workspace unavailable");
+          await this.#imagePolicy.prepare(this.#client, providerSessionId, directory);
+        } catch (error) {
+          if (error instanceof ProviderAdapterError && error.code.startsWith("IMAGE_POLICY_")) throw error;
+          throw new ProviderAdapterError("opencode", "IMAGE_POLICY_UNAVAILABLE",
+            "Tethoq could not prepare temporary image handling. Your message has been retained.", true, { cause: error });
+        }
+      }
       const previousPromptId = this.#activePromptMessageIds.get(providerSessionId);
       const wasActive = this.#activePrompts.has(providerSessionId);
       const guard = this.#guardAbortGenerations.get(providerSessionId);
@@ -991,9 +1093,13 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       this.#emptyUnknownSequences.delete(providerSessionId);
       this.#activePrompts.add(providerSessionId);
       this.#activePromptMessageIds.set(providerSessionId, messageID);
+      const promptRequest = new AbortController();
+      const promptSignal = AbortSignal.any([promptRequest.signal, this.#abort.signal]);
+      this.#pendingPromptRequests.set(providerSessionId, promptRequest);
       try {
         await this.#client.request("POST", `/session/${encodeURIComponent(providerSessionId)}/prompt_async`, {
-          query: this.query(),
+          query,
+          signal: promptSignal,
           body: {
             messageID,
             parts: [
@@ -1019,24 +1125,17 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
               : {}),
           },
         });
+        // prompt_async returns 204 before image processing and message storage.
+        // That transport acknowledgement must not consume the user's queued
+        // attachments or claim a running turn if the background prompt fails.
+        await this.waitForPromptReceipt(providerSessionId, messageID, attachments, promptSignal);
       } catch (error) {
-        let providerObservedPrompt = this.#messageRoles.get(messageID) === "user";
-        if (!providerObservedPrompt) {
-          try {
-            const persisted = await this.#client.request<unknown>(
-              "GET",
-              `/session/${encodeURIComponent(providerSessionId)}/message/${encodeURIComponent(messageID)}`,
-              { query: this.query() },
-            );
-            const info = isRecord(persisted) && isRecord(persisted.info) ? persisted.info : undefined;
-            providerObservedPrompt = info?.id === messageID && info.role === "user";
-            if (providerObservedPrompt && isRecord(persisted)) this.rememberMessageRole(persisted);
-          } catch {
-            // This read only resolves an ambiguous write. Preserve the original
-            // prompt failure when native history cannot prove acceptance.
-          }
-        }
+        // A user-header SSE event is also too early: OpenCode saves its parts
+        // separately. Confirm the complete receipt even after an HTTP failure.
+        const providerObservedPrompt = await this.readPromptReceipt(providerSessionId, messageID, attachments,
+          Math.min(this.#promptReceiptTimeoutMs, 2_000)).catch(() => false);
         if (!providerObservedPrompt && this.#activePromptMessageIds.get(providerSessionId) === messageID) {
+          this.cancelPendingOwnedCompletion(providerSessionId);
           if (previousPromptId === undefined) this.#activePromptMessageIds.delete(providerSessionId);
           else this.#activePromptMessageIds.set(providerSessionId, previousPromptId);
           if (!wasActive) this.#activePrompts.delete(providerSessionId);
@@ -1058,9 +1157,60 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
           return { accepted: true, providerTurnId: messageID, details: ["OpenCode accepted the asynchronous prompt before its response disconnected."] };
         }
         throw error;
+      } finally {
+        if (this.#pendingPromptRequests.get(providerSessionId) === promptRequest) this.#pendingPromptRequests.delete(providerSessionId);
       }
       return { accepted: true, providerTurnId: messageID, details: ["OpenCode accepted the asynchronous prompt."] };
     });
+  }
+
+  private async readPromptReceipt(sessionId: string, messageId: string, attachments: readonly MessageAttachment[], timeoutMs?: number, signal = this.#abort.signal): Promise<boolean> {
+    if (signal.aborted) return false;
+    const value = await this.#client.request<unknown>("GET", `/session/${encodeURIComponent(sessionId)}/message/${encodeURIComponent(messageId)}`, {
+      query: this.sessionQuery(sessionId), signal, ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    });
+    if (!this.isCompletePromptReceipt(value, sessionId, messageId, attachments)) return false;
+    if (isRecord(value)) this.rememberMessageRole(value);
+    return true;
+  }
+
+  private isCompletePromptReceipt(value: unknown, sessionId: string, messageId: string, attachments: readonly MessageAttachment[]): boolean {
+    if (!isRecord(value) || !isRecord(value.info) || value.info.id !== messageId || value.info.role !== "user"
+      || (value.info.sessionID !== undefined && value.info.sessionID !== sessionId)
+      || !Array.isArray(value.parts) || value.parts.length < attachments.length + 1
+      || !value.parts.some(part => isRecord(part) && part.type === "text" && typeof part.text === "string")) return false;
+    const files = value.parts.filter((part): part is Record<string, unknown> => isRecord(part) && part.type === "file");
+    // OpenCode may resize/re-encode images, so verify retained media and its
+    // identity rather than requiring byte equality with the uploaded original.
+    for (const attachment of attachments.filter((part) => part.mimeType.startsWith("image/"))) {
+      const index = files.findIndex((part) => part.filename === attachment.name && typeof part.mime === "string"
+        && part.mime.startsWith("image/") && typeof part.url === "string"
+        && (/^data:image\/[^,]+,.+/u.test(part.url) || this.#imagePolicy?.isCachedImage(part.url) === true));
+      if (index < 0) return false;
+      files.splice(index, 1);
+    }
+    return true;
+  }
+
+  private async waitForPromptReceipt(sessionId: string, messageId: string, attachments: readonly MessageAttachment[], signal = this.#abort.signal): Promise<void> {
+    const deadline = performance.now() + this.#promptReceiptTimeoutMs;
+    let delayMs = 50;
+    do {
+      const remaining = Math.max(1, deadline - performance.now());
+      // One stalled read must not consume the entire receipt window. The
+      // provider may save the message while that older HTTP request is stuck.
+      if (await this.readPromptReceipt(sessionId, messageId, attachments, Math.min(remaining, 2_000), signal).catch(() => false)) return;
+      if (signal.aborted || performance.now() >= deadline
+        || (this.#nativeStates.get(sessionId) === "failed" && this.#activePromptMessageIds.get(sessionId) !== messageId)) break;
+      await new Promise<void>((resolve) => {
+        const finish = () => { clearTimeout(timer); signal.removeEventListener("abort", finish); resolve(); };
+        const timer = setTimeout(finish, Math.min(delayMs, Math.max(1, deadline - performance.now())));
+        signal.addEventListener("abort", finish, { once: true });
+      });
+      delayMs = Math.min(delayMs * 2, 1_000);
+    } while (!signal.aborted);
+    throw new ProviderAdapterError("opencode", "PROMPT_DELIVERY_UNCONFIRMED",
+      "OpenCode acknowledged the request but did not confirm saving the message and its attachments. Delivery is unresolved; the instruction has been retained.", false);
   }
 
   /**
@@ -1077,8 +1227,15 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   public hasActiveTurn(providerSessionId: string): boolean {
     if (this.#primaryEventStreamDisconnected || this.#disconnectedActiveSessionIds.has(providerSessionId)) return false;
     if (this.isSettledOwnedSession(providerSessionId)) return false;
-    if (this.#activePrompts.has(providerSessionId) || this.#persistedWorking.has(providerSessionId)) return true;
-    return this.#nativeStates.get(providerSessionId) === "working";
+    if (this.#activePrompts.has(providerSessionId) || this.#nativeContextRecoveries.has(providerSessionId)) return true;
+    const nativeState = this.#nativeStates.get(providerSessionId);
+    return nativeState !== undefined && nativeState !== "unknown"
+      ? nativeState === "working"
+      : this.#persistedWorking.has(providerSessionId);
+  }
+
+  public ownsActiveTurn(providerSessionId: string): boolean {
+    return this.#activePrompts.has(providerSessionId) || this.#nativeContextRecoveries.has(providerSessionId);
   }
 
   public activeSessionIds(options: { readonly includeDisconnected?: boolean } = {}): readonly string[] {
@@ -1108,7 +1265,23 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     this.ensureSecondaryLoop();
   }
 
+  public async listSubagentSessionIds(providerSessionId: string): Promise<readonly string[]> {
+    const value = await this.#client.request<unknown>("GET", `/session/${encodeURIComponent(providerSessionId)}/children`, {
+      query: await this.resolveSessionQuery(providerSessionId), timeoutMs: 2000,
+    });
+    if (!Array.isArray(value)) throw new Error("OpenCode returned an invalid sub-agent list");
+    return value.flatMap((entry) => {
+      if (!isRecord(entry) || typeof entry.id !== "string" || entry.parentID !== providerSessionId) return [];
+      this.rememberSessionDirectory(entry);
+      return [entry.id];
+    });
+  }
+
   public async interrupt(providerSessionId: string): Promise<void> {
+    // Release stalled delivery I/O before taking the lifecycle lock. sendMessage
+    // still confirms the exact persisted receipt before this stop reaches the
+    // provider, so a late accepted prompt cannot escape cancellation or duplicate.
+    this.#pendingPromptRequests.get(providerSessionId)?.abort();
     let interruption: Promise<void> | undefined;
     await this.withSessionLifecycleLock(providerSessionId, async () => {
       this.retireGuardGeneration(providerSessionId);
@@ -1124,11 +1297,21 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       const generation = this.rememberTerminalCleanupGeneration(providerSessionId, "interrupted", parentId);
       let aborted = false;
       let abortError: unknown;
+      const abortResponse = new AbortController();
       try {
-        await this.#client.request("POST", `/session/${encodeURIComponent(providerSessionId)}/abort`, { query: this.query() });
-        aborted = true;
+        const request = this.#client.request("POST", `/session/${encodeURIComponent(providerSessionId)}/abort`, {
+          query: await this.resolveSessionQuery(providerSessionId), signal: abortResponse.signal, timeoutMs: 2000,
+        }).then(() => ({ kind: "accepted" as const }), (error: unknown) => ({ kind: "failed" as const, error }));
+        // Native abort/idle events can confirm cancellation while OpenCode is
+        // still closing a tool or draining the HTTP response. Use either proof;
+        // do not leave the user waiting on a response whose work already stopped.
+        const result = await Promise.race([request, generation.cleanupObservedSignal.then(() => ({ kind: "cleanup" as const }))]);
+        aborted = result.kind === "accepted";
+        if (result.kind === "failed") abortError = result.error;
       } catch (error) {
         abortError = error;
+      } finally {
+        abortResponse.abort();
       }
       if (this.#terminalCleanupGenerations.get(providerSessionId) !== generation) {
         if (!aborted && abortError !== undefined) throw abortError;
@@ -1170,7 +1353,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     if (pending === undefined) throw new ProviderAdapterError(this.providerId, "APPROVAL_NOT_FOUND", "OpenCode permission request is stale or unknown", false);
     if (response.choiceId !== "approve" && response.choiceId !== "reject") throw new ProviderAdapterError(this.providerId, "APPROVAL_CHOICE_INVALID", "Only approve once and reject are exposed", false);
     await this.#client.request("POST", `/session/${encodeURIComponent(pending.sessionId)}/permissions/${encodeURIComponent(pending.nativePermissionId)}`, {
-      query: this.query(),
+      query: await this.resolveSessionQuery(pending.sessionId),
       body: { response: response.choiceId === "approve" ? "once" : "reject" },
     });
     this.#permissions.delete(response.providerRequestId);
@@ -1202,7 +1385,8 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   }
 
   public async getSessionPermissions(providerSessionId: string): Promise<ProviderSessionPermissions> {
-    const session = await this.#client.request<unknown>("GET", `/session/${encodeURIComponent(providerSessionId)}`, { query: this.query() });
+    const session = await this.#client.request<unknown>("GET", `/session/${encodeURIComponent(providerSessionId)}`, { query: this.sessionQuery(providerSessionId) });
+    this.rememberSessionDirectory(session);
     return openCodeSessionPermissions(session, providerSessionId);
   }
 
@@ -1211,7 +1395,8 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       throw new ProviderAdapterError(this.providerId, "PERMISSION_VALUE_INVALID", "Choose Ask, Allow, or Deny for this task's tools", false);
     }
     const path = `/session/${encodeURIComponent(providerSessionId)}`;
-    const current = await this.#client.request<unknown>("GET", path, { query: this.query() });
+    const current = await this.#client.request<unknown>("GET", path, { query: this.sessionQuery(providerSessionId) });
+    this.rememberSessionDirectory(current);
     openCodeSessionPermissions(current, providerSessionId);
     const directory = isRecord(current) && typeof current.directory === "string" ? current.directory : this.#directory;
     // OpenCode 1.18.21 appends these rules; the last matching rule wins.
@@ -1237,6 +1422,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       this.#secondaryLoop?.catch(() => undefined),
       this.#activityLoop?.catch(() => undefined),
       this.#nativeStatusLoop?.catch(() => undefined),
+      this.#terminalRecovery?.catch(() => undefined),
       this.#nativeStatusReconcileTail.catch(() => undefined),
       this.#initialActivitySnapshot?.catch(() => undefined),
       this.#questionDiscovery,
@@ -1251,6 +1437,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     this.#partTypes.clear();
     this.#messageRoles.clear();
     this.#compactionMessageIds.clear();
+    this.#nativeContextRecoveries.clear();
     this.#reportedSelections.clear();
     this.#permissions.clear();
     this.#questions.clear();
@@ -1281,6 +1468,26 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
 
   private query(directory = this.#directory): Readonly<Record<string, string | undefined>> {
     return { directory };
+  }
+
+  private rememberSessionDirectory(value: unknown): void {
+    if (!isRecord(value)) return;
+    const session = isRecord(value.info) ? value.info : value;
+    if (typeof session.id === "string" && typeof session.directory === "string" && session.directory.length > 0) {
+      this.#sessionDirectories.set(session.id, session.directory);
+    }
+  }
+
+  private sessionQuery(sessionId: string): Readonly<Record<string, string | undefined>> {
+    return this.query(this.#sessionDirectories.get(sessionId));
+  }
+
+  private async resolveSessionQuery(sessionId: string): Promise<Readonly<Record<string, string | undefined>>> {
+    if (!this.#sessionDirectories.has(sessionId) && this.#directory === undefined) {
+      const session = await this.#client.request<unknown>("GET", `/session/${encodeURIComponent(sessionId)}`, { signal: this.#abort.signal });
+      this.rememberSessionDirectory(session);
+    }
+    return this.sessionQuery(sessionId);
   }
 
   private discoverPendingQuestions(): void {
@@ -1408,7 +1615,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
 
   private async rawMessages(providerSessionId: string, limit = 500, signal?: AbortSignal): Promise<unknown> {
     return await this.#client.request<unknown>("GET", `/session/${encodeURIComponent(providerSessionId)}/message`, {
-      query: { ...this.query(), limit },
+      query: { ...this.sessionQuery(providerSessionId), limit },
       ...(signal !== undefined ? { signal } : {}),
     });
   }
@@ -1441,29 +1648,56 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     });
   }
 
-  private sessionStatuses(): Promise<NativeStatusSnapshot> {
-    const inFlight = this.#nativeStatusRead;
-    if (inFlight !== undefined) return inFlight;
-    const reading = this.readNativeStatusSnapshot().finally(() => {
-      if (this.#nativeStatusRead === reading) this.#nativeStatusRead = undefined;
-    });
-    this.#nativeStatusRead = reading;
-    return reading;
+  private sessionStatuses(directory = this.#directory): Promise<NativeStatusSnapshot> {
+    return this.readNativeStatusSnapshot(directory, true);
   }
 
   /** Reconnect recovery must never reuse a request begun on the dead stream's
    * generation, so this primitive intentionally does not consult the poll cache. */
-  private readNativeStatusSnapshot(): Promise<NativeStatusSnapshot> {
+  private async readNativeStatusSnapshot(directory = this.#directory, coalesce = false): Promise<NativeStatusSnapshot> {
+    // OpenCode keeps runner state in an Instance per directory. An empty map
+    // for the server's cwd says nothing about a task running in another project.
+    // Poll once per active project, never once per task or every saved project.
+    const directories = new Set([directory]);
+    for (const sessionId of this.knownActiveSessionIds()) directories.add(this.#sessionDirectories.get(sessionId) ?? this.#directory);
+    const scopes = [...directories];
+    const snapshots: PromiseSettledResult<NativeStatusSnapshot>[] = [];
+    for (let offset = 0; offset < scopes.length; offset += maximumConcurrentActivityReconciliations) {
+      snapshots.push(...await Promise.allSettled(scopes.slice(offset, offset + maximumConcurrentActivityReconciliations).map((scope) => {
+        const inFlight = coalesce ? this.#nativeStatusReads.get(scope) : undefined;
+        if (inFlight !== undefined) return inFlight;
+        const reading = this.readDirectoryStatusSnapshot(scope).finally(() => {
+          if (this.#nativeStatusReads.get(scope) === reading) this.#nativeStatusReads.delete(scope);
+        });
+        if (coalesce) this.#nativeStatusReads.set(scope, reading);
+        return reading;
+      })));
+    }
+    const completed = snapshots.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+    if (completed.length === 0) throw (snapshots[0] as PromiseRejectedResult).reason;
+    return {
+      statuses: Object.assign({}, ...completed.map((snapshot) => snapshot.statuses)) as Record<string, unknown>,
+      directories: new Set(completed.flatMap((snapshot) => [...snapshot.directories])),
+      nativeEventRevisionAtStart: Math.min(...completed.map((snapshot) => snapshot.nativeEventRevisionAtStart)),
+      connectionGenerationAtStart: Math.min(...completed.map((snapshot) => snapshot.connectionGenerationAtStart)),
+    };
+  }
+
+  private readDirectoryStatusSnapshot(directory: string | undefined): Promise<NativeStatusSnapshot> {
     const nativeEventRevisionAtStart = this.#nativeEventRevision;
     const connectionGenerationAtStart = this.#primaryConnectionGeneration;
     return this.#client.request<unknown>("GET", "/session/status", {
-      query: this.query(),
+      query: this.query(directory),
       signal: AbortSignal.any([this.#abort.signal, AbortSignal.timeout(nativeStatusRequestTimeoutMs)]),
-    }).then((value): NativeStatusSnapshot => ({
-      statuses: isRecord(value) ? value : {},
-      nativeEventRevisionAtStart,
-      connectionGenerationAtStart,
-    }));
+    }).then((value): NativeStatusSnapshot => {
+      const statuses = isRecord(value) ? value : {};
+      // A scope can reveal another running task before its metadata or first
+      // SSE event arrives. Keep that scope for the next background poll too.
+      if (directory !== undefined) for (const sessionId of Object.keys(statuses)) {
+        if (!this.#sessionDirectories.has(sessionId)) this.#sessionDirectories.set(sessionId, directory);
+      }
+      return { statuses, directories: new Set([directory]), nativeEventRevisionAtStart, connectionGenerationAtStart };
+    });
   }
 
   private ensureEventLoop(): void {
@@ -1512,7 +1746,14 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       if (snapshot !== undefined && !this.#abort.signal.aborted) {
         await this.reconcileNativeStatusSnapshot(snapshot);
       }
-      if (!this.#abort.signal.aborted) await this.recoverTerminalResponses();
+      // Transcript recovery can involve several slow tasks. Keep the one
+      // provider-wide activity poll responsive while a single sweep runs.
+      if (!this.#abort.signal.aborted && this.#terminalRecovery === undefined) {
+        const recovery = this.recoverTerminalResponses().catch(() => undefined).finally(() => {
+          if (this.#terminalRecovery === recovery) this.#terminalRecovery = undefined;
+        });
+        this.#terminalRecovery = recovery;
+      }
       if (!this.#abort.signal.aborted && this.#now().getTime() >= this.#nextQuestionRecoveryAt) {
         this.#nextQuestionRecoveryAt = this.#now().getTime() + questionRecoveryIntervalMs;
         for (const directory of this.#questionDirectories) {
@@ -1538,17 +1779,22 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   /** Recover missed finish events for active chats, even when none is open. */
   private async recoverTerminalResponses(): Promise<void> {
     if (this.#primaryEventStreamDisconnected) return;
+    // A pending idle can still refer to a prompt replaced by native compaction
+    // or an outside follow-up. Keep probing its bounded tail: otherwise a lost
+    // finish event leaves confirmation waiting on that old parent forever.
     const sessions = [...this.knownActiveSessionIds()].filter((id) =>
-      !this.#pendingOwnedIdles.has(id) && !this.#secondaryActive.has(id)
+      (!this.#secondaryActive.has(id) || this.#nativeContextRecoveries.has(id))
       && !this.#disconnectedActiveSessionIds.has(id)
       && !this.#guardAbortGenerations.has(id) && !this.#terminalCleanupGenerations.has(id));
     for (let offset = 0; offset < sessions.length; offset += maximumConcurrentActivityReconciliations) {
+      if (this.#abort.signal.aborted) return;
       await Promise.all(sessions.slice(offset, offset + maximumConcurrentActivityReconciliations).map(async (sessionId) => {
         const revision = this.#nativeEventRevisionBySession.get(sessionId);
         const connection = this.#primaryConnectionGeneration;
         const value = await this.#client.request<unknown>("GET", `/session/${encodeURIComponent(sessionId)}/message`, {
-          query: { ...this.query(), limit: 2 },
+          query: { ...this.sessionQuery(sessionId), limit: 2 },
           timeoutMs: nativeStatusRequestTimeoutMs,
+          signal: this.#abort.signal,
         }).catch((): unknown => undefined);
         if (this.#disposed || this.#primaryEventStreamDisconnected || connection !== this.#primaryConnectionGeneration
           || revision !== this.#nativeEventRevisionBySession.get(sessionId) || !Array.isArray(value)) return;
@@ -1575,18 +1821,15 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       return;
     }
     const previousWorking = this.nativeWorkingSessionIds();
+    const previouslyActive = this.knownActiveSessionIds();
     this.captureNativeStates(snapshot);
     const nextWorking = this.nativeWorkingSessionIds();
     const sessionIds = new Set([...previousWorking, ...nextWorking]);
     for (const sessionId of sessionIds) {
       if (this.#disconnectedActiveSessionIds.has(sessionId)) continue;
       if ((this.#nativeEventRevisionBySession.get(sessionId) ?? 0) > snapshot.nativeEventRevisionAtStart) continue;
-      const wasWorking = previousWorking.has(sessionId)
-        || this.#persistedWorking.has(sessionId)
-        || this.#activePrompts.has(sessionId);
-      const isWorking = nextWorking.has(sessionId)
-        || this.#persistedWorking.has(sessionId)
-        || this.#activePrompts.has(sessionId);
+      const wasWorking = previouslyActive.has(sessionId);
+      const isWorking = this.hasActiveTurn(sessionId);
       if (wasWorking === isWorking) continue;
       const nativeStatus = snapshot.statuses[sessionId];
       const providerStatus = normalizeOpenCodeProviderStatus(nativeStatus);
@@ -1702,6 +1945,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
           if (connectionGeneration !== this.#primaryConnectionGeneration || this.#primaryEventStreamDisconnected) return;
           const activePromptId = this.#activePromptMessageIds.get(sessionId);
           if (activePromptId !== undefined) {
+            if (this.#disconnectedActiveSessionIds.has(sessionId)) return;
             if (isWorking) {
               if (this.hasTerminalOwnedIdleArmed(sessionId)) return;
               this.cancelPendingOwnedCompletion(sessionId);
@@ -1755,11 +1999,14 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   private knownActiveSessionIds(): Set<string> {
     return new Set([
       ...this.#activePrompts,
+      ...this.#nativeContextRecoveries,
       ...this.#persistedWorking,
       ...(this.#applyingPersistedWorking ?? []),
       ...[...this.#nativeStates].flatMap(([sessionId, state]) => state === "working" ? [sessionId] : []),
       ...this.#disconnectedActiveSessionIds,
-    ].filter((id) => !this.isSettledOwnedSession(id)));
+    ].filter((id) => !this.isSettledOwnedSession(id)
+      && (this.#activePrompts.has(id) || this.#nativeContextRecoveries.has(id) || this.#disconnectedActiveSessionIds.has(id)
+        || this.#nativeStates.get(id) === undefined || this.#nativeStates.get(id) === "unknown" || this.#nativeStates.get(id) === "working")));
   }
 
   private async ensureInitialActivitySnapshot(): Promise<boolean> {
@@ -1921,13 +2168,14 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       const nativeState = hasNativeStatus
         ? normalizeStatus(nativeStatus)
         : usableNativeSnapshot !== undefined && (nativeWasRelevant || ownedPromptId !== undefined)
+          && usableNativeSnapshot.directories.has(this.#sessionDirectories.get(sessionId) ?? this.#directory)
           ? "idle"
           : undefined;
       const persistedIsWorking = persistedWorking?.has(sessionId) === true;
 
       let restoredState: RemoteSession["state"] | undefined;
       if (nativeState === "failed") restoredState = "failed";
-      else if (nativeState === "working" || persistedIsWorking) restoredState = "working";
+      else if (nativeState === "working" || (nativeState === undefined && persistedIsWorking)) restoredState = "working";
       else if (ownedPromptId !== undefined) {
         // Provider inactivity is not the final-answer signal. Keep this task
         // disconnected while exact history confirms and publishes its terminal
@@ -2033,8 +2281,13 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     const type = typeof payload.type === "string" ? payload.type : "unknown";
     const properties = isRecord(payload.properties) ? payload.properties : isRecord(payload.data) ? payload.data : {};
     const sessionId = findSessionId(properties);
+    if (source === "primary" && sessionId !== undefined) {
+      if (typeof global.directory === "string" && global.directory !== "global") this.#sessionDirectories.set(sessionId, global.directory);
+      if (type === "session.created" || type === "session.updated") this.rememberSessionDirectory(properties);
+    }
     const base = { ...(sessionId !== undefined ? { providerSessionId: sessionId } : {}), nativeEvent: asJsonObject(global) };
-    if (source === "primary" && sessionId !== undefined && primaryEventCarriesActivityState(type)) {
+    if (sessionId !== undefined && (source === "primary" || this.#nativeContextRecoveries.has(sessionId))
+      && primaryEventCarriesActivityState(type)) {
       this.#nativeEventRevision += 1;
       this.#nativeEventRevisionBySession.set(sessionId, this.#nativeEventRevision);
     }
@@ -2071,6 +2324,8 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
         }
         this.#nativeStatuses.set(sessionId, properties.status);
         const activePromptId = this.#activePromptMessageIds.get(sessionId);
+        if (activePromptId === undefined && this.#nativeContextRecoveries.has(sessionId)
+          && (status === "idle" || status === "unknown")) return;
         if (activePromptId !== undefined && (status === "idle" || status === "unknown")) {
           // This event carries only a session id, so it cannot prove which prompt
           // ended. Keep the provider-side ownership mark until session.idle can
@@ -2086,6 +2341,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
           this.cancelPendingOwnedCompletion(sessionId);
         }
         if (status === "failed") {
+          this.#nativeContextRecoveries.delete(sessionId);
           this.rememberTerminalCleanupGeneration(sessionId, "failed", activePromptId);
           if (activePromptId !== undefined) this.releaseOwnedPrompt(sessionId, activePromptId);
         }
@@ -2100,12 +2356,13 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     }
     if (type === "session.idle") {
       if (source === "secondary" && sessionId !== undefined) {
-        this.#secondaryActive.delete(sessionId);
+        if (!this.#nativeContextRecoveries.has(sessionId)) this.#secondaryActive.delete(sessionId);
         // The retired server can finish the old generation after the replacement
         // server has accepted a new prompt for the same session. Its unlabelled
         // idle owns only the retired feed; it must not clear or complete the
         // replacement server's newer prompt.
         if (this.#activePromptMessageIds.has(sessionId)) return;
+        if (this.#nativeContextRecoveries.has(sessionId)) return;
       }
       if (source === "primary" && sessionId !== undefined) this.#nativeStatuses.delete(sessionId);
       if (source === "primary" && sessionId !== undefined) {
@@ -2119,6 +2376,10 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
           this.observeTerminalCleanup(terminalCleanup);
           return;
         }
+        // A task already running when Tethoq attached has no owned prompt.
+        // Retain native recovery until the bounded history poll confirms its
+        // final answer or failure, even if that message's SSE was missed.
+        if (activePromptId === undefined && this.#nativeContextRecoveries.has(sessionId)) return;
         if (activePromptId !== undefined) {
           // Never block the SSE loop on history: a queued tool part must get a
           // chance to invalidate this otherwise-unlabelled idle first.
@@ -2444,6 +2705,26 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     // is the authoritative, named evidence that files actually changed.
     if (type === "file.edited" || type === "file.watcher.updated" || type === "session.diff") return;
     if (type === "session.error") {
+      // OpenCode publishes this notification before starting native compaction.
+      // It is terminal only when persisted on a completed assistant (including
+      // a failed summary). Keep the runner's ownership until that evidence or
+      // its normal post-compaction answer reaches the completion reconciler.
+      if (sessionId !== undefined && isOpenCodeContextOverflowError(properties.error)) {
+        if (source === "secondary" && this.#activePromptMessageIds.has(sessionId)) return;
+        if (this.#guardAbortGenerations.get(sessionId)?.outcome === "confirmed"
+          || this.#terminalCleanupGenerations.has(sessionId)) return;
+        this.cancelPendingOwnedCompletion(sessionId);
+        this.#settledOwnedSessions.delete(sessionId);
+        this.#nativeContextRecoveries.add(sessionId);
+        while (this.#nativeContextRecoveries.size > maxTrackedParts) {
+          const oldest = this.#nativeContextRecoveries.values().next().value!;
+          this.#nativeContextRecoveries.delete(oldest);
+        }
+        this.#nativeStates.set(sessionId, "working");
+        if (source === "secondary") this.#secondaryActive.add(sessionId);
+        this.clearDisconnectedSession(sessionId);
+        return await this.emit({ ...base, type: "session.status_changed", payload: { state: "working", recovery: "native_compaction", providerStatus: null } });
+      }
       if (source === "primary" && sessionId !== undefined && isOpenCodeAbortError(properties.error)) {
         const guard = this.#guardAbortGenerations.get(sessionId);
         if (guard?.outcome === "confirmed") return;
@@ -2611,7 +2892,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       // Install narrow abort-error protection before the request. A timeout can
       // happen after the server acted, so rejection must not remove this marker.
       const guard = this.rememberGuardAbortGeneration(sessionId, parentId, continuationAssistantId, terminalKind);
-      const aborted = await this.#client.request("POST", `/session/${encodeURIComponent(sessionId)}/abort`, { query: this.query() })
+      const aborted = await this.#client.request("POST", `/session/${encodeURIComponent(sessionId)}/abort`, { query: await this.resolveSessionQuery(sessionId) })
         .then(() => true, () => false);
       if (this.#guardAbortGenerations.get(sessionId) !== guard) return { kind: "stale" };
       // A matching abort event can confirm the attempt while its HTTP response is
@@ -2705,6 +2986,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     requireSelectedTail = false,
     requireLatestPrompt = false,
     supersededPromptId?: string,
+    allowContextFailure = false,
   ): Promise<TerminalConfirmation> {
     const value = await this.rawMessages(sessionId, requireSelectedTail ? 2 : 500).catch((): unknown => undefined);
     if (!Array.isArray(value)) return { kind: "unavailable" };
@@ -2767,12 +3049,13 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     if (requireSelectedTail && info.id !== latestAssistantId) return { kind: "unavailable" };
     const parts = Array.isArray(selected.parts) ? selected.parts : [];
     if (parts.some(isContinuingOpenCodeToolPart)) return { kind: "continuing" };
-    if (info.error !== undefined || info.summary === true) return { kind: "continuing" };
+    const contextFailure = allowContextFailure && isTerminalOpenCodeContextFailure(info);
+    if (!contextFailure && (info.error !== undefined || info.summary === true)) return { kind: "continuing" };
     // OpenCode writes `finish` at step-finish and `time.completed` only later in
     // cleanup (snapshot/title/plugins). Missing finish is a lagging persist, not
     // proof the model will continue.
-    if (typeof info.finish !== "string" || info.finish.length === 0) return { kind: "unavailable" };
-    if (!isOpenCodeTurnExitFinish(info.finish)) return { kind: "continuing" };
+    if (!contextFailure && (typeof info.finish !== "string" || info.finish.length === 0)) return { kind: "unavailable" };
+    if (!contextFailure && !isOpenCodeTurnExitFinish(info.finish)) return { kind: "continuing" };
     if (supersededPromptId !== undefined) {
       // A native-client follow-up can replace the prompt Tethoq dispatched.
       // Prove it is newer before releasing that ownership: a delayed answer
@@ -2780,7 +3063,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       const prompts = await Promise.all([supersededPromptId, parentId].map(async (id) => {
         const message = await this.#client.request<unknown>(
           "GET", `/session/${encodeURIComponent(sessionId)}/message/${encodeURIComponent(id)}`,
-          { query: this.query() },
+          { query: this.sessionQuery(sessionId) },
         ).catch((): unknown => undefined);
         const prompt = isRecord(message) && isRecord(message.info) ? message.info : undefined;
         const time = prompt !== undefined && isRecord(prompt.time) ? prompt.time : undefined;
@@ -2791,7 +3074,8 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       if (ownedCreated === undefined || successorCreated === undefined) return { kind: "unavailable" };
       if (successorCreated <= ownedCreated) return { kind: "continuing" };
     }
-    return { kind: "terminal", assistantId: typeof info.id === "string" ? info.id : assistantId ?? "" };
+    return { kind: "terminal", assistantId: typeof info.id === "string" ? info.id : assistantId ?? "",
+      ...(contextFailure ? { error: normalizeOpenCodeError(info.error) } : {}) };
   }
 
   private rememberPendingOwnedIdle(
@@ -2871,6 +3155,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       pending.assistantId !== undefined,
       pending.ownedPromptId !== pending.parentId,
       pending.ownedPromptId !== pending.parentId ? pending.ownedPromptId : undefined,
+      true,
     );
     pending.checksInFlight -= 1;
     if (this.#disposed || this.#pendingOwnedIdles.get(sessionId) !== pending
@@ -2891,12 +3176,12 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
       const nativeEvent = pending.nativeEvent;
       this.rememberSettledOwnedSession(sessionId, pending.parentId, confirmation.assistantId);
       this.releaseOwnedPrompt(sessionId, pending.ownedPromptId);
-      this.#nativeStates.set(sessionId, "idle");
+      this.#nativeStates.set(sessionId, confirmation.error === undefined ? "idle" : "failed");
       await this.emit({
         providerSessionId: sessionId,
         ...(nativeEvent !== undefined ? { nativeEvent } : {}),
-        type: "agent.completed",
-        payload: { providerStatus: null },
+        type: confirmation.error === undefined ? "agent.completed" : "agent.error",
+        payload: { ...confirmation.error, providerStatus: null },
       });
       return;
     }
@@ -2928,6 +3213,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     this.cancelPendingOwnedCompletion(sessionId);
     this.#activePrompts.delete(sessionId);
     this.#activePromptMessageIds.delete(sessionId);
+    if (this.#nativeContextRecoveries.delete(sessionId)) this.#secondaryActive.delete(sessionId);
     this.#persistedWorking.delete(sessionId);
     this.#emptyUnknownSequences.delete(sessionId);
     this.clearDisconnectedSession(sessionId);
@@ -2993,7 +3279,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     return info.role === "assistant"
       && info.id === settled.assistantId
       && (typeof info.parentID !== "string" || info.parentID === settled.parentId)
-      && isOpenCodeTurnExitFinish(info.finish);
+      && (isOpenCodeTurnExitFinish(info.finish) || isTerminalOpenCodeContextFailure(info));
   }
 
   private rememberSettledOwnedSession(sessionId: string, parentId: string, assistantId: string): void {
@@ -3008,11 +3294,12 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
 
   private armTerminalCompletion(sessionId: string, info: Record<string, unknown>, nativeEvent?: JsonObject): void {
     const ownedPromptId = this.#activePromptMessageIds.get(sessionId);
+    const contextFailure = isTerminalOpenCodeContextFailure(info);
     if (info.role !== "assistant" || typeof info.id !== "string" || typeof info.parentID !== "string"
-      || !isOpenCodeTurnExitFinish(info.finish) || info.error !== undefined || info.summary === true
+      || (!contextFailure && (!isOpenCodeTurnExitFinish(info.finish) || info.error !== undefined || info.summary === true))
       || this.#continuingToolMessageIds.has(info.id) || this.isSettledTerminalRepeat(sessionId, info)
       || this.#guardAbortGenerations.has(sessionId) || this.#terminalCleanupGenerations.has(sessionId)) return;
-    if (ownedPromptId === info.parentID) this.rememberTerminalCandidate(info.parentID, info.id);
+    if (!contextFailure && ownedPromptId === info.parentID) this.rememberTerminalCandidate(info.parentID, info.id);
     // Use the same persisted-history proof for observed turns without adopting
     // them into the dispatch/abort ownership maps.
     this.rememberPendingOwnedIdle(sessionId, info.parentID, nativeEvent, info.id);
@@ -3092,7 +3379,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     generation.interruption = this.emit({
       providerSessionId: sessionId,
       type: "agent.interrupted",
-      payload: { providerStatus: null },
+      payload: { providerStatus: null, ...(generation.parentId === undefined ? {} : { turnId: generation.parentId }) },
     });
     return generation.interruption;
   }
@@ -3303,9 +3590,14 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     // changed by primary SSE after this request began instead of letting a slow
     // old snapshot overwrite the newer event.
     for (const [sessionId, state] of this.#nativeStates) {
-      if ((this.#nativeEventRevisionBySession.get(sessionId) ?? 0) > snapshot.nativeEventRevisionAtStart) {
+      if ((this.#nativeEventRevisionBySession.get(sessionId) ?? 0) > snapshot.nativeEventRevisionAtStart
+        || !snapshot.directories.has(this.#sessionDirectories.get(sessionId) ?? this.#directory)) {
         next.set(sessionId, state);
         if (this.#nativeStatuses.has(sessionId)) nextStatuses.set(sessionId, this.#nativeStatuses.get(sessionId));
+      } else if (!next.has(sessionId)) {
+        // Only an owning scope can clear prior native activity. Keep an explicit
+        // idle so an orphaned unfinished SQLite row cannot revive this runner.
+        next.set(sessionId, "idle");
       }
     }
     this.#nativeStates = next;
@@ -3313,7 +3605,7 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
   }
 
   private nativeWorkingSessionIds(): ReadonlySet<string> {
-    return new Set([...this.#nativeStates].flatMap(([sessionId, state]) => state === "working" ? [sessionId] : []));
+    return new Set([...this.#nativeContextRecoveries, ...[...this.#nativeStates].flatMap(([sessionId, state]) => state === "working" ? [sessionId] : [])]);
   }
 
   private resolvedStatus(sessionId: string, nativeStatus: unknown, persistedWorking: ReadonlySet<string>): unknown {
@@ -3324,7 +3616,8 @@ export class OpenCodeAdapter implements AgentProviderAdapter {
     if (this.#primaryEventStreamDisconnected || this.#disconnectedActiveSessionIds.has(providerSessionId)) return "disconnected";
     if ([...this.#questions.values()].some((question) => question.sessionId === providerSessionId)) return "needs_input";
     if (normalizedState === "failed" || normalizedState === "needs_approval" || normalizedState === "needs_input") return normalizedState;
-    if (this.#activePrompts.has(providerSessionId) || this.#activePromptMessageIds.has(providerSessionId)) return "working";
+    if (this.#activePrompts.has(providerSessionId) || this.#activePromptMessageIds.has(providerSessionId)
+      || this.#nativeContextRecoveries.has(providerSessionId)) return "working";
     if (this.isSettledOwnedSession(providerSessionId)) return "idle";
     if (normalizedState !== "unknown") return normalizedState;
     // Until one bounded database read succeeds, an empty status response from
@@ -3415,7 +3708,6 @@ function openCodeTurnToolOverrides(request: SendMessageRequest, visionHelper = f
   return {
     uar_mesh_ask_eyes: enabled,
     uar_mesh_tethoq_turn_support: enabled,
-    ...(request.clientToolOverrides?.mesh_dispatch_delegation === true ? { uar_mesh_dispatch_delegation: true } : {}),
   };
 }
 
@@ -3427,7 +3719,7 @@ function completedOpenCodeBranchBody(history: readonly unknown[]): Record<string
     const info = isRecord(candidate.info) ? candidate.info : candidate;
     const parts = Array.isArray(candidate.parts) ? candidate.parts : [];
     if (!isCompletedOpenCodeAssistant(info)
-      || (info.finish !== "stop" && info.finish !== "length")
+      || !isOpenCodeTurnExitFinish(info.finish)
       || parts.some(isContinuingOpenCodeToolPart)) continue;
     if (typeof info.id === "string" && info.id.length > 0) latestSafeIndex = index;
   }
@@ -3445,6 +3737,7 @@ function completedOpenCodeBranchBody(history: readonly unknown[]): Record<string
     ? { messageID: nextInfo.id }
     : undefined;
 }
+
 
 function openCodeCompactionMarkerIds(history: readonly unknown[], excluded: ReadonlySet<string> = new Set()): ReadonlySet<string> {
   const markers = new Set<string>();
@@ -3481,6 +3774,16 @@ function openCodeCompactionOutcome(history: readonly unknown[], markerIds: Reado
 function isCompletedOpenCodeAssistant(info: Record<string, unknown>): boolean {
   const time = isRecord(info.time) ? info.time : {};
   return info.role === "assistant" && typeof time.completed === "number" && info.error === undefined;
+}
+
+function isOpenCodeContextOverflowError(error: unknown): boolean {
+  return isRecord(error) && error.name === "ContextOverflowError";
+}
+
+function isTerminalOpenCodeContextFailure(info: Record<string, unknown>): boolean {
+  const time = isRecord(info.time) ? info.time : {};
+  return info.role === "assistant" && typeof time.completed === "number"
+    && isOpenCodeContextOverflowError(info.error);
 }
 
 /** OpenCode's prompt loop exits on any finish except `tool-calls` and `unknown`. */

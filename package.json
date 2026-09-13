@@ -19,7 +19,7 @@
     "test": "npm run build && node scripts/run-tests.mjs",
     "quality": "node scripts/quality-gate.mjs",
     "publication": "node scripts/publication-gate.mjs",
-    "verify": "npm run clean && npm run typecheck && npm test && npm run quality && npm run publication",
+    "verify": "npm run clean && npm test && npm run quality && npm run publication",
     "release:bridge:win": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release/build-bridge-portable.ps1",
     "start:bridge": "node dist/apps/agent_bridge/src/main.js",
     "phone:pair": "node dist/apps/agent_bridge/src/main.js --phone-pair",

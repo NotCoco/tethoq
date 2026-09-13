@@ -192,6 +192,7 @@ function registerFakeModelIpc(window, host, options = {}) {
   handle('tethoq:copy-text', () => true);
   handle('tethoq:local-open-handlers', () => localOpenState);
   handle('tethoq:open-local-target', () => ({ opened: true, handlerId: 'system', state: localOpenState }));
+  handle('tethoq:open-external-url', () => undefined);
   handle('tethoq:open-dictation-setup-page', () => undefined);
   handle('tethoq:open-harness-setup-page', () => undefined);
   handle('tethoq:show-window', () => {

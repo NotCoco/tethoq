@@ -1,8 +1,17 @@
 import assert from "node:assert/strict";
 import { access, readFile } from "node:fs/promises";
 import test from "node:test";
+import ts from "typescript";
 
 const source = async (path) => readFile(new URL(path, import.meta.url));
+
+test("the built desktop main keeps its runtime path shim at module scope", async () => {
+  const code = (await source("../out/main/index.js")).toString();
+  const parsed = ts.createSourceFile("index.js", code, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const names = parsed.statements.filter(ts.isVariableStatement)
+    .flatMap(statement => statement.declarationList.declarations.map(declaration => declaration.name.getText(parsed)));
+  assert.ok(names.includes("__dirname"), "a generated plugin string must not capture Electron's runtime shim");
+});
 
 function iconDirectory(buffer) {
   assert.equal(buffer.readUInt16LE(0), 0);

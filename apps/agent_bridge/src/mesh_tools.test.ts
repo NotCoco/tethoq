@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { createConnection, createServer } from "node:net";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
-import { callMeshToolGateway, MeshToolGateway, pruneStaleMeshRuntimes } from "./mesh_tools.js";
+import { callMeshToolGateway, callMeshToolRuntime, MeshToolGateway, pruneStaleMeshRuntimes } from "./mesh_tools.js";
 import { meshToolDefinitions } from "./mesh_tools.js";
 
 test("mesh tools expose bounded task discovery and isolated cross-task messaging", () => {
@@ -14,10 +14,9 @@ test("mesh tools expose bounded task discovery and isolated cross-task messaging
   const turnSupport = meshToolDefinitions.find((tool) => tool.name === "tethoq_turn_support");
   assert.equal(discovery?.inputSchema.additionalProperties, false);
   assert.deepEqual(messaging?.inputSchema.required, ["target_session_id", "message", "request_id"]);
-  assert.match(messaging?.description ?? "", /native steering when supported/i);
-  assert.match(messaging?.description ?? "", /queued user messages always run first/i);
+  assert.match(messaging?.description ?? "", /never steers/i);
   const dispatchSchema = dispatch?.inputSchema as { readonly required?: unknown; readonly properties?: Record<string, unknown> } | undefined;
-  assert.deepEqual(dispatchSchema?.required, ["delegation_id", "assignments"]);
+  assert.deepEqual(dispatchSchema?.required, ["assignments"]);
   assert.deepEqual(Object.keys(dispatchSchema?.properties ?? {}), ["delegation_id", "assignments"]);
   const assignments = dispatchSchema?.properties?.assignments as { readonly items?: { readonly properties?: object; readonly additionalProperties?: boolean } } | undefined;
   assert.deepEqual(Object.keys(assignments?.items?.properties ?? {}), ["target_index", "instruction"]);
@@ -25,6 +24,65 @@ test("mesh tools expose bounded task discovery and isolated cross-task messaging
   assert.deepEqual(turnSupport?.inputSchema.required, ["request"]);
   assert.doesNotMatch(JSON.stringify(turnSupport), /eyes|image|visual|ask_eyes/iu,
     "the provider-wide definition must not reveal the private turn capability");
+});
+
+test("a live gateway repairs discovery and an MCP client follows its replacement", async t => {
+  const root = await mkdtemp(join(tmpdir(), "tethoq-mesh-recovery-"));
+  t.after(async () => { assert.equal(dirname(resolve(root)), resolve(tmpdir())); await rm(root, { recursive: true, force: true }); });
+  const runtimePath = join(root, "runtime.json");
+  const first = new MeshToolGateway("host-generation", async () => ({ generation: 1 }), { runtimePath });
+  await first.listen();
+  t.after(() => first.close());
+  const environment = first.mcpServer("grok", "session-one").env;
+  const descriptor = await readFile(runtimePath, "utf8");
+  await rm(runtimePath);
+  const deadline = Date.now() + 4_000;
+  while (Date.now() < deadline && await readFile(runtimePath, "utf8").catch(() => "") !== descriptor) await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(await readFile(runtimePath, "utf8"), descriptor, "a live runtime must recover its deleted descriptor");
+  assert.deepEqual(await callMeshToolRuntime(environment, "host-generation/grok/session-one", "mesh_list_children", {}), { generation: 1 });
+  await first.close();
+  const second = new MeshToolGateway("host-generation", async () => ({ generation: 2 }), { runtimePath });
+  await second.listen();
+  t.after(() => second.close());
+  assert.deepEqual(await callMeshToolRuntime(environment, "host-generation/grok/session-one", "mesh_list_children", {}), { generation: 2 }, "MCP must not retain the old token and pipe until its process is restarted");
+  await second.close();
+  await new Promise(resolve => setTimeout(resolve, 2_100));
+  await assert.rejects(readFile(runtimePath, "utf8"), { code: "ENOENT" }, "closing must stop descriptor repair");
+});
+
+test("disconnecting a waiting caller settles the client and cancels its wait", async t => {
+  let waiting!: () => void;
+  const started = new Promise<void>(resolve => { waiting = resolve; });
+  let cancelled = false;
+  const gateway = new MeshToolGateway("host-wait-close", async (_parent, _tool, _input, context) => {
+    await new Promise<void>(resolve => { context!.signal!.addEventListener("abort", () => { cancelled = true; resolve(); }, { once: true }); waiting(); });
+    return {};
+  });
+  await gateway.listen();
+  t.after(() => gateway.close());
+  const request = gateway.executeForParent("host-wait-close/grok/session-one", "mesh_wait", { timeout_seconds: 300 });
+  const rejected = assert.rejects(request, (error: unknown) => (error as { code?: string }).code === "TOOL_DELIVERY_UNKNOWN");
+  await started;
+  await gateway.close();
+  await rejected;
+  assert.equal(cancelled, true);
+});
+
+test("a connection can dispatch only one tool request", async t => {
+  let calls = 0;
+  const gateway = new MeshToolGateway("host-single-call", async () => { calls++; return {}; });
+  await gateway.listen();
+  t.after(() => gateway.close());
+  const environment = gateway.sharedMcpServer().env;
+  const request = JSON.stringify({ token: environment.UAR_MESH_TOKEN, parentSessionId: "host-single-call/grok/session-one", tool: "mesh_message_child", input: {} }) + "\n";
+  await new Promise<void>((resolve, reject) => {
+    const socket = createConnection(environment.UAR_MESH_PIPE!);
+    socket.once("error", reject);
+    socket.once("connect", () => { socket.write(request); setTimeout(() => { if (!socket.destroyed) socket.write(request); }, 1); });
+    socket.resume();
+    socket.once("close", () => resolve());
+  });
+  assert.equal(calls, 1);
 });
 
 test("mesh gateway authenticates and carries scoped parent context", async (t) => {

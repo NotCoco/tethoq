@@ -40,6 +40,7 @@ const api: DesktopHarnessApi = Object.freeze({
   copyText: (text: string): ReturnType<DesktopHarnessApi["copyText"]> => ipcRenderer.invoke(IPC_CHANNELS.copyText, { text }),
   localOpenHandlers: (): ReturnType<DesktopHarnessApi["localOpenHandlers"]> => ipcRenderer.invoke(IPC_CHANNELS.localOpenHandlers),
   openLocalTarget: (target: Parameters<DesktopHarnessApi["openLocalTarget"]>[0]): ReturnType<DesktopHarnessApi["openLocalTarget"]> => ipcRenderer.invoke(IPC_CHANNELS.openLocalTarget, target),
+  openExternalUrl: (url: string): ReturnType<DesktopHarnessApi["openExternalUrl"]> => ipcRenderer.invoke(IPC_CHANNELS.openExternalUrl, url),
   openDictationSetupPage: (sourceId: Parameters<DesktopHarnessApi["openDictationSetupPage"]>[0]): ReturnType<DesktopHarnessApi["openDictationSetupPage"]> => ipcRenderer.invoke(IPC_CHANNELS.openDictationSetupPage, { sourceId }),
   openHarnessSetupPage: (providerId: Parameters<DesktopHarnessApi["openHarnessSetupPage"]>[0]): Promise<void> => ipcRenderer.invoke(IPC_CHANNELS.openHarnessSetupPage, { providerId }),
   showWindow: (): ReturnType<DesktopHarnessApi["showWindow"]> => ipcRenderer.invoke(IPC_CHANNELS.showWindow),

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import {
   createHostIdentity,
@@ -19,6 +20,7 @@ import type { BridgeConfig } from "./config.js";
 import {
   queueDeliveryContentHash,
   queueDeliveryPayloadHash,
+  validateQueueDeliveryState,
   type QueueDeliveryRecord,
 } from "./queue_delivery_store.js";
 
@@ -104,10 +106,19 @@ class NativeQueueDeliveryProvider extends DeliveryProvider {
   }
 }
 
-async function waitForQueueDispatch(predicate: () => boolean): Promise<void> {
-  const deadline = Date.now() + 2_000;
-  while (!predicate() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
-  assert.ok(predicate(), "the idle task must dispatch its queued follow-up");
+class ReceiptDeliveryProvider extends DeliveryProvider {
+  public receiptReads: string[] = [];
+  public confirmRequests = false;
+
+  public async getMessage(providerSessionId: string, providerMessageId: string): Promise<RemoteMessage | undefined> {
+    this.receiptReads.push(providerMessageId);
+    const request = this.requests.at(-1);
+    if (this.confirmRequests && request !== undefined) {
+      const message = this.matchingMessage(providerSessionId, request);
+      return { ...message, providerMessageId: `msg_${createHash("sha256").update(request.requestId).digest("hex").slice(0, 32)}` };
+    }
+    return this.history.find(message => message.providerMessageId === providerMessageId);
+  }
 }
 
 class UnavailableQueueOwnerProvider extends DeliveryProvider {
@@ -185,82 +196,132 @@ test("ordinary send ambiguity is durable, blocks duplicate content, and confirms
   assert.equal(writes.at(-1)?.find((delivery) => delivery.requestId === provider.requests[0]!.requestId)?.state, "confirmed");
 });
 
-test("dismissed delivery uncertainty cannot strand a later OpenCode queue after completion or restart", async (t) => {
-  for (const restart of [false, true]) {
-    await t.test(restart ? "restored dismissal" : "current dismissal", async (t) => {
-      const hostId = `host-dismissed-queue-${restart}`;
-      let provider = new DeliveryProvider(hostId, "opencode");
-      provider.outcomes.push("unknown");
-      let persisted: readonly QueueDeliveryRecord[] = [];
-      const options = { onQueueDeliveriesChange: (records: readonly QueueDeliveryRecord[]) => { persisted = records; } };
-      let bridge = new AgentBridge(bridgeConfig(hostId, "opencode"), [provider], options);
-      t.after(() => bridge.dispose());
-      await bridge.start();
-      const session = (await bridge.refresh()).sessions[0]!;
-      await assert.rejects(bridge.sendMessage(session.id, { requestId: "uncertain-original", content: "The uncertain instruction" }), (error: unknown) =>
-        error instanceof ProviderAdapterError && error.code === "DELIVERY_UNKNOWN");
-      const tombstone = bridge.queuedMessages(session.id)[0]!;
-      assert.equal(await bridge.cancelQueuedMessage(tombstone.id), true);
-      assert.ok(persisted[0]?.dismissedAt);
-      if (restart) {
-        await bridge.dispose();
-        provider = new DeliveryProvider(hostId, "opencode");
-        bridge = new AgentBridge(bridgeConfig(hostId, "opencode"), [provider], { ...options, queueDeliveries: persisted });
-        await bridge.start();
-        await bridge.refresh();
-      }
-      await provider.resumeSession(session.providerSessionId);
-      const previousSends = provider.requests.length;
-      provider.holdActiveTurn = true;
-      const queued = await bridge.enqueueMessage(session.id, { requestId: "new-follow-up", content: "Run the next independent check" });
-      await assert.rejects(bridge.editQueuedMessage(queued.id, "The uncertain instruction"), (error: unknown) =>
-        error instanceof ProviderAdapterError && error.code === "DELIVERY_UNKNOWN");
-      assert.equal(bridge.queuedMessages(session.id)[0]?.content, queued.content);
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      assert.equal(provider.requests.length, previousSends, "Queue must still hold while the provider is active");
-      assert.equal(bridge.queuedMessages(session.id)[0]?.id, queued.id);
-      provider.holdActiveTurn = false;
-      await provider.resumeSession(session.providerSessionId);
-      await waitForQueueDispatch(() => provider.requests.length === previousSends + 1 && bridge.queuedMessages(session.id).length === 0);
-      assert.equal(provider.requests.at(-1)?.content, "Run the next independent check");
-      assert.equal(persisted.find((record) => record.messageId === tombstone.id)?.state, "unknown", "dismissal must retain the original uncertainty");
-      await assert.rejects(bridge.sendMessage(session.id, { requestId: "duplicate-direct", content: "The uncertain instruction" }), (error: unknown) =>
-        error instanceof ProviderAdapterError && error.code === "DELIVERY_UNKNOWN");
-      await assert.rejects(bridge.enqueueMessage(session.id, { requestId: "duplicate-queued", content: "The uncertain instruction" }), (error: unknown) =>
-        error instanceof ProviderAdapterError && error.code === "DELIVERY_UNKNOWN");
-      assert.equal(provider.requests.length, previousSends + 1, "neither direct send nor queue may replay the uncertain instruction");
-    });
-  }
+test("OpenCode unresolved image delivery reconciles its native identity only after the image is retained", async (t) => {
+  const hostId = "host-opencode-image-receipt";
+  const provider = new DeliveryProvider(hostId, "opencode");
+  provider.outcomes.push("transport_unknown");
+  const writes: QueueDeliveryRecord[][] = [];
+  const bridge = new AgentBridge(bridgeConfig(hostId, "opencode"), [provider], {
+    onQueueDeliveriesChange: (deliveries) => { writes.push([...deliveries]); },
+  });
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  const session = (await bridge.refresh()).sessions[0]!;
+  const request = { requestId: "delayed-image", content: "Use this reference",
+    attachments: [{ name: "image.png", mimeType: "image/png", byteLength: 3, dataBase64: "AQID" }] };
+  await assert.rejects(bridge.sendMessage(session.id, request), { code: "DELIVERY_UNKNOWN" });
+  assert.equal(bridge.queuedMessages(session.id)[0]?.attachments[0]?.name, "image.png");
+  const saved = provider.matchingMessage(session.providerSessionId, provider.requests[0]!);
+  const providerMessageId = `msg_${createHash("sha256").update(provider.requests[0]!.requestId).digest("hex").slice(0, 32)}`;
+  provider.history = [{ ...saved, providerMessageId }];
+  await bridge.refreshQueuedMessages(session.id);
+  assert.equal(bridge.queuedMessages(session.id).length, 1, "a partial text echo cannot consume the image");
+  provider.history = [{ ...saved, providerMessageId, parts: [...saved.parts,
+    { type: "image", name: "image.png", mimeType: "image/png", uri: "data:image/png;base64," }] }];
+  await bridge.refreshQueuedMessages(session.id);
+  assert.equal(bridge.queuedMessages(session.id).length, 1, "an empty image URI cannot confirm delivery");
+  provider.history = [{ ...saved, providerMessageId, parts: [...saved.parts,
+    { type: "image", name: "image.png", mimeType: "image/webp", uri: "data:image/webp;base64,AQID" }] }];
+  await bridge.refreshQueuedMessages(session.id);
+  assert.deepEqual(bridge.queuedMessages(session.id), []);
+  assert.equal(writes.at(-1)?.find(delivery => delivery.requestId === request.requestId)?.state, "confirmed");
+  assert.equal(provider.requests.length, 1, "receipt recovery must not resend the instruction");
 });
 
-test("resolving a delivery hold wakes an already idle queue without another provider event", async (t) => {
-  for (const resolution of ["dismiss", "history"] as const) {
-    await t.test(resolution, async (t) => {
-      const hostId = `host-delivery-release-${resolution}`;
-      const provider = new DeliveryProvider(hostId, "opencode");
-      provider.outcomes.push("unknown");
-      const bridge = new AgentBridge(bridgeConfig(hostId, "opencode"), [provider]);
-      t.after(() => bridge.dispose());
-      await bridge.start();
-      const session = (await bridge.refresh()).sessions[0]!;
-      await assert.rejects(bridge.sendMessage(session.id, { requestId: "lost-ack", content: "Original uncertain message" }), (error: unknown) =>
-        error instanceof ProviderAdapterError && error.code === "DELIVERY_UNKNOWN");
-      const tombstone = bridge.queuedMessages(session.id)[0]!;
-      await provider.resumeSession(session.providerSessionId);
-      const queued = await bridge.enqueueMessage(session.id, { requestId: "later-work", content: "Do the later requested work" });
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      assert.equal(provider.requests.length, 1, "an undismissed uncertainty still holds the queue");
-      assert.equal(bridge.sessions().find((item) => item.id === session.id)?.state, "idle");
-      if (resolution === "dismiss") {
-        assert.equal(await bridge.cancelQueuedMessage(tombstone.id), true);
-      } else {
-        provider.history = [provider.matchingMessage(session.providerSessionId, provider.requests[0]!)];
-        await bridge.refreshQueuedMessages(session.id);
-      }
-      await waitForQueueDispatch(() => provider.requests.length === 2 && bridge.queuedMessages(session.id).length === 0);
-      assert.equal(provider.requests[1]?.content, queued.content);
-    });
-  }
+test("a late OpenCode receipt confirms the original send without a warning, transcript read, or retry", async (t) => {
+  const hostId = "host-late-receipt";
+  const provider = new ReceiptDeliveryProvider(hostId, "opencode");
+  provider.outcomes.push("transport_unknown");
+  provider.confirmRequests = true;
+  const writes: QueueDeliveryRecord[][] = [];
+  const bridge = new AgentBridge(bridgeConfig(hostId, "opencode"), [provider], {
+    onQueueDeliveriesChange: deliveries => { writes.push([...validateQueueDeliveryState({ version: 1, deliveries }, hostId).deliveries]); },
+  });
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  const session = (await bridge.refresh()).sessions[0]!;
+  const request = { requestId: "late-continue", content: "continue" };
+  const result = await bridge.sendMessage(session.id, request);
+  const nativeId = `msg_${createHash("sha256").update(request.requestId).digest("hex").slice(0, 32)}`;
+  assert.equal(result.accepted, true);
+  assert.equal(result.providerTurnId, nativeId);
+  assert.deepEqual(provider.receiptReads, [nativeId]);
+  assert.equal(provider.messageReads, 0);
+  assert.equal(provider.requests.length, 1);
+  assert.deepEqual(bridge.queuedMessages(session.id), []);
+  assert.equal(writes.at(-1)?.[0]?.state, "confirmed");
+  assert.equal(writes.at(-1)?.[0]?.providerMessageId, undefined, "receipt recovery must preserve the original payload identity");
+});
+
+test("queued steering also adopts a late exact receipt instead of restoring a delivered instruction", async (t) => {
+  const hostId = "host-steer-late-receipt";
+  const provider = new ReceiptDeliveryProvider(hostId, "opencode");
+  provider.outcomes.push("transport_unknown");
+  provider.confirmRequests = true;
+  provider.holdActiveTurn = true;
+  const bridge = new AgentBridge(bridgeConfig(hostId, "opencode"), [provider]);
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  const session = (await bridge.refresh()).sessions[0]!;
+  const queued = await bridge.enqueueMessage(session.id, { requestId: "steer-late-receipt", content: "continue" });
+  assert.equal(await bridge.deliverQueuedMessage(queued.id, "steer"), true);
+  assert.equal(provider.requests.length, 1);
+  assert.equal(provider.messageReads, 0);
+  assert.equal(provider.receiptReads.length, 1);
+  assert.deepEqual(bridge.queuedMessages(session.id), []);
+});
+
+test("a dismissed unresolved delivery stays hidden through late receipt recovery and restart", async (t) => {
+  const hostId = "host-dismissed-receipt";
+  const provider = new ReceiptDeliveryProvider(hostId, "opencode");
+  provider.outcomes.push("unknown");
+  let persisted: readonly QueueDeliveryRecord[] = [];
+  const bridge = new AgentBridge(bridgeConfig(hostId, "opencode"), [provider], {
+    onQueueDeliveriesChange: deliveries => { persisted = validateQueueDeliveryState({ version: 1, deliveries }, hostId).deliveries; },
+  });
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  const session = (await bridge.refresh()).sessions[0]!;
+  await assert.rejects(bridge.sendMessage(session.id, { requestId: "dismissed-continue", content: "continue" }), { code: "DELIVERY_UNKNOWN" });
+  const messageId = bridge.queuedMessages(session.id)[0]!.id;
+  assert.equal(await bridge.cancelQueuedMessage(messageId), true);
+  assert.deepEqual(bridge.queuedMessages(session.id), []);
+  assert.ok(persisted[0]?.dismissedAt);
+  const restarted = new AgentBridge(bridgeConfig(hostId, "opencode"), [provider], {
+    queueDeliveries: persisted, onQueueDeliveriesChange: deliveries => { persisted = validateQueueDeliveryState({ version: 1, deliveries }, hostId).deliveries; },
+  });
+  t.after(() => restarted.dispose());
+  await restarted.start();
+  assert.deepEqual(restarted.queuedMessages(session.id), []);
+  provider.confirmRequests = true;
+  await restarted.refreshQueuedMessages(session.id);
+  assert.deepEqual(restarted.queuedMessages(session.id), []);
+  assert.equal(persisted[0]?.state, "confirmed");
+  assert.ok(persisted[0]?.dismissedAt);
+  assert.equal(provider.requests.length, 1, "dismissing the notice must never resend or abort the provider's turn");
+  assert.equal(provider.messageReads, 0);
+});
+
+test("dismissal does not wait for a pending history lookup and that lookup cannot restore the notice", async (t) => {
+  const hostId = "host-dismiss-during-history";
+  const provider = new DeliveryProvider(hostId);
+  provider.outcomes.push("unknown");
+  const bridge = new AgentBridge(bridgeConfig(hostId), [provider]);
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  const session = (await bridge.refresh()).sessions[0]!;
+  await assert.rejects(bridge.sendMessage(session.id, { requestId: "dismiss-during-history", content: "continue" }), { code: "DELIVERY_UNKNOWN" });
+  let finishRead!: (messages: readonly RemoteMessage[]) => void;
+  let readStarted!: () => void;
+  const started = new Promise<void>(resolve => { readStarted = resolve; });
+  provider.getMessages = async () => { readStarted(); return await new Promise(resolve => { finishRead = resolve; }); };
+  const refreshing = bridge.refreshQueuedMessages(session.id);
+  await started;
+  assert.equal(await bridge.cancelQueuedMessage(bridge.queuedMessages(session.id)[0]!.id), true);
+  assert.deepEqual(bridge.queuedMessages(session.id), []);
+  finishRead([provider.matchingMessage(session.providerSessionId, provider.requests[0]!)]);
+  assert.deepEqual(await refreshing, []);
+  assert.deepEqual(bridge.queuedMessages(session.id), []);
 });
 
 test("journal persistence failure happens before an ordinary provider call", async (t) => {

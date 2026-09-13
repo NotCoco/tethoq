@@ -196,7 +196,7 @@ test("mounted side chat focuses, dismisses without deletion, and reopens from th
               return <><button type="button" aria-label="Reopen transaction side chat" onClick={() => setOpen(true)}>Reopen side chat</button>{open ? <SideChatPanel
                 session={currentSession} provider={provider} timeline={currentTimeline} draft={draft}
                 sending={sending}
-                request={request} selectImages={async () => selectedAttachmentBatches[selectionIndex++] ?? []}
+                request={request} selectImages={async () => { const selected = selectedAttachmentBatches[selectionIndex++] ?? []; if (selected instanceof Error) throw selected; return selected; }}
                 notify={(message, tone) => { notifications.push({ message, tone }); }}
                 onDraftChange={(update) => {
                   retainedDraft = typeof update === "function" ? update(retainedDraft) : update;
@@ -313,7 +313,24 @@ test("mounted side chat focuses, dismisses without deletion, and reopens from th
               name: "submitted.png", path: "C:\\qa\\submitted.png", mimeType: "image/png",
               byteLength: 1, dataBase64: "AQ==", origin: "file-picker",
             };
-            let transaction = await mountSendPanel([[submittedImage]]);
+            let transaction = await mountSendPanel([
+              Array.from({ length: 12 }, (_, index) => ({ ...submittedImage, name: "side-" + index + ".png", path: "side-" + index })),
+              [submittedImage],
+              new Error("Choose up to 12 files at a time"),
+            ]);
+            element('button[aria-label="Attach image"]').click();
+            await settle(5);
+            check(transaction.draft().attachments.length === 12, "Side chat did not accept twelve images");
+            element('button[aria-label="Attach image"]').click();
+            await settle(5);
+            check(transaction.draft().attachments.length === 12, "Side chat accepted a thirteenth image");
+            check(transaction.notifications.some(item => item.message.includes("up to 12 items")), "Side chat did not explain its attachment limit");
+            element('button[aria-label="Attach image"]').click();
+            await settle(5);
+            check(transaction.notifications.some(item => item.message === "Choose up to 12 files at a time"), "Side chat swallowed the native picker error");
+            check(transaction.draft().attachments.length === 12, "Side chat lost attachments after picker rejection");
+
+            transaction = await mountSendPanel([[submittedImage]]);
             let transactionField = element('textarea[aria-label="Side chat message"]');
             await setTextarea(transactionField, "Send this side-chat prompt exactly once");
             element('button[aria-label="Attach image"]').click();

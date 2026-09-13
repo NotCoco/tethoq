@@ -112,15 +112,3 @@ test("pagination helper preserves a provider's incomplete-catalogue signal", asy
 test("pagination helper rejects provider cursor loops", async () => {
   await assert.rejects(() => collectAllSessionPages(pagedAdapter(true)), /repeated pagination cursor/);
 });
-
-test("provider adapters can expose an optional idle-resource release hook", async () => {
-  let releases = 0;
-  const adapter: AgentProviderAdapter = {
-    ...pagedAdapter(),
-    releaseIdleResources: async () => { releases += 1; },
-  };
-
-  await adapter.releaseIdleResources?.();
-  assert.equal(releases, 1);
-  assert.equal(pagedAdapter().releaseIdleResources, undefined);
-});

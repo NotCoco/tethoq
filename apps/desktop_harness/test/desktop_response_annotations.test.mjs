@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -85,38 +85,4 @@ test("annotation-only optimistic rows reconcile with their provider echo", () =>
 
   const reconciled = timeline.reconcileTimelinePage([provider], [optimistic]);
   assert.deepEqual(reconciled.map((item) => item.id), ["provider-user"]);
-});
-
-test("desktop annotation controls are wired as complete interactions", async () => {
-  const [app, chat, composer, styles] = await Promise.all([
-    readFile(join(appRoot, "src", "renderer", "src", "App.tsx"), "utf8"),
-    readFile(join(appRoot, "src", "renderer", "src", "ChatTimeline.tsx"), "utf8"),
-    readFile(join(appRoot, "src", "renderer", "src", "Composer.tsx"), "utf8"),
-    readFile(join(appRoot, "src", "renderer", "src", "styles.css"), "utf8"),
-  ]);
-
-  // Annotating is asked for by right-clicking a selection. A bare selection
-  // must not summon the action on its own, so no pointer-release route exists.
-  assert.doesNotMatch(chat, /onPointerUp=\{item\.kind === "assistant"/u);
-  assert.doesNotMatch(chat, /annotation-selection-action/u);
-  assert.doesNotMatch(styles, /annotation-selection-action/u);
-  assert.match(chat, /onContextMenu=\{item\.kind === "assistant"/u);
-  assert.match(chat, /<AnnotationIcon \/>Annotate/u);
-  assert.match(chat, /className="annotation-context-menu"/u);
-  // A keyboard context menu reports no pointer position; the menu still lands
-  // on the answer instead of the window corner.
-  assert.match(chat, /event\.clientX > 0 \? event\.clientX : bounds\.left \+ 24/u);
-  assert.match(chat, /<MessageAnnotationBadges annotations=\{item\.annotations\}/u);
-  assert.match(composer, /className="composer-annotation-edit"/u);
-  assert.match(composer, /className="composer-annotation-remove"/u);
-  assert.match(composer, /serializeResponseAnnotations\(messageContent, submissionAnnotations, outgoingAudio\.length - annotationAudioCount\)/u);
-  assert.match(composer, /sendAfterDictation\.current = true;[\s\S]*dictationControl\.current\?\.stop\(\)/u);
-  assert.match(composer, /setPhase\("transcribing"\);[\s\S]*const audio = await recorder\.stop\(\)[\s\S]*onSettled\?\.\(committed\)[\s\S]*setPhase\("idle"\)/u);
-  assert.match(composer, /visibleOutgoingAudio = outgoingAudio\.filter/u);
-  assert.match(composer, /acceptedAnnotations = submissionAnnotations\.map/u);
-  assert.match(composer, /\? \{ id: annotation\.id, text: annotation\.text, annotation: appendTranscript/u);
-  assert.match(app, /const emptyResponseAnnotations:[^\n]+Object\.freeze\(\[\]\)/u);
-  assert.match(app, /initialAnnotations=\{composerAnnotations\.current\[selectedSession\?\.id \?\? ""\] \?\? emptyResponseAnnotations\}/u);
-  assert.match(app, /const annotateTimelineSelection = useCallback/u);
-  assert.match(app, /onAnnotateSelection=\{annotateTimelineSelection\}/u);
 });

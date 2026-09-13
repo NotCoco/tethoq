@@ -9,7 +9,11 @@ export function extractAdvertisedReasoningEfforts(source: unknown): readonly str
   if (source === undefined || source === null) return [];
   if (typeof source === "string") return concreteEffort(source);
   if (Array.isArray(source)) {
-    return uniqueEfforts(source.flatMap((entry) => extractAdvertisedReasoningEfforts(entry)));
+    return uniqueEfforts(source.flatMap((entry) => {
+      const extracted = extractAdvertisedReasoningEfforts(entry);
+      return extracted.length === 0 && entry !== null && typeof entry === "object" && typeof entry.id === "string"
+        ? concreteEffort(entry.id) : extracted;
+    }));
   }
   if (typeof source !== "object") return [];
   const record = source as Record<string, unknown>;
@@ -124,9 +128,11 @@ export function resolveModelReasoningProfile(input: {
   const advertised = extractAdvertisedReasoningEfforts(input.advertised);
   if (advertised.length > 0) {
     const known = knownReasoningProfile(input.providerId, input.modelId, input.displayName);
-    const defaultEffort = known?.defaultEffort && advertised.some((effort) => effort.toLowerCase() === known.defaultEffort)
-      ? known.defaultEffort
-      : advertised[0];
+    const metadata = input.advertised !== null && typeof input.advertised === "object" && !Array.isArray(input.advertised)
+      ? input.advertised as Record<string, unknown> : {};
+    const nativeDefault = [metadata.defaultReasoningEffort, metadata.default_reasoning_effort]
+      .find((value): value is string => typeof value === "string");
+    const defaultEffort = matchReasoningEffort(nativeDefault, advertised) ?? matchReasoningEffort(known?.defaultEffort, advertised);
     return { efforts: advertised, ...(defaultEffort ? { defaultEffort } : {}) };
   }
   return knownReasoningProfile(input.providerId, input.modelId, input.displayName) ?? { efforts: [] };

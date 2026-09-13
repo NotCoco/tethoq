@@ -27,6 +27,9 @@ export interface SqliteOpenCodeActivityReaderOptions {
   readonly now?: () => Date;
 }
 
+// User messages never receive time.completed; even an orphaned empty header
+// can otherwise make a finished task look busy for the full freshness window.
+// Follow the latest assistant, including while a new steer is being saved.
 const exactActivityQuery = `
   WITH candidates AS (
     SELECT CAST(value AS TEXT) AS session_id
@@ -38,6 +41,7 @@ const exactActivityQuery = `
         SELECT message.id
         FROM message
         WHERE message.session_id = candidates.session_id
+          AND json_extract(message.data, '$.role') = 'assistant'
         ORDER BY message.time_created DESC, message.id DESC
         LIMIT 1
       ) AS message_id
@@ -61,7 +65,7 @@ const exactActivityQuery = `
 /**
  * Every provider-wide wake visits the lightweight session catalogue so no
  * arbitrary recent-row cap can hide one of many simultaneous tasks. The
- * latest-message and per-message part lookups remain indexed, so this does not
+ * latest-assistant and per-message part lookups remain indexed, so this does not
  * sweep the much larger message and part histories. The adapter separately
  * coalesces change wakes and performs missed-event safety reads on a calm
  * cadence instead of hot-polling this query.
@@ -85,6 +89,7 @@ const completeActivityQuery = `
         SELECT message.id
         FROM message
         WHERE message.session_id = candidates.session_id
+          AND json_extract(message.data, '$.role') = 'assistant'
         ORDER BY message.time_created DESC, message.id DESC
         LIMIT 1
       ) AS message_id

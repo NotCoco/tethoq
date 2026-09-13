@@ -21,6 +21,7 @@ test("session transfer state persists restart-safe handoff and branch data", asy
       sessionId: "host/provider/branch",
       relationship: { kind: "branch", sourceSessionId: "host/provider/source", strategy: "transcript_bootstrap" },
       pending: true,
+      paused: true,
       bootstrap: "[[TETHOQ_BRANCH_TRANSCRIPT_BOOTSTRAP_V1]]",
       copiedMessages: [{
         id: "provider/message",
@@ -46,6 +47,7 @@ test("session transfer state persists restart-safe handoff and branch data", asy
     assert.equal(restored.transfers.length, 3);
     assert.equal(restored.transfers[0]?.summary, "A bounded handoff summary.");
     assert.equal(restored.transfers[1]?.copiedMessages?.[0]?.parts[0]?.type, "text");
+    assert.equal(restored.transfers[1]?.paused, true);
     assert.equal(restored.transfers[2]?.relationship.kind, "side_chat");
     assert.equal(restored.transfers[2]?.sideChatPreview, "Why did this task choose that architecture?");
     assert.match(await readFile(path, "utf8"), /TETHOQ_BRANCH_TRANSCRIPT_BOOTSTRAP_V1/);

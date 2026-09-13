@@ -44,6 +44,12 @@ test("OpenCode persisted activity detects every fresh unfinished turn", async (c
   insertMessage.run("m-part", "active_part", now - 60_000, now - 60_000, JSON.stringify({ role: "assistant", time: { created: now - 60_000 } }));
   insertMessage.run("m-unrequested", "unrequested", now - 60_000, now - 60_000, JSON.stringify({ role: "assistant", time: { created: now - 60_000 } }));
   insertPart.run("p-active", "m-part", now - 500);
+  // A user record has no completion timestamp, even if it was only partially
+  // saved and never started a turn. It cannot revive a completed/failed task.
+  insertMessage.run("m-orphan-after-completed", "completed", now - 200, now - 200, JSON.stringify({ role: "user", time: { created: now - 200 } }));
+  insertMessage.run("m-orphan-after-failed", "failed", now - 200, now - 200, JSON.stringify({ role: "user", time: { created: now - 200 } }));
+  // Conversely, a follow-up during a still-running assistant must not hide it.
+  insertMessage.run("m-steer", "fresh", now - 200, now - 200, JSON.stringify({ role: "user", time: { created: now - 200 } }));
   database.close();
 
   const reader = new SqliteOpenCodeActivityReader({ databasePath, freshnessMs: 10_000, now: () => new Date(now) });
@@ -54,11 +60,11 @@ test("OpenCode persisted activity detects every fresh unfinished turn", async (c
 
   const working = await reader.readWorkingSessionIds(new Set(["fresh", "user_only", "completed", "failed", "stale", "active_part"]));
   assert.ok(working);
-  assert.deepEqual([...working].sort(), ["active_part", "fresh", "user_only"]);
+  assert.deepEqual([...working].sort(), ["active_part", "fresh"]);
 
   const discovered = await reader.readWorkingSessionIds(new Set(), { discoverRecent: true });
   assert.ok(discovered);
-  assert.deepEqual([...discovered].sort(), ["active_part", "fresh", "user_only"], "startup discovery catches a prompt before its first assistant row and a long active task, but not old incomplete records");
+  assert.deepEqual([...discovered].sort(), ["active_part", "fresh"], "discovery follows unfinished assistant work, not user records that never carry a completion timestamp");
 
   const retained = await reader.readWorkingSessionIds(new Set(["active_part"]));
   assert.ok(retained);

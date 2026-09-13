@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -45,12 +45,19 @@ test("an existing task switches from Codex to DeepSeek with its draft and conver
     const result = await new Promise((resolveResult, reject) => {
       const child = spawn(electronPath, [join(directory, "main.cjs")], { cwd: appRoot, env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
       let output = "", errors = "";
-      const timer = setTimeout(() => { child.kill(); reject(new Error(`Model switch check timed out: ${errors}`)); }, 35_000);
+      let timeoutError;
+      const timer = setTimeout(() => {
+        timeoutError = new Error(`Model switch check timed out: ${errors}\n${output}`);
+        if (process.platform === "win32" && child.pid) {
+          execFile("taskkill", ["/pid", String(child.pid), "/t", "/f"], { windowsHide: true }, () => child.kill());
+        } else child.kill();
+      }, 35_000);
       child.stdout.on("data", (chunk) => { output += chunk; });
       child.stderr.on("data", (chunk) => { errors += chunk; });
       child.once("error", (error) => { clearTimeout(timer); reject(error); });
-      child.once("exit", (code) => {
+      child.once("close", (code) => {
         clearTimeout(timer);
+        if (timeoutError) { reject(timeoutError); return; }
         const line = output.split(/\r?\n/u).find((value) => value.startsWith("MODEL_SWITCH_QA="));
         if (code !== 0 || !line) reject(new Error(`Model switch check exited ${code}: ${errors}\n${output}`));
         else resolveResult(JSON.parse(line.slice("MODEL_SWITCH_QA=".length)));
@@ -59,6 +66,6 @@ test("an existing task switches from Codex to DeepSeek with its draft and conver
     assert.equal(result.ok, true, result.error);
   } finally {
     assert.equal(dirname(resolve(directory)), resolve(tmpdir()));
-    await rm(directory, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });

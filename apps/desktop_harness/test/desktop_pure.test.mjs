@@ -271,47 +271,54 @@ test("OpenCode keeps a confirmed external server through transient health misses
   assert.equal(bindChecks, 0, "the reset grace must cover a later transient pause too");
 
   const failed = await supervisor.ensureRunning();
-  assert.equal(failed.state, "failed");
-  assert.equal(failed.reason, "port_in_use");
-  assert.equal(bindChecks, 1, "confirmed repeated failure must retain the existing recovery path");
+  assert.equal(failed.state, "unavailable");
+  assert.equal(failed.reason, "unresponsive");
+  assert.equal(bindChecks, 1, "a listening endpoint must be retained while its health check recovers");
   assert.equal(spawned, false);
 });
 
-test("OpenCode watchdog preserves an active runner through repeated failed probes while explicit restart still works", async () => {
+test("OpenCode health misses cannot kill a listening managed runner or move its task to another server", async () => {
   let healthy = false;
+  let listening = false;
   const children = [];
   const supervisor = new openCode.OpenCodeSupervisor({
-    hasActiveWork: () => true,
-    canBindPort: async () => true,
     fetchHealth: async () => new Response(null, { status: healthy ? 200 : 503 }),
+    canBindPort: async () => !listening,
     spawnProcess: () => {
-      healthy = true;
-      const child = new EventEmitter();
-      child.exitCode = null;
-      child.killed = false;
-      child.kill = () => { child.killed = true; child.exitCode = 0; child.emit("close", 0); return true; };
+      const child = Object.assign(new EventEmitter(), {
+        pid: undefined, exitCode: null, killed: false, stderr: new PassThrough(),
+        kill() { this.killed = true; listening = false; return true; },
+      });
       children.push(child);
+      healthy = true;
+      listening = true;
       return child;
     },
   });
   try {
     assert.equal((await supervisor.ensureRunning()).state, "managed");
     healthy = false;
-    for (let index = 0; index < 7; index += 1) await supervisor.ensureRunning();
-    assert.equal(children.length, 1);
-    assert.equal(children[0].killed, false, "a missing health response cannot cancel a running tool");
-    assert.match(supervisor.status().message, /active tasks were left running/u);
+    for (let i = 0; i < 6; i += 1) await supervisor.ensureRunning();
+    assert.equal(children[0].killed, false, "a slow health endpoint killed an existing runner");
+    assert.equal(children.length, 1, "health failures started another runner");
+    assert.equal(supervisor.hasManagedChild, true);
+    assert.equal(supervisor.status().state, "unavailable");
+    assert.equal(supervisor.status().reason, "unresponsive");
+    assert.equal(discovery.resolveFailedOpenCodeFallback({ envUrl: undefined, adopted: true, status: supervisor.status() }), undefined);
+    assert.equal(discovery.shouldDiscoverOpenCodeServer({ envUrl: undefined, status: supervisor.status(), hasManagedChild: true }), false);
+
     healthy = true;
-    assert.equal((await supervisor.ensureRunning()).message, undefined, "a successful probe clears the warning");
+    assert.equal((await supervisor.ensureRunning()).state, "managed", "the original runner did not recover");
+    assert.equal(supervisor.status().reason, undefined);
+    assert.equal(children.length, 1);
+
+    // A real exit still gets a replacement automatically.
     healthy = false;
-    assert.equal((await supervisor.restart()).state, "managed");
-    assert.equal(children[0].killed, true);
-    assert.equal(children.length, 2);
-    children[1].exitCode = 1;
-    children[1].emit("close", 1);
-    healthy = false;
+    listening = false;
+    children[0].exitCode = 1;
+    children[0].emit("close", 1);
     assert.equal((await supervisor.ensureRunning()).state, "managed");
-    assert.equal(children.length, 3, "a confirmed process exit still allows automatic recovery");
+    assert.equal(children.length, 2);
   } finally {
     await supervisor.dispose();
   }
@@ -799,15 +806,13 @@ test("desktop scheduling opens its durable store and reconciles before Bridge st
   assert.ok(startupStart >= 0 && startupEnd > startupStart, "desktop runtime startup source must remain discoverable");
   const startup = runtimeSource.slice(startupStart, startupEnd);
 
-  assert.match(runtimeSource, /import \{ ScheduledTaskStore, defaultScheduledTaskStatePath \} from "\.\.\/\.\.\/\.\.\/agent_bridge\/src\/scheduled_task_store\.js"/u);
-  assert.match(runtimeSource, /import \{ ScheduledTaskScheduler \} from "\.\.\/\.\.\/\.\.\/agent_bridge\/src\/scheduled_tasks\.js"/u);
   assert.match(startup, /const scheduledTaskStore = new ScheduledTaskStore\(defaultScheduledTaskStatePath\(this\.#configPath\)\)/u);
 
   const configureAt = startup.indexOf("bridge.configureScheduledTasks(await ScheduledTaskScheduler.open({");
   const bridgeStartAt = startup.indexOf("await bridge.start()");
   assert.ok(configureAt >= 0, "desktop startup must open and attach the durable scheduled-task scheduler");
   assert.ok(bridgeStartAt > configureAt, "overdue tasks must reconcile before Bridge startup is reported ready");
-  assert.match(startup, /store: scheduledTaskStore,[\s\S]*?dispatch: async \(task\) => await bridge\.dispatchScheduledTask\(task\),[\s\S]*?onChange: async \(\{ reason, task, previousTargetSessionId \}\) =>[\s\S]*?bridge\.scheduledTaskChanged\(task, reason, previousTargetSessionId\),[\s\S]*?onError: \(error\) => console\.error\("Scheduled task reconciliation failed", error\)/u);
+  assert.match(startup, /store: scheduledTaskStore,[\s\S]*?dispatch: async \(task\) => await this\.dispatchScheduledTask\(bridge, task\)/u);
 
   const reconcile = runtimeSource.match(/public async reconcileScheduledTasks\(\): Promise<void> \{[\s\S]*?\n  \}/u)?.[0] ?? "";
   assert.match(reconcile, /await this\.start\(\)/u, "resume reconciliation must wait until the runtime is ready");

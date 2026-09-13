@@ -30,6 +30,8 @@ extraResources:
     to: app.asar.unpacked/node_modules/uiohook-napi/binding.gyp
   - from: ../agent_bridge/assets/opencode/uar_mesh.txt
     to: provider-tools/opencode/uar_mesh.txt
+  - from: ../agent_bridge/assets/opencode/tethoq_images.txt
+    to: provider-tools/opencode/tethoq_images.txt
   - from: ../agent_bridge/assets/pi/tethoq_tools.txt
     to: provider-tools/pi/tethoq_tools.txt
   - from: ../../packages/connector_sdk/tethoq.connector.schema.json

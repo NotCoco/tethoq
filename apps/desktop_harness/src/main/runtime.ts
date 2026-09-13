@@ -13,7 +13,7 @@ import { VisionProxyStore, defaultVisionProxyStatePath } from "../../../agent_br
 import { CompactionThresholdStore, defaultCompactionThresholdStatePath } from "../../../agent_bridge/src/compaction_threshold_store.js";
 import { GoalStore, defaultGoalStatePath } from "../../../agent_bridge/src/goal_store.js";
 import { QueueDeliveryStore, defaultQueueDeliveryStatePath } from "../../../agent_bridge/src/queue_delivery_store.js";
-import { ScheduledTaskStore, defaultScheduledTaskStatePath } from "../../../agent_bridge/src/scheduled_task_store.js";
+import { ScheduledTaskStore, defaultScheduledTaskStatePath, type ScheduledTask } from "../../../agent_bridge/src/scheduled_task_store.js";
 import { ScheduledTaskScheduler } from "../../../agent_bridge/src/scheduled_tasks.js";
 import { recordStartupProfile, startStartupProfileHeartbeat } from "../../../agent_bridge/src/startup_profile.js";
 import { PairingStateStore, defaultPairingStatePath } from "../../../agent_bridge/src/pairing_store.js";
@@ -22,18 +22,19 @@ import { defaultMeshRuntimePath, MeshToolGateway, meshToolDefinitions } from "..
 import { tethoqEnvironmentValue } from "../../../agent_bridge/src/environment.js";
 import { defaultTranscriptionSourceRegistry } from "../../../agent_bridge/src/dictation.js";
 import { DictationCredentialStore, defaultDictationCredentialStatePath } from "../../../agent_bridge/src/dictation_credentials.js";
-import { installOpenCodeMeshTools } from "../../../agent_bridge/src/opencode_tools.js";
+import { installOpenCodeMeshTools, installOpenCodeImagePolicy } from "../../../agent_bridge/src/opencode_tools.js";
 import { installPiTools, piToolExtensionPath } from "../../../agent_bridge/src/pi_tools.js";
 import { CodexAdapter } from "../../../../packages/provider_codex/src/codex_adapter.js";
 import { createPublicAcpProviderAdapter, GrokProviderAdapter, type PublicAcpProviderId } from "../../../../packages/provider_grok/src/grok_adapter.js";
 import { OpenCodeAdapter } from "../../../../packages/provider_opencode/src/opencode_adapter.js";
 import { PiRpcProviderAdapter, piHarnessPresets } from "../../../../packages/provider_pi/src/pi_rpc_adapter.js";
 import { DirectApiProviderAdapter } from "../../../../packages/provider_direct/src/direct_api_adapter.js";
-import type { AgentEvent, JsonObject, RequestEnvelope, ResponseEnvelope } from "../../../../packages/protocol/src/index.js";
+import type { JsonObject, RequestEnvelope, ResponseEnvelope } from "../../../../packages/protocol/src/index.js";
 import { DESKTOP_PROVIDERS, type ConnectorAction, type ConnectorActionResult, type DesktopConnectorState, type DesktopEventBatch, type DesktopRuntimeState } from "../shared/desktop_api.js";
 import { isOpenCodePortInUseStatus, OpenCodeSupervisor, resolveAvailableOpenCodeServerUrl } from "./opencode_supervisor.js";
 import { discoverOpenCodeServerUrl, ensureOpenCodeFallbackCycle, isOpenCodeServerHealthy, resolveOpenCodeEndpoint, shouldDiscoverOpenCodeServer, DEFAULT_OPENCODE_URL } from "./opencode_discovery.js";
 import { OpenCodeWatchdog } from "./opencode_watch.js";
+import { DesktopEventDelivery } from "./event_delivery.js";
 import { approveDesktopConnector, fingerprintInstalledDesktopConnector, loadDesktopConnectors, revokeDesktopConnector, type DesktopConnectorRegistryResult } from "./connectors.js";
 import { BrowserAgentTools, browserToolDefinitions } from "./browser_agent_tools.js";
 import { installProviderToolHelpers, type ProviderToolSetupIssue } from "./provider_tool_setup.js";
@@ -45,7 +46,6 @@ import type { BrowserWorkspaceManager } from "./browser_workspace.js";
 // delivery latency.
 const ACTIVE_EVENT_POLL_MS = 1_000;
 const HIDDEN_EVENT_POLL_MS = 1_000;
-const MAX_EVENT_BATCH = 200;
 const OPENCODE_RELIST_MS = 15_000;
 
 export interface DesktopRuntimeOptions {
@@ -108,9 +108,8 @@ export class DesktopRuntime {
   #eventTimer: NodeJS.Timeout | undefined;
   #openCodeRelistTimer: NodeJS.Timeout | undefined;
   #unsubscribeEventAppended: (() => void) | undefined;
-  #eventFlushQueued = false;
+  #eventDelivery: DesktopEventDelivery | undefined;
   #windowVisible = true;
-  #latestSequence = 0;
   #startPromise: Promise<void> | undefined;
   #disposed = false;
   #providerSetupIssues: ProviderToolSetupIssue[] = [];
@@ -147,7 +146,6 @@ export class DesktopRuntime {
       ...(openCodeCommand !== undefined ? { command: openCodeCommand } : {}),
       statePath: join(dirname(this.#configPath), stateFile),
       environment: { ...process.env, UAR_MESH_RUNTIME: this.#meshRuntimePath },
-      hasActiveWork: () => (this.#bridge?.providerActiveSessions("opencode").length ?? 0) > 0,
     };
   }
 
@@ -165,6 +163,7 @@ export class DesktopRuntime {
     return new OpenCodeAdapter({
       hostId: this.#config.hostId,
       baseUrl: options.url,
+      imagePolicy: {},
       ...(workingDirectory !== undefined ? { directory: workingDirectory } : {}),
       ...(openCodeUsername !== undefined ? { username: openCodeUsername } : {}),
       ...(openCodePassword !== undefined ? { password: openCodePassword } : {}),
@@ -187,6 +186,7 @@ export class DesktopRuntime {
   public async setupProviderTools(providerId?: string): Promise<void> {
     const tasks = [
       { providerId: "opencode", install: () => installOpenCodeMeshTools({ sourcePath: join(this.#providerAssetsDirectory, "opencode", "uar_mesh.txt") }) },
+      { providerId: "opencode", install: () => installOpenCodeImagePolicy({ sourcePath: join(this.#providerAssetsDirectory, "opencode", "tethoq_images.txt") }) },
       { providerId: "pi", install: () => installPiTools({ sourcePath: join(this.#providerAssetsDirectory, "pi", "tethoq_tools.txt") }) },
     ].filter((task) => providerId === undefined || task.providerId === providerId);
     const issues = await installProviderToolHelpers(tasks);
@@ -426,6 +426,7 @@ export class DesktopRuntime {
     this.#onState({ state: "stopping" });
     this.#unsubscribeEventAppended?.();
     this.#unsubscribeEventAppended = undefined;
+    this.#eventDelivery?.dispose();
     clearTimeout(this.#eventTimer);
     this.#eventTimer = undefined;
     clearTimeout(this.#openCodeRelistTimer);
@@ -634,6 +635,7 @@ export class DesktopRuntime {
         onGoalsChange: (goals) => goalStore.write(goals),
         defaultWorkingDirectory: workingDirectory,
         internalHelperWorkingDirectory: dirname(this.#configPath),
+        presentedImageDirectory: join(dirname(this.#configPath), "presented-images"),
         transcriptionSources: defaultTranscriptionSourceRegistry({
           ...(dictationCredentials["openai-stt"] !== undefined ? { openAiApiKey: dictationCredentials["openai-stt"] } : {}),
           ...(dictationCredentials["xai-stt"] !== undefined ? { xAiApiKey: dictationCredentials["xai-stt"] } : {}),
@@ -670,7 +672,7 @@ export class DesktopRuntime {
       this.#bridge = bridge;
       bridge.configureScheduledTasks(await ScheduledTaskScheduler.open({
         store: scheduledTaskStore,
-        dispatch: async (task) => await bridge.dispatchScheduledTask(task),
+        dispatch: async (task) => await this.dispatchScheduledTask(bridge, task),
         onChange: async ({ reason, task, previousTargetSessionId }) =>
           bridge.scheduledTaskChanged(task, reason, previousTargetSessionId),
         onError: (error) => console.error("Scheduled task reconciliation failed", error),
@@ -679,8 +681,9 @@ export class DesktopRuntime {
       profile("bridge-start.begin");
       await bridge.start();
       profile("bridge-start.end");
-      this.#latestSequence = 0;
-      this.#unsubscribeEventAppended = bridge.subscribeEventAppended(() => this.queueEventFlush());
+      this.#eventDelivery = new DesktopEventDelivery(sequence => bridge.eventReplaySince(sequence), this.#onEvents);
+      this.#unsubscribeEventAppended = bridge.subscribeEventAppended(() => this.#eventDelivery?.schedule());
+      this.#eventDelivery.schedule();
       this.scheduleEventPoll();
       this.#onState({ state: "ready" });
       profile("ready");
@@ -688,6 +691,9 @@ export class DesktopRuntime {
       this.startOpenCodeWatchdog(bridge);
       this.scheduleOpenCodeRelist();
     } catch (error) {
+      this.#eventDelivery?.dispose();
+      this.#unsubscribeEventAppended?.();
+      this.#unsubscribeEventAppended = undefined;
       clearTimeout(this.#eventTimer);
       this.#eventTimer = undefined;
       await Promise.allSettled([
@@ -707,6 +713,19 @@ export class DesktopRuntime {
     } finally {
       stopStartupHeartbeat();
     }
+  }
+
+  private async dispatchScheduledTask(bridge: AgentBridge, task: ScheduledTask) {
+    // Overdue schedules start during Bridge startup, before background provider
+    // supervision. Wait for that same coalesced startup before creating a task.
+    if (task.providerId === "opencode" || task.meshTargets?.some((target) => target.providerId === "opencode")) {
+      const status = await this.ensureOpenCode();
+      if (status.state !== "managed" && status.state !== "external") {
+        throw new Error(status.message || "OpenCode could not start for the scheduled task");
+      }
+      await this.reconnectOpenCodeProvider(bridge);
+    }
+    return await bridge.dispatchScheduledTask(task);
   }
 
   /**
@@ -754,27 +773,8 @@ export class DesktopRuntime {
     this.#openCodeWatchdog.start();
   }
 
-  private queueEventFlush(): void {
-    if (this.#eventFlushQueued || this.#disposed) return;
-    this.#eventFlushQueued = true;
-    setImmediate(() => {
-      this.#eventFlushQueued = false;
-      this.pollEvents();
-    });
-  }
-
   private pollEvents(): void {
-    const bridge = this.#bridge;
-    if (bridge === undefined || this.#disposed) return;
-    const replay = bridge.eventReplaySince(this.#latestSequence);
-    if (replay.events.length === 0 && !replay.replayGap) return;
-    const events: readonly AgentEvent[] = replay.events.slice(0, MAX_EVENT_BATCH);
-    const through = events.at(-1)?.sequence ?? replay.latestSequence;
-    this.#latestSequence = through;
-    this.#onEvents({ events, latestSequence: through, replayGap: replay.replayGap });
-    // A burst can exceed one bounded IPC batch. Drain the rest on the next
-    // event-loop turn instead of leaving its final text/status on the heartbeat.
-    if (replay.events.length > events.length) this.queueEventFlush();
+    if (!this.#disposed) this.#eventDelivery?.flush();
   }
 
   private scheduleEventPoll(): void {

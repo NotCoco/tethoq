@@ -23,6 +23,40 @@ await build({
 const merge = await import(`file://${bundle.replaceAll("\\", "/")}`);
 const { mergeTimeline, settleRunningTimeline } = merge;
 
+test("serialized Mesh echoes adopt one pending row and canonical refresh retires both old aliases", () => {
+  const mesh = {
+    targets: [{ providerId: "grok", modelId: "grok-4.6", reasoningEffort: "xhigh" }],
+    segments: [{ type: "text", text: "Review " }, { type: "mesh", targetIndex: 0 }, { type: "text", text: " please" }],
+  };
+  const local = { id: "local-321", presentationId: "local-321", delegationId: "local-321", kind: "user", body: "Review  please", timestamp: "2026-09-08T19:10:00Z", state: "completed", mesh };
+  const pending = { ...local, id: "tethoq-mesh:local-321-0", messageId: "tethoq-mesh:local-321" };
+  const raw = { id: "provider-live", messageId: "provider-one", kind: "user", body: "Review [Mesh target 0: grok / grok-4.6 / xhigh] please", timestamp: "2026-09-08T19:10:02Z", state: "completed" };
+  const canonical = { ...local, id: "provider-history", messageId: raw.messageId, timestamp: raw.timestamp };
+  for (const first of [local, pending]) {
+    for (const rows of [mergeTimeline([first], raw), merge.reconcileTimelinePage([raw], [first])]) {
+      assert.equal(rows.length, 1, "the wire prompt must adopt its pending Mesh row");
+      assert.equal(rows[0].messageId, raw.messageId);
+      assert.equal(rows[0].body, local.body, "raw routing references must not replace the visible prompt");
+      assert.equal(rows[0].presentationId, local.presentationId);
+      assert.deepEqual(rows[0].mesh, mesh);
+    }
+    for (const oldRows of [[first, raw], [raw, first]]) {
+      for (const rows of [mergeTimeline(oldRows, canonical), merge.reconcileTimelinePage([canonical], oldRows)]) {
+        assert.equal(rows.length, 1, "canonical identity must repair an already duplicated timeline in either order");
+        assert.equal(rows[0].messageId, raw.messageId);
+        assert.equal(rows[0].presentationId, local.presentationId);
+        assert.equal(rows[0].body, local.body);
+      }
+    }
+  }
+  const second = { ...canonical, id: "second-history", messageId: "provider-two", delegationId: "local-322", presentationId: "local-322" };
+  assert.equal(merge.reconcileTimelinePage([canonical, second], []).length, 2, "two real Mesh sends with identical text and timestamps must remain distinct");
+  const unrelated = { ...raw, id: "unrelated", messageId: "provider-three" };
+  assert.equal(merge.reconcileTimelinePage([canonical], [local, raw, unrelated]).length, 2, "repair must not remove a different provider message");
+  assert.equal(mergeTimeline([canonical], unrelated).length, 2, "a later echo must not reuse an already adopted send");
+  assert.equal(mergeTimeline([local], { ...raw, body: raw.body.replace("xhigh", "low") }).length, 2, "different Mesh targets must not match by stripped prose");
+});
+
 test("Mesh badges survive delayed provider history and repeated identical sends", () => {
   const mesh = {
     targets: [{ providerId: "grok", modelId: "Grok Code", reasoningEffort: "high" }],
@@ -950,6 +984,26 @@ test("stale image hydration never downgrades or removes a ready local preview", 
   const hydrated = merge.mergeTimelineImageHydration([ready], stale);
   assert.equal(hydrated[0].images.length, 2, "a stale short page cannot shrink the local gallery");
   assert.equal(hydrated[0].images[0].dataUrl, ready.images[0].dataUrl, "an unavailable retrieval cannot replace a ready preview");
+});
+
+test("history refresh and live metadata retain loaded assistant previews until their replacement arrives", () => {
+  const ready = { id: "image", messageId: "image", kind: "assistant", phase: "final_answer", body: "Preview", timestamp: "2026-09-09T10:00:00Z", state: "completed",
+    images: [{ name: "render.png", mimeType: "image/png", retrievalId: "original", dataUrl: "data:image/png;base64,AQID", loading: false }] };
+  const placeholder = { ...ready, images: [{ name: "render.png", mimeType: "image/png", retrievalId: "original", loading: true }] };
+  const live = [ready];
+  assert.equal(merge.reconcileTimelinePage([placeholder], live), live, "history refresh must not replace a decoded image with a placeholder");
+  assert.deepEqual(mergeTimeline(live, placeholder)[0].images, ready.images, "a live metadata update must preserve the preview too");
+  const replacement = { ...placeholder, images: [{ ...placeholder.images[0], retrievalId: "replacement" }] };
+  const replacing = merge.reconcileTimelinePage([replacement], live);
+  assert.equal(replacing[0].images[0].dataUrl, ready.images[0].dataUrl, "keep the previous image visible during a refresh");
+  assert.equal(replacing[0].images[0].retrievalId, "replacement");
+  const oldHydration = [{ ...ready, images: [{ ...ready.images[0], dataUrl: "data:image/png;base64,OLD1" }] }];
+  assert.equal(merge.mergeTimelineImageHydration(replacing, oldHydration), replacing, "a late load cannot replace a newer image identity");
+  const hydrated = merge.mergeTimelineImageHydration(replacing, [{ ...replacement, images: [{ ...replacement.images[0], dataUrl: "data:image/png;base64,BAUG", loading: false }] }]);
+  assert.equal(hydrated[0].images[0].dataUrl, "data:image/png;base64,BAUG", "the replacement must eventually become visible");
+  const removed = merge.reconcileTimelinePage([{ ...ready, images: [] }], live);
+  assert.deepEqual(removed[0].images, [], "explicit removal must still remove the image");
+  assert.equal(merge.mergeTimelineImageHydration(removed, [ready]), removed, "a late load cannot restore an explicitly removed image");
 });
 
 test("an unchanged canonical history refresh preserves the entire live timeline identity", () => {

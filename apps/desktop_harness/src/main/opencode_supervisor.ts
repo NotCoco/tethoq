@@ -29,8 +29,6 @@ export interface OpenCodeSupervisorOptions {
   readonly canBindPort?: (port: number) => Promise<boolean>;
   /** Remembers the managed process so a force-killed desktop can reclaim it. */
   readonly statePath?: string;
-  /** Includes turns whose event stream disconnected before completion. */
-  readonly hasActiveWork?: () => boolean;
 }
 
 class OpenCodePortInUseError extends Error {
@@ -46,7 +44,6 @@ export class OpenCodeSupervisor {
   readonly #authorization: string | undefined;
   readonly #canBindPort: (port: number) => Promise<boolean>;
   readonly #statePath: string | undefined;
-  readonly #hasActiveWork: (() => boolean) | undefined;
   #child: ChildProcess | undefined;
   #status: OpenCodeProcessStatus;
   #startPromise: Promise<OpenCodeProcessStatus> | undefined;
@@ -69,7 +66,6 @@ export class OpenCodeSupervisor {
       : undefined;
     this.#canBindPort = options.canBindPort ?? canBindLoopbackPort;
     this.#statePath = options.statePath;
-    this.#hasActiveWork = options.hasActiveWork;
     this.#status = { state: "stopped", url: this.#url.toString(), managed: false };
   }
 
@@ -109,7 +105,8 @@ export class OpenCodeSupervisor {
     // A busy but healthy OpenCode server can occasionally miss this short probe.
     // Keep a previously confirmed endpoint through two consecutive misses so a
     // transient pause cannot make Tethoq abandon live work for another port.
-    const wasRunning = this.#status.state === "managed" || this.#status.state === "external";
+    const wasRunning = this.#status.state === "managed" || this.#status.state === "external"
+      || this.#status.reason === "unresponsive";
     if (!bypassRunningHealthGrace
       && wasRunning
       && this.#consecutiveRunningHealthFailures < RUNNING_HEALTH_FAILURE_GRACE_CHECKS) {
@@ -117,22 +114,19 @@ export class OpenCodeSupervisor {
       return this.#status;
     }
     this.#consecutiveRunningHealthFailures = 0;
-    // A short HTTP probe measures responsiveness, not whether the runner or
-    // its tools have ended. Never kill possibly live work to recover a probe.
-    // Explicit Restart still owns cancellation; a genuinely exited child can
-    // still be replaced by the watchdog.
-    if (!bypassRunningHealthGrace && this.#hasActiveWork?.() === true) {
-      const pid = this.#child?.pid ?? await this.recordedProcessId();
-      let alive = this.#child !== undefined && this.#child.exitCode === null && !this.#child.killed;
-      if (!alive && pid !== undefined) {
-        try { process.kill(pid, 0); alive = true; } catch { /* the recorded process has exited */ }
-      }
-      if (alive) {
-        this.#status = { state: "managed", url: this.#url.toString(), managed: true,
-          ...(pid !== undefined ? { pid } : {}),
-          message: "OpenCode is not responding. Its active tasks were left running; use Restart OpenCode if you want to stop them and recover the server." };
-        return this.#status;
-      }
+    // A listening runner may be busy parsing a large history or attachment.
+    // Missing HTTP health responses is not evidence that its process exited:
+    // startManaged reclaims the recorded PID and would destroy the live turn.
+    if (!bypassRunningHealthGrace && wasRunning && health !== 401 && health !== 403
+      && this.#url.protocol === "http:" && this.#url.hostname === "127.0.0.1"
+      && !await this.#canBindPort(Number(this.#url.port || 80))) {
+      this.#status = {
+        ...this.#status,
+        state: "unavailable",
+        reason: "unresponsive",
+        message: "OpenCode is not responding. Waiting for its existing server to recover.",
+      };
+      return this.#status;
     }
     // A server we started ourselves and then lost is reclaimable no matter how it
     // answers now — including the 401 a degraded one starts returning.
@@ -224,8 +218,10 @@ export class OpenCodeSupervisor {
   /** Restores ownership after an Electron generation released its child handle. */
   private async recognizeHealthyProcess(): Promise<OpenCodeProcessStatus> {
     if (this.#child !== undefined) {
-      this.#status = { state: "managed", url: this.#url.toString(), managed: true,
-        ...(this.#child.pid !== undefined ? { pid: this.#child.pid } : {}) };
+      this.#status = {
+        state: "managed", url: this.#url.toString(), managed: true,
+        ...(this.#child.pid !== undefined ? { pid: this.#child.pid } : {}),
+      };
       return this.#status;
     }
     const recordedPid = await this.recordedProcessId();

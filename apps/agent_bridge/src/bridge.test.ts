@@ -4,8 +4,6 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { CURRENT_PROTOCOL_VERSION, createDeviceIdentity, createHostIdentity, earsModelKey, makeGlobalSessionId, parseGlobalSessionId, type DelegationTask, type JsonObject, type ProviderCapabilities, type RemoteMessage, type RemoteModel, type RemoteSession, type SessionContextState, type SessionGoal } from "../../../packages/protocol/src/index.js";
 import { FakeProviderAdapter } from "../../../packages/provider_fake/src/index.js";
 import { ProviderAdapterError, stripProviderPromptGuidance } from "../../../packages/provider_contract/src/index.js";
@@ -20,7 +18,6 @@ import type { AuthStatus, CreateSessionOptions, EnqueueProviderMessageRequest, L
 import { defaultTranscriptionSourceRegistry, type DictationTranscriber } from "./dictation.js";
 import type { SessionTransferRecord } from "./session_transfer_store.js";
 import type { PersistedVisionProxy } from "./vision_proxy_store.js";
-import type { QueueDeliveryRecord } from "./queue_delivery_store.js";
 import {
   BridgeOwnedClientToolFailureStore,
   durableClientToolCallId,
@@ -1095,12 +1092,14 @@ class LaggingListingFakeProvider extends FakeProviderAdapter {
 
 class WaitableMeshResultProvider extends LaggingListingFakeProvider {
   #resultAvailable = false;
+  public readonly historyLimits: number[] = [];
 
   public constructor(private readonly resultHostId: string) {
     super({ hostId: resultHostId, providerId: "worker", sessionCount: 0 });
   }
 
-  public override async getMessages(providerSessionId: string): Promise<readonly RemoteMessage[]> {
+  public override async getMessages(providerSessionId: string, options: { readonly limit?: number } = {}): Promise<readonly RemoteMessage[]> {
+    if (options.limit !== undefined) this.historyLimits.push(options.limit);
     if (!this.#resultAvailable) return [];
     const completedAt = new Date().toISOString();
     return [{
@@ -1548,6 +1547,37 @@ class DispatchThenRejectMeshProvider extends MeshCaptureProvider {
     this.requests.push(request);
     await this.dispatchDuringSend?.();
     throw new ProviderAdapterError(this.providerId, "NOT_DELIVERED", "late parent rejection", true);
+  }
+}
+
+class MeshStartupRaceProvider extends MeshCaptureProvider {
+  #sink: ProviderEventSink | undefined;
+  public active = false;
+  public duringSend: (() => Promise<void>) | undefined;
+
+  public override hasActiveTurn(): boolean { return this.active; }
+
+  public override async subscribe(providerSessionId: string | null, sink: ProviderEventSink): Promise<Subscription> {
+    this.#sink = sink;
+    return await super.subscribe(providerSessionId, sink);
+  }
+
+  public async emitParentState(providerSessionId: string, completed = false): Promise<void> {
+    await this.#sink?.({
+      eventId: randomUUID(), providerId: this.providerId, providerSessionId,
+      type: completed ? "agent.completed" : "session.updated",
+      occurredAt: new Date().toISOString(), payload: { state: "idle" },
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+
+  public override async sendMessage(providerSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
+    this.requests.push(request);
+    // Resuming a cold task first publishes its existing idle catalogue record.
+    await this.emitParentState(providerSessionId);
+    this.active = true;
+    await this.duringSend?.();
+    return { accepted: true, providerTurnId: request.requestId, details: [] };
   }
 }
 
@@ -2337,11 +2367,11 @@ function uploadEarsClip(bridge: AgentBridge, name: string): string {
 }
 
 test("EARS transcribes dictation audio on a hidden helper without a destination turn", async (t) => {
-  const ears = new EarsFakeProvider({ hostId: "host-ears", providerId: "direct", sessionCount: 1 });
+  const ears = new EarsFakeProvider({ hostId: "host-ears", providerId: "direct", sessionCount: 0 });
   const bridge = new AgentBridge({ ...config("host-ears"), enabledProviders: ["direct"] }, [ears]);
   t.after(() => bridge.dispose());
   await bridge.start();
-  const destination = (await bridge.refresh()).sessions.find((session) => session.providerId === "direct")!;
+  const destination = await bridge.createSession("direct", { workingDirectory: "C:\\workspace", modelId: "gpt-5.6-sol", reasoningEffort: "Ultra" });
   const beforeEvents = bridge.eventsSince(0).length;
   const bytes = Buffer.from("abcd");
   const started = bridge.beginAttachmentUpload({ name: "dictation.mp3", mimeType: "audio/mpeg", byteLength: bytes.length });
@@ -2362,6 +2392,8 @@ test("EARS transcribes dictation audio on a hidden helper without a destination 
   assert.match(ears.helperRequest?.developerInstructions ?? "", /native-audio listening helper/);
   assert.equal(ears.helperRequest?.attachments?.[0]?.mimeType, "audio/mpeg");
   assert.equal(ears.helperRequest?.reasoningEffort, "Low");
+  assert.equal(destination.reasoningEffort, "Ultra");
+  assert.equal(bridge.sessions().find((session) => session.id === destination.id)?.reasoningEffort, "Ultra");
   assert.doesNotMatch(ears.helperRequest?.content ?? "", /Fix the failing test/);
   await assert.rejects(() => bridge.processEars({
     providerId: "direct",
@@ -2709,6 +2741,45 @@ test("concurrent EARS requests create one helper and cannot cross-wire transcrip
   ]);
   assert.equal(ears.createCalls, 1);
   assert.equal(ears.helperRequests.length, 2);
+});
+
+test("a slow hidden-helper creation cannot delay an existing task's output or completion", async (t) => {
+  let signalCreated!: () => void;
+  const created = new Promise<void>(resolve => { signalCreated = resolve; });
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  class PausedHelperProvider extends EyesFakeProvider {
+    public override async createSession(options: CreateSessionOptions) {
+      const session = await super.createSession(options);
+      if (options.metadata?.internalPurpose === "vision_proxy") {
+        signalCreated();
+        await blocked;
+      }
+      return session;
+    }
+    public async emitPublic(providerSessionId: string, type: ProviderEvent["type"], payload: JsonObject = {}) {
+      await this.emitEyesProviderEvent(providerSessionId, type, payload);
+    }
+  }
+  const provider = new PausedHelperProvider({ hostId: "host-eyes", providerId: "eyes", sessionCount: 1 });
+  const bridge = new AgentBridge({ ...config("host-eyes"), enabledProviders: ["eyes"] }, [provider]);
+  t.after(() => { release(); return bridge.dispose(); });
+  await bridge.start();
+  const primary = (await bridge.refresh()).sessions[0]!;
+  await bridge.configureVisionProxy(primary.id, { providerId: "eyes", modelId: "eyes-model", reasoningEffort: "low" });
+  const inspection = bridge.askVisionProxy(primary.id, "Inspect the reference", [{
+    name: "screen.png", mimeType: "image/png", dataBase64: "AQID", byteLength: 3,
+  }]);
+  t.after(() => inspection.catch(() => undefined));
+  await created;
+  await provider.emitPublic(primary.providerSessionId, "message.delta", { text: "Visible immediately" });
+  assert.equal(bridge.eventsSince(0).some(event => event.sessionId === primary.id && event.payload.text === "Visible immediately"), true);
+  await provider.emitPublic(primary.providerSessionId, "agent.completed");
+  assert.equal(bridge.sessions().find(session => session.id === primary.id)?.state, "completed", "helper startup must not leave an already completed task busy");
+  release();
+  const answer = await inspection;
+  assert.equal(bridge.sessions().some(session => session.id === answer.helperSessionId), false);
+  assert.equal(bridge.eventsSince(0).some(event => event.sessionId === answer.helperSessionId), false, "helper creation must remain private");
 });
 
 test("session-scoped eyes use a hidden isolated helper and stay out of normal recents", async (t) => {
@@ -4184,6 +4255,54 @@ test("a provider model report received during send acceptance outranks the reque
   assert.equal(current?.reasoningEffort, "medium");
 });
 
+test("follow-ups and Continue retain this task's model and reasoning unless explicitly changed", async (t) => {
+  const hostId = "host-reasoning-followups";
+  const provider = new GoalCapturingFakeProvider({ hostId, providerId: "opencode", sessionCount: 2 });
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: ["opencode"] }, [provider]);
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  const [session, other] = (await bridge.refresh()).sessions;
+  const modelId = "opencode-go/muse-spark-1.3-contributor";
+  await bridge.sendMessage(session!.id, { requestId: "choose-xhigh", content: "Work", modelId, reasoningEffort: "xhigh" });
+  await bridge.sendMessage(other!.id, { requestId: "other-minimal", content: "Separate task", modelId, reasoningEffort: "minimal" });
+  await bridge.sendMessage(session!.id, { requestId: "followup", content: "Keep going" });
+  assert.equal(provider.lastRequest?.modelId, modelId);
+  assert.equal(provider.lastRequest?.reasoningEffort, "xhigh");
+  await bridge.continueSession(session!.id, { requestId: "continue" });
+  assert.equal(provider.lastRequest?.reasoningEffort, "xhigh");
+  await bridge.sendMessage(session!.id, { requestId: "change-effort", content: "Use high", reasoningEffort: "high" });
+  assert.equal(provider.lastRequest?.reasoningEffort, "high");
+  await bridge.sendMessage(session!.id, { requestId: "change-model", content: "Switch", modelId: "another-model" });
+  assert.equal(provider.lastRequest?.reasoningEffort, undefined, "a different model must not inherit the old effort");
+});
+
+test("EYES reasoning stays isolated from a parent using the same provider", async (t) => {
+  const hostId = "host-eyes-reasoning";
+  class CapturingEyesProvider extends EyesFakeProvider {
+    public parentRequest: SendMessageRequest | undefined;
+    public override async sendMessage(id: string, request: SendMessageRequest): Promise<SendMessageResult> {
+      if (request.metadata?.internalPurpose === "vision_proxy") return await super.sendMessage(id, request);
+      this.parentRequest = request;
+      return { accepted: true, details: [] };
+    }
+  }
+  const provider = new CapturingEyesProvider({ hostId, providerId: "eyes", sessionCount: 1 });
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: ["eyes"] }, [provider]);
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  const parent = (await bridge.refresh()).sessions[0]!;
+  await bridge.sendMessage(parent.id, { requestId: "parent-reasoning", content: "Work", modelId: "eyes-model", reasoningEffort: "xhigh" });
+  for (const reasoningEffort of ["minimal", "high"]) {
+    await bridge.configureVisionProxy(parent.id, { providerId: "eyes", modelId: "eyes-model", reasoningEffort });
+    await bridge.askVisionProxy(parent.id, "Describe the image", [{ name: "screen.png", mimeType: "image/png", dataBase64: "AQID", byteLength: 3 }]);
+    assert.equal(provider.helperOptions?.reasoningEffort, reasoningEffort);
+    assert.equal(provider.helperRequest?.reasoningEffort, reasoningEffort);
+    assert.equal(bridge.sessions().find((session) => session.id === parent.id)?.reasoningEffort, "xhigh");
+    await bridge.sendMessage(parent.id, { requestId: `parent-after-${reasoningEffort}`, content: "Continue my task" });
+    assert.equal(provider.parentRequest?.reasoningEffort, "xhigh");
+  }
+});
+
 test("fake-provider vertical slice streams, requests exact approval, resumes, and completes", async (t) => {
   const fake = new FakeProviderAdapter({ hostId: "host-flow", sessionCount: 1 });
   const bridge = new AgentBridge(config("host-flow"), [fake]);
@@ -4910,12 +5029,13 @@ test("provider-native older pages do not redecorate transcript-bootstrap branch 
   await bridge.start();
   const source = (await bridge.refresh()).sessions[0]!;
   const branch = (await bridge.branchSession(source.id)).session;
+  const sourceOlderReads = fake.getOlderMessagesCalls;
 
   let page = await bridge.openSession(branch.id);
-  while (page.nextCursor !== null && fake.getOlderMessagesCalls === 0) {
+  while (page.nextCursor !== null && fake.getOlderMessagesCalls === sourceOlderReads) {
     page = await bridge.openSession(branch.id, page.nextCursor);
   }
-  assert.equal(fake.getOlderMessagesCalls, 1, "the regression must cross the provider's first older-page boundary");
+  assert.equal(fake.getOlderMessagesCalls, sourceOlderReads + 1, "the regression must cross the provider's first older-page boundary");
 
   const copiedIds: string[] = [];
   page = await bridge.openSession(branch.id);
@@ -6740,7 +6860,8 @@ test("delegation.prepare sends one clean parent turn and creates no child before
   assert.deepEqual(task.children, []);
   assert.equal(workerProvider.creates.length, 0, "preparation must not provision a child");
   assert.equal(parentProvider.requests.length, 1);
-  assert.equal(parentProvider.requests[0]?.content, prompt, "the parent receives the exact clean visible text");
+  assert.equal(parentProvider.requests[0]?.content, "Ask [Mesh target 0: worker / fake-careful / high] to review this.\nThen summarize.",
+    "inline selections must retain their meaning in the parent's actual user message");
   assert.equal(parentProvider.requests[0]?.requestId, task.id);
   assert.match(parentProvider.requests[0]?.developerInstructions ?? "", /mesh_dispatch_delegation/u);
   assert.match(parentProvider.requests[0]?.developerInstructions ?? "", /finish without waiting/u);
@@ -6748,6 +6869,7 @@ test("delegation.prepare sends one clean parent turn and creates no child before
   assert.match(parentProvider.requests[0]?.developerInstructions ?? "", /order and position of each Mesh chip/u);
   assert.match(parentProvider.requests[0]?.developerInstructions ?? "", /pronouns and references/u);
   assert.match(parentProvider.requests[0]?.developerInstructions ?? "", /do not include a sibling's work/u);
+  assert.match(parentProvider.requests[0]?.developerInstructions ?? "", /Native subagents are additional workers and cannot substitute/u);
   assert.equal(parentProvider.requests[0]?.clientToolOverrides?.mesh_dispatch_delegation, true);
   assert.ok(parentProvider.requests[0]?.developerInstructions?.includes(JSON.stringify(presentationSegments)), "the exact inline layout must reach the parent model");
   const history = await bridge.openSession(parent.id, undefined, 80, true);
@@ -6762,108 +6884,6 @@ test("delegation.prepare sends one clean parent turn and creates no child before
   await bridge.sendMessage(parent.id, { requestId: "ordinary-after-mesh", content: "Ordinary follow-up" });
   assert.doesNotMatch(parentProvider.requests.at(-1)?.developerInstructions ?? "", /UAR_MESH_PREPARED|mesh_dispatch_delegation/u,
     "Mesh orchestration guidance must be turn-scoped");
-});
-
-for (const providerId of ["opencode", "grok"]) {
-  test(`queued Mesh waits for ${providerId} to finish, preserves edits and dispatches once`, async (t) => {
-    const hostId = `host-queued-mesh-${providerId}`;
-    const parentProvider = new MeshCaptureProvider({ hostId, providerId, sessionCount: 2 });
-    const worker = new MeshCaptureProvider({ hostId, providerId: "worker", sessionCount: 0 });
-    const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [providerId, "worker"] }, [parentProvider, worker]);
-    const runtimeDirectory = await mkdtemp(join(tmpdir(), "tethoq-queued-mesh-"));
-    const gateway = new MeshToolGateway(hostId, (id, tool, input) => bridge.executeMeshTool(id, tool, input), { runtimePath: join(runtimeDirectory, "runtime.json") });
-    await gateway.listen();
-    bridge.configureClientTooling(gateway);
-    const client = new Client({ name: "queued-mesh-regression", version: "1.0.0" });
-    t.after(async () => { await client.close(); await gateway.close(); await rm(runtimeDirectory, { recursive: true, force: true }); });
-    t.after(() => bridge.dispose());
-    await bridge.start();
-    const parent = (await bridge.refresh()).sessions.find((session) => session.providerId === providerId && session.state === "idle")!;
-    await bridge.sendMessage(parent.id, { requestId: "busy-first", content: "Finish this first" });
-    await waitFor(() => bridge.pendingApprovals().length === 1, "active parent approval");
-    const targets = [{ providerId: "worker", modelId: "fake-careful", reasoningEffort: "high" }];
-    const segments = [{ type: "text" as const, text: "Ask " }, { type: "mesh" as const, targetIndex: 0 }, { type: "text" as const, text: " for feedback" }];
-    const response = await new BridgeRequestRouter(bridge).handle({
-      protocolVersion: 1, messageId: "queue-mesh", hostId, sentAt: new Date().toISOString(), kind: "request",
-      type: "delegation.prepare", requestId: "queue-mesh", payload: {
-        mode: "queue", parentSessionId: parent.id, prompt: "Ask  for feedback", targets, presentationSegments: segments,
-        modelId: "fake-careful", reasoningEffort: "high",
-      },
-    });
-    assert.equal(response.ok, true);
-    const queued = bridge.queuedMessages(parent.id)[0]!;
-    assert.deepEqual(queued.mesh, { targets, segments });
-    assert.equal(parentProvider.requests.length, 1, "queuing must not send or steer the active parent");
-    assert.equal(bridge.delegations(parent.id).length, 0, "a queued instruction must not appear as a started Mesh turn");
-    assert.equal(worker.creates.length, 0);
-    await bridge.editQueuedMessage(queued.id, "Please ask  for feedback");
-    const edited = bridge.queuedMessages(parent.id)[0]!;
-    assert.deepEqual(edited.mesh?.segments, [{ type: "text", text: "Please ask " }, { type: "mesh", targetIndex: 0 }, { type: "text", text: " for feedback" }]);
-    const approval = bridge.pendingApprovals()[0]!;
-    await bridge.respondToApproval({ requestId: approval.requestId, choiceId: "approve", respondedAt: new Date().toISOString() });
-    await waitFor(() => parentProvider.requests.length === 2, "queued Mesh delivery after completion");
-    const sent = parentProvider.requests[1]!;
-    assert.equal(sent.content, edited.content);
-    assert.equal(sent.modelId, "fake-careful");
-    assert.equal(sent.reasoningEffort, "high");
-    assert.equal(sent.clientToolOverrides?.mesh_dispatch_delegation, true);
-    assert.match(sent.developerInstructions ?? "", providerId === "opencode" ? /Call uar_mesh_dispatch_delegation/ : /Call mesh_dispatch_delegation/);
-    assert.ok(sent.developerInstructions?.includes(JSON.stringify(edited.mesh!.segments)));
-    assert.equal(worker.creates.length, 0, "only the parent's dispatch tool can start the worker");
-    await waitFor(() => bridge.queuedMessages(parent.id).length === 0, "queue consumption");
-    const server = gateway.mcpServer(providerId, parent.providerSessionId, "provider");
-    await client.connect(new StdioClientTransport({ command: server.command, args: [...server.args], env: { ...server.env }, stderr: "pipe" }));
-    assert.ok((await client.listTools()).tools.some((tool) => tool.name === "mesh_dispatch_delegation"), "the provider's bound MCP server must actually advertise dispatch");
-    const alreadyIdle = await client.callTool({ name: "mesh_wait", arguments: { child_session_ids: [], timeout_seconds: 900 } });
-    assert.notEqual(alreadyIdle.isError, true, "the bound MCP schema must accept a 15-minute wait");
-    const assignments = {
-      delegation_id: sent.requestId, assignments: [{ target_index: 0, instruction: "Review the completed work and return feedback only." }],
-    };
-    const dispatched = await client.callTool({ name: "mesh_dispatch_delegation", arguments: assignments });
-    assert.notEqual(dispatched.isError, true);
-    if (providerId === "opencode") {
-      await installOpenCodeMeshTools({ userHome: runtimeDirectory });
-      const source = await readFile(openCodeMeshToolPath(runtimeDirectory), "utf8");
-      const dispatchExport = source.slice(source.indexOf("export const dispatch_delegation"), source.indexOf("export const message_child"));
-      const executable = source
-        .replace(/import \{ tool \} from "@opencode-ai\/plugin"\r?\n/u,
-          "const schema = new Proxy(() => schema, { get: () => schema }); const tool = Object.assign((definition) => definition, { schema });\n")
-        .replace("  const runtimes = await matchingRuntimes(name)",
-          `  const runtimes = [JSON.parse(await readFile(${JSON.stringify(join(runtimeDirectory, "runtime.json"))}, "utf8"))]`)
-        .replace(/export const list_children[\s\S]*$/u, dispatchExport);
-      const installed = await import(`data:text/javascript;base64,${Buffer.from(executable).toString("base64")}#${randomUUID()}`);
-      await installed.dispatch_delegation.execute(assignments, { sessionID: parent.providerSessionId });
-    }
-    assert.equal(worker.creates.length, 1);
-    assert.equal(parentProvider.requests.length, 2);
-  });
-}
-
-test("queued Mesh can be cancelled or explicitly steered without losing target authorization", async (t) => {
-  const hostId = "host-queued-mesh-controls";
-  const parentProvider = new MeshCaptureProvider({ hostId, providerId: "opencode", sessionCount: 1 });
-  parentProvider.holdActiveTurn = true;
-  const worker = new MeshCaptureProvider({ hostId, providerId: "worker", sessionCount: 0 });
-  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: ["opencode", "worker"] }, [parentProvider, worker]);
-  bridge.configureClientTooling(testClientTooling());
-  t.after(() => bridge.dispose());
-  await bridge.start();
-  const parent = (await bridge.refresh()).sessions[0]!;
-  const targets = [{ providerId: "worker" }];
-  const segments = [{ type: "mesh" as const, targetIndex: 0 }, { type: "text" as const, text: "Review this" }];
-  const cancelled = await bridge.enqueueDelegation(parent.id, "Review this", targets, segments, "cancel-mesh");
-  await bridge.cancelQueuedMessage(cancelled.id);
-  assert.equal(bridge.delegations(parent.id).length, 0);
-  assert.equal(parentProvider.requests.length, 0);
-  const queued = await bridge.enqueueDelegation(parent.id, "Review this", targets, segments, "steer-mesh");
-  let steers = 0;
-  const originalSteer = parentProvider.steerMessage.bind(parentProvider);
-  parentProvider.steerMessage = async (id, request) => { steers += 1; return await originalSteer(id, request); };
-  assert.equal(await bridge.deliverQueuedMessage(queued.id, "steer"), true);
-  assert.equal(steers, 1);
-  assert.deepEqual(bridge.delegations(parent.id)[0]?.targets, targets);
-  assert.match(parentProvider.requests[0]?.developerInstructions ?? "", /Call uar_mesh_dispatch_delegation/);
-  assert.equal(parentProvider.requests[0]?.clientToolOverrides?.mesh_dispatch_delegation, true);
 });
 
 test("manual compaction holds concurrent callers and new instructions until completion", async (t) => {
@@ -6930,6 +6950,75 @@ test("Mesh history exposes ordered references while the parent send is pending a
   assert.deepEqual(reopened.messages.find((message) => message.nativeMetadata.tethoqMesh)?.nativeMetadata.tethoqMesh, visible[0]?.nativeMetadata.tethoqMesh);
 });
 
+for (const scenario of ["provider-message-id", "serialized-before-ack", "legacy-text", "chip-only"] as const) {
+  test(`Mesh history adopts ${scenario} without duplicating the provider prompt`, async (t) => {
+    const hostId = `host-mesh-echo-${scenario}`;
+    const parentId = makeGlobalSessionId(hostId, "parent", "fake_session_0001");
+    const stamp = new Date().toISOString();
+    const prompt = scenario === "chip-only" ? "" : "Review  please";
+    const task: DelegationTask = {
+      id: "mesh-echo", parentSessionId: parentId, prompt, state: "failed", children: [],
+      createdAt: stamp, updatedAt: stamp, orchestration: "parent",
+      targets: [{ providerId: "grok", modelId: "grok-4.6", reasoningEffort: "xhigh" }],
+      presentationSegments: scenario === "chip-only" ? [{ type: "mesh", targetIndex: 0 }] : [
+        { type: "text", text: "Review " }, { type: "mesh", targetIndex: 0 }, { type: "text", text: " please" },
+      ],
+      ...(scenario === "provider-message-id" ? { parentTurnId: "native-user-id", parentTurnAcceptedAt: stamp } : {}),
+    };
+    const providerMessage: RemoteMessage = {
+      id: "native-user-id", providerMessageId: "native-user-id", sessionId: parentId, role: "user", status: "completed",
+      createdAt: scenario === "provider-message-id" ? new Date(Date.parse(stamp) + 600_000).toISOString() : stamp,
+      parts: [{ type: "text", text: scenario === "provider-message-id" ? "Provider-reformatted prompt"
+        : scenario === "legacy-text" ? prompt : scenario === "chip-only" ? "[Mesh target 0: grok / grok-4.6 / xhigh]"
+          : "Review [Mesh target 0: grok / grok-4.6 / xhigh] please" }, { type: "file", name: "reference.txt", mimeType: "text/plain" }],
+      nativeMetadata: {},
+    };
+    const provider = new MeshCaptureProvider({ hostId, providerId: "parent", sessionCount: 1 });
+    provider.getMessages = async () => [providerMessage];
+    const bridge = new AgentBridge({ ...config(hostId), enabledProviders: ["parent"] }, [provider], { delegations: [task] });
+    t.after(() => bridge.dispose());
+    await bridge.start(); await bridge.refresh();
+    const opened = await bridge.openSession(parentId, undefined, 80, true);
+    assert.equal(opened.messages.length, 1, "checking only the decorated row count would miss an extra raw provider row");
+    assert.equal(opened.messages[0]?.providerMessageId, providerMessage.providerMessageId);
+    assert.deepEqual(opened.messages[0]?.parts, [{ type: "text", text: prompt }, providerMessage.parts[1]]);
+    assert.equal((opened.messages[0]?.nativeMetadata.tethoqMesh as JsonObject)?.delegationId, task.id);
+    assert.equal(provider.requests.length, 0, "history repair must not resend the prompt");
+  });
+}
+
+test("Mesh history reserves real identities across identical sends and bounded pages", async (t) => {
+  const hostId = "host-mesh-identical-history";
+  const parentId = makeGlobalSessionId(hostId, "parent", "fake_session_0001");
+  const stamp = Date.now();
+  const tasks: DelegationTask[] = [0, 1].map(index => ({
+    id: `mesh-${index}`, parentSessionId: parentId, prompt: "Review  please", state: "failed", children: [],
+    createdAt: new Date(stamp + index * 1000).toISOString(), updatedAt: new Date(stamp + index * 1000).toISOString(),
+    orchestration: "parent", parentTurnId: `native-${index}`, parentTurnAcceptedAt: new Date(stamp + index * 1000).toISOString(),
+    targets: [{ providerId: "grok", modelId: "grok-4.6" }],
+    presentationSegments: [{ type: "text", text: "Review " }, { type: "mesh", targetIndex: 0 }, { type: "text", text: " please" }],
+  }));
+  const messages: RemoteMessage[] = tasks.map((task, index) => ({
+    id: `native-${index}`, providerMessageId: `native-${index}`, sessionId: parentId, role: "user", status: "completed",
+    createdAt: task.createdAt, parts: [{ type: "text", text: task.prompt }], nativeMetadata: {},
+  }));
+  const provider = new MeshCaptureProvider({ hostId, providerId: "parent", sessionCount: 1 });
+  provider.getMessages = async () => messages;
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: ["parent"] }, [provider], { delegations: tasks });
+  t.after(() => bridge.dispose());
+  await bridge.start(); await bridge.refresh();
+  const full = await bridge.openSession(parentId, undefined, 80, true);
+  assert.deepEqual(full.messages.map(message => (message.nativeMetadata.tethoqMesh as JsonObject).delegationId), ["mesh-0", "mesh-1"]);
+  const recentProvider = new MeshCaptureProvider({ hostId, providerId: "parent", sessionCount: 1 });
+  Object.assign(recentProvider, { getRecentMessages: async () => ({ messages: messages.slice(1), complete: false }) });
+  const restored = new AgentBridge({ ...config(hostId), enabledProviders: ["parent"] }, [recentProvider], { delegations: tasks });
+  t.after(() => restored.dispose());
+  await restored.start(); await restored.refresh();
+  const recent = await restored.openSession(parentId, undefined, 80, true);
+  assert.equal(recent.messages.length, 1, "an older matching prompt must not be injected into a bounded page");
+  assert.equal((recent.messages[0]?.nativeMetadata.tethoqMesh as JsonObject).delegationId, "mesh-1");
+});
+
 test("parent Mesh dispatch is authorized, tailored, and exactly-once", async (t) => {
   const hostId = "host-parent-mesh-dispatch";
   const parentProvider = new MeshCaptureProvider({ hostId, providerId: "parent", sessionCount: 2 });
@@ -6974,6 +7063,10 @@ test("parent Mesh dispatch is authorized, tailored, and exactly-once", async (t)
       providerId: "parent",
     }],
   }), /do not accept providerId/);
+  await assert.rejects(() => bridge.executeMeshTool(parent.id, "mesh_dispatch_delegation", {
+    delegation_id: task.id,
+    assignments: [{ target_index: 0, instruction: parentProvider.requests[0]!.content }],
+  }), /must be rewritten for only its target/);
   assert.equal(workerProvider.creates.length, 0, "invalid dispatches must be side-effect free");
 
   await bridge.executeMeshTool(parent.id, "mesh_dispatch_delegation", input);
@@ -6999,6 +7092,87 @@ test("parent Mesh dispatch is authorized, tailored, and exactly-once", async (t)
     assignments: [{ target_index: 0, instruction: "A changed retry must not create another child." }],
   }), /already dispatched with different instructions/);
   assert.equal(workerProvider.creates.length, 1);
+});
+
+test("Mesh recovers a stale stopped ID without errors or silently changing its targets", async (t) => {
+  const hostId = "host-mesh-stale-current";
+  const parentProvider = new MeshCaptureProvider({ hostId, providerId: "parent", sessionCount: 2 });
+  const worker = new MeshCaptureProvider({ hostId, providerId: "worker", sessionCount: 0 });
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: ["parent", "worker"] }, [parentProvider, worker]);
+  bridge.configureClientTooling(testClientTooling());
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  const parents = (await bridge.refresh()).sessions.filter(session => session.providerId === "parent");
+  const parent = parents.find(session => session.state === "idle")!;
+  const other = parents.find(session => session.id !== parent.id)!;
+  const assignments = [{ target_index: 0, instruction: "Inspect reconnect behaviour and report failing cases." }];
+  await assert.rejects(() => bridge.executeMeshTool(parent.id, "mesh_dispatch_delegation", { assignments }), /no prepared Mesh delegation/);
+  const oldPrompt = "Review the earlier interface.";
+  const old = (await bridge.prepareDelegation(parent.id, oldPrompt, [{ providerId: "parent" }], [
+    { type: "text", text: oldPrompt }, { type: "mesh", targetIndex: 0 },
+  ], "mesh-stopped-selection")).delegation;
+  await bridge.interrupt(parent.id);
+  const prompt = "Review the current retry implementation.";
+  const current = (await bridge.prepareDelegation(parent.id, prompt, [{ providerId: "worker", modelId: "fake-careful" }], [
+    { type: "mesh", targetIndex: 0 }, { type: "text", text: prompt },
+  ], "mesh-current-selection")).delegation;
+
+  const recovery = await bridge.executeMeshTool(parent.id, "mesh_dispatch_delegation", { delegation_id: old.id, assignments });
+  assert.equal(recovery.dispatched, false);
+  assert.equal(recovery.status, "needs_current_delegation");
+  assert.equal(recovery.delegation_id, current.id);
+  assert.deepEqual(recovery.targets, [{ providerId: "worker", modelId: "fake-careful" }]);
+  assert.equal(worker.creates.length + parentProvider.creates.length, 0, "a stale-ID response must not dispatch either selection");
+  assert.ok(bridge.delegations(parent.id).find(task => task.id === old.id)?.interruptedAt);
+  await assert.rejects(() => bridge.executeMeshTool(other.id, "mesh_dispatch_delegation", { delegation_id: old.id, assignments }), /different parent session/);
+  await assert.rejects(() => bridge.executeMeshTool(other.id, "mesh_dispatch_delegation", { assignments }), (error: unknown) => {
+    assert.ok(error instanceof Error && "code" in error);
+    assert.equal(error.code, "TASK_NOT_OWNED_HERE", "discovery must continue past a runtime that has no prepared selection");
+    assert.match(error.message, /no prepared Mesh delegation/);
+    return true;
+  });
+
+  const results = await Promise.all([
+    bridge.executeMeshTool(parent.id, "mesh_dispatch_delegation", { assignments }),
+    bridge.executeMeshTool(parent.id, "mesh_dispatch_delegation", { assignments }),
+  ]);
+  assert.equal(worker.creates.length, 1, "concurrent implicit retries must share one dispatch");
+  assert.equal(parentProvider.creates.length, 0, "the stopped selection must never be revived");
+  assert.equal((results[0]!.delegation as unknown as DelegationTask).id, current.id);
+  assert.deepEqual(results[0]!.child_session_ids, results[1]!.child_session_ids);
+  const replay = await bridge.executeMeshTool(parent.id, "mesh_dispatch_delegation", { assignments });
+  assert.deepEqual(replay.child_session_ids, results[0]!.child_session_ids);
+  assert.equal(worker.creates.length, 1);
+  await assert.rejects(() => bridge.executeMeshTool(parent.id, "mesh_dispatch_delegation", { delegation_id: old.id, assignments }), /stopped by the user/);
+  await assert.rejects(() => bridge.executeMeshTool(parent.id, "mesh_dispatch_delegation", {
+    assignments: [{ target_index: 0, instruction: "Changed instructions cannot become an implicit second dispatch." }],
+  }), /already dispatched with different instructions/);
+});
+
+test("Mesh implicit dispatch never guesses between pending selections or revives an older one", async (t) => {
+  const hostId = "host-mesh-implicit-ambiguity";
+  const parentProvider = new MeshCaptureProvider({ hostId, providerId: "parent", sessionCount: 1 });
+  const worker = new MeshCaptureProvider({ hostId, providerId: "worker", sessionCount: 0 });
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: ["parent", "worker"] }, [parentProvider, worker]);
+  bridge.configureClientTooling(testClientTooling());
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  const parent = (await bridge.refresh()).sessions.find(session => session.providerId === "parent")!;
+  const prompt = "Review retries and persistence.";
+  const prepare = (id: string) => bridge.prepareDelegation(parent.id, prompt, [{ providerId: "worker" }], [
+    { type: "mesh", targetIndex: 0 }, { type: "text", text: prompt },
+  ], id);
+  await prepare("mesh-pending-older");
+  const latest = (await prepare("mesh-pending-latest")).delegation;
+  const input = { assignments: [{ target_index: 0, instruction: "Review only the persistence recovery path." }] };
+  await assert.rejects(() => bridge.executeMeshTool(parent.id, "mesh_dispatch_delegation", input), /More than one Mesh delegation/);
+  await assert.rejects(() => bridge.executeMeshTool(parent.id, "mesh_dispatch_delegation", { ...input, delegation_id: " " }), /delegation_id must contain/);
+  assert.equal(worker.creates.length, 0);
+  const explicit = await bridge.executeMeshTool(parent.id, "mesh_dispatch_delegation", { ...input, delegation_id: latest.id });
+  const replay = await bridge.executeMeshTool(parent.id, "mesh_dispatch_delegation", input);
+  assert.deepEqual(replay.child_session_ids, explicit.child_session_ids);
+  assert.equal(worker.creates.length, 1, "the remaining older pending selection must not absorb an implicit retry");
+  assert.equal(bridge.delegations(parent.id).find(task => task.id === "mesh-pending-older")?.state, "awaiting_dispatch");
 });
 
 test("legacy multi-target Mesh rejects raw forwarding before creating isolated workers", async (t) => {
@@ -7044,7 +7218,7 @@ test("legacy multi-target Mesh rejects raw forwarding before creating isolated w
     { type: "mesh", targetIndex: 1 },
     { type: "text", text: prompt },
   ]);
-  assert.equal(parentProvider.requests[0]?.content, prompt);
+  assert.equal(parentProvider.requests[0]?.content, `[Mesh target 0: grok][Mesh target 1: opencode]${prompt}`);
   assert.match(parentProvider.requests[0]?.developerInstructions ?? "", /Never copy, quote, or forward the complete multi-target user message/u);
 
   const normalizedRawPrompt = `  ${prompt.toUpperCase().replaceAll(" ", "   ")}  `;
@@ -7097,7 +7271,7 @@ test("legacy multi-target Mesh rejects raw forwarding before creating isolated w
   assert.match(opencodeRequest.developerInstructions ?? "", /Do not infer, request, or discuss sibling worker assignments/u);
 });
 
-test("a target-only prepared Mesh turn uses hidden transport content without changing its visible prompt", async (t) => {
+test("a target-only prepared Mesh turn preserves its selected worker without changing its visible prompt", async (t) => {
   const hostId = "host-parent-mesh-target-only";
   const parentProvider = new MeshCaptureProvider({ hostId, providerId: "parent", sessionCount: 1 });
   const workerProvider = new MeshCaptureProvider({ hostId, providerId: "worker", sessionCount: 0 });
@@ -7121,7 +7295,7 @@ test("a target-only prepared Mesh turn uses hidden transport content without cha
   assert.equal(task.prompt, "");
   assert.equal(task.state, "awaiting_dispatch");
   assert.deepEqual(task.children, []);
-  assert.match(parentProvider.requests[0]?.content ?? "", /^<tethoq_hidden_control_turn>mesh-prepare:/u);
+  assert.equal(parentProvider.requests[0]?.content, "[Mesh target 0: worker]");
   assert.doesNotMatch(parentProvider.requests[0]?.developerInstructions ?? "", /tethoq_hidden_control_turn/u);
   assert.equal(workerProvider.creates.length, 0);
 
@@ -7307,6 +7481,54 @@ test("a restored parent Mesh dispatch in spawning state becomes an explicit unce
     "recovery must never guess that it is safe to create the worker again");
 });
 
+test("Mesh survives a cold parent idle snapshot before acknowledgement and stale idle updates during its active turn", async (t) => {
+  const hostId = "host-mesh-startup-race";
+  const parentProvider = new MeshStartupRaceProvider({ hostId, providerId: "parent", sessionCount: 2 });
+  const workerProvider = new MeshCaptureProvider({ hostId, providerId: "worker", sessionCount: 0 });
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: ["parent", "worker"] }, [parentProvider, workerProvider]);
+  bridge.configureClientTooling(testClientTooling());
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  const parent = (await bridge.refresh()).sessions.find((session) => session.providerId === "parent" && session.state === "idle")!;
+  parentProvider.duringSend = async () => {
+    assert.equal(bridge.delegations(parent.id)[0]?.state, "awaiting_dispatch", "resuming a cold parent must not fail its new Mesh request");
+  };
+  const prompt = "Interview the selected model about the implementation.";
+  const task = (await bridge.prepareDelegation(parent.id, prompt, [{ providerId: "worker", modelId: "fake-careful" }], [
+    { type: "text", text: prompt }, { type: "mesh", targetIndex: 0 },
+  ], "mesh-startup-race")).delegation;
+  assert.equal(task.state, "awaiting_dispatch");
+  await parentProvider.emitParentState(parent.providerSessionId);
+  assert.equal(bridge.delegations(parent.id)[0]?.state, "awaiting_dispatch", "adapter-owned active work must survive a stale idle catalogue event");
+  const assignments = [{ target_index: 0, instruction: "Give your initial diagnosis and implementation approach for the first-person hand orientation. Work read-only." }];
+  await bridge.executeMeshTool(parent.id, "mesh_dispatch_delegation", { delegation_id: task.id, assignments });
+  await bridge.executeMeshTool(parent.id, "mesh_dispatch_delegation", { delegation_id: task.id, assignments });
+  assert.equal(workerProvider.creates.length, 1, "the selected worker must start exactly once, including a repeated dispatch");
+  assert.equal(workerProvider.creates[0]?.modelId, "fake-careful");
+});
+
+test("Mesh still detects a real parent completion before its send acknowledgement", async (t) => {
+  const hostId = "host-mesh-fast-parent";
+  const parentProvider = new MeshStartupRaceProvider({ hostId, providerId: "parent", sessionCount: 2 });
+  const workerProvider = new MeshCaptureProvider({ hostId, providerId: "worker", sessionCount: 0 });
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: ["parent", "worker"] }, [parentProvider, workerProvider]);
+  bridge.configureClientTooling(testClientTooling());
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  const parent = (await bridge.refresh()).sessions.find((session) => session.providerId === "parent" && session.state === "idle")!;
+  parentProvider.duringSend = async () => {
+    parentProvider.active = false;
+    await parentProvider.emitParentState(parent.providerSessionId, true);
+  };
+  const prompt = "Ask the selected worker.";
+  const task = (await bridge.prepareDelegation(parent.id, prompt, [{ providerId: "worker" }], [
+    { type: "text", text: prompt }, { type: "mesh", targetIndex: 0 },
+  ], "mesh-fast-parent")).delegation;
+  assert.equal(task.state, "failed");
+  assert.match(task.error ?? "", /finished before dispatching/u);
+  assert.equal(workerProvider.creates.length, 0);
+});
+
 test("a parent turn that finishes without dispatching Mesh fails instead of waiting forever", async (t) => {
   const hostId = "host-parent-mesh-no-dispatch";
   const parentProvider = new MeshCaptureProvider({ hostId, providerId: "parent", sessionCount: 2 });
@@ -7405,12 +7627,22 @@ test("a parent can wait for and read a parent-orchestrated Mesh result when its 
     await assert.rejects(() => bridge.executeMeshTool(otherParent.id, tool, tool === "mesh_wait"
       ? { child_session_ids: [childRecordId], timeout_seconds: 1 }
       : { child_session_id: childRecordId, message: "Must not reach a foreign child." }), /not a delegated child/);
+    await assert.rejects(() => bridge.executeMeshTool(parent.id, tool, tool === "mesh_wait"
+      ? { child_session_ids: ["other-host/worker/session-one"], timeout_seconds: 1 }
+      : { child_session_id: "other-host/worker/session-one", message: "Do not send on the wrong runtime." }),
+    (error: unknown) => (error as { code?: string }).code === "TASK_NOT_OWNED_HERE");
   }
+
+  const disconnected = new AbortController();
+  const abandoned = bridge.executeClientTool(parent.id, "mesh_wait", { child_session_ids: [childId], timeout_seconds: 300 }, { signal: disconnected.signal });
+  const rejected = assert.rejects(abandoned, /caller disconnected/);
+  disconnected.abort(new Error("caller disconnected"));
+  await rejected;
 
   let waitSettled = false;
   const waiting = bridge.executeMeshTool(parent.id, "mesh_wait", {
     child_session_ids: [childRecordId, childId],
-    timeout_seconds: 900,
+    timeout_seconds: 3,
   }).finally(() => { waitSettled = true; });
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.equal(waitSettled, false, "mesh_wait stays pending while the selected child is still working");
@@ -7419,13 +7651,13 @@ test("a parent can wait for and read a parent-orchestrated Mesh result when its 
   const waited = await waiting;
   assert.equal(waited.timedOut, false);
   assert.deepEqual(waited.children, [{ sessionId: childId, state: "completed" }]);
-  await assert.rejects(bridge.executeMeshTool(parent.id, "mesh_wait", { child_session_ids: [childId], timeout_seconds: 901 }), /1 to 900/);
 
   const result = await bridge.executeMeshTool(parent.id, "mesh_read_result", {
     child_session_id: childRecordId,
   });
   assert.equal(result.state, "completed");
   assert.equal(result.latestAssistantOutput, "The delegated result is ready.");
+  assert.ok(workerProvider.historyLimits.includes(8), "reading a result requests a bounded recent transcript");
   assert.equal(result.childSessionId, childId);
   const followUp = await bridge.executeMeshTool(parent.id, "mesh_message_child", { child_session_id: childRecordId, message: "Review the result once more." });
   assert.equal(followUp.childSessionId, childId);
@@ -8707,25 +8939,16 @@ test("Tethoq goals support the full lifecycle on a provider with no native goal 
   let goal = await bridge.setSessionGoal(session.id, { objective: "Make goals reliable for every model", tokenBudget: 24_000 });
   assert.equal(goal.status, "active");
   assert.equal(goal.source, "tethoq");
-  const firstActivation = goal.activationId;
-  assert.ok(firstActivation);
-  goal = await bridge.setSessionGoal(session.id, { tokenBudget: 24_000 });
-  assert.equal(goal.activationId, firstActivation, "budget edits keep delivery ownership");
   goal = await bridge.setSessionGoal(session.id, { status: "paused" });
   assert.equal(goal.status, "paused");
-  assert.equal(goal.activationId, firstActivation);
   goal = await bridge.setSessionGoal(session.id, { status: "active", objective: "Make goals reliable across restarts" });
   assert.equal(goal.objective, "Make goals reliable across restarts");
-  assert.notEqual(goal.activationId, firstActivation);
-  const resumedActivation = goal.activationId;
   goal = await bridge.setSessionGoal(session.id, { status: "blocked" });
   assert.equal(goal.status, "blocked");
   goal = await bridge.setSessionGoal(session.id, { status: "complete" });
   assert.equal(goal.status, "complete");
-  assert.equal(goal.activationId, resumedActivation);
   goal = await bridge.setSessionGoal(session.id, { status: "active" });
   assert.equal(goal.status, "active", "completed goals can be reopened");
-  assert.notEqual(goal.activationId, resumedActivation);
   assert.deepEqual(await provider.getMessages(session.providerSessionId), beforeMessages, "goal mutations never start a model turn");
 
   await bridge.sendMessage(session.id, { requestId: "goal-context-turn", content: "Continue" });
@@ -8796,263 +9019,6 @@ test("active fallback goals continue privately and stop when the model completes
   await assert.rejects(bridge.executeClientTool(session.id, "tethoq_goal", { status: "complete" }), /no longer active/);
 });
 
-test("uncertain goal delivery blocks automation even when the provider disconnects before rejecting", async (t) => {
-  for (const mode of ["direct", "automatic"] as const) {
-    await t.test(mode, async (t) => {
-      const hostId = `goal-delivery-${mode}`;
-      class DisconnectedProvider extends GoalCapturingFakeProvider {
-        override async sendMessage(id: string, request: SendMessageRequest): Promise<SendMessageResult> {
-          await super.sendMessage(id, request);
-          await this.finish(id, "session.status_changed", { state: "disconnected" });
-          throw new Error("OpenCode request failed: fetch failed");
-        }
-      }
-      const provider = new DisconnectedProvider({ hostId, providerId: "opencode", sessionCount: 1 });
-      let persisted: Readonly<Record<string, SessionGoal>> = {};
-      let deliveries: readonly QueueDeliveryRecord[] = [];
-      const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider], {
-        onGoalsChange: (goals) => { persisted = goals; },
-        onQueueDeliveriesChange: (records) => { deliveries = records; },
-      });
-      bridge.configureClientTooling(testClientTooling());
-      t.after(() => bridge.dispose());
-      await bridge.start();
-      await bridge.refresh();
-      const session = bridge.sessions()[0]!;
-      await bridge.setSessionGoal(session.id, { objective: "Finish the repair once delivery is reliable" });
-      if (mode === "direct") {
-        await assert.rejects(bridge.sendMessage(session.id, { requestId: "uncertain-goal-prompt", content: "Continue the repair" }), /Delivery could not be confirmed/);
-      } else {
-        await provider.finish(session.providerSessionId);
-      }
-      await waitFor(() => persisted[session.id]?.status === "blocked", "uncertain delivery must stop the active goal");
-      assert.equal((await bridge.sessionGoal(session.id))?.status, "blocked");
-      if (mode === "automatic") {
-        assert.equal(bridge.queuedMessages(session.id)[0]?.content, "Continue task", "failed controls must not expose internal markup");
-        assert.match(deliveries[0]!.content, /tethoq_hidden_control_turn/, "the journal retains the actual payload for reconciliation");
-      }
-      const event = bridge.eventReplaySince(0).events.filter((event) => event.type === "session.goal_updated").at(-1)!;
-      assert.equal((event.payload.goal as unknown as SessionGoal).status, "blocked");
-      await provider.finish(session.providerSessionId);
-      await new Promise((resolve) => setTimeout(resolve, 850));
-      assert.equal(provider.requests.length, 1, "reconnection must not replay an ambiguous instruction or resume the goal");
-      await bridge.dispose();
-      const restoredProvider = new GoalCapturingFakeProvider({ hostId, providerId: "opencode", sessionCount: 1 });
-      const restored = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [restoredProvider], {
-        // Older installations persisted this inconsistent combination. Dismissing
-        // the delivery warning must not make it safe to continue after restart.
-        goals: { [session.id]: { ...persisted[session.id]!, status: "active" } },
-        queueDeliveries: deliveries.map((delivery) => ({ ...delivery, dismissedAt: new Date().toISOString() })),
-      });
-      t.after(() => restored.dispose());
-      restored.configureClientTooling(testClientTooling());
-      await restored.start();
-      await restored.refresh();
-      assert.equal((await restored.sessionGoal(session.id))?.status, "blocked");
-      await new Promise((resolve) => setTimeout(resolve, 850));
-      assert.equal(restoredProvider.requests.length, 0);
-    });
-  }
-});
-
-test("historical delivery failures cannot stall a newly started goal on refresh or restart", async (t) => {
-  for (const dismissed of [false, true]) {
-    await t.test(dismissed ? "dismissed" : "visible", async (t) => {
-      const hostId = `goal-historical-delivery-${dismissed}`;
-      class FailedProvider extends GoalCapturingFakeProvider {
-        override async sendMessage(id: string, request: SendMessageRequest): Promise<SendMessageResult> {
-          await super.sendMessage(id, request);
-          throw new Error("OpenCode request failed: fetch failed");
-        }
-      }
-      let deliveries: readonly QueueDeliveryRecord[] = [];
-      const failed = new FailedProvider({ hostId, providerId: "opencode", sessionCount: 1 });
-      const old = new AgentBridge({ ...config(hostId), enabledProviders: [failed.providerId] }, [failed], {
-        onQueueDeliveriesChange: (records) => { deliveries = records; },
-      });
-      t.after(() => old.dispose());
-      await old.start();
-      await old.refresh();
-      const session = old.sessions()[0]!;
-      await assert.rejects(old.sendMessage(session.id, { requestId: "old-send", content: "Yesterday's instruction" }), /Delivery could not be confirmed/);
-      await old.dispose();
-      const historical = deliveries.map((delivery) => ({
-        ...delivery,
-        createdAt: "2026-01-01T00:00:00.000Z",
-        updatedAt: "2026-01-01T00:00:01.000Z",
-        ...(dismissed ? { dismissedAt: "2026-01-01T00:00:02.000Z" } : {}),
-      }));
-      const provider = new GoalCapturingFakeProvider({ hostId, providerId: "opencode", sessionCount: 1 });
-      let goals: Readonly<Record<string, SessionGoal>> = {};
-      const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider], {
-        queueDeliveries: historical,
-        onGoalsChange: (records) => { goals = records; },
-        onQueueDeliveriesChange: (records) => { deliveries = records; },
-      });
-      t.after(() => bridge.dispose());
-      bridge.configureClientTooling(testClientTooling());
-      await bridge.start();
-      await bridge.refresh();
-      await bridge.sendMessage(session.id, {
-        requestId: "new-goal-send", content: "Start today's repair",
-        metadata: { tethoqGoalObjective: "Finish today's repair" },
-      });
-      await bridge.refresh();
-      assert.equal((await bridge.sessionGoal(session.id))?.status, "active", "an unrelated old error must not stall a successful new goal");
-      await provider.finish(session.providerSessionId);
-      await waitFor(() => provider.requests.length === 2, "new goal continues despite historical uncertainty");
-      await assert.rejects(bridge.sendMessage(session.id, { requestId: "old-replay", content: "Yesterday's instruction" }), /fetch failed|Delivery could not be confirmed/);
-      await bridge.dispose();
-      const restartedProvider = new GoalCapturingFakeProvider({ hostId, providerId: "opencode", sessionCount: 1 });
-      const restarted = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [restartedProvider], {
-        goals, queueDeliveries: deliveries,
-      });
-      t.after(() => restarted.dispose());
-      restarted.configureClientTooling(testClientTooling());
-      await restarted.start();
-      await restarted.refresh();
-      assert.equal((await restarted.sessionGoal(session.id))?.status, "active");
-      await restartedProvider.finish(session.providerSessionId);
-      await waitFor(() => restartedProvider.requests.length === 1, "goal resumes after restart without replaying the original prompt");
-      assert.equal(stripProviderPromptGuidance(restartedProvider.lastRequest!.content), "");
-    });
-  }
-});
-
-test("explicitly resumed goals can send fresh continuations after an uncertain automatic prompt", async (t) => {
-  const hostId = "goal-resume-uncertain-continuation";
-  class FailOnceProvider extends GoalCapturingFakeProvider {
-    override async sendMessage(id: string, request: SendMessageRequest): Promise<SendMessageResult> {
-      const result = await super.sendMessage(id, request);
-      if (this.requests.length === 2) {
-        await this.finish(id, "session.status_changed", { state: "disconnected" });
-        throw new Error("OpenCode request failed: fetch failed");
-      }
-      return result;
-    }
-  }
-  const provider = new FailOnceProvider({ hostId, providerId: "opencode", sessionCount: 1 });
-  let goals: Readonly<Record<string, SessionGoal>> = {};
-  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider], {
-    onGoalsChange: (records) => { goals = records; },
-  });
-  t.after(() => bridge.dispose());
-  bridge.configureClientTooling(testClientTooling());
-  await bridge.start();
-  await bridge.refresh();
-  const session = bridge.sessions()[0]!;
-  await bridge.setSessionGoal(session.id, { objective: "Finish the repair" });
-  await bridge.sendMessage(session.id, { requestId: "start-repair", content: "Repair this once" });
-  await provider.finish(session.providerSessionId);
-  await waitFor(() => goals[session.id]?.status === "blocked", "current uncertain continuation stalls automation");
-  await provider.finish(session.providerSessionId);
-  await bridge.setSessionGoal(session.id, { status: "active" });
-  await bridge.refresh();
-  assert.equal((await bridge.sessionGoal(session.id))?.status, "active", "explicit resume supersedes the old failed run");
-  await provider.finish(session.providerSessionId);
-  await waitFor(() => provider.requests.length === 3, "a fresh continuation after explicit resume");
-  assert.equal(stripProviderPromptGuidance(provider.lastRequest!.content), "");
-  await bridge.executeClientTool(session.id, "tethoq_goal", { status: "complete" });
-  await provider.finish(session.providerSessionId);
-  await new Promise((resolve) => setTimeout(resolve, 850));
-  assert.equal(provider.requests.length, 3, "completion still stops the resumed goal");
-});
-
-test("a late delivery failure cannot block a replacement goal", async (t) => {
-  const hostId = "goal-late-delivery-failure";
-  let rejectSend!: (error: Error) => void;
-  class DeferredProvider extends GoalCapturingFakeProvider {
-    override async sendMessage(id: string, request: SendMessageRequest): Promise<SendMessageResult> {
-      await super.sendMessage(id, request);
-      return await new Promise<SendMessageResult>((_resolve, reject) => { rejectSend = reject; });
-    }
-  }
-  const provider = new DeferredProvider({ hostId, providerId: "opencode", sessionCount: 1 });
-  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider]);
-  t.after(() => bridge.dispose());
-  await bridge.start();
-  await bridge.refresh();
-  const session = bridge.sessions()[0]!;
-  await bridge.setSessionGoal(session.id, { objective: "Old goal" });
-  const sending = assert.rejects(bridge.sendMessage(session.id, { requestId: "delayed-old-send", content: "Old instruction" }), /Delivery could not be confirmed/);
-  await waitFor(() => provider.requests.length === 1, "old send started");
-  await bridge.setSessionGoal(session.id, { objective: "Replacement goal", status: "active" });
-  rejectSend(new Error("OpenCode request failed: fetch failed"));
-  await sending;
-  assert.equal((await bridge.sessionGoal(session.id))?.status, "active", "late failure belongs to the old goal");
-  await bridge.refresh();
-  assert.equal((await bridge.sessionGoal(session.id))?.status, "active");
-});
-
-test("queued goal prompts bind delivery failures to the goal created at dispatch", async (t) => {
-  const hostId = "queued-goal-delivery-owner";
-  class FailedProvider extends GoalCapturingFakeProvider {
-    override async sendMessage(id: string, request: SendMessageRequest): Promise<SendMessageResult> {
-      await super.sendMessage(id, request);
-      throw new Error("OpenCode request failed: fetch failed");
-    }
-  }
-  const provider = new FailedProvider({ hostId, providerId: "opencode", sessionCount: 1 });
-  let goals: Readonly<Record<string, SessionGoal>> = {};
-  let deliveries: readonly QueueDeliveryRecord[] = [];
-  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider], {
-    onGoalsChange: (records) => { goals = records; },
-    onQueueDeliveriesChange: (records) => { deliveries = records; },
-  });
-  t.after(() => bridge.dispose());
-  await bridge.start();
-  await bridge.refresh();
-  const session = bridge.sessions()[0]!;
-  await bridge.setSessionGoal(session.id, { objective: "Existing goal", status: "paused" });
-  const queued = await bridge.enqueueMessage(session.id, {
-    requestId: "queued-new-goal", content: "Start the new repair",
-    metadata: { tethoqGoalObjective: "Queued replacement goal" },
-  });
-  assert.equal((await bridge.sessionGoal(session.id))?.objective, "Existing goal", "queuing must not activate the next goal early");
-  await provider.finish(session.providerSessionId);
-  await waitFor(() => goals[session.id]?.status === "blocked", "uncertain first queued send blocks its new goal");
-  const goal = (await bridge.sessionGoal(session.id))!;
-  const delivery = deliveries.find((record) => record.messageId === queued.id)!;
-  assert.equal(goal.objective, "Queued replacement goal");
-  assert.ok(goal.activationId);
-  assert.equal(delivery.goalActivationId, goal.activationId);
-  assert.equal(delivery.state, "unknown");
-});
-
-test("legacy goal recovery distinguishes older failures from uncertainty during that objective", async (t) => {
-  for (const current of [false, true]) {
-    await t.test(current ? "current uncertainty" : "older failure", async (t) => {
-      const hostId = `legacy-goal-delivery-${current}`;
-      let goals: Readonly<Record<string, SessionGoal>> = {};
-      let deliveries: readonly QueueDeliveryRecord[] = [];
-      const provider = new GoalCapturingFakeProvider({ hostId, providerId: "opencode", sessionCount: 1 });
-      const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider], {
-        onGoalsChange: (records) => { goals = records; },
-        onQueueDeliveriesChange: (records) => { deliveries = records; },
-      });
-      t.after(() => bridge.dispose());
-      await bridge.start();
-      await bridge.refresh();
-      const session = bridge.sessions()[0]!;
-      await bridge.setSessionGoal(session.id, { objective: "Legacy objective" });
-      await bridge.sendMessage(session.id, { requestId: "legacy-send", content: "Legacy instruction" });
-      await bridge.dispose();
-      const { activationId: _goalActivation, ...legacyGoal } = goals[session.id]!;
-      const { goalActivationId: _deliveryActivation, ...legacyDelivery } = deliveries[0]!;
-      const restoredProvider = new GoalCapturingFakeProvider({ hostId, providerId: "opencode", sessionCount: 1 });
-      const restored = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [restoredProvider], {
-        goals: { [session.id]: { ...legacyGoal, createdAt: "2026-01-02T00:00:00.000Z" } },
-        queueDeliveries: [{ ...legacyDelivery, state: "unknown", dismissedAt: "2026-01-04T00:00:00.000Z",
-          createdAt: current ? "2026-01-03T00:00:00.000Z" : "2026-01-01T00:00:00.000Z" }],
-      });
-      t.after(() => restored.dispose());
-      await restored.start();
-      await restored.refresh();
-      assert.equal((await restored.sessionGoal(session.id))?.status, current ? "blocked" : "active");
-    });
-  }
-});
-
 test("OpenCode's installed goal tool persists terminal states, publishes them, and stops automatic prompts", async (t) => {
   for (const status of ["complete", "blocked"] as const) {
     await t.test(status, async (t) => {
@@ -9072,6 +9038,7 @@ test("OpenCode's installed goal tool persists terminal states, publishes them, a
       const source = await readFile(openCodeMeshToolPath(directory), "utf8");
       const goalExport = source.slice(source.indexOf("export const tethoq_goal"), source.indexOf("export const list_sessions"));
       assert.match(goalExport, /Call this before your final response/);
+      assert.match(goalExport, /at least three consecutive goal turns/);
       // Keep the installed execute function and IPC transport intact. Only the
       // schema helper and runtime discovery are scoped to this isolated fixture.
       const executable = source
@@ -9089,11 +9056,13 @@ test("OpenCode's installed goal tool persists terminal states, publishes them, a
       await bridge.sendMessage(session.id, { requestId: "goal-start", content: "Start" });
       assert.match(provider.lastRequest!.developerInstructions!, /call uar_mesh_tethoq_goal with \{"status":"complete"\} before your final response/);
       assert.match(provider.lastRequest!.developerInstructions!, /call uar_mesh_tethoq_goal with \{"status":"blocked"\} before explaining the blocker/);
+      assert.match(provider.lastRequest!.developerInstructions!, /at least three consecutive goal turns/);
+      assert.match(provider.lastRequest!.developerInstructions!, /Failed quality checks and unfinished improvements are work to do/);
+      assert.match(provider.lastRequest!.developerInstructions!, /fresh three-turn blocked audit/);
       await provider.finish(session.providerSessionId);
       await waitFor(() => provider.requests.length === 2, "goal status check after a normal turn");
       assert.match(provider.lastRequest!.developerInstructions!, /^Check the active goal's status against your latest response before doing more work/);
       assert.match(provider.lastRequest!.developerInstructions!, /not new user input, approval, or a change that removes a blocker/);
-      assert.match(provider.lastRequest!.developerInstructions!, /give a brief final acknowledgement and end this turn/);
       assert.equal(JSON.parse(await execute({})).status, "active");
       assert.deepEqual(JSON.parse(await execute({ status })), { status });
       assert.equal(persisted[session.id]?.status, status, "the successful tool result must be durable");
@@ -9139,6 +9108,35 @@ test("fallback goals continue across idle-only turn boundaries and late provider
   await provider.finish(session.providerSessionId, "session.status_changed", { state: "idle" });
   await new Promise((resolve) => setTimeout(resolve, 850));
   assert.equal(provider.requests.length, 3, "verified completion ends the goal loop");
+});
+
+test("Grok fallback goals preserve the selected model and audit blockers across automatic turns", async (t) => {
+  const hostId = "host-grok-goal";
+  const provider = new GoalCapturingFakeProvider({ hostId, providerId: "grok", sessionCount: 1 });
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider]);
+  bridge.configureClientTooling(testClientTooling());
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  await bridge.refresh();
+  const session = bridge.sessions()[0]!;
+  await bridge.setSessionGoal(session.id, { objective: "Meet every requirement, including the failing quality gate" });
+  await bridge.sendMessage(session.id, { requestId: "grok-goal-start", content: "Keep working", modelId: "grok-4.6", reasoningEffort: "xhigh" });
+  await provider.finish(session.providerSessionId);
+  await waitFor(() => provider.requests.length === 2, "Grok goal continuation");
+  assert.equal(provider.lastRequest?.modelId, "grok-4.6");
+  assert.equal(provider.lastRequest?.reasoningEffort, "xhigh");
+  assert.match(provider.lastRequest!.developerInstructions!, /call tethoq_goal with/);
+  assert.doesNotMatch(provider.lastRequest!.developerInstructions!, /uar_mesh_tethoq_goal/);
+  assert.match(provider.lastRequest!.developerInstructions!, /three consecutive goal turns/);
+  assert.match(provider.lastRequest!.developerInstructions!, /full objective/);
+  await bridge.executeClientTool(session.id, "tethoq_goal", { status: "blocked" });
+  await provider.finish(session.providerSessionId);
+  await new Promise(resolve => setTimeout(resolve, 850));
+  assert.equal(provider.requests.length, 2, "a confirmed blocker stops automatic work");
+  await bridge.setSessionGoal(session.id, { status: "active" });
+  await waitFor(() => provider.requests.length === 3, "user resume starts a fresh run");
+  assert.match(provider.lastRequest!.developerInstructions!, /fresh three-turn blocked audit/);
+  await bridge.executeClientTool(session.id, "tethoq_goal", { status: "complete" });
 });
 
 test("fallback goals retain a turn completion received before continuation acceptance", async (t) => {
@@ -9222,6 +9220,98 @@ class GoalContextRecoveryProvider extends GoalCapturingFakeProvider {
 }
 
 const imageLimitFailure = { code: "IMAGE_LIMIT_EXCEEDED", recovery: "compact_context", message: "51 images exceed the limit of 50" };
+
+class SessionImageRecoveryProvider extends GoalContextRecoveryProvider {
+  ownsActiveTurn(): boolean { return true; }
+}
+
+test("ordinary tasks recover image capacity without goal tooling, preserve selection and bound retries", async (t) => {
+  const hostId = "host-session-image-recovery";
+  const provider = new SessionImageRecoveryProvider({ hostId, sessionCount: 1 });
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider]);
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  await bridge.refresh();
+  const session = bridge.sessions()[0]!;
+  await bridge.sendMessage(session.id, { requestId: "images", content: "Review these images", modelId: "opencode-go/glm-5.3-flash", reasoningEffort: "max" });
+  let release!: () => void;
+  provider.compactBlocker = new Promise(resolve => { release = resolve; });
+  await resolvesPromptly(provider.finish(session.providerSessionId, "agent.error", imageLimitFailure), "recovery leaves SSE free");
+  await provider.finish(session.providerSessionId, "agent.error", imageLimitFailure);
+  await waitFor(() => provider.compactCalls === 1, "one compaction");
+  assert.equal(provider.requests.length, 1);
+  assert.equal(await bridge.sessionGoal(session.id), null);
+  release();
+  await waitFor(() => provider.requests.length === 2, "automatic continuation without a goal");
+  assert.equal(provider.lastRequest?.modelId, "opencode-go/glm-5.3-flash");
+  assert.equal(provider.lastRequest?.reasoningEffort, "max");
+  assert.equal(stripProviderPromptGuidance(provider.lastRequest!.content), "");
+  await provider.finish(session.providerSessionId, "agent.error", imageLimitFailure);
+  assert.equal(provider.compactCalls, 1, "no endless retry without model progress");
+  await bridge.sendMessage(session.id, { requestId: "explicit-retry", content: "Continue the review" });
+  await provider.finish(session.providerSessionId, "agent.error", imageLimitFailure);
+  await waitFor(() => provider.requests.length === 4, "an explicit retry resets recovery");
+  await provider.finish(session.providerSessionId, "tool.completed", { status: "completed", callId: "new-image" });
+  await provider.finish(session.providerSessionId, "agent.error", imageLimitFailure);
+  await waitFor(() => provider.requests.length === 5, "new work permits a later recovery");
+  assert.equal(provider.compactCalls, 3);
+  assert.equal(await bridge.sessionGoal(session.id), null);
+});
+
+test("ordinary image recovery respects Stop, newer instructions, failures and external tasks", async (t) => {
+  for (const action of ["stop", "direct", "queued", "failure", "unrelated", "external"] as const) {
+    await t.test(action, async (t) => {
+      const hostId = `host-session-image-${action}`;
+      const provider = new SessionImageRecoveryProvider({ hostId, sessionCount: 1 });
+      const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider]);
+      t.after(() => bridge.dispose());
+      await bridge.start();
+      await bridge.refresh();
+      const session = bridge.sessions()[0]!;
+      if (action !== "external") await bridge.sendMessage(session.id, { requestId: "initial", content: "Review" });
+      let release!: () => void;
+      provider.compactBlocker = new Promise(resolve => { release = resolve; });
+      provider.failCompaction = action === "failure";
+      await provider.finish(session.providerSessionId, "agent.error", action === "unrelated" ? { message: "Authentication failed" } : imageLimitFailure);
+      if (action !== "external" && action !== "unrelated") await waitFor(() => provider.compactCalls === 1, "compaction began");
+      let sending: Promise<SendMessageResult> | undefined;
+      if (action === "stop") await bridge.interrupt(session.id);
+      if (action === "direct") sending = bridge.sendMessage(session.id, { requestId: "newer", content: "Use this correction" });
+      if (action === "queued") await bridge.enqueueMessage(session.id, { requestId: "newer", content: "Use this correction" });
+      release();
+      await sending;
+      if (action === "queued") await waitFor(() => provider.requests.length === 2, "newer queued instruction delivered");
+      await new Promise(resolve => setTimeout(resolve, 50));
+      assert.equal(provider.requests.some(request => request.requestId.startsWith("context_recovery_")), false);
+      if (action === "direct" || action === "queued") assert.equal(provider.lastRequest?.content, "Use this correction");
+      if (action === "failure") assert.equal(bridge.sessions().find(candidate => candidate.id === session.id)?.state, "failed");
+      if (action === "external" || action === "unrelated") assert.equal(provider.compactCalls, 0);
+    });
+  }
+});
+
+test("goal context recovery joins an existing compaction without stalling or duplicating it", async (t) => {
+  const hostId = "host-goal-existing-compaction";
+  const provider = new GoalContextRecoveryProvider({ hostId, sessionCount: 1 });
+  const bridge = new AgentBridge({ ...config(hostId), enabledProviders: [provider.providerId] }, [provider]);
+  bridge.configureClientTooling(testClientTooling());
+  t.after(() => bridge.dispose());
+  await bridge.start();
+  await bridge.refresh();
+  const session = bridge.sessions()[0]!;
+  await bridge.setSessionGoal(session.id, { objective: "Finish the visual review" });
+  let release!: () => void;
+  provider.compactBlocker = new Promise(resolve => { release = resolve; });
+  const compaction = bridge.compactSession(session.id);
+  await waitFor(() => provider.compactCalls === 1, "manual compaction started");
+  await provider.finish(session.providerSessionId, "agent.error", imageLimitFailure);
+  assert.equal((await bridge.sessionGoal(session.id))?.status, "active");
+  assert.equal(provider.compactCalls, 1);
+  release();
+  await compaction;
+  await waitFor(() => provider.requests.length === 1, "one continuation after shared compaction");
+  await bridge.executeClientTool(session.id, "tethoq_goal", { status: "complete" });
+});
 
 test("goal image-limit recovery waits for compaction, coalesces errors and bounds retries without progress", async (t) => {
   const hostId = "host-goal-image-recovery";

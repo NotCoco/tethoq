@@ -170,6 +170,10 @@ export class SessionCache {
     if (session === undefined) return;
     // This is the newest thing known about the session, so it is applied directly.
     const dropsEffort = previous?.reasoningEffort !== undefined && !reasoningEffort && !keepsEffort;
+    // Reaffirming the current selection is not a new state observation. Keep
+    // the row identity used to reconcile in-flight queue/state operations.
+    if (!dropsEffort && (!modelId || modelId === session.modelId)
+      && (!reasoningEffort || reasoningEffort === session.reasoningEffort)) return;
     const base = dropsEffort ? withoutEffort(session) : session;
     this.#sessions.set(globalSessionId, {
       ...base,

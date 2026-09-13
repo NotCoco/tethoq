@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { build } from "esbuild";
 
 const source = async (path) => await readFile(new URL(path, import.meta.url), "utf8");
 
@@ -70,40 +72,35 @@ test("a dead renderer offers a guarded user-triggered reload without a restart l
   assert.match(main, /dialog\.showErrorBox\("Tethoq could not start"/);
 });
 
-test("copying goes through the desktop clipboard and can never reject", async () => {
-  const [clipboard, chat, rich, preload, ipc, security] = await Promise.all([
-    source("../src/renderer/src/clipboard.ts"),
-    source("../src/renderer/src/ChatTimeline.tsx"),
-    source("../src/renderer/src/RichText.tsx"),
-    source("../src/preload/index.ts"),
-    source("../src/main/ipc.ts"),
-    source("../src/main/security.ts"),
-  ]);
-
-  // The window runs from file:// and the permission policy grants nothing but
-  // audio, so the web clipboard is refused outright: every copy control in the
-  // app was failing, and the refusal arrived as an unhandled rejection that the
-  // fault handler turned into a full-window error card.
-  assert.match(security, /permission === "media"/);
-  assert.doesNotMatch(security, /clipboard-sanitized-write|clipboard-read/);
-  assert.doesNotMatch(chat, /navigator\.clipboard\.writeText/);
-  assert.doesNotMatch(rich, /navigator\.clipboard/);
-
-  // Electron's own clipboard needs no permission, and the call is bounded.
-  assert.match(ipc, /handle\(IPC_CHANNELS\.copyText[\s\S]*?clipboard\.writeText\(trimmed\)/);
-  assert.match(ipc, /const trimmed = text\.slice\(0, MAX_CLIPBOARD_CHARACTERS\)/);
-  assert.match(preload, /copyText: \(text: string\)[\s\S]*?ipcRenderer\.invoke\(IPC_CHANNELS\.copyText, \{ text \}\)/);
-
-  // A copy that cannot happen answers false; it never throws at a click handler.
-  assert.match(clipboard, /export async function copyText\(text: string\): Promise<boolean>/);
-  assert.match(clipboard, /try \{\s*\n\s*return await desktop\.copyText\(text\);\s*\n\s*\} catch \{\s*\n\s*return false;/);
-  assert.doesNotMatch(clipboard, /throw /);
-  // Reading the DOM at module scope would keep these controls out of headless tests.
-  assert.match(clipboard, /globalThis\.window\?\.tethoqDesktop/);
-
-  // The control says what happened: silently doing nothing is the same defect.
-  assert.match(chat, /onClick=\{\(\) => \{ void copyToClipboard\(text\)\.then\(\(copied\) => setResult\(copied \? "copied" : "failed"\)\); \}\}/);
-  assert.match(chat, /\{result === "copied" \? <CheckIcon \/> : <CopyIcon \/>\}/);
-  assert.match(chat, /<CopyButton className="timeline-copy-button"/);
-  assert.match(chat, /<CopyButton className="copy-message"/);
+test("copying reports failures without throwing and prefers Desktop over the web clipboard", async (t) => {
+  const { outputFiles } = await build({
+    entryPoints: [fileURLToPath(new URL("../src/renderer/src/clipboard.ts", import.meta.url))],
+    write: false, bundle: true, format: "esm", platform: "node",
+  });
+  const { copyText } = await import("data:text/javascript;base64," + Buffer.from(outputFiles[0].text).toString("base64"));
+  const descriptors = ["window", "navigator"].map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]);
+  t.after(() => { for (const [key, descriptor] of descriptors) {
+    if (descriptor) Object.defineProperty(globalThis, key, descriptor); else delete globalThis[key];
+  } });
+  const calls = [];
+  const desktop = { copyText: async (text) => { calls.push(text); return true; } };
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { tethoqDesktop: desktop } });
+  const navigator = { clipboard: { writeText: async () => { throw new Error("Desktop must not use the web clipboard"); } } };
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: navigator });
+  assert.equal(await copyText("  A complete answer\n"), true);
+  assert.deepEqual(calls, ["  A complete answer\n"]);
+  assert.equal(await copyText("   "), false);
+  assert.equal(calls.length, 1, "empty text must not reach a clipboard");
+  desktop.copyText = async () => { throw new Error("Clipboard denied"); };
+  assert.equal(await copyText("answer"), false);
+  desktop.copyText = async () => false;
+  assert.equal(await copyText("answer"), false);
+  delete globalThis.window;
+  navigator.clipboard.writeText = async (text) => { calls.push(text); };
+  assert.equal(await copyText("browser preview"), true);
+  assert.equal(calls.at(-1), "browser preview");
+  navigator.clipboard.writeText = async () => { throw new Error("Permission denied"); };
+  assert.equal(await copyText("answer"), false);
+  delete navigator.clipboard;
+  assert.equal(await copyText("answer"), false);
 });

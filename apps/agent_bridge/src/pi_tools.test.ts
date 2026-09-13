@@ -19,6 +19,8 @@ test("Pi tools install the complete bounded browser workspace contract", async (
   assert.match(source, /\["browser_activate"/);
   assert.match(source, /\["browser_set_muted"/);
   assert.match(source, /\["mesh_dispatch_delegation"/);
+  assert.match(source, /\["tethoq_show_image"/);
+  assert.match(source, /inline in this task, instead of sending a link/);
   assert.match(source, /new background tab/);
   assert.match(source, /activate: Type\.Optional\(Type\.Boolean\(\)\)/);
   const turnSupport = source.split(/\r?\n/u).find((line) => line.includes('["tethoq_turn_support"'));

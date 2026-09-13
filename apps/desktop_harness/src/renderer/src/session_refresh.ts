@@ -1,5 +1,30 @@
-import type { Session, SessionContextState, SessionSchedule, SessionState, SessionUsageTotals, TimelineItem } from "./types";
+import type { DesktopSnapshot, Session, SessionContextState, SessionSchedule, SessionState, SessionUsageTotals, TimelineItem } from "./types";
 import { isAmbiguousSelectionValue } from "./composer_helpers";
+import { settleRunningTimeline } from "./timeline_merge";
+
+/** Apply only after the bridge has confirmed cancellation of the entire subtree. */
+export function applyConfirmedInterruption(snapshot: DesktopSnapshot, sessionId: string, interruptedAt: string): DesktopSnapshot {
+  const stopped = new Set([sessionId]);
+  for (const parentId of stopped) {
+    for (const session of snapshot.sessions) {
+      if (session.relationshipKind === "subagent" && (session.relationshipSourceSessionId ?? session.parentSessionId) === parentId) stopped.add(session.id);
+    }
+    for (const row of snapshot.timelines[parentId] ?? []) {
+      if (row.kind === "subagent" && row.childSessionId) stopped.add(row.childSessionId);
+    }
+  }
+  return { ...snapshot,
+    sessions: snapshot.sessions.map((session) => {
+      if (!stopped.has(session.id)) return session;
+      const { providerStatus: _status, ...rest } = session;
+      return { ...rest, state: "idle", interruptedAt, updatedAt: interruptedAt };
+    }),
+    timelines: Object.fromEntries(Object.entries(snapshot.timelines).map(([id, rows]) => [id, stopped.has(id)
+      ? settleRunningTimeline(rows, "failed").map(row => row.kind === "subagent" && row.childSessionId && stopped.has(row.childSessionId)
+        ? { ...row, state: "completed", childInterruptedAt: interruptedAt, childStatusUpdatedAt: interruptedAt } : row)
+      : rows])),
+  };
+}
 
 function sameProviderStatus(left: Session["providerStatus"], right: Session["providerStatus"]): boolean {
   return left === right || (left?.kind === right?.kind && left?.message === right?.message && left?.retryAt === right?.retryAt);
@@ -193,7 +218,6 @@ export function scheduledTaskPresentationState(
   scheduledTaskId?: string,
 ): SessionState | undefined {
   if (status === "failed") return scheduledTaskHasProviderEvidence(session, timeline, scheduledTaskId) ? undefined : "failed";
-  if (status === "dispatching") return "working";
   if (session === undefined || session.state === "working") return "working";
   if (session.state !== "idle") return undefined;
   const terminalTimeline = timeline.some((item) => item.kind === "error" && item.state === "failed"

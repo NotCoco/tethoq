@@ -196,7 +196,7 @@ export type BrowserWorkspaceNotice =
   | { readonly type: "blocked-popup"; readonly tabId: string; readonly url: string }
   | { readonly type: "tab-limit" }
   | { readonly type: "focus-address"; readonly tabId: string }
-  | { readonly type: "workspace-closed" }
+  | { readonly type: "closed" }
   | { readonly type: "permission-blocked"; readonly tabId: string; readonly permission: string; readonly origin: string }
   | { readonly type: "permission-expired"; readonly requestId: string }
   | { readonly type: "download-started"; readonly downloadId: string }
@@ -341,18 +341,17 @@ export class BrowserWorkspaceManager {
     this.#assertAvailable();
     await this.initialize();
     const tab = this.#addTab(activate);
-    const contents = tab.view.webContents;
 
     const url = normalizeNavigationInput(input?.url ?? this.#initialUrl);
     try {
       await withBrowserDeadline(
-        contents.loadURL(url),
+        tab.view.webContents.loadURL(url),
         BROWSER_NAVIGATION_TIMEOUT_MS,
         "The browser page took too long to load",
-        () => { if (!contents.isDestroyed()) contents.stop(); },
+        () => tab.view.webContents.stop(),
       );
     } catch (error: unknown) {
-      if (!contents.isDestroyed() && !isAbortedNavigationError(error)) {
+      if (!tab.view.webContents.isDestroyed() && !isAbortedNavigationError(error)) {
         tab.loading = false;
         tab.error = errorMessage(error);
         this.#emitSoon();
@@ -396,10 +395,10 @@ export class BrowserWorkspaceManager {
       if (next !== undefined) this.#activate(next);
     }
     if (this.#tabs.size === 0) {
-      const returnToChat = this.#requestedVisible;
       if (this.#activeSessionId !== null) this.#sessionSnapshots.delete(this.#activeSessionId);
+      const wasOpen = this.#requestedVisible;
       this.setVisible(false);
-      if (returnToChat) this.#onNotice?.({ type: "workspace-closed" });
+      if (wasOpen) this.#onNotice?.({ type: "closed" });
     }
     this.#emitSoon();
     return this.getState();
@@ -419,7 +418,7 @@ export class BrowserWorkspaceManager {
         () => tab.view.webContents.stop(),
       );
     } catch (error: unknown) {
-      if (this.#tabs.has(tabId) && !isAbortedNavigationError(error)) throw error;
+      if (!isAbortedNavigationError(error)) throw error;
     }
     return this.#tabState(tab);
   }
@@ -1290,21 +1289,18 @@ export class BrowserWorkspaceManager {
   }
 
   #tabState(tab: TabRecord): BrowserTabState {
-    // An in-flight navigation can settle after closing detached its webContents.
-    const contents = tab.view.webContents;
-    const closed = contents === undefined || contents.isDestroyed();
-    if (!closed) this.#syncAudioState(tab);
-    const history = closed ? undefined : contents.navigationHistory;
+    this.#syncAudioState(tab);
+    const history = tab.view.webContents.navigationHistory;
     return {
       id: tab.id,
       title: tab.title,
       url: tab.url,
       faviconUrl: tab.faviconUrl,
-      loading: closed ? false : tab.loading,
-      canGoBack: history?.canGoBack() ?? false,
-      canGoForward: history?.canGoForward() ?? false,
+      loading: tab.loading,
+      canGoBack: history.canGoBack(),
+      canGoForward: history.canGoForward(),
       crashed: tab.crashed,
-      error: closed ? "The browser tab was closed." : tab.error,
+      error: tab.error,
       muted: tab.muted,
       audible: tab.audible,
     };

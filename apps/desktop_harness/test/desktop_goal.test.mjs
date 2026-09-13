@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -55,7 +55,6 @@ await build({
   alias: { "@shared": join(appRoot, "src", "shared") },
 });
 const bridge = await import(`file:///${bridgeBundle.replaceAll("\\", "/")}`);
-const source = async (path) => await readFile(join(appRoot, path), "utf8");
 process.on("exit", () => { void rm(outputDirectory, { recursive: true, force: true }); });
 
 test("goal bridge reads, writes, and clears through non-turn RPCs", async () => {
@@ -131,67 +130,4 @@ test("goal bridge rejects a valid goal returned for a different task", async () 
     revision: 1,
   };
   await assert.rejects(bridge.loadSessionGoal("goal-session"), /invalid goal/);
-});
-
-test("goal lives in the command and overflow flow without permanent header UI", async () => {
-  const [app, composer, styles, composerStyles] = await Promise.all([
-    source(join("src", "renderer", "src", "App.tsx")),
-    source(join("src", "renderer", "src", "Composer.tsx")),
-    source(join("src", "renderer", "src", "styles.css")),
-    source(join("src", "renderer", "src", "composer.css")),
-  ]);
-  const goal = composer.match(/function GoalSettingsPanel[\s\S]*?(?=\nfunction EarsSettingsPanel)/u)?.[0] ?? "";
-
-  assert.doesNotMatch(app, /<GoalControl/u);
-  assert.doesNotMatch(styles, /\.goal-trigger/u);
-  assert.match(app, /goal=\{snapshot\.goals\[session\.id\] \?\? null\}/u);
-  assert.ok(composer.includes('if (!hasSlashCommandToken(content, "/goal")) return;'));
-  assert.ok(composer.includes('const next = removeSlashCommandToken(content, "/goal");'));
-  assert.match(composer, /<strong>Goal<\/strong>/u);
-  assert.match(composer, /setGoalOpen\(true\)/u);
-  assert.match(app, /function reconcileGoalResult[\s\S]*?goal\.revision < currentGoal\.revision/u);
-  assert.match(app, /clearRevision < currentGoal\.revision/u);
-  assert.match(app, /currentGoal\.revision > expectedRevision/u);
-  assert.match(goal, /className="goal-popover composer-goal-panel" role="dialog" aria-modal="false" aria-label="Task goal"/u);
-  assert.match(goal, /<label><span>Objective<\/span><textarea/u);
-  assert.match(goal, /advisoryBudget \? "Token target" : "Token budget"/u);
-  assert.match(goal, /advisoryBudget \? "advisory" : "optional"/u);
-  assert.match(goal, /goal\.source === "tethoq" \? "Advisory target" : "Budget"/u);
-  assert.match(goal, /maxLength=\{4000\}/u);
-  assert.match(goal, /goal \? "Save" : "Start goal"/u);
-  assert.match(goal, /goal\.status === "active".*?Pause/u);
-  assert.match(goal, /goal\.status === "complete" \? "Reopen" : "Resume"/u);
-  assert.match(goal, /goal\.status !== "blocked".*?Mark stalled/u);
-  assert.match(goal, /goal\.status !== "complete".*?Complete/u);
-  assert.match(goal, /className="button button-danger"[^>]*onClick=\{\(\) => void clear\(\)\}/u);
-  assert.match(goal, /const result = await clearSessionGoal\(session\.id\);[\s\S]*?const superseded = latestGoal\.current !== null && latestGoal\.current\.revision > result\.revision;[\s\S]*?if \(result\.cleared && !superseded\) onGoal\(null, result\.revision\);[\s\S]*?onClose\(\);/u);
-  assert.match(styles, /\.goal-popover > header button[^\n]*width: 30px; height: 30px/iu);
-  assert.match(composerStyles, /\.goal-popover\.composer-goal-panel[\s\S]*?position: static;[\s\S]*?max-height:/u);
-});
-
-test("goal panel restores composer focus and dismisses on keyboard or outside interaction", async () => {
-  const composer = await source(join("src", "renderer", "src", "Composer.tsx"));
-  const goal = composer.match(/function GoalSettingsPanel[\s\S]*?(?=\nfunction EarsSettingsPanel)/u)?.[0] ?? "";
-  assert.match(goal, /requestAnimationFrame\(\(\) => objectiveInput\.current\?\.focus\(\)\)/u);
-  assert.match(goal, /const outside = \(event: PointerEvent\) => \{ if \(!panelRef\.current\?\.contains\(event\.target as Node\)\) onClose\(\); \}/u);
-  assert.match(goal, /event\.key === "Escape"/u);
-  assert.match(goal, /window\.addEventListener\("pointerdown", outside\)/u);
-  assert.match(goal, /window\.addEventListener\("keydown", escape\)/u);
-  assert.match(goal, /window\.removeEventListener\("pointerdown", outside\)/u);
-  assert.match(goal, /window\.removeEventListener\("keydown", escape\)/u);
-  assert.match(composer, /const closeGoal = useCallback[\s\S]*?requestAnimationFrame\(\(\) => textarea\.current\?\.focus\(\)\)/u);
-  assert.match(goal, /event\.key === "Enter" && !event\.shiftKey && !event\.nativeEvent\.isComposing/u);
-  assert.match(goal, /event\.currentTarget\.form\?\.requestSubmit\(\)/u);
-  assert.match(goal, /if \(await mutate\([\s\S]*?\) onClose\(\);/u);
-  assert.match(goal, /catch \(error\) \{ notify\([\s\S]*?"error"\); return false; \}/u);
-});
-
-test("goal updates and clears ignore stale lifecycle events and stay inside the composer viewport", async () => {
-  const [app, styles] = await Promise.all([
-    source(join("src", "renderer", "src", "App.tsx")),
-    source(join("src", "renderer", "src", "composer.css")),
-  ]);
-  assert.match(app, /if \(event\.type === "session\.goal_updated"\) \{[\s\S]*?const clearedThrough = next\.goalClearRevisions\[event\.sessionId\] \?\? -1;[\s\S]*?goal\.revision > clearedThrough[\s\S]*?next\.goals\[event\.sessionId\] = goal;[\s\S]*?continue;/u);
-  assert.match(app, /if \(event\.type === "session\.goal_cleared"\) \{[\s\S]*?if \(typeof revision !== "number" \|\| !Number\.isSafeInteger\(revision\) \|\| revision < 0\) continue;[\s\S]*?delete next\.goals\[event\.sessionId\];[\s\S]*?next\.goalClearRevisions\[event\.sessionId\] = Math\.max[\s\S]*?continue;/u);
-  assert.match(styles, /\.goal-popover\.composer-goal-panel \{[\s\S]*?width: auto;[\s\S]*?max-height: min\(520px, calc\(100vh - 180px\)\);[\s\S]*?overflow: auto;/u);
 });

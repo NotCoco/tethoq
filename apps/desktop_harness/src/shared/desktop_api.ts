@@ -43,6 +43,7 @@ export const IPC_CHANNELS = Object.freeze({
   copyText: "tethoq:copy-text",
   localOpenHandlers: "tethoq:local-open-handlers",
   openLocalTarget: "tethoq:open-local-target",
+  openExternalUrl: "tethoq:open-external-url",
   openDictationSetupPage: "tethoq:open-dictation-setup-page",
   openHarnessSetupPage: "tethoq:open-harness-setup-page",
   showWindow: "tethoq:show-window",
@@ -160,7 +161,7 @@ export interface OpenCodeProcessStatus {
   readonly pid?: number;
   readonly message?: string;
   /** Stable machine-readable cause used for safe supervision decisions. */
-  readonly reason?: "credentials_required" | "port_in_use";
+  readonly reason?: "credentials_required" | "port_in_use" | "unresponsive";
 }
 
 export interface DesktopEventBatch {
@@ -253,7 +254,7 @@ export interface BrowserWorkspaceState {
 export interface BrowserNotice {
   readonly tone: "info" | "error";
   readonly message: string;
-  readonly action?: "focus-address" | "return-to-chat";
+  readonly action?: "focus-address" | "return-to-task";
   readonly tabId?: string;
 }
 export type BrowserAction =
@@ -316,6 +317,8 @@ export interface DesktopPreferencesState {
   /** Explicitly saved project folders, most recently used first. */
   readonly savedProjectDirectories: readonly string[];
   readonly localOpenHandlerId: LocalOpenHandlerId;
+  /** Web links use the system browser unless the user explicitly opts in. */
+  readonly openLinksInApp: boolean;
   /** What the window close button does. Tray keeps active tasks and alerts alive. */
   readonly closeAction: DesktopCloseAction;
   /** Whether Windows starts Tethoq for the user, and whether it opens a window. */
@@ -359,6 +362,7 @@ export const MAX_TASK_OVERRIDES = 500;
 export const MAX_TASK_TITLE_CHARACTERS = 120;
 export type PreferencesAction =
   | { readonly type: "set-experimental-features"; readonly enabled: boolean }
+  | { readonly type: "set-open-links-in-app"; readonly enabled: boolean }
   | { readonly type: "set-reasoning-display"; readonly value: "compact" | "expanded" }
   | { readonly type: "set-task-list-mode"; readonly value: TaskListMode }
   | { readonly type: "save-project" | "use-project"; readonly directory: string }
@@ -510,6 +514,7 @@ export interface DesktopHarnessApi {
   copyText(text: string): Promise<boolean>;
   localOpenHandlers(): Promise<LocalOpenState>;
   openLocalTarget(target: LocalOpenTarget): Promise<LocalOpenResult>;
+  openExternalUrl(url: string): Promise<void>;
   openDictationSetupPage(sourceId: "openai-stt" | "xai-stt"): Promise<void>;
   openHarnessSetupPage(providerId: BuiltInDesktopProviderId): Promise<void>;
   showWindow(): Promise<void>;

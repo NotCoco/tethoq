@@ -66,19 +66,3 @@ test("queue delivery validation permits attachment-only submissions", () => {
   const record = delivery({ content: "", attachments: [{ name: "voice.mp3", mimeType: "audio/mpeg", byteLength: 42 }] });
   assert.deepEqual(validateQueueDeliveryState({ version: 1, deliveries: [record] }, "host-queue-store").deliveries, [record]);
 });
-
-test("queue delivery stores preserve goal ownership without changing legacy payload hashes", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "tethoq-goal-delivery-store-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const path = join(root, "queue-deliveries.json");
-  const legacy = delivery();
-  const owned = { ...legacy, goalActivationId: "persisted-goal-activation" };
-  assert.equal(queueDeliveryPayloadHash(owned), legacy.payloadHash);
-  const store = new QueueDeliveryStore(path, "host-queue-store");
-  await store.scheduleWrite([owned]);
-  await store.flush();
-  assert.deepEqual((await new QueueDeliveryStore(path, "host-queue-store").read()).deliveries, [owned]);
-  for (const goalActivationId of ["", "x".repeat(257), 1]) {
-    assert.throws(() => validateQueueDeliveryState({ version: 1, deliveries: [{ ...legacy, goalActivationId }] }), /goal activation ID is invalid/);
-  }
-});

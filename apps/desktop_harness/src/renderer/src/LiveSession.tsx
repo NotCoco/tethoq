@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { JsonObject } from "../../../../../packages/protocol/src/index";
+import { matchReasoningEffort, reasoningDisplayLabel, resolveModelReasoningProfile } from "../../../../../packages/protocol/src/reasoning";
 import type { LiveSessionState, UtteranceEvidence, VisionProxySelection, VisionProxyStatus, VisionProxyTarget } from "@shared/desktop_api";
 import { buildEyesQuestion, buildUtterancePrompt } from "@shared/live_session_prompt";
 import { isBrowserPreview, request } from "./bridge";
@@ -57,6 +58,7 @@ export function LiveSessionPanel({ session, experimental, notify, onClose }: {
   const [targets, setTargets] = useState<readonly VisionProxyTarget[]>([]);
   const [providerId, setProviderId] = useState("");
   const [modelId, setModelId] = useState("");
+  const [effort, setEffort] = useState("");
   const [utterances, setUtterances] = useState<readonly UtteranceRecord[]>([]);
   const [transcript, setTranscript] = useState("");
   const [eyesNote, setEyesNote] = useState("");
@@ -308,20 +310,25 @@ export function LiveSessionPanel({ session, experimental, notify, onClose }: {
     setPhase("idle");
   }, [notify, stopLocalAudio]);
 
+  const visionTarget = targets.find((item) => item.providerId === providerId) ?? targets[0];
+  const visionModel = visionTarget?.models.find((item) => item.id === modelId) ?? visionTarget?.models.find((item) => item.isDefault) ?? visionTarget?.models[0];
+  const visionReasoning = resolveModelReasoningProfile({ providerId: visionTarget?.providerId ?? "", modelId: visionModel?.id ?? "", advertised: visionModel?.nativeMetadata });
+  const visionEffort = matchReasoningEffort(effort, visionReasoning.efforts) ?? visionReasoning.defaultEffort ?? "";
   const configureEyes = useCallback(async () => {
     setError(null);
     try {
       const target = targets.find((item) => item.providerId === providerId) ?? targets[0];
       const model = target?.models.find((item) => item.id === modelId) ?? target?.models.find((item) => item.isDefault) ?? target?.models[0];
       if (target === undefined || model === undefined) throw new Error("Choose a vision model to continue.");
-      const selection: VisionProxySelection = { providerId: target.providerId, modelId: model.id };
+      if (visionReasoning.efforts.length && !visionEffort) throw new Error("Choose a reasoning level for EYES before saving.");
+      const selection: VisionProxySelection = { providerId: target.providerId, modelId: model.id, ...(visionEffort ? { reasoningEffort: visionEffort } : {}) };
       await request("session.vision.configure", { sessionId: sessionRef.current.id, selection: selection as unknown as JsonObject });
       setVision("eyes");
       notify("Vision model configured as eyes for this session.");
     } catch (failure) {
       notify(failure instanceof Error ? failure.message : String(failure), "error");
     }
-  }, [modelId, notify, providerId, targets]);
+  }, [modelId, notify, providerId, targets, visionEffort, visionReasoning.efforts.length]);
 
   const running = phase === "recording";
   const visionStatus = vision === "native" ? "Model sees the screen directly" : vision === "eyes" ? "Using the configured vision model as eyes" : vision === "configuring" ? "Choose a vision model as eyes" : "Checking vision support";
@@ -334,8 +341,9 @@ export function LiveSessionPanel({ session, experimental, notify, onClose }: {
       {vision === "configuring" ? <section className="live-session-eyes" aria-label="Choose a vision model">
         <header><span><strong>Choose a model as eyes</strong><small>The current model cannot see images, so each synchronized frame is described by a visual-support model.</small></span></header>
         <div className="vision-picker-fields">
-          <label><span>Provider</span><select aria-label="Vision provider" value={providerId} onChange={(event) => { setProviderId(event.target.value); setModelId(""); }}>{targets.map((item) => <option key={item.providerId} value={item.providerId}>{item.displayName}</option>)}</select></label>
-          <label><span>Model</span><select aria-label="Vision model" value={modelId} onChange={(event) => setModelId(event.target.value)}>{(targets.find((item) => item.providerId === providerId) ?? targets[0])?.models.map((item) => <option key={item.id} value={item.id}>{item.displayName}</option>)}</select></label>
+          <label><span>Provider</span><select aria-label="Vision provider" value={providerId} onChange={(event) => { setProviderId(event.target.value); setModelId(""); setEffort(""); }}>{targets.map((item) => <option key={item.providerId} value={item.providerId}>{item.displayName}</option>)}</select></label>
+          <label><span>Model</span><select aria-label="Vision model" value={visionModel?.id ?? ""} onChange={(event) => { setModelId(event.target.value); setEffort(""); }}>{visionTarget?.models.map((item) => <option key={item.id} value={item.id}>{item.displayName}</option>)}</select></label>
+          <label><span>Reasoning</span><select aria-label="Vision reasoning effort" value={visionEffort} disabled={!visionReasoning.efforts.length} onChange={(event) => setEffort(event.target.value)}><option value="">{visionReasoning.efforts.length ? "Choose effort" : "Not available"}</option>{visionReasoning.efforts.map((item) => <option key={item} value={item}>{reasoningDisplayLabel(item, { providerId, modelId: visionModel?.id })}</option>)}</select></label>
         </div>
         <div className="live-session-actions"><Button variant="primary" onClick={() => void configureEyes()}>Use this model as eyes</Button><Button onClick={onClose}>Cancel</Button></div>
       </section> : null}

@@ -30,8 +30,35 @@ await build({
   target: "node22",
   plugins: [inlineWorkerStubPlugin],
 });
-const { mergeAuthoritativeOpenedSession, mergeRefreshedSessions, sameSessionContext, scheduledTaskEventSchedule, scheduledTaskFailureCanRetractPresentation, scheduledTaskHasProviderEvidence, scheduledTaskPresentationState, scheduledTaskScheduleAfterProviderEvidence, withoutRetiredScheduledSessions } = await import(`file:///${bundle.replaceAll("\\", "/")}`);
+const { applyConfirmedInterruption, mergeAuthoritativeOpenedSession, mergeRefreshedSessions, sameSessionContext, scheduledTaskEventSchedule, scheduledTaskFailureCanRetractPresentation, scheduledTaskHasProviderEvidence, scheduledTaskPresentationState, scheduledTaskScheduleAfterProviderEvidence, withoutRetiredScheduledSessions } = await import(`file:///${bundle.replaceAll("\\", "/")}`);
 process.on("exit", () => { void rm(outputDirectory, { recursive: true, force: true }); });
+
+test("confirmed Stop settles the whole visible subtree immediately and preserves unrelated tasks", () => {
+  const sessions = [
+    { id: "parent", state: "working", providerStatus: { kind: "retry", message: "retrying" } },
+    { id: "child", state: "working", relationshipKind: "subagent", relationshipSourceSessionId: "parent" },
+    { id: "nested", state: "working", relationshipKind: "subagent", relationshipSourceSessionId: "child" },
+    { id: "branch", state: "working", relationshipKind: "branch", parentSessionId: "parent" },
+    { id: "unrelated", state: "working" },
+  ];
+  const row = { id: "reasoning", kind: "reasoning", body: "Working", state: "running" };
+  const snapshot = { sessions, timelines: { parent: [row, { id: "child-row", kind: "subagent", childSessionId: "child", state: "running" }], child: [row], nested: [row], branch: [row], unrelated: [row] } };
+  const stoppedAt = "2026-09-09T00:00:03.000Z";
+  const result = applyConfirmedInterruption(snapshot, "parent", stoppedAt);
+  for (const id of ["parent", "child", "nested"]) {
+    const session = result.sessions.find(session => session.id === id);
+    assert.equal(session.state, "idle");
+    assert.equal(session.interruptedAt, stoppedAt);
+    assert.equal(session.providerStatus, undefined);
+    assert.ok(result.timelines[id].every(row => row.state !== "running"));
+  }
+  assert.equal(result.timelines.parent[1].childInterruptedAt, stoppedAt);
+  assert.equal(result.sessions[3], sessions[3]);
+  assert.equal(result.sessions[4], sessions[4]);
+  assert.equal(result.timelines.unrelated, snapshot.timelines.unrelated);
+  assert.equal(snapshot.timelines.parent[0].state, "running", "snapshot mutation would corrupt other cached views");
+  assert.equal(mergeRefreshedSessions(result.sessions, sessions)[0].state, "idle", "an older catalogue must not restore the spinner");
+});
 
 const session = (overrides = {}) => ({
   id: "host/opencode/session-one",
@@ -222,7 +249,8 @@ test("a late started schedule acknowledgement never resurrects terminal provider
   assert.equal(scheduledTaskPresentationState(session({ state: "idle" }), [final], "started"), undefined);
   assert.equal(scheduledTaskPresentationState(session({ state: "needs_approval" }), [], "started"), undefined);
   assert.equal(scheduledTaskPresentationState(session({ state: "idle" }), [], "started"), "working");
-  assert.equal(scheduledTaskPresentationState(session({ state: "completed" }), [final], "dispatching"), "working");
+  assert.equal(scheduledTaskPresentationState(session({ state: "completed" }), [final], "dispatching"), undefined);
+  assert.equal(scheduledTaskPresentationState(session({ state: "idle" }), [], "dispatching"), "working");
   assert.equal(scheduledTaskPresentationState(session({ state: "idle" }), [], "failed"), "failed");
 });
 

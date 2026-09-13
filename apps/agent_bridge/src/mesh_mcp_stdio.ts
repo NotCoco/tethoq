@@ -1,17 +1,31 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { readFile } from "node:fs/promises";
 import { z } from "zod";
 import { isJsonObject, type JsonObject } from "../../../packages/protocol/src/index.js";
-import { callMeshToolGateway } from "./mesh_tools.js";
-
-const runtime = await runtimeConnection();
-const pipePath = runtime.pipePath;
-const token = runtime.token;
+import { callMeshToolRuntime, meshToolDefinitions } from "./mesh_tools.js";
 const boundParentSessionId = process.env.UAR_MESH_PARENT_SESSION_ID;
 const bindingId = process.env.UAR_MESH_BINDING_ID;
 const lifecycleOwner = process.env.UAR_MESH_CLIENT_TOOL_LIFECYCLE_OWNER === "provider" ? "provider" : "bridge";
 const server = new McpServer({ name: "uar-mesh", version: "0.1.0" });
+
+server.registerTool("tethoq_show_image", {
+  title: "Show image",
+  description: meshToolDefinitions.find(tool => tool.name === "tethoq_show_image")!.description,
+  inputSchema: {
+    path: z.string().min(1).max(32_768),
+    caption: z.string().max(2_000).optional(),
+    request_id: z.string().min(1).max(256),
+    parent_session_id: z.string().optional(),
+  },
+}, async ({ path, caption, request_id, parent_session_id }) => result(await call(parent_session_id, "tethoq_show_image", {
+  path, request_id, ...(caption !== undefined ? { caption } : {}),
+})));
+
+server.registerTool("tethoq_goal", {
+  title: "Update task goal",
+  description: meshToolDefinitions.find(tool => tool.name === "tethoq_goal")!.description,
+  inputSchema: { status: z.enum(["complete", "blocked"]).optional(), parent_session_id: z.string().optional() },
+}, async ({ status, parent_session_id }) => result(await call(parent_session_id, "tethoq_goal", status === undefined ? {} : { status })));
 
 server.registerTool("mesh_list_sessions", {
   title: "Find Tethoq tasks",
@@ -28,7 +42,7 @@ server.registerTool("mesh_list_sessions", {
 
 server.registerTool("mesh_message_session", {
   title: "Message Tethoq task",
-  description: "Send a message to another indexed Tethoq task. Steers active work when supported or waits for idle; queued user messages run first.",
+  description: "Send an isolated, queue-safe message to another indexed Tethoq task.",
   inputSchema: {
     target_session_id: z.string().min(1).max(16_384),
     message: z.string().min(1).max(32_000),
@@ -77,7 +91,7 @@ server.registerTool("mesh_wait", {
   description: "Wait until selected delegated children stop working, need attention, or the timeout expires.",
   inputSchema: {
     child_session_ids: z.array(z.string().min(1)).optional(),
-    timeout_seconds: z.number().int().min(1).max(900).optional(),
+    timeout_seconds: z.number().int().min(1).max(300).optional(),
     parent_session_id: z.string().optional(),
   },
 }, async ({ child_session_ids, timeout_seconds, parent_session_id }) => result(await call(parent_session_id, "mesh_wait", {
@@ -233,14 +247,14 @@ async function call(
   context?: { readonly callId?: string; readonly lifecycleOwner?: "bridge" | "provider" },
 ) {
   if (bindingId !== undefined && bindingId.length > 0) {
-    return await callMeshToolGateway(pipePath, token, undefined, tool, input, bindingId, context);
+    return await callMeshToolRuntime(process.env, undefined, tool, input, bindingId, context);
   }
   if (tool === "mesh_message_session" && boundParentSessionId === undefined) {
     throw new Error("Cross-task messaging requires a Tethoq session-bound tool connection");
   }
   const resolvedParent = boundParentSessionId ?? parentSessionId;
   if (resolvedParent === undefined || resolvedParent.length === 0) throw new Error("parent_session_id is required for this shared mesh tool server");
-  return await callMeshToolGateway(pipePath, token, resolvedParent, tool, input, undefined, context);
+  return await callMeshToolRuntime(process.env, resolvedParent, tool, input, undefined, context);
 }
 
 function result(value: unknown) {
@@ -248,24 +262,4 @@ function result(value: unknown) {
     content: [{ type: "text" as const, text: JSON.stringify(value) }],
     ...(isJsonObject(value) ? { structuredContent: value } : {}),
   };
-}
-
-function requiredEnvironment(name: string): string {
-  const value = process.env[name];
-  if (value === undefined || value.length === 0) throw new Error(`${name} is required`);
-  return value;
-}
-
-async function runtimeConnection(): Promise<{ readonly pipePath: string; readonly token: string }> {
-  const explicitPipe = process.env.UAR_MESH_PIPE;
-  const explicitToken = process.env.UAR_MESH_TOKEN;
-  if (explicitPipe !== undefined && explicitPipe.length > 0 && explicitToken !== undefined && explicitToken.length > 0) {
-    return { pipePath: explicitPipe, token: explicitToken };
-  }
-  const path = process.env.UAR_MESH_RUNTIME;
-  if (path !== undefined && path.length > 0) {
-    const parsed = JSON.parse(await readFile(path, "utf8")) as { readonly pipePath?: unknown; readonly token?: unknown };
-    if (typeof parsed.pipePath === "string" && typeof parsed.token === "string") return { pipePath: parsed.pipePath, token: parsed.token };
-  }
-  return { pipePath: requiredEnvironment("UAR_MESH_PIPE"), token: requiredEnvironment("UAR_MESH_TOKEN") };
 }

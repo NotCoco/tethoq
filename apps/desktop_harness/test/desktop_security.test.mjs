@@ -49,6 +49,7 @@ test("preload exposes a narrow frozen API without Node or raw IPC access", async
     "copyText",
     "localOpenHandlers",
     "openLocalTarget",
+    "openExternalUrl",
     "openDictationSetupPage",
     "openHarnessSetupPage",
     "showWindow",
@@ -124,13 +125,12 @@ test("screen-region capture stays in main and returns bounded renderer-safe prev
   assert.match(ipc, /assertTrustedSender\(event, window\)/);
 });
 
-test("provider requests stay in the main process and event replay is bounded", async () => {
+test("provider requests and event delivery stay in the main process", async () => {
   const runtime = await source("../src/main/runtime.ts");
 
   assert.match(runtime, /new BridgeRequestRouter\(bridge\)/);
-  assert.match(runtime, /const MAX_EVENT_BATCH\s*=\s*200/);
-  assert.match(runtime, /eventReplaySince\(this\.#latestSequence\)/);
-  assert.match(runtime, /replay\.events\.slice\(0,\s*MAX_EVENT_BATCH\)/);
+  // Batch bounds and replay ordering are exercised by desktop_event_delivery.
+  assert.match(runtime, /new DesktopEventDelivery\(sequence => bridge\.eventReplaySince\(sequence\), this\.#onEvents\)/);
   assert.match(runtime, /const ACTIVE_EVENT_POLL_MS\s*=\s*1_000/);
   assert.match(runtime, /const HIDDEN_EVENT_POLL_MS\s*=\s*1_000/);
   assert.match(runtime, /setWindowVisible\(visible: boolean\)[\s\S]*?scheduleEventPoll\(\)/);
@@ -203,6 +203,8 @@ test("IPC request routing is allowlisted and provider targets are validated", as
   assert.ok(allowed.includes("session.context_handoff"));
   assert.ok(allowed.includes("session.branch"));
   assert.ok(allowed.includes("session.image.get"));
+  assert.ok(allowed.includes("message_queue.draft"));
+  assert.ok(allowed.includes("message_queue.draft_attachment"));
   assert.ok(allowed.includes("session.goal.get"));
   assert.ok(allowed.includes("session.goal.set"));
   assert.ok(allowed.includes("session.goal.clear"));

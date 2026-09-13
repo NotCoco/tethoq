@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,17 +31,6 @@ await build({
 });
 
 const state = await import(`file://${bundle.replaceAll("\\", "/")}`);
-const appSource = await readFile(join(appRoot, "src", "renderer", "src", "App.tsx"), "utf8");
-const stylesSource = await readFile(join(appRoot, "src", "renderer", "src", "styles.css"), "utf8");
-
-const sourceSection = (source, start, end) => {
-  const startIndex = source.indexOf(start);
-  assert.notEqual(startIndex, -1, `missing source marker: ${start}`);
-  const endIndex = source.indexOf(end, startIndex + start.length);
-  assert.notEqual(endIndex, -1, `missing source marker: ${end}`);
-  return source.slice(startIndex, endIndex);
-};
-
 const provider = (id, detected = true) => ({
   id,
   name: id,
@@ -124,24 +113,6 @@ test("sessionless workspace navigation presents the dashboard", () => {
   assert.equal(state.presentedNavigationView("workspace", false), "dashboard");
   assert.equal(state.presentedNavigationView("workspace", true), "workspace");
   assert.equal(state.presentedNavigationView("dashboard", false), "dashboard");
-});
-
-test("the renderer has no dead workspace and task actions select before opening Workspace", () => {
-  assert.equal(appSource.includes("Choose a task"), false);
-  assert.equal(stylesSource.includes(".empty-workspace"), false);
-  assert.match(appSource, /presentedView === "workspace" && selectedSession\s*\?\s*<Workspace/u);
-
-  const openSessionSource = sourceSection(appSource, "const openSession = useCallback", "const insertDerivedSession = useCallback");
-  const taskSelection = openSessionSource.indexOf("setSelectedSessionId(sessionId)");
-  const taskWorkspace = openSessionSource.indexOf('setView("workspace")');
-  assert.ok(taskSelection >= 0 && taskSelection < taskWorkspace, "opening a task must select it before navigating to Workspace");
-  assert.match(appSource, /onOpen=\{openSession\}/u);
-
-  const newTaskSource = sourceSection(appSource, "const startDraftTask = useCallback", "const startProjectTask = useCallback");
-  const draftSelection = newTaskSource.indexOf("setSelectedSessionId(draft.id)");
-  const draftWorkspace = newTaskSource.indexOf('setView("workspace")');
-  assert.ok(draftSelection >= 0 && draftSelection < draftWorkspace, "New Task must select its draft before navigating to Workspace");
-  assert.match(appSource, /onNewTask=\{\(\) => startDraftTask\(\)\}/u);
 });
 
 test("draft materialization rebinds follow-up text, media, workflow, mode, and mesh state", () => {

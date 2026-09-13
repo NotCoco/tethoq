@@ -71,7 +71,6 @@ function dashboardPreviewSessions(): Session[] {
 }
 
 let previewOpenCodeSteerQueue: { readonly id: string; readonly sessionId: string; readonly content: string; readonly state: "queued"; readonly attachments: readonly [] } | null = null;
-let previewSubagentRequestCount = 0;
 let previewUserEchoBatch: ((batch: DesktopEventBatch) => void) | null = null;
 const previewGoals = new Map<string, SessionGoal>();
 const previewEyesApiKeys = new Set<string>();
@@ -293,7 +292,7 @@ export async function request(type: string, payload: JsonObject = {}, requestId?
       const parentSessionId = typeof payload.sessionId === "string" ? payload.sessionId : "desktop-harness";
       const parent = demoSnapshot.sessions.find((session) => session.id === parentSessionId) ?? demoSnapshot.sessions[0];
       const livePreviewState = location.hash === "#subagents"
-        ? (["idle", "working", "completed"] as const)[Math.min(previewSubagentRequestCount++, 2)]!
+        ? (document.body.dataset.qaSubagentState ?? "idle") as "idle" | "working" | "completed"
         : "working";
       const children: RemoteSession[] = parent ? [{
         id: "preview-subagent-layout",
@@ -850,14 +849,35 @@ async function retrieveUncachedHistoryImage(sessionId: string, retrievalId: stri
   throw new Error("Image requires too many chunks");
 }
 
-async function retrieveHistoryImage(sessionId: string, retrievalId: string): Promise<CachedHistoryImage> {
+function cachedHistoryImage(sessionId: string, retrievalId: string): CachedHistoryImage | undefined {
   const key = historyImageCacheKey(sessionId, retrievalId);
   const cached = historyImageCache.get(key);
   if (cached !== undefined) {
     historyImageCache.delete(key);
     historyImageCache.set(key, cached);
-    return cached;
   }
+  return cached;
+}
+
+/** Include ready previews in the first paint instead of briefly publishing placeholders. */
+function hydrateCachedHistoryImages(sessionId: string, messages: readonly RemoteMessage[]): RemoteMessage[] {
+  return messages.map(message => {
+    let changed = false;
+    const parts = message.parts.map(part => {
+      if (part.type !== "image" || part.uri !== undefined || part.retrievalId === undefined) return part;
+      const image = cachedHistoryImage(sessionId, part.retrievalId);
+      if (image === undefined) return part;
+      changed = true;
+      return { ...part, uri: image.uri, mimeType: part.mimeType ?? image.mimeType };
+    });
+    return changed ? { ...message, parts } : message;
+  });
+}
+
+async function retrieveHistoryImage(sessionId: string, retrievalId: string): Promise<CachedHistoryImage> {
+  const cached = cachedHistoryImage(sessionId, retrievalId);
+  if (cached !== undefined) return cached;
+  const key = historyImageCacheKey(sessionId, retrievalId);
   const existingLoad = historyImageLoads.get(key);
   if (existingLoad !== undefined) return await existingLoad;
   const load = retrieveUncachedHistoryImage(sessionId, retrievalId);
@@ -986,6 +1006,7 @@ function mapPart(message: RemoteMessage, part: ContentPart, index: number): Time
     : undefined;
   const base = {
     id: `${message.id}-${index}`,
+    ...(message.nativeMetadata.tethoqPresentedImage === true ? { presentationOnly: true } : {}),
     messageId: message.providerMessageId || message.id,
     ...(providerPartId ? { providerPartId } : {}),
     ...timelineUserRecordMetadata(message),
@@ -1039,10 +1060,17 @@ function mapPart(message: RemoteMessage, part: ContentPart, index: number): Time
     case "subagent":
       return { ...base, kind: "subagent", title: `${part.action} agent`, body: part.summary ?? part.prompt ?? "Delegated agent activity", detail: [part.modelId, part.reasoningEffort].filter(Boolean).join(" · "), state: part.status === "pending" || part.status === "unknown" ? "running" : part.status };
     case "error":
+      if (part.code === "MessageAbortedError" || part.code === "TURN_ABORTED") {
+        const turnId = string(message.nativeMetadata.parentID) || string(message.nativeMetadata.turnId) || base.messageId.replace(/^turn-aborted-/u, "");
+        return { ...base, id: `${message.sessionId}:interrupted:${turnId}`, messageId: turnId, turnId,
+          timestamp: message.completedAt ?? message.createdAt, kind: "assistant", notice: "interruption",
+          title: "Task interrupted", body: "Task interrupted", state: "completed" };
+      }
       return { ...base, kind: "error", title: part.code ?? "Agent error", body: part.message, state: "failed" };
     case "image": {
       const imageUrl = renderableImageUri(part.uri);
-      return { ...base, kind: message.role === "user" ? "user" : "assistant", body: "", images: [{ name: part.name ?? "Attached image", ...(part.mimeType ? { mimeType: part.mimeType } : {}), ...(imageUrl ? { dataUrl: imageUrl } : part.retrievalId ? { loading: true } : {}) }], state: message.status === "streaming" ? "running" : "completed" };
+      const phase = message.role === "assistant" ? timelineMessagePhase(message.nativeMetadata.phase) : undefined;
+      return { ...base, ...(phase ? { phase } : {}), kind: message.role === "user" ? "user" : "assistant", body: "", images: [{ name: part.name ?? "Attached image", ...(part.mimeType ? { mimeType: part.mimeType } : {}), ...(part.retrievalId ? { retrievalId: part.retrievalId } : {}), ...(imageUrl ? { dataUrl: imageUrl } : part.retrievalId ? { loading: true } : {}) }], state: message.status === "streaming" ? "running" : "completed" };
     }
     case "audio": {
       const audioUrl = renderableAudioUri(part.uri);
@@ -1543,7 +1571,7 @@ export async function loadSessionTimelinePage(sessionId: string, cursor?: string
   const openedSession = payload.session && typeof payload.session === "object" && !Array.isArray(payload.session)
     ? mapSession(payload.session as unknown as RemoteSession, true) ?? undefined
     : undefined;
-  const messages = remoteMessages(payload.messages);
+  const messages = hydrateCachedHistoryImages(sessionId, remoteMessages(payload.messages));
   const imageHydration = historyImagesNeedHydration(messages)
     ? hydrateHistoryImages(sessionId, messages).then((hydrated) => mapMessages(hydrated))
     : undefined;
@@ -1775,6 +1803,19 @@ export function delegationTimelineItems(value: unknown, fallbackTimestamp = new 
     if (!delegationId || !parentSessionId) return [];
     const taskState = string(task.state).trim();
     const timestamp = delegationCreatedAt(task.createdAt, fallbackTimestamp);
+    if (taskState === "failed" && !task.interruptedAt
+      && !array(task.children).some((child) => string(object(child).sessionId).trim())) {
+      const targets = array(task.targets).map((target) => {
+        const selection = object(target);
+        return string(selection.modelId).trim() || string(selection.providerId).trim();
+      }).filter(Boolean);
+      return [{
+        id: `${parentSessionId}:delegation:${delegationId}:failure`,
+        timestamp, kind: "tool", notice: "mesh_failure", state: "completed", delegationId,
+        title: "Mesh workers did not start",
+        body: `Mesh workers did not start${targets.length ? `: ${targets.join(", ")}` : ""}. ${string(task.error).trim() || "Send a new Mesh request to try again."}`,
+      }];
+    }
     return array(task.children).flatMap((childValue): TimelineItem[] => {
       const child = object(childValue);
       const childSessionId = string(child.sessionId).trim();
@@ -1829,19 +1870,6 @@ export function reconcileSubagentTimeline(parentSessionId: string, timeline: rea
 
 export function eventToTimeline(event: AgentEvent): TimelineItem | null {
   const sessionId = event.sessionId ?? "host";
-  if (event.type === "message.remote_received") {
-    const envelope = object(event.payload.envelope);
-    if (event.payload.state !== "delivered" || envelope.version !== 1 || envelope.targetSessionId !== sessionId) return null;
-    const origin = timelineOrigin({ kind: "cross_session", envelopeId: envelope.id, sourceSessionId: envelope.sourceSessionId, sourceTitle: envelope.sourceTitle });
-    if (!origin || typeof envelope.content !== "string" || !envelope.content.trim()) return null;
-    // Delivery already contains the verified body. Do not wait for a history
-    // reload (which can lose its race with a continuously streaming answer).
-    return {
-      id: `${sessionId}:remote:${envelope.id}`,
-      timestamp: event.occurredAt,
-      kind: "user", origin, body: envelope.content, state: "completed",
-    };
-  }
   if (event.type === "context.compaction_failed") {
     return { id: `${sessionId}:compaction:${event.eventId}`, timestamp: event.occurredAt, kind: "assistant", title: "System", body: "Compaction could not be completed. You can try again.", state: "completed" };
   }
@@ -1913,8 +1941,9 @@ export function eventToTimeline(event: AgentEvent): TimelineItem | null {
     return delegationTimelineItems([event.payload], event.occurredAt)[0] ?? null;
   }
   if (event.type === "agent.interrupted") {
-    const id = eventIdentity(event, "message");
-    return { id: `${sessionId}:interrupted:${id}`, messageId: id, timestamp: event.occurredAt, kind: "error", title: "Task interrupted", body: "Task interrupted", state: "failed" };
+    const id = string(event.payload.turnId) || eventIdentity(event, "message");
+    return { id: `${sessionId}:interrupted:${id}`, messageId: id, turnId: id, timestamp: event.occurredAt,
+      kind: "assistant", notice: "interruption", title: "Task interrupted", body: "Task interrupted", state: "completed" };
   }
   if (event.type === "agent.error") return { id: `${sessionId}:error:${event.eventId}`, timestamp: event.occurredAt, kind: "error", title: "Agent error", body: eventText(event, "Agent error"), state: "failed" };
   // ACP harnesses echo the prompt back as a user chunk on message.started. Without
@@ -1958,7 +1987,7 @@ export function eventToTimeline(event: AgentEvent): TimelineItem | null {
     // a second copy onto what is already shown.
     const streaming = event.type === "message.delta" && event.payload.replace !== true;
     const replacing = event.type === "message.delta" && event.payload.replace === true;
-    return { id: `${sessionId}:${kind}:${id}`, messageId: messageIdentity(event, id), ...(providerPartId ? { providerPartId } : {}), ...(kind === "user" ? eventUserRecordMetadata(event) : {}), timestamp: event.occurredAt, kind, ...(phase ? { phase } : {}), ...(origin ? { origin } : {}), ...(event.payload.compaction === true ? { title: "Compaction" } : kind === "reasoning" ? { title: "Reasoning" } : {}), body: responseAnnotations?.body ?? body, ...(images.length ? { images } : {}), ...(responseAnnotations ? { annotations: responseAnnotations.annotations } : {}), state: event.type === "message.delta" ? "running" : "completed", ...(streaming ? { streamDelta: true, sourceEventId: event.eventId } : replacing ? { streamDelta: false } : {}) };
+    return { id: `${sessionId}:${kind}:${id}`, messageId: messageIdentity(event, id), ...(providerPartId ? { providerPartId } : {}), ...(kind === "user" ? eventUserRecordMetadata(event) : {}), timestamp: event.occurredAt, kind, ...(phase ? { phase } : {}), ...(event.payload.tethoqPresentedImage === true ? { presentationOnly: true } : {}), ...(origin ? { origin } : {}), ...(event.payload.compaction === true ? { title: "Compaction" } : kind === "reasoning" ? { title: "Reasoning" } : {}), body: responseAnnotations?.body ?? body, ...(images.length ? { images } : {}), ...(responseAnnotations ? { annotations: responseAnnotations.annotations } : {}), state: event.type === "message.delta" ? "running" : "completed", ...(streaming ? { streamDelta: true, sourceEventId: event.eventId } : replacing ? { streamDelta: false } : {}) };
   }
   return null;
 }

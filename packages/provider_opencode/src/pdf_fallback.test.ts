@@ -85,11 +85,16 @@ async function sendPdfWithCapability(pdfCapability: boolean | undefined): Promis
   const fetchLike: FetchLike = async (input, init) => {
     const url = requestUrl(input);
     if (url.pathname === "/provider") return providerResponse(pdfCapability);
+    if (url.pathname.startsWith("/session/pdf-fallback/message/")) {
+      assert.ok(requestBody);
+      return jsonResponse({ info: { id: requestBody.messageID, sessionID: "pdf-fallback", role: "user" }, parts: requestBody.parts });
+    }
     assert.equal(url.pathname, "/session/pdf-fallback/prompt_async");
     requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
     return new Response(null, { status: 204 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_pdf_fallback",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -153,13 +158,22 @@ test("malformed, encrypted, and textless PDF fallbacks fail before prompt_async 
   for (const failure of cases) {
     await t.test(failure.name, async () => {
       let promptWrites = 0;
-      const fetchLike: FetchLike = async (input) => {
+      let storedPrompt: Record<string, unknown> | undefined;
+      const fetchLike: FetchLike = async (input, init) => {
         const url = requestUrl(input);
         if (url.pathname === "/provider") return providerResponse(false);
-        if (url.pathname.endsWith("/prompt_async")) promptWrites += 1;
+        if (url.pathname.endsWith("/prompt_async")) {
+          promptWrites += 1;
+          storedPrompt = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        }
+        if (url.pathname.startsWith("/session/pdf-failure/message/")) {
+          assert.ok(storedPrompt);
+          return jsonResponse({ info: { id: storedPrompt.messageID, sessionID: "pdf-failure", role: "user" }, parts: storedPrompt.parts });
+        }
         return new Response(null, { status: 204 });
       };
       const adapter = new OpenCodeAdapter({
+        directory: "C:/fixture",
         hostId: "host_pdf_failure",
         baseUrl: "http://127.0.0.1:4096/",
         fetch: fetchLike,
