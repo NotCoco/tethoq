@@ -137,8 +137,7 @@ void main() {
         find.ancestor(of: page, matching: tickerModes).first);
 
     expect(tickerFor(find.byType(DashboardScreen)).enabled, isTrue);
-    expect(tickerFor(find.byType(SessionsScreen, skipOffstage: false)).enabled,
-        isFalse);
+    expect(find.byType(SessionsScreen, skipOffstage: false), findsNothing);
 
     tester
         .widget<NavigationBar>(find.byType(NavigationBar))
@@ -148,6 +147,13 @@ void main() {
     expect(tickerFor(find.byType(DashboardScreen, skipOffstage: false)).enabled,
         isFalse);
     expect(tickerFor(find.byType(SessionsScreen)).enabled, isTrue);
+
+    tester
+        .widget<NavigationBar>(find.byType(NavigationBar))
+        .onDestinationSelected!(0);
+    await tester.pump();
+    expect(tickerFor(find.byType(SessionsScreen, skipOffstage: false)).enabled,
+        isFalse);
   });
 
   testWidgets('tablet layout uses a rail and keeps dashboard content bounded',
@@ -3914,13 +3920,27 @@ const aVeryLongIdentifierForHorizontalScrolling = 'safe';
     expect(tester.widget<ListTile>(google).selected, isFalse);
     await tester.tap(google);
     await tester.pumpAndSettle();
+    final reasoning = find.descendant(of: find.byKey(const Key('vision-api-reasoning')),
+        matching: find.byType(DropdownButton<String>));
+    expect(tester.widget<DropdownButton<String>>(reasoning).value, isNull);
+    tester.widget<DropdownButton<String>>(reasoning).onChanged!('high');
+    await tester.pumpAndSettle();
     await apply();
     expect(store.configured?.modelId, 'google::vision-test');
+    expect(store.configured?.reasoningEffort, 'high');
+    await reopen();
+    expect(tester.widget<DropdownButton<String>>(reasoning).value, 'high');
+    tester.widget<DropdownButton<String>>(reasoning).onChanged!('xhigh');
+    await tester.pumpAndSettle();
+    await apply();
+    expect(store.configured?.reasoningEffort, 'xhigh');
     await reopen();
     store.fail = true;
     await tester.ensureVisible(xai);
     await tester.pumpAndSettle();
     await tester.tap(xai);
+    await tester.pumpAndSettle();
+    tester.widget<DropdownButton<String>>(reasoning).onChanged!('high');
     await tester.pumpAndSettle();
     expect(store.configured?.modelId, 'google::vision-test');
     expect(tester.widget<ListTile>(xai).selected, isTrue);
@@ -4508,7 +4528,7 @@ class _ApiToggleVisionDemoStore extends _VisionProxyDemoStore {
         RemoteModel(id: '$endpoint::vision-test', providerId: 'direct',
           displayName: '$endpoint vision', isDefault: true,
           inputModalities: const ['text', 'image'],
-          nativeMetadata: const {'walletKind': 'user_api', 'apiKeyConfigured': true, 'apiKeyVerified': true}),
+          nativeMetadata: const {'walletKind': 'user_api', 'apiKeyConfigured': true, 'apiKeyVerified': true, 'reasoningEfforts': ['minimal', 'high', 'xhigh']}),
     ]),
   ];
 

@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
@@ -12,7 +12,7 @@ import {
   type SessionMcpBinding,
   type SessionMcpServer,
 } from "../../../packages/provider_contract/src/index.js";
-import { isJsonObject, makeGlobalSessionId, type JsonObject, type JsonValue } from "../../../packages/protocol/src/index.js";
+import { isJsonObject, makeGlobalSessionId, parseGlobalSessionId, type JsonObject, type JsonValue } from "../../../packages/protocol/src/index.js";
 
 export type MeshToolExecutor = (
   parentSessionId: string,
@@ -39,8 +39,22 @@ interface GatewayResponse {
 
 export const meshToolDefinitions: readonly ClientToolDefinition[] = [
   {
+    name: "tethoq_show_image",
+    description: "Display an existing local image directly to the user, inline in this task. Use when showing screenshots, renders, charts, or other images instead of sending a file link. Saves a copy in the task history. Does not generate or inspect images and works without model vision support. Supports PNG, JPEG, GIF, and WebP up to 25 MB. On success the user sees the image; do not send it again as a link.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", minLength: 1, maxLength: 32_768, description: "Absolute local path to an existing image file." },
+        caption: { type: "string", maxLength: 2_000, description: "Optional short caption shown with the image." },
+        request_id: { type: "string", minLength: 1, maxLength: 256, description: "A unique ID for this presentation. Reuse it only when retrying the same path and caption." },
+      },
+      required: ["path", "request_id"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "tethoq_goal",
-    description: "Read this task's Tethoq goal, or stop its automatic prompts by marking it complete after verifying the objective or blocked when progress requires user input or an external change. Call this before your final response when done or blocked; saying so in prose does not update the goal. Blocking does not claim success. Use only for the goal in private Tethoq instructions; never create or reopen a goal.",
+    description: "Read this task's Tethoq goal, or mark it complete only after verifying the full objective. Mark blocked only when the same genuine blocker has repeated for at least three consecutive goal turns and no meaningful progress is possible without user input or an external change. A resumed blocked goal starts a fresh three-turn audit. Hard, slow, uncertain, or incomplete work is not blocked. Call this before your final response when done or blocked; saying so in prose does not update the goal. Blocking stops automatic prompts without claiming success. Use only for the goal in private Tethoq instructions; never create or reopen a goal.",
     inputSchema: {
       type: "object",
       properties: { status: { type: "string", enum: ["complete", "blocked"] } },
@@ -61,7 +75,7 @@ export const meshToolDefinitions: readonly ClientToolDefinition[] = [
   },
   {
     name: "mesh_message_session",
-    description: "Send a message to another indexed Tethoq task through its separate inbox. Active tasks receive it through native steering when supported; otherwise it waits for idle. Queued user messages always run first.",
+    description: "Send a message to another indexed Tethoq task through its separate inbox. It never steers active work or changes that task's user-authored queue; queued user messages always run first.",
     inputSchema: {
       type: "object",
       properties: {
@@ -79,7 +93,7 @@ export const meshToolDefinitions: readonly ClientToolDefinition[] = [
     inputSchema: {
       type: "object",
       properties: {
-        delegation_id: { type: "string", maxLength: 256, description: "Copy the exact delegation_id from this turn's private Mesh guidance. It identifies an existing prepared delegation; never invent a new ID." },
+        delegation_id: { type: "string", maxLength: 256, description: "Omit to use the current prepared Mesh selection. Supply the exact ID from this turn's private guidance only to disambiguate pending selections or retry a specific dispatch. Never copy an ID from earlier tool history." },
         assignments: {
           type: "array",
           minItems: 1,
@@ -95,7 +109,7 @@ export const meshToolDefinitions: readonly ClientToolDefinition[] = [
           },
         },
       },
-      required: ["delegation_id", "assignments"],
+      required: ["assignments"],
       additionalProperties: false,
     },
   },
@@ -124,7 +138,7 @@ export const meshToolDefinitions: readonly ClientToolDefinition[] = [
       type: "object",
       properties: {
         child_session_ids: { type: "array", items: { type: "string" }, description: "Copy child_session_ids from mesh_dispatch_delegation, or childSessionId from mesh_list_children. Omit to wait for all children." },
-        timeout_seconds: { type: "integer", minimum: 1, maximum: 900, default: 120 },
+        timeout_seconds: { type: "integer", minimum: 1, maximum: 300, default: 120 },
       },
       additionalProperties: false,
     },
@@ -262,6 +276,9 @@ export class MeshToolGateway implements ProviderClientTooling {
   readonly #sessionBindings = new Map<string, { readonly providerId: string; providerSessionId?: string }>();
   #server: Server | null = null;
   readonly #sockets = new Set<Socket>();
+  #runtimeDescriptor = "";
+  #descriptorTimer: ReturnType<typeof setInterval> | undefined;
+  #descriptorWrite: Promise<void> | undefined;
 
   public constructor(hostId: string, execute: MeshToolExecutor, options: { readonly runtimePath?: string; readonly definitions?: readonly ClientToolDefinition[]; readonly mcpScript?: string } = {}) {
     this.#hostId = hostId;
@@ -284,7 +301,7 @@ export class MeshToolGateway implements ProviderClientTooling {
         server.off("error", reject);
         resolve();
       });
-    });
+    }).catch(error => { if (this.#server === server) this.#server = null; throw error; });
     await mkdir(dirname(this.#runtimePath), { recursive: true });
     // A previous bridge on this host may have leaked descriptors that will
     // otherwise be walked before this live runtime on every provider tool call.
@@ -298,19 +315,52 @@ export class MeshToolGateway implements ProviderClientTooling {
     // this runtime started may still call its legacy wire name until they
     // naturally reload. Keep that alias private to runtime discovery.
     if (tools.includes("tethoq_turn_support")) tools.push("ask_eyes");
-    await writeFile(this.#runtimePath, JSON.stringify({
+    this.#runtimeDescriptor = JSON.stringify({
       hostId: this.#hostId,
       pipePath: this.#pipePath,
       pid: process.pid,
       token: this.#token,
       tools,
       startedAt: new Date().toISOString(),
-    }), { encoding: "utf8", mode: 0o600 });
+    });
+    await this.publishDescriptor(server);
+    if (this.#server !== server) return;
+    this.#descriptorTimer = setInterval(() => {
+      // Older provider plugins can mistake a slow reply for a dead runtime and
+      // unlink its descriptor. A live listener repairs only its missing file.
+      void this.publishDescriptor(server, true).catch(() => undefined);
+    }, 2_000);
+    this.#descriptorTimer.unref();
+  }
+
+  private publishDescriptor(server: Server, missingOnly = false): Promise<void> {
+    if (this.#descriptorWrite !== undefined) return this.#descriptorWrite;
+    const pending = (async () => {
+      if (this.#server !== server) return;
+      if (missingOnly) {
+        try { await readFile(this.#runtimePath, "utf8"); return; }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      }
+      const temporary = `${this.#runtimePath}.${randomBytes(6).toString("hex")}.tmp`;
+      try {
+        await writeFile(temporary, this.#runtimeDescriptor, { encoding: "utf8", mode: 0o600 });
+        if (this.#server === server) {
+          if (missingOnly) await link(temporary, this.#runtimePath).catch(error => { if (error.code !== "EEXIST") throw error; });
+          else await rename(temporary, this.#runtimePath);
+        }
+      } finally { await unlink(temporary).catch(() => undefined); }
+    })();
+    this.#descriptorWrite = pending;
+    void pending.finally(() => { if (this.#descriptorWrite === pending) this.#descriptorWrite = undefined; }).catch(() => undefined);
+    return pending;
   }
 
   public async close(): Promise<void> {
     const server = this.#server;
     this.#server = null;
+    clearInterval(this.#descriptorTimer);
+    this.#descriptorTimer = undefined;
+    await this.#descriptorWrite?.catch(() => undefined);
     this.#sessionBindings.clear();
     if (server === null) return;
     for (const socket of this.#sockets) socket.destroy();
@@ -418,11 +468,17 @@ export class MeshToolGateway implements ProviderClientTooling {
     socket.once("close", release);
     socket.once("error", release);
     let buffer = "";
+    let received = false;
     socket.setEncoding("utf8");
+    socket.setTimeout(10_000, () => socket.destroy());
     socket.on("data", (chunk) => {
+      if (received) return;
       buffer += chunk;
+      if (buffer.length > 2 * 1024 * 1024) { socket.destroy(); return; }
       const newline = buffer.indexOf("\n");
       if (newline < 0) return;
+      received = true;
+      socket.setTimeout(0);
       const line = buffer.slice(0, newline);
       buffer = "";
       void this.respond(socket, line);
@@ -433,6 +489,9 @@ export class MeshToolGateway implements ProviderClientTooling {
     let response: GatewayResponse;
     let heartbeat: ReturnType<typeof setInterval> | undefined;
     const stopHeartbeat = () => clearInterval(heartbeat);
+    const controller = new AbortController();
+    const disconnected = () => controller.abort(new Error("The tool caller disconnected"));
+    socket.once("close", disconnected);
     try {
       const request = parseGatewayRequest(line);
       if (request.token !== this.#token) throw new Error("Mesh tool authentication failed");
@@ -447,7 +506,8 @@ export class MeshToolGateway implements ProviderClientTooling {
       }, 500);
       heartbeat.unref();
       socket.once("close", stopHeartbeat);
-      const result = await this.#execute(parentSessionId, request.tool, request.input, request.context);
+      const result = await this.#execute(parentSessionId, request.tool, request.input,
+        request.tool === "mesh_wait" ? { ...request.context, signal: controller.signal } : request.context);
       response = { ok: true, result };
     } catch (error) {
       const code = gatewayErrorCode(error);
@@ -459,6 +519,7 @@ export class MeshToolGateway implements ProviderClientTooling {
     } finally {
       stopHeartbeat();
       socket.off("close", stopHeartbeat);
+      socket.off("close", disconnected);
     }
     if (!socket.destroyed) socket.end(`${JSON.stringify(response)}\n`);
   }
@@ -483,13 +544,35 @@ export async function callMeshToolGateway(
   return await new Promise<JsonValue>((resolve, reject) => {
     const socket = createConnection(pipePath);
     let buffer = "";
+    let settled = false;
+    let sent = false;
+    const finish = (error?: Error, value?: JsonValue) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      socket.setTimeout(0);
+      socket.destroy();
+      if (error) reject(error); else resolve(value ?? null);
+    };
+    const transportFailure = () => {
+      const error = new Error(sent
+        ? "Tethoq lost the tool connection before its result arrived. Check the task state before repeating an action."
+        : "The Tethoq tool runtime is reconnecting. Try again shortly.") as Error & { code: string };
+      error.code = sent ? "TOOL_DELIVERY_UNKNOWN" : "RUNTIME_UNAVAILABLE";
+      finish(error);
+    };
+    const waitSeconds = tool === "mesh_wait" && typeof input.timeout_seconds === "number" ? Math.min(300, Math.max(1, input.timeout_seconds)) : 300;
+    const deadline = setTimeout(transportFailure, (waitSeconds + 30) * 1_000);
     socket.setEncoding("utf8");
-    socket.once("error", reject);
+    socket.setTimeout(30_000, transportFailure);
+    socket.once("error", transportFailure);
+    socket.once("end", () => { if (!settled) transportFailure(); });
+    socket.once("close", () => { if (!settled) transportFailure(); });
     socket.on("data", (chunk) => {
       buffer += chunk;
+      if (buffer.length > 16 * 1024 * 1024) { finish(new Error("Tethoq tool response is too large")); return; }
       const newline = buffer.indexOf("\n");
       if (newline < 0) return;
-      socket.destroy();
       try {
         const parsed = JSON.parse(buffer.slice(0, newline)) as GatewayResponse;
         if (!parsed.ok) {
@@ -498,20 +581,73 @@ export async function callMeshToolGateway(
           if (code !== undefined) error.code = code;
           throw error;
         }
-        resolve(parsed.result ?? null);
+        finish(undefined, parsed.result ?? null);
       } catch (error) {
-        reject(error);
+        finish(error instanceof Error ? error : new Error(String(error)));
       }
     });
-    socket.once("connect", () => socket.write(`${JSON.stringify({
+    socket.once("connect", () => { sent = true; socket.write(`${JSON.stringify({
       token,
       ...(parentSessionId !== undefined ? { parentSessionId } : {}),
       ...(bindingId !== undefined ? { bindingId } : {}),
       tool,
       input,
-      ...(context !== undefined ? { context } : {}),
-    })}\n`));
+      ...(context !== undefined ? { context: { callId: context.callId, lifecycleOwner: context.lifecycleOwner } } : {}),
+    })}\n`); });
   });
+}
+
+/** Resolve a replacement listener per call; an MCP process can outlive the app. */
+export async function callMeshToolRuntime(
+  environment: Readonly<Record<string, string | undefined>>,
+  parentSessionId: string | undefined,
+  tool: string,
+  input: JsonObject,
+  bindingId?: string,
+  context?: ClientToolExecutionContext,
+): Promise<JsonValue> {
+  const hostId = parentSessionId === undefined ? undefined : parseGlobalSessionId(parentSessionId).hostId;
+  const configured = environment.UAR_MESH_RUNTIME;
+  const candidates: { pipePath: string; token: string; startedAt: string }[] = [];
+  const paths = new Set(configured ? [configured] : []);
+  if (hostId !== undefined && bindingId === undefined) {
+    for (const directory of new Set([meshRuntimeDirectory(), ...(configured ? [dirname(configured)] : [])])) {
+      for (const name of await readdir(directory).catch(() => [] as string[])) {
+        if (name.endsWith(".json")) paths.add(join(directory, name));
+      }
+    }
+  }
+  for (const path of paths) {
+    try {
+      const value: unknown = JSON.parse(await readFile(path, "utf8"));
+      if (!isJsonObject(value) || typeof value.pipePath !== "string" || typeof value.token !== "string") continue;
+      if (hostId !== undefined && value.hostId !== hostId) continue;
+      // An opaque creation binding belongs to its original listener. Never
+      // guess a different parent after that listener has been replaced.
+      if (bindingId !== undefined && environment.UAR_MESH_TOKEN !== value.token) continue;
+      candidates.push({ pipePath: value.pipePath, token: value.token, startedAt: typeof value.startedAt === "string" ? value.startedAt : "" });
+    } catch { /* An atomic runtime replacement can briefly remove an old file. */ }
+  }
+  candidates.sort((left, right) => right.startedAt.localeCompare(left.startedAt));
+  if (environment.UAR_MESH_PIPE && environment.UAR_MESH_TOKEN) {
+    candidates.push({ pipePath: environment.UAR_MESH_PIPE, token: environment.UAR_MESH_TOKEN, startedAt: "" });
+  }
+  const seen = new Set<string>();
+  const repeatable = ["mesh_list_children", "mesh_list_sessions", "mesh_wait", "mesh_read_result", "browser_get_state", "browser_inspect", "browser_inspect_all"].includes(tool)
+    || tool === "tethoq_goal" && input.status === undefined;
+  let lastError: unknown;
+  for (const candidate of candidates) {
+    const key = JSON.stringify([candidate.pipePath, candidate.token]);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    try { return await callMeshToolGateway(candidate.pipePath, candidate.token, parentSessionId, tool, input, bindingId, context); }
+    catch (error) {
+      const code = (error as { code?: string }).code;
+      if (code !== "RUNTIME_UNAVAILABLE" && code !== "TASK_NOT_OWNED_HERE" && !(repeatable && code === "TOOL_DELIVERY_UNKNOWN")) throw error;
+      lastError = error;
+    }
+  }
+  throw lastError ?? new Error("The Tethoq tool runtime is reconnecting. Try again shortly.");
 }
 
 function safeGatewayErrorCode(value: unknown): string | undefined {

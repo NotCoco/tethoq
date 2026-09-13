@@ -1,4 +1,4 @@
-import { lstat, readFile, stat } from "node:fs/promises";
+import { lstat, readFile } from "node:fs/promises";
 import { basename, extname, isAbsolute, normalize, resolve } from "node:path";
 import {
   app,
@@ -12,6 +12,7 @@ import {
   type IpcMainInvokeEvent,
 } from "electron";
 import type { JsonObject } from "../../../../packages/protocol/src/index.js";
+import { maxMessageAttachments } from "../../../../packages/protocol/src/attachments.js";
 import {
   DESKTOP_PROVIDERS,
   IPC_CHANNELS,
@@ -44,10 +45,7 @@ import type { DesktopPreferencesStore } from "./preferences.js";
 import type { LiveSessionManager } from "./live_session/manager.js";
 import { detectLocalOpenHandlers, existingLocalTarget, openExistingLocalTarget, publicLocalOpenHandlers } from "./local_open.js";
 
-const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
-const MAX_SELECTED_IMAGES = 4;
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
-const MAX_SELECTED_FILES = 4;
 const MAX_SELECTED_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_CAPTURE_EDGE = 4_096;
 /** A whole long answer copies comfortably; an unbounded renderer string does not. */
@@ -104,6 +102,8 @@ const ALLOWED_REQUESTS = new Set([
   "session.edit_message",
   "session.interrupt",
   "message_queue.list",
+  "message_queue.draft",
+  "message_queue.draft_attachment",
   "message_queue.enqueue",
   "message_queue.edit",
   "message_queue.deliver",
@@ -256,7 +256,7 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
       filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "gif"] }],
     });
     if (result.canceled) return [];
-    return await Promise.all(result.filePaths.slice(0, MAX_SELECTED_IMAGES).map(readSelectedImage));
+    return await readSelectedImages(result.filePaths);
   });
   handle(IPC_CHANNELS.selectFiles, async (_event, value: unknown) => {
     const providerId = nonEmptyString(record(value, "file attachment options").providerId, "provider ID", 160);
@@ -299,6 +299,11 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
     await openExistingLocalTarget(target, handler, { shell });
     if (input.rememberAsDefault === true) await options.preferences.setLocalOpenHandler(handler.id);
     return { opened: true as const, handlerId: handler.id, state: await localOpenState() };
+  });
+  handle(IPC_CHANNELS.openExternalUrl, async (_event, value: unknown) => {
+    const url = new URL(nonEmptyString(value, "web link", 8_192));
+    if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error("Only http and https links can be opened in the system browser");
+    await shell.openExternal(url.href);
   });
   handle(IPC_CHANNELS.openDictationSetupPage, async (_event, value: unknown) => {
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Dictation source is invalid");
@@ -383,6 +388,7 @@ export function registerDesktopIpc(options: RegisterDesktopIpcOptions): () => vo
     const action = validatePreferencesAction(value);
     switch (action.type) {
       case "set-experimental-features": return await options.preferences.setExperimentalFeatures(action.enabled);
+      case "set-open-links-in-app": return await options.preferences.setOpenLinksInApp(action.enabled);
       case "set-reasoning-display": return await options.preferences.setReasoningDisplay(action.value);
       case "set-task-list-mode": return await options.preferences.setTaskListMode(action.value);
       case "save-project": return await options.preferences.saveProject(action.directory);
@@ -510,6 +516,10 @@ function validateRecorderAction(value: unknown): RecorderAction {
 
 function validatePreferencesAction(value: unknown): PreferencesAction {
   const input = record(value, "preferences action");
+  if (input.type === "set-open-links-in-app") {
+    if (typeof input.enabled !== "boolean") throw new Error("The in-app links setting must be true or false");
+    return { type: "set-open-links-in-app", enabled: input.enabled };
+  }
   if (input.type === "set-experimental-features") {
     if (typeof input.enabled !== "boolean") throw new Error("The experimental features setting must be true or false");
     return { type: "set-experimental-features", enabled: input.enabled };
@@ -676,16 +686,14 @@ function safeAbsolutePath(value: unknown): string {
   return normalize(resolve(path));
 }
 
-async function readSelectedImage(path: string): Promise<SelectedImage> {
-  const file = await stat(path);
-  if (!file.isFile() || file.size <= 0 || file.size > MAX_IMAGE_BYTES) throw new Error("Selected image must be between 1 byte and 25 MiB");
-  const mimeType = imageMimeType(extname(path));
-  const data = await readFile(path);
-  return { name: basename(path), path, mimeType, byteLength: data.byteLength, dataBase64: data.toString("base64") };
+async function readSelectedImages(paths: readonly string[]): Promise<readonly SelectedImage[]> {
+  for (const path of paths) imageMimeType(extname(path));
+  const files = await readSelectedFiles(paths);
+  return files.map(({ kind, ...image }) => image);
 }
 
 async function readSelectedFiles(paths: readonly string[]): Promise<readonly SelectedFile[]> {
-  if (paths.length > MAX_SELECTED_FILES) throw new Error("Choose up to four files at a time");
+  if (paths.length > maxMessageAttachments) throw new Error(`Choose up to ${maxMessageAttachments} files at a time`);
   const selected: Array<{ path: string; byteLength: number }> = [];
   let totalBytes = 0;
   for (const value of paths) {

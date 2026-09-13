@@ -10,3 +10,4 @@ export * from "./relay_attach.js";
 export * from "./simplify.js";
 export * from "./ears.js";
 export * from "./reasoning.js";
+export * from "./mesh.js";

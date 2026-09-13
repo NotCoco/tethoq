@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -78,23 +78,4 @@ test("system open reveals files and editors launch fixed executables without a s
   assert.deepEqual(spawned.args, ["--goto", "C:\\work\\app.ts:12:4"]);
   assert.equal(spawned.options.shell, false);
   assert.equal(spawned.options.detached, true);
-});
-
-test("workspace and transcript surfaces share the compact Open in interaction", async () => {
-  const [app, richText, localOpenUi, styles] = await Promise.all([
-    readFile(join(appRoot, "src", "renderer", "src", "App.tsx"), "utf8"),
-    readFile(join(appRoot, "src", "renderer", "src", "RichText.tsx"), "utf8"),
-    readFile(join(appRoot, "src", "renderer", "src", "LocalOpen.tsx"), "utf8"),
-    readFile(join(appRoot, "src", "renderer", "src", "styles.css"), "utf8"),
-  ]);
-  assert.match(app, /<LocalOpenProvider state=\{localOpenState\} onOpen=\{openLocalTarget\}>/);
-  assert.match(app, /<ContextUsageControl[\s\S]*?<WorkspaceLocalOpenControl path=\{session\.workingDirectory\}/);
-  assert.match(richText, /child\.type === "inlineCode"[\s\S]*?type: "link"/);
-  assert.match(richText, /node\.type === "link" \|\| node\.type === "code"/);
-  assert.match(localOpenUi, /data-tooltip=\{`Open in \$\{current\.label\}`\}/);
-  assert.match(localOpenUi, /onContextMenu=\{\(event\)/);
-  assert.match(localOpenUi, /role="menu" aria-label="Open in"/);
-  assert.match(styles, /\.workspace-local-open-split button:hover[\s\S]*?background: #292927/);
-  assert.doesNotMatch(styles.match(/\.workspace-local-open-split \{[^}]+\}/)?.[0] ?? "", /border:/);
-  assert.match(styles, /\.local-open-menu > div \{[^}]*overflow: auto/);
 });

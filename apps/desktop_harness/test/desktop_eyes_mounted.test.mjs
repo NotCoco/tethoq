@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -34,15 +34,20 @@ function runElectron(mainPath, htmlPath) {
     });
     let stdout = "";
     let stderr = "";
+    let timeoutError;
     const timeout = setTimeout(() => {
-      child.kill();
-      reject(new Error(`Mounted EYES QA timed out.\n${stderr}`));
+      timeoutError = new Error(`Mounted EYES QA timed out.\n${stderr}\n${stdout}`);
+      // Wait for this test's process tree to close before deleting its profile.
+      if (process.platform === "win32" && child.pid) {
+        execFile("taskkill", ["/pid", String(child.pid), "/t", "/f"], { windowsHide: true }, () => child.kill());
+      } else child.kill();
     }, 45_000);
     child.stdout.on("data", (chunk) => { stdout += chunk; });
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.once("error", (error) => { clearTimeout(timeout); reject(error); });
-    child.once("exit", (code) => {
+    child.once("close", (code) => {
       clearTimeout(timeout);
+      if (timeoutError) { reject(timeoutError); return; }
       if (code !== 0) { reject(new Error(`Mounted EYES QA exited ${code}.\n${stderr}\n${stdout}`)); return; }
       const marker = stdout.split(/\r?\n/u).find((line) => line.startsWith("TETHOQ_EYES_QA="));
       if (!marker) { reject(new Error(`Mounted EYES QA returned no result.\n${stderr}\n${stdout}`)); return; }
@@ -191,6 +196,65 @@ test("mounted desktop EYES controls hydrate, recover, and coalesce saves without
           };
 
           try {
+            progress("API EYES reasoning is editable and survives save and reopen");
+            const reasoningSession = session("eyes-reasoning");
+            const reasoningTarget = visionTarget("google::gemini-reasoning", "Gemini Reasoning", "direct", "Direct API", {
+              sourceProviderId: "google", walletKind: "user_api", apiKeyConfigured: true,
+              variants: { minimal: {}, low: {}, medium: {}, high: {}, xhigh: {} },
+            });
+            let reasoningSaved = { providerId: "direct", modelId: "google::gemini-reasoning", reasoningEffort: "xhigh" };
+            const reasoningSaves = [];
+            const reasoningRequest = async (type, payload) => {
+              if (type === "vision.targets") return { targets: [reasoningTarget] };
+              if (type === "wallet.get") return { wallet: wallet(payload.endpointId, payload.endpointId === "google") };
+              if (type === "session.vision.configure") { reasoningSaves.push(payload); reasoningSaved = payload.selection; }
+              if (type === "session.vision.get" || type === "session.vision.configure") return { vision: { sessionId: reasoningSession.id, primaryModelSupportsImageInput: false, configured: reasoningSaved } };
+              throw new Error("Unexpected reasoning request: " + type);
+            };
+            const reasoningNode = () => <VisionEyesPicker snapshot={snapshot(reasoningSession)} session={reasoningSession} request={reasoningRequest} action="settings" onClose={() => undefined} onReady={() => undefined} />;
+            await mount(reasoningNode());
+            await settle();
+            check(element('.vision-single-choice select[aria-label="Vision reasoning effort"]').value === "xhigh", "Saved API reasoning was hidden or reset to the first variant");
+            check(footerSave(element('.vision-eyes-picker')).disabled, "Opening saved EYES silently proposed a different reasoning level");
+            await setControl(element('select[aria-label="Vision reasoning effort"]'), "high");
+            await click(footerSave(element('.vision-eyes-picker')));
+            check(reasoningSaves.length === 1 && reasoningSaves[0].selection.reasoningEffort === "high", "Chosen API reasoning did not reach configuration");
+            check(reasoningSaves[0].sessionId === reasoningSession.id && reasoningSession.effort === "medium", "EYES changed the primary chat selection");
+            await mount(reasoningNode());
+            await settle();
+            check(element('select[aria-label="Vision reasoning effort"]').value === "high", "Reopening EYES lost saved reasoning");
+            reasoningSaved = null;
+            await mount(reasoningNode());
+            await settle();
+            await click(element('.vision-api-route button[aria-label="Gemini API: Off"]'));
+            check(element('select[aria-label="Vision reasoning effort"]').value === "", "A newly chosen API invented Minimal as its default");
+            await setControl(element('select[aria-label="Vision reasoning effort"]'), "xhigh");
+            await click(footerSave(element('.vision-eyes-picker')));
+            check(reasoningSaves.at(-1).selection.reasoningEffort === "xhigh", "A newly chosen API ignored explicit reasoning");
+
+            progress("Instant session EYES sends the chosen reasoning");
+            const { LiveSessionPanel } = await import("./src/renderer/src/LiveSession.tsx");
+            const instantSaves = [];
+            window.tethoqDesktop.liveSessionState = async () => ({ phase: "idle", privacy: { warning: "QA" } });
+            window.tethoqDesktop.onLiveSessionState = () => () => undefined;
+            window.tethoqDesktop.onLiveSessionEvent = () => () => undefined;
+            window.tethoqDesktop.liveSessionAction = async () => ({});
+            bridgeHandler = async (type, payload) => {
+              if (type === "session.vision.get") return envelope({ vision: { sessionId: reasoningSession.id, primaryModelSupportsImageInput: false, configured: null } });
+              if (type === "vision.targets") return envelope({ targets: [reasoningTarget] });
+              if (type === "session.vision.configure") { instantSaves.push(payload); return envelope({}); }
+              throw new Error("Unexpected instant request: " + type);
+            };
+            await mount(<LiveSessionPanel session={reasoningSession} experimental={true} notify={() => undefined} onClose={() => undefined} />);
+            await click(element('.live-session-start'));
+            check(element('.live-session-eyes select[aria-label="Vision reasoning effort"]').value === "", "Instant session guessed Minimal");
+            await click(buttonWithText(element('.live-session-eyes'), "Use this model as eyes"));
+            check(instantSaves.length === 0, "Instant session saved an unchosen reasoning level");
+            await setControl(element('.live-session-eyes select[aria-label="Vision reasoning effort"]'), "xhigh");
+            await click(buttonWithText(element('.live-session-eyes'), "Use this model as eyes"));
+            check(instantSaves.length === 1 && instantSaves[0].selection.reasoningEffort === "xhigh", "Instant session lost explicit EYES reasoning");
+            bridgeHandler = async () => envelope({});
+
             progress("delayed structural hydration");
             const delayedSession = session("eyes-delayed");
             const targetsGate = deferred();
@@ -960,6 +1024,6 @@ test("mounted desktop EYES controls hydrate, recover, and coalesce saves without
     const result = await runElectron(mainPath, htmlPath);
     assert.deepEqual(result, { ok: true }, result.error ?? result.stack);
   } finally {
-    await rm(outputDirectory, { recursive: true, force: true });
+    await rm(outputDirectory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });

@@ -114,7 +114,7 @@ test("mounted Mesh child row settles and opens only its exact child by pointer o
           const missing = await resolveTimelineSubagentSession("mesh-parent", "missing-child", [], async () => [sibling, exactChild]);
           check(missing === null, "a missing child id must not fabricate a partial task");
 
-          const { mapMessages, eventToTimeline } = await import("./src/renderer/src/bridge.ts");
+          const { mapMessages, eventToTimeline, delegationTimelineItems } = await import("./src/renderer/src/bridge.ts");
           const mesh = {
             delegationId: "mesh-turn",
             targets: [
@@ -129,12 +129,22 @@ test("mounted Mesh child row settles and opens only its exact child by pointer o
               { type: "text", text: " review both results." },
             ],
           };
-          const user = mapMessages([{
+          const canonicalUser = mapMessages([{
             id: "user", providerMessageId: "turn", sessionId: "mesh-parent", role: "user",
             createdAt: "2026-09-03T10:59:57.000Z", status: "completed",
             parts: [{ type: "text", text: mesh.segments.filter((segment) => segment.type === "text").map((segment) => segment.text).join("") }],
             nativeMetadata: { tethoqMesh: mesh },
           }])[0];
+          const { meshParentPrompt } = await import("../../packages/protocol/src/mesh.ts");
+          const { reconcileTimelinePage } = await import("./src/renderer/src/timeline_merge.ts");
+          const duplicated = [
+            { ...canonicalUser, id: "local-123", messageId: undefined },
+            { id: "raw-echo", messageId: canonicalUser.messageId, kind: "user", state: "completed", timestamp: canonicalUser.timestamp,
+              body: meshParentPrompt(mesh.targets, mesh.segments) },
+          ];
+          const repaired = reconcileTimelinePage([canonicalUser], duplicated);
+          check(repaired.length === 1 && repaired[0].body === canonicalUser.body, "Reopening the task kept a second raw Mesh prompt");
+          const user = repaired[0];
           check(user.mesh?.targets.length === 3, "reopened history lost its Mesh badges");
           const reasoning = { id: "reasoning", messageId: "turn", kind: "reasoning", title: "Reasoning", body: "Preparing the focused assignment", timestamp: "2026-09-03T10:59:58.000Z", state: "completed" };
           const childRow = (state) => ({
@@ -250,6 +260,32 @@ test("mounted Mesh child row settles and opens only its exact child by pointer o
           check(cleanBody.textContent === "Please confirm the final build is ready." && !document.body.textContent.includes("TETHOQ_REMOTE_MESSAGE_V1"), "routing metadata leaked into the readable message");
           window.__meshQaStoppedReady = true;
           await new Promise((resolve) => { const wait = () => window.__meshQaStoppedCaptured === true ? resolve() : setTimeout(wait, 10); wait(); });
+          const failedTask = {
+            id: "mesh-turn", parentSessionId: "mesh-parent", state: "failed", children: [],
+            targets: [{ providerId: "opencode", modelId: "opencode-go/glm-5.3-flash" }, { providerId: "grok", modelId: "grok-4.6" }],
+            createdAt: "2026-09-03T10:59:56.000Z",
+            error: "The parent turn finished before dispatching the selected Mesh targets",
+          };
+          const failures = delegationTimelineItems([failedTask]);
+          const liveFailure = eventToTimeline({ type: "delegation.failed", payload: failedTask, occurredAt: failedTask.createdAt });
+          check(failures.length === 1 && liveFailure?.id === failures[0].id, "live and restored failure must share one durable notice");
+          check(!failures[0].childSessionId, "a failed dispatch must not invent a child task");
+          check(delegationTimelineItems([{ ...failedTask, state: "awaiting_dispatch" }]).length === 0, "preparing must not claim failure");
+          check(delegationTimelineItems([{ ...failedTask, interruptedAt: failedTask.createdAt }]).length === 0, "a user stop must not claim dispatch failure");
+          const failureUser = { ...user, mesh: { targets: failedTask.targets, segments: [
+            { type: "text", text: "Use " }, { type: "mesh", targetIndex: 0 }, { type: "text", text: " and " }, { type: "mesh", targetIndex: 1 },
+          ] } };
+          stoppedRoot.render(<ChatTimeline timeline={[...failures, failureUser, reasoning, { ...answer, body: "The parent reply finished without using the selected workers." }]}
+            providerId="opencode" active={false} onContinue={async () => true} />);
+          await settle();
+          const failureNotice = stoppedHost.querySelector('.timeline-error-notice');
+          check(failureNotice?.textContent.includes("grok-4.6") && failureNotice.textContent.includes("glm-5.3-flash"), "failed selections must remain visible by name");
+          check(!failureNotice.closest('.reasoning-group'), "a dispatch failure must not disappear inside collapsed Reasoning");
+          check(!failureNotice.querySelector('button'), "generic Continue must not imply it retries a failed Mesh request");
+          check(!stoppedHost.querySelector('.spawned-subagent-row, .spinner, [aria-busy="true"]'), "undispatched workers must not appear running or spawned");
+          check(failureNotice.getBoundingClientRect().top > stoppedHost.querySelector('.message-user').getBoundingClientRect().bottom, "failure must follow its own Mesh prompt");
+          window.__meshQaFailureReady = true;
+          await new Promise((resolve) => { const wait = () => window.__meshQaFailureCaptured === true ? resolve() : setTimeout(wait, 10); wait(); });
           stoppedRoot.unmount(); stoppedHost.remove(); host.style.display = "";
           root.render(<ChatTimeline
             timeline={[childRow("completed"), user, reasoning, answer,
@@ -306,6 +342,9 @@ test("mounted Mesh child row settles and opens only its exact child by pointer o
         await waitFor(window, "window.__meshQaStoppedReady === true || window.__meshQaResult !== undefined");
         await capture("-stopped");
         await window.webContents.executeJavaScript("window.__meshQaStoppedCaptured = true", true);
+        await waitFor(window, "window.__meshQaFailureReady === true || window.__meshQaResult !== undefined");
+        await capture("-failure");
+        await window.webContents.executeJavaScript("window.__meshQaFailureCaptured = true", true);
         await waitFor(window, "window.__meshQaVisualReady === true || window.__meshQaResult !== undefined");
         const earlyResult = await window.webContents.executeJavaScript("window.__meshQaResult", true);
         if (earlyResult) {

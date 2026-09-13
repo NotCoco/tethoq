@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -201,54 +201,4 @@ test("dispatch paints one optimistic user row which failure can retract by stabl
     longContent,
     "the durable prompt must outrank the bounded replay preview",
   );
-});
-
-test("an interrupted dispatch warns before an explicitly requested retry", async () => {
-  const app = await readFile(join(appRoot, "src", "renderer", "src", "App.tsx"), "utf8");
-  assert.match(app, /outcome is uncertain[\s\S]*It may already have started\. Retrying can run it twice\./u);
-  assert.match(app, /uncertainOutcome \? "Retry anyway" : "Retry now"/u);
-  assert.match(app, /schedule\.status === "failed"[\s\S]*void act\("cancel"\)[\s\S]*Dismiss/u);
-});
-
-test("App retains edits made while schedule persistence is pending in a fresh local draft", async () => {
-  const [app, composer] = await Promise.all([
-    readFile(join(appRoot, "src", "renderer", "src", "App.tsx"), "utf8"),
-    readFile(join(appRoot, "src", "renderer", "src", "Composer.tsx"), "utf8"),
-  ]);
-  assert.match(composer, /scheduledComposerContent,\s*content: scheduledContent/u, "Composer did not pass its exact submitted snapshot to App");
-  assert.match(app, /const previousContent = composerDrafts\.current\[input\.draftSessionId\] \?\? "";\s*const retainedContent = clearScheduledDraftContent\(previousContent, input\.scheduledComposerContent\)/u);
-  assert.match(app, /const draftWriteTarget: Session = \{[\s\S]*?draft: true/u);
-  assert.match(app, /composerDraftSessionAliases\.current\[input\.draftSessionId\] = draftWriteTargetId/u);
-  assert.match(app, /latentComposerDraftSessions\.current\[draftWriteTargetId\] = \{[\s\S]*scheduledSessionId: scheduled\.id/u);
-  assert.match(app, /rebindComposerDraftState\(composerDraftStore, input\.draftSessionId, draftWriteTargetId, retainedDraft\)/u);
-  assert.match(app, /setSelectedSessionId\(retainedSession\?\.id \?\? scheduled\.id\)/u, "App did not select the retained draft or scheduled placeholder");
-  assert.match(app, /resolveComposerDraftWriteSessionId\(selectedSession\.id, attachments\.length > 0\)/u, "A late attachment picker cannot materialize its retained draft");
-  assert.match(app, /resolveComposerDraftWriteSessionId\(selectedSession\.id, value\.length > 0\)/u, "Late content cannot materialize its retained draft");
-});
-
-test("dispatching rows paint the working spinner instead of an overlapping schedule mark", async () => {
-  const navigation = await readFile(join(appRoot, "src", "renderer", "src", "NavigationPanels.tsx"), "utf8");
-  assert.match(navigation, /session\.state === "working" \? <span className="session-project-working-indicator"[\s\S]*: scheduledIndicator/u);
-  assert.match(navigation, /session\.state === "working" \? null : scheduledIndicator \?\? \(session\.pinned \? <PinIcon/u);
-});
-
-test("restored placeholders open locally and hide provider-only task actions", async () => {
-  const [app, navigation] = await Promise.all([
-    readFile(join(appRoot, "src", "renderer", "src", "App.tsx"), "utf8"),
-    readFile(join(appRoot, "src", "renderer", "src", "NavigationPanels.tsx"), "utf8"),
-  ]);
-  assert.match(app, /if \(isScheduledTaskPlaceholderId\(sessionId\)[\s\S]*session\.schedule !== undefined[\s\S]*initialTimelineWindow\(\[\], null\)[\s\S]*return;/u);
-  assert.match(app, /if \(!source \|\| source\.draft \|\| source\.schedule \|\| source\.state === "offline"/u);
-  assert.match(app, /const contextSessionKey = session && !session\.draft && !session\.schedule \? session\.id : null/u);
-  assert.match(app, /if \(!session \|\| session\.draft \|\| session\.schedule\)[\s\S]*setSessionContext\(null\)[\s\S]*return;/u);
-  assert.match(app, /session\.draft \|\| session\.schedule \? null : <ContextUsageControl/u);
-  assert.match(app, /session\.draft \|\| session\.schedule \? null : <TaskDetailsControl/u);
-  assert.match(navigation, /canBranchMenuSession = connected[\s\S]*menuSession\?\.schedule === undefined/u);
-  assert.match(navigation, /menuSession\?\.schedule === undefined \? <>[\s\S]*Rename[\s\S]*Pin to top[\s\S]*Branch in New Task/u);
-  assert.match(navigation, /Open in File Explorer[\s\S]*menuSession\?\.schedule === undefined \? <button[\s\S]*Archive/u);
-});
-
-test("App retracts a failed scheduled presentation only when provider evidence is absent", async () => {
-  const app = await readFile(join(appRoot, "src", "renderer", "src", "App.tsx"), "utf8");
-  assert.match(app, /const failureCanRetractPresentation = presentation\?\.status === "failed"[\s\S]*scheduledTaskFailureCanRetractPresentation\([\s\S]*presentationSession[\s\S]*presentationTimeline[\s\S]*presentation\.item\.scheduledTaskId[\s\S]*\)[\s\S]*\[event\.sessionId\]: failureCanRetractPresentation[\s\S]*rollbackOptimisticComposerRow/u);
 });

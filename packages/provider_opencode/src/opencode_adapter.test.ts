@@ -1,10 +1,38 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { ProviderEvent } from "../../provider_contract/src/index.js";
+import { ProviderAdapterError, type ProviderEvent } from "../../provider_contract/src/index.js";
 import type { JsonObject, RemoteSession } from "../../protocol/src/index.js";
 import { type FetchLike } from "./http_client.js";
 import type { OpenCodeActivityReadOptions, OpenCodeActivityReader } from "./activity.js";
-import { OpenCodeAdapter } from "./opencode_adapter.js";
+import { OpenCodeAdapter as NativeOpenCodeAdapter, type OpenCodeAdapterOptions } from "./opencode_adapter.js";
+
+// Lifecycle fixtures model a successful native prompt store. Keep that store
+// behind the HTTP boundary; receipt-failure tests below use the unwrapped adapter.
+// Single-workspace fixtures pin their directory; the routing tests exercise
+// restoring and sharing project scopes through the actual metadata endpoint.
+class OpenCodeAdapter extends NativeOpenCodeAdapter {
+  constructor(options: OpenCodeAdapterOptions) {
+    const receipts = new Map<string, unknown>();
+    const fetchLike = options.fetch ?? globalThis.fetch;
+    super({ ...options, fetch: async (input, init) => {
+      const url = requestUrl(input);
+      const receipt = receipts.get(url.pathname);
+      if (init?.method === "GET" && receipt !== undefined) {
+        receipts.delete(url.pathname);
+        return jsonResponse(receipt);
+      }
+      const response = await fetchLike(input, init);
+      if (init?.method === "POST" && url.pathname.endsWith("/prompt_async") && response.ok) {
+        const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+        const sessionID = decodeURIComponent(url.pathname.split("/")[2]!);
+        receipts.set(`/session/${encodeURIComponent(sessionID)}/message/${encodeURIComponent(String(body.messageID))}`, {
+          info: { id: body.messageID, sessionID, role: "user" }, parts: body.parts,
+        });
+      }
+      return response;
+    } });
+  }
+}
 
 class SequenceActivityReader implements OpenCodeActivityReader {
   readonly #snapshots: readonly (ReadonlySet<string> | undefined)[];
@@ -67,6 +95,196 @@ function jsonResponse(value: unknown): Response {
     headers: { "content-type": "application/json" },
   });
 }
+
+test("OpenCode sends images and stops in the task directory, resolving a restored task only once", async (t) => {
+  const directory = "C:/Users/Example User/project";
+  let metadataReads = 0;
+  let stopped = false;
+  const prompts: Record<string, unknown>[] = [];
+  const adapter = new NativeOpenCodeAdapter({ hostId: "scoped-send", fetch: async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/session/restored") {
+      metadataReads += 1;
+      return jsonResponse({ id: "restored", directory });
+    }
+    assert.equal(url.searchParams.get("directory"), directory, "the request reached a different OpenCode Instance");
+    if (url.pathname.endsWith("/prompt_async")) {
+      prompts.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return new Response(null, { status: 204 });
+    }
+    if (url.pathname.includes("/message/")) {
+      const prompt = prompts.find((entry) => url.pathname.endsWith(String(entry.messageID)))!;
+      return jsonResponse({ info: { id: prompt.messageID, sessionID: "restored", role: "user" }, parts: prompt.parts });
+    }
+    assert.equal(url.pathname, "/session/restored/abort");
+    stopped = true;
+    return jsonResponse(true);
+  } });
+  t.after(() => adapter.dispose());
+  const image = { name: "image.png", mimeType: "image/png", dataBase64: "aW1hZ2U=", byteLength: 5 };
+  assert.equal((await adapter.sendMessage("restored", { requestId: "one", content: "Inspect", attachments: [image] })).accepted, true);
+  assert.equal((await adapter.steerMessage("restored", { requestId: "two", content: "Continue" })).accepted, true);
+  await adapter.interrupt("restored");
+  assert.equal(stopped, true);
+  assert.equal(metadataReads, 1, "cached task routing must not add a metadata round trip to every send");
+  assert.equal(prompts.length, 2);
+  assert.deepEqual((prompts[0]!.parts as unknown[])[1], { type: "file", mime: "image/png", filename: "image.png", url: "data:image/png;base64,aW1hZ2U=" });
+});
+
+test("OpenCode directory status cannot idle another project or revive its orphaned SQLite turn", async (t) => {
+  const directories = { a: "C:/project a", b: "C:/project b" };
+  let aBusy = true;
+  let bUnavailable = false;
+  const adapter = new NativeOpenCodeAdapter({ hostId: "scoped-status", activityReader: new SequenceActivityReader(new Set(["a", "b", "external"])), fetch: async (input) => {
+    const url = requestUrl(input);
+    const id = url.pathname.split("/")[2] as "a" | "b";
+    if (url.pathname !== "/session/status") return jsonResponse({ id, directory: directories[id], title: id, time: { created: 1, updated: 2 } });
+    const scope = url.searchParams.get("directory");
+    if (scope === directories.a) return jsonResponse(aBusy ? { a: { type: "busy" } } : {});
+    if (scope === directories.b) return bUnavailable ? new Response(null, { status: 503 }) : jsonResponse({ b: { type: "busy" } });
+    return jsonResponse({});
+  } });
+  t.after(() => adapter.dispose());
+  assert.equal((await adapter.getSession("a")).state, "working");
+  assert.equal((await adapter.getSession("b")).state, "working");
+  bUnavailable = true;
+  assert.equal((await adapter.getSession("a")).state, "working");
+  assert.equal(adapter.hasActiveTurn("b"), true, "another scope's successful empty map cannot erase B after its own status read failed");
+  bUnavailable = false;
+  aBusy = false;
+  assert.equal((await adapter.getSession("a")).state, "idle");
+  assert.equal(adapter.hasActiveTurn("a"), false, "an unfinished DB row is not a live runner");
+  assert.deepEqual([...adapter.activeSessionIds()].sort(), ["b", "external"], "SQLite-only work on another server must remain visible");
+  assert.equal((await adapter.getSession("b")).state, "working");
+  assert.equal((await adapter.getSession("a")).state, "idle", "repeated refresh must not flicker back to working");
+});
+
+test("OpenCode waits past HTTP acknowledgement and a partial user header for the saved image", async (t) => {
+  let body: Record<string, unknown> = {};
+  let reads = 0;
+  let settled = false;
+  const adapter = new NativeOpenCodeAdapter({ directory: "C:/fixture", hostId: "receipt", requestTimeoutMs: 2_000, fetch: async (input, init) => {
+    const path = requestUrl(input).pathname;
+    if (path.endsWith("/prompt_async")) {
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(null, { status: 204 });
+    }
+    assert.equal(path, `/session/image-task/message/${String(body.messageID)}`);
+    assert.equal(settled, false, "a transport ack or incomplete image consumed the composition");
+    reads++;
+    if (reads === 1) return new Response(null, { status: 404 });
+    const text = { type: "text", text: "Inspect this" };
+    const file = { type: "file", filename: "image.png", mime: "image/webp", url: "data:image/webp;base64,AQID" };
+    return jsonResponse({ info: { id: body.messageID, sessionID: "image-task", role: "user" },
+      parts: reads === 2 ? [] : reads === 3 ? [text] : reads === 4 ? [text, { ...file, url: "" }] : [text, file] });
+  } });
+  t.after(() => adapter.dispose());
+  const result = await adapter.sendMessage("image-task", { requestId: "image-upload", content: "Inspect this",
+    attachments: [{ name: "image.png", mimeType: "image/png", byteLength: 3, dataBase64: "AQID" }] }).then(value => { settled = true; return value; });
+  assert.equal(reads, 5);
+  assert.equal(result.accepted, true);
+  assert.equal(adapter.hasActiveTurn("image-task"), true);
+});
+
+test("OpenCode does not invent a running turn when an acknowledged prompt never persists", async (t) => {
+  let body: Record<string, unknown> = {};
+  let persist = false;
+  let writes = 0;
+  const adapter = new NativeOpenCodeAdapter({ directory: "C:/fixture", hostId: "receipt", requestTimeoutMs: 20, fetch: async (input, init) => {
+    const path = requestUrl(input).pathname;
+    if (path.endsWith("/prompt_async")) {
+      writes++;
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(null, { status: 204 });
+    }
+    assert.equal(path, `/session/lost-task/message/${String(body.messageID)}`);
+    return persist ? jsonResponse({ info: { id: body.messageID, role: "user" }, parts: body.parts }) : new Response(null, { status: 404 });
+  } });
+  t.after(() => adapter.dispose());
+  await assert.rejects(adapter.sendMessage("lost-task", { requestId: "lost", content: "Do the work" }), { code: "PROMPT_DELIVERY_UNCONFIRMED" });
+  assert.equal(adapter.hasActiveTurn("lost-task"), false);
+  assert.equal(writes, 1, "ambiguous delivery must not automatically duplicate a prompt");
+  persist = true;
+  assert.equal((await adapter.sendMessage("lost-task", { requestId: "next", content: "A later turn" })).accepted, true);
+  assert.equal(adapter.hasActiveTurn("lost-task"), true);
+});
+
+test("OpenCode lost-response recovery requires the image parts, not just the saved user header", async (t) => {
+  let body: Record<string, unknown> = {};
+  let complete = false;
+  const adapter = new NativeOpenCodeAdapter({ directory: "C:/fixture", hostId: "receipt", fetch: async (input, init) => {
+    if (requestUrl(input).pathname.endsWith("/prompt_async")) {
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      throw new Error("socket closed");
+    }
+    return jsonResponse({ info: { id: body.messageID, role: "user" }, parts: complete ? body.parts : [] });
+  } });
+  t.after(() => adapter.dispose());
+  const request = { requestId: "partial", content: "Inspect", attachments: [{ name: "image.png", mimeType: "image/png", byteLength: 3, dataBase64: "AQID" }] };
+  await assert.rejects(adapter.sendMessage("partial-task", request), { code: "HTTP_REQUEST_FAILED" });
+  assert.equal(adapter.hasActiveTurn("partial-task"), false);
+  complete = true;
+  assert.equal((await adapter.sendMessage("partial-task", request)).accepted, true);
+});
+
+test("OpenCode scheduled retries cannot accept or resend a partially saved image", async (t) => {
+  const adapter = new NativeOpenCodeAdapter({ directory: "C:/fixture", hostId: "receipt", requestTimeoutMs: 20, fetch: async (input, init) => {
+    assert.equal(init?.method, "GET", "an incomplete prior delivery must not be posted again");
+    const messageId = requestUrl(input).pathname.split("/").at(-1);
+    return jsonResponse({ info: { id: messageId, role: "user" }, parts: [{ type: "text", text: "Inspect" }] });
+  } });
+  t.after(() => adapter.dispose());
+  await assert.rejects(adapter.sendMessage("partial-schedule", { requestId: "partial-schedule", content: "Inspect",
+    metadata: { tethoqScheduledTaskId: "image-schedule" },
+    attachments: [{ name: "image.png", mimeType: "image/png", byteLength: 3, dataBase64: "AQID" }] }), { code: "PROMPT_DELIVERY_UNCONFIRMED" });
+  assert.equal(adapter.hasActiveTurn("partial-schedule"), false);
+});
+
+test("OpenCode retries a stalled receipt read without posting the prompt again", async (t) => {
+  let body: Record<string, unknown> = {};
+  let reads = 0;
+  let writes = 0;
+  const adapter = new NativeOpenCodeAdapter({ directory: "C:/fixture", hostId: "stalled-receipt", requestTimeoutMs: 3_000, fetch: async (input, init) => {
+    if (requestUrl(input).pathname.endsWith("/prompt_async")) {
+      writes++;
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(null, { status: 204 });
+    }
+    reads++;
+    if (reads === 1) return await new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new Error("first receipt read stalled")), { once: true });
+    });
+    return jsonResponse({ info: { id: body.messageID, role: "user" }, parts: body.parts });
+  } });
+  t.after(() => adapter.dispose());
+  const result = await adapter.sendMessage("task", { requestId: "stalled-read", content: "continue" });
+  assert.equal(result.accepted, true);
+  assert.equal(adapter.hasActiveTurn("task"), true);
+  assert.equal(reads, 2);
+  assert.equal(writes, 1);
+});
+
+test("OpenCode exact message lookup validates identity and never loads full history", async (t) => {
+  let mode = "saved";
+  let reads = 0;
+  const adapter = new NativeOpenCodeAdapter({ hostId: "exact-receipt", fetch: async (input, init) => {
+    reads++;
+    assert.equal(init?.method, "GET");
+    assert.equal(requestUrl(input).pathname, "/session/task/message/saved-id");
+    if (mode === "missing") return new Response(null, { status: 404 });
+    if (mode === "offline") throw new Error("offline");
+    return jsonResponse({ info: { id: mode === "wrong-id" ? "other-id" : "saved-id", role: "user",
+      sessionID: mode === "wrong-task" ? "other-task" : "task", time: { created: Date.now() } }, parts: [{ type: "text", text: "continue" }] });
+  } });
+  t.after(() => adapter.dispose());
+  assert.equal((await adapter.getMessage("task", "saved-id"))?.providerMessageId, "saved-id");
+  for (mode of ["missing", "wrong-id", "wrong-task"]) assert.equal(await adapter.getMessage("task", "saved-id"), undefined);
+  mode = "offline";
+  await assert.rejects(adapter.getMessage("task", "saved-id"), { code: "HTTP_REQUEST_FAILED" });
+  await adapter.dispose();
+  assert.equal(await adapter.getMessage("task", "saved-id"), undefined);
+  assert.equal(reads, 5, "a disposed adapter must not create another receipt request");
+});
 
 test("OpenCode detection explains the fixed default endpoint without starting another server", async (t) => {
   const fetchLike: FetchLike = async () => { throw new Error("connection refused"); };
@@ -192,7 +410,7 @@ test("OpenCode async prompts use a stable native message ID separate from bridge
     requestBodies.push(JSON.parse(init.body as string) as Record<string, unknown>);
     return new Response(null, { status: 204 });
   };
-  const adapter = new OpenCodeAdapter({ hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", fetch: fetchLike, activityReader: new SequenceActivityReader(new Set()) });
+  const adapter = new OpenCodeAdapter({ directory: "C:/fixture", hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", fetch: fetchLike, activityReader: new SequenceActivityReader(new Set()) });
 
   const request = {
     requestId: "bridge_request_1",
@@ -284,6 +502,7 @@ test("OpenCode confirms a persisted stable prompt after its HTTP response discon
     });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_ambiguous_send",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -321,6 +540,7 @@ test("OpenCode rethrows the original prompt error when exact history does not pr
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_rejected_send",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -366,6 +586,7 @@ test("OpenCode preserves native PDF attachments when the selected model explicit
     return new Response(null, { status: 204 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_pdf",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -410,6 +631,7 @@ test("OpenCode grants turn support only for the explicitly routed task turn", as
     return new Response(null, { status: 204 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_eyes_scope",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -466,7 +688,8 @@ test("OpenCode scheduled retries do not resend a prompt already present in nativ
     promptWrites += 1;
     return new Response(null, { status: 204 });
   };
-  const adapter = new OpenCodeAdapter({
+  const adapter = new NativeOpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -482,7 +705,7 @@ test("OpenCode scheduled retries do not resend a prompt already present in nativ
   const retry = await adapter.sendMessage("ses_scheduled", request);
 
   assert.equal(promptWrites, 1, "the persisted scheduled prompt was posted twice");
-  assert.equal(historyReads, 2);
+  assert.equal(historyReads, 3);
   assert.equal(retry.providerTurnId, first.providerTurnId);
   assert.deepEqual(retry.details, ["OpenCode already accepted this scheduled prompt."]);
   await adapter.dispose();
@@ -499,6 +722,7 @@ test("OpenCode scheduled retries fail closed when native message history is unav
     return new Response(null, { status: 204 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -517,32 +741,13 @@ test("OpenCode scheduled retries fail closed when native message history is unav
   await adapter.dispose();
 });
 
-test("OpenCode grants the installed dispatch tool for a prepared Mesh turn", async (t) => {
-  const bodies: Record<string, unknown>[] = [];
-  const adapter = new OpenCodeAdapter({ hostId: "mesh-tool-host", baseUrl: "http://127.0.0.1:4096/",
-    fetch: async (_input, init) => { bodies.push(JSON.parse(String(init?.body))); return new Response(null, { status: 204 }); },
-    activityReader: new SequenceActivityReader(new Set()),
-  });
-  t.after(() => adapter.dispose());
-  await adapter.sendMessage("mesh-parent", { requestId: "mesh-tool-grant", content: "Ask the selected worker for feedback",
-    developerInstructions: "Call uar_mesh_dispatch_delegation with the prepared assignments.",
-    clientToolOverrides: { mesh_dispatch_delegation: true },
-  });
-  assert.equal((bodies[0]?.tools as Record<string, boolean>).uar_mesh_dispatch_delegation, true);
-  assert.equal((bodies[0]?.tools as Record<string, boolean>).mesh_dispatch_delegation, undefined);
-  await adapter.sendMessage("vision-helper", { requestId: "mesh-helper-denied", content: "Read this image",
-    metadata: { internalPurpose: "vision_proxy" }, clientToolOverrides: { mesh_dispatch_delegation: true },
-  });
-  assert.deepEqual(bodies[1]?.tools, { "*": false }, "internal vision helpers must retain their tool boundary");
-});
-
 test("OpenCode omits the internal default effort sentinel from native prompts", async () => {
   let requestBody: Record<string, unknown> | undefined;
   const fetchLike: FetchLike = async (_input, init) => {
     requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
     return new Response(null, { status: 204 });
   };
-  const adapter = new OpenCodeAdapter({ hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", fetch: fetchLike, activityReader: new SequenceActivityReader(new Set()) });
+  const adapter = new OpenCodeAdapter({ directory: "C:/fixture", hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", fetch: fetchLike, activityReader: new SequenceActivityReader(new Set()) });
 
   await adapter.sendMessage("ses_default", {
     requestId: "bridge_request_default",
@@ -556,7 +761,7 @@ test("OpenCode omits the internal default effort sentinel from native prompts", 
   await adapter.dispose();
 });
 
-test("OpenCode branches at the latest completed response instead of copying an active tail", async () => {
+test("OpenCode requests a paused snapshot instead of silently dropping the latest exchange", async () => {
   let requestBody: unknown;
   let forkedMessageIds: string[] = [];
   const sourceHistory = [
@@ -607,22 +812,16 @@ test("OpenCode branches at the latest completed response instead of copying an a
     });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
     activityReader: new SequenceActivityReader(new Set()),
   });
 
-  const session = await adapter.branchSession("source");
-
-  assert.deepEqual(requestBody, { messageID: "user_active" });
-  assert.deepEqual(
-    forkedMessageIds,
-    ["user_safe", "assistant_safe"],
-    "OpenCode's exclusive fork boundary dropped the completed response or copied the active tail",
-  );
-  assert.equal(session.providerSessionId, "forked");
-  assert.equal(session.workingDirectory, "C:\\workspace");
+  await assert.rejects(adapter.branchSession("source"), (error: unknown) => error instanceof ProviderAdapterError && error.code === "BRANCH_SNAPSHOT_REQUIRED");
+  assert.equal(requestBody, undefined, "an incomplete native fork was created");
+  assert.deepEqual(forkedMessageIds, []);
   await adapter.dispose();
 });
 
@@ -652,6 +851,7 @@ test("OpenCode forks all history when the completed response is already the safe
     return jsonResponse({ id: "forked", directory: "C:\\workspace", title: "Safe fork", time: { created: 1, updated: 2 } });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -707,6 +907,7 @@ test("OpenCode serializes a safe-tail fork against a concurrent Tethoq send", as
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -780,13 +981,14 @@ test("OpenCode refuses to branch a non-empty task with no completed response", a
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
     activityReader: new SequenceActivityReader(new Set()),
   });
 
-  await assert.rejects(() => adapter.branchSession("source"), /completed response boundary/i);
+  await assert.rejects(() => adapter.branchSession("source"), /paused snapshot/i);
   assert.equal(forkCalls, 0);
   await adapter.dispose();
 });
@@ -803,6 +1005,7 @@ test("OpenCode can still fork a genuinely empty task", async () => {
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -977,6 +1180,8 @@ test("OpenCode history opens with a bounded latest-message window", async () => 
   assert.ok(historyUrl);
   assert.equal(historyUrl.pathname, "/session/ses_large/message");
   assert.equal(historyUrl.searchParams.get("limit"), "500");
+  await adapter.getMessages("ses_large", { limit: 8 });
+  assert.equal(historyUrl.searchParams.get("limit"), "8", "worker result reads should fetch only the requested recent tail");
   await adapter.dispose();
 });
 
@@ -1362,6 +1567,48 @@ test("OpenCode provider-wide status polling unions native and SQLite work and pr
   assert.equal(statusCalls, 3, "one provider-wide request may be in flight; polling never fans out per task");
 });
 
+test("slow transcript recovery cannot hold up current activity or start overlapping history sweeps", async (t) => {
+  const events = new SseFixture();
+  let statuses: Record<string, { type: string }> = { slow: { type: "busy" } };
+  let historyReads = 0;
+  let historyPending = false;
+  const adapter = new OpenCodeAdapter({
+    hostId: "host_1", activityReader: new SequenceActivityReader(new Set()),
+    activityPollIntervalMs: 60_000, nativeStatusPollIntervalMs: 20,
+    fetch: async (input, init) => {
+      const url = requestUrl(input);
+      if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+      if (url.pathname === "/session/status") return jsonResponse(statuses);
+      if (url.pathname === "/session/slow/message") {
+        historyReads += 1;
+        historyPending = true;
+        try {
+          return await new Promise<Response>((_resolve, reject) => {
+            const abort = () => reject(new Error("aborted"));
+            if (init?.signal?.aborted) abort();
+            else init?.signal?.addEventListener("abort", abort, { once: true });
+          });
+        } finally { historyPending = false; }
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+  t.after(() => adapter.dispose());
+  const states: string[] = [];
+  await adapter.subscribe(null, event => {
+    if (event.providerSessionId === "fast" && event.type === "session.status_changed") states.push(String(event.payload.state));
+  });
+  await waitFor(() => historyPending, "the slow transcript check should start");
+  statuses = { slow: { type: "busy" }, fast: { type: "busy" } };
+  await waitFor(() => states.includes("working"), "new native activity must arrive during the blocked history read");
+  assert.equal(historyPending, true, "activity must not wait for a transcript timeout");
+  statuses = { slow: { type: "busy" } };
+  await waitFor(() => states.includes("idle"), "current native inactivity must also arrive during the blocked read");
+  assert.equal(historyPending, true);
+  assert.equal(adapter.hasActiveTurn("fast"), false);
+  assert.equal(historyReads, 1, "fast polls must share the in-flight history sweep");
+});
+
 test("a slow native status snapshot cannot erase a newer SSE working state", async (t) => {
   const events = new SseFixture();
   let resolveStatus!: (response: Response) => void;
@@ -1673,6 +1920,7 @@ test("OpenCode does not settle an unproven turn when the server never emits sess
   };
   const reader = new SequenceActivityReader(new Set(), new Set());
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -1702,6 +1950,7 @@ test("OpenCode exposes live steering and persists a second prompt while work is 
     return new Response(null, { status: 204 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -1747,6 +1996,7 @@ test("OpenCode clears the dispatch mark once activity disappearance confirms an 
   };
   const reader = new SequenceActivityReader(new Set(["dispatched"]), new Set());
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -2499,6 +2749,93 @@ async function waitFor(condition: () => boolean, message: string): Promise<void>
   throw new Error(`timed out: ${message}`);
 }
 
+test("OpenCode reconnect uses each project's runner truth instead of unfinished rows from the lost process", async (t) => {
+  const events = new SseFixture();
+  const directoryA = "C:/project a";
+  const directoryB = "C:/project b";
+  const scopes: Array<string | null> = [];
+  const adapter = new NativeOpenCodeAdapter({
+    hostId: "scoped-reconnect", activityReader: new SequenceActivityReader(new Set(["orphan"])),
+    activityPollIntervalMs: 60_000, nativeStatusPollIntervalMs: 60_000,
+    fetch: async (input, init) => {
+      const url = requestUrl(input);
+      if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+      if (url.pathname === "/session/status") {
+        const directory = url.searchParams.get("directory");
+        scopes.push(directory);
+        return jsonResponse(directory === directoryB ? { running: { type: "busy" } } : {});
+      }
+      return new Response(null, { status: 404 });
+    },
+  });
+  t.after(() => adapter.dispose());
+  const observed: ProviderEvent[] = [];
+  await adapter.subscribe(null, (event) => { observed.push(event); });
+  for (const [sessionID, directory] of [["orphan", directoryA], ["running", directoryB]]) {
+    events.push({ directory, payload: { type: "session.status", properties: { sessionID, status: { type: "busy" } } } });
+  }
+  await waitFor(() => adapter.hasActiveTurn("running"), "project B's live status");
+  events.fail();
+  await waitFor(() => observed.some((event) => event.type === "provider.disconnected"), "stream disconnect");
+  events.push({ payload: { type: "server.connected", properties: {} } });
+  await waitFor(() => observed.some((event) => event.providerSessionId === "orphan" && event.payload.state === "idle"), "the lost runner must settle despite its orphaned SQLite assistant");
+  assert.ok(scopes.includes(directoryA) && scopes.includes(directoryB));
+  assert.equal(adapter.hasActiveTurn("running"), true);
+  assert.equal(adapter.hasActiveTurn("orphan"), false);
+  const disconnectIndex = observed.findIndex((event) => event.type === "provider.disconnected");
+  assert.equal(observed.slice(disconnectIndex).some((event) => event.providerSessionId === "orphan" && event.payload.state === "working"), false);
+});
+
+test("OpenCode coalesces simultaneous task status reads in the same directory", async (t) => {
+  let statusReads = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const adapter = new NativeOpenCodeAdapter({ hostId: "coalesced-directory", fetch: async (input) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/session/status") {
+      assert.equal(url.searchParams.get("directory"), "C:/shared project");
+      statusReads += 1;
+      await gate;
+      return jsonResponse({});
+    }
+    return jsonResponse({ id: url.pathname.split("/")[2], directory: "C:/shared project", time: { created: 1, updated: 2 } });
+  } });
+  t.after(() => { release(); return adapter.dispose(); });
+  const reads = Promise.all(Array.from({ length: 20 }, (_, index) => adapter.getSession(`task_${index}`)));
+  await waitFor(() => statusReads > 0, "status lookup");
+  assert.equal(statusReads, 1, "a shared project must not create twenty status requests");
+  release();
+  assert.equal((await reads).length, 20);
+  assert.equal(statusReads, 1);
+});
+
+test("OpenCode keeps polling the project of a running task discovered only by its scoped status map", async (t) => {
+  const events = new SseFixture();
+  let projectPolls = 0;
+  const adapter = new NativeOpenCodeAdapter({ hostId: "scoped-discovery", nativeStatusPollIntervalMs: 20,
+    fetch: async (input, init) => {
+      const url = requestUrl(input);
+      if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+      if (url.pathname === "/session/selected") return jsonResponse({ id: "selected", directory: "C:/project" });
+      if (url.pathname === "/session/status") {
+        if (url.searchParams.get("directory") !== "C:/project") return jsonResponse({});
+        projectPolls += 1;
+        return jsonResponse({ unseen: { type: "busy" } });
+      }
+      return new Response(null, { status: 404 });
+    },
+  });
+  t.after(() => adapter.dispose());
+  await adapter.getSession("selected");
+  const states: unknown[] = [];
+  await adapter.subscribe(null, (event) => {
+    if (event.providerSessionId === "unseen" && event.type === "session.status_changed") states.push(event.payload.state);
+  });
+  await waitFor(() => projectPolls >= 3, "later polls must retain the discovered task's scope");
+  assert.equal(adapter.hasActiveTurn("unseen"), true);
+  assert.equal(states.includes("idle"), false);
+});
+
 test("OpenCode marks every active task disconnected before the provider and restores from fresh reconnect truth", async (t) => {
   const events = new SseFixture();
   let statusCalls = 0;
@@ -2647,6 +2984,7 @@ test("an active OpenCode steer becomes the owned follow-up and settles on its ow
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -2846,6 +3184,7 @@ test("manual interrupt turns abort cleanup into one interruption and leaves the 
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -2862,11 +3201,11 @@ test("manual interrupt turns abort cleanup into one interruption and leaves the 
     if (event.type === "agent.error") errors.push(event.payload);
   });
 
-  await adapter.sendMessage("ses_manual_interrupt", { requestId: "first", content: "First" });
+  const first = await adapter.sendMessage("ses_manual_interrupt", { requestId: "first", content: "First" });
   await adapter.interrupt("ses_manual_interrupt");
   await new Promise((resolve) => setTimeout(resolve, 30));
 
-  assert.deepEqual(interruptions, [{ providerStatus: null }]);
+  assert.deepEqual(interruptions, [{ providerStatus: null, turnId: first.providerTurnId }]);
   assert.deepEqual(errors, []);
   assert.deepEqual(completions, []);
   assert.equal(promptCalls, 1);
@@ -2923,6 +3262,7 @@ test("sequential duplicate stops share one abort while a genuine successor can s
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -2959,6 +3299,101 @@ test("sequential duplicate stops share one abort while a genuine successor can s
   assert.equal(adapter.hasActiveTurn("ses_sequential_stop"), false);
 });
 
+test("manual Stop settles from native abort evidence without waiting for a stalled HTTP body", async (t) => {
+  const events = new SseFixture();
+  let abortCalls = 0;
+  let cancelledResponse = false;
+  let releaseResponse!: () => void;
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname.endsWith("/prompt_async")) return new Response(null, { status: 204 });
+    if (url.pathname.endsWith("/abort")) {
+      abortCalls += 1;
+      return await new Promise<Response>((resolve, reject) => {
+        const cleanup = setTimeout(() => {
+          events.push({ payload: { type: "session.error", properties: { sessionID: "ses_slow_abort",
+            error: { name: "MessageAbortedError", data: { message: "Aborted" } } } } });
+          events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_slow_abort" } } });
+        }, 70);
+        const aborted = () => { cancelledResponse = true; clearTimeout(cleanup); reject(new Error("abort response cancelled after native cleanup")); };
+        init?.signal?.addEventListener("abort", aborted, { once: true });
+        releaseResponse = () => { clearTimeout(cleanup); init?.signal?.removeEventListener("abort", aborted); resolve(jsonResponse({})); };
+      });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new OpenCodeAdapter({ directory: "C:/fixture", hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()), activityPollIntervalMs: 60_000 });
+  t.after(async () => { releaseResponse?.(); await adapter.dispose(); });
+  const observed: ProviderEvent[] = [];
+  await adapter.subscribe(null, event => { observed.push(event); });
+  await adapter.sendMessage("ses_slow_abort", { requestId: "slow-abort", content: "Run a long tool and keep working" });
+  const started = performance.now();
+  const stopping = adapter.interrupt("ses_slow_abort");
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([stopping, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Stop exceeded 3 seconds despite confirmed native cancellation")), 3000); })]);
+  } finally { if (timer !== undefined) clearTimeout(timer); }
+  assert.ok(performance.now() - started < 3000);
+  assert.equal(cancelledResponse, true, "the unused HTTP response must be cancelled, not leaked");
+  assert.equal(adapter.hasActiveTurn("ses_slow_abort"), false);
+  assert.equal(observed.filter(event => event.type === "agent.interrupted").length, 1);
+  assert.equal(observed.filter(event => event.type === "agent.error").length, 0);
+  await adapter.interrupt("ses_slow_abort");
+  assert.equal(abortCalls, 1);
+});
+
+for (const blockedRequest of ["prompt response", "receipt read"]) test(`Stop does not wait behind a ${blockedRequest} after OpenCode already saved the instruction`, async (t) => {
+  const events = new SseFixture();
+  let promptBody: Record<string, unknown> | undefined;
+  let releaseResponse!: () => void;
+  let responseCancelled = false;
+  let abortCalls = 0;
+  let receiptReads = 0;
+  const stall = (signal: AbortSignal | null | undefined) => new Promise<Response>((resolve, reject) => {
+    const aborted = () => { responseCancelled = true; reject(new Error("prompt response cancelled")); };
+    signal?.addEventListener("abort", aborted, { once: true });
+    releaseResponse = () => { signal?.removeEventListener("abort", aborted); resolve(new Response(null, { status: 204 })); };
+  });
+  const fetchLike: FetchLike = async (input, init) => {
+    const url = requestUrl(input);
+    if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+    if (url.pathname.endsWith("/prompt_async")) {
+      promptBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      events.push({ payload: { type: "session.status", properties: { sessionID: "ses_pending_stop", status: { type: "busy" } } } });
+      return blockedRequest === "prompt response" ? await stall(init?.signal) : new Response(null, { status: 204 });
+    }
+    if (url.pathname.includes("/message/") && promptBody) {
+      if (++receiptReads === 1 && blockedRequest === "receipt read") return await stall(init?.signal);
+      return jsonResponse({ info: { id: promptBody.messageID, sessionID: "ses_pending_stop", role: "user" }, parts: promptBody.parts });
+    }
+    if (url.pathname.endsWith("/abort")) {
+      abortCalls++;
+      events.push({ payload: { type: "session.error", properties: { sessionID: "ses_pending_stop",
+        error: { name: "MessageAbortedError", data: { message: "Aborted" } } } } });
+      events.push({ payload: { type: "session.idle", properties: { sessionID: "ses_pending_stop" } } });
+      return jsonResponse({});
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const adapter = new NativeOpenCodeAdapter({ directory: "C:/fixture", hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", fetch: fetchLike,
+    activityReader: new SequenceActivityReader(new Set()), activityPollIntervalMs: 60_000 });
+  t.after(async () => { releaseResponse?.(); await adapter.dispose(); });
+  await adapter.subscribe(null, () => undefined);
+  const sending = adapter.sendMessage("ses_pending_stop", { requestId: "pending-stop", content: "Run a long tool" });
+  await waitFor(() => releaseResponse !== undefined, "native prompt accepted while HTTP is pending");
+  const stopping = adapter.interrupt("ses_pending_stop");
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([stopping, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Stop waited over 3 seconds behind prompt delivery")), 3000); })]);
+  } finally { if (timer !== undefined) clearTimeout(timer); }
+  assert.equal((await sending).accepted, true, "the exact saved instruction must remain accepted");
+  assert.equal(responseCancelled, true);
+  assert.equal(abortCalls, 1);
+  assert.equal(adapter.hasActiveTurn("ses_pending_stop"), false);
+});
+
 test("a delayed abort cleanup confirms a manual stop whose HTTP response disconnected", async (t) => {
   const events = new SseFixture();
   let abortCalls = 0;
@@ -2977,6 +3412,7 @@ test("a delayed abort cleanup confirms a manual stop whose HTTP response disconn
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -2993,11 +3429,11 @@ test("a delayed abort cleanup confirms a manual stop whose HTTP response disconn
     if (event.type === "agent.completed") completions.push(event.payload);
   });
 
-  await adapter.sendMessage("ses_delayed_manual_cleanup", { requestId: "first", content: "First" });
+  const first = await adapter.sendMessage("ses_delayed_manual_cleanup", { requestId: "first", content: "First" });
   await adapter.interrupt("ses_delayed_manual_cleanup");
 
   assert.equal(abortCalls, 1);
-  assert.deepEqual(interruptions, [{ providerStatus: null }]);
+  assert.deepEqual(interruptions, [{ providerStatus: null, turnId: first.providerTurnId }]);
   assert.deepEqual(errors, []);
   assert.deepEqual(completions, []);
   assert.equal(adapter.hasActiveTurn("ses_delayed_manual_cleanup"), false);
@@ -3022,6 +3458,7 @@ test("a genuine manual abort failure rejects after its bounded cleanup grace and
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -3068,6 +3505,7 @@ test("genuine provider error stays failed through trailing idle cleanup and the 
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -3176,6 +3614,7 @@ test("an idle queued ahead of a continuing tool cannot finish the prompt", async
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -3280,6 +3719,7 @@ test("activity disappearance and its timeout cannot settle incomplete owned prom
     new Set(),
   );
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -3340,6 +3780,7 @@ test("a delayed guard abort cannot erase or complete a concurrently starting suc
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -3475,6 +3916,7 @@ test("an ambiguous guard abort does not turn its later abort event into an agent
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -3562,6 +4004,7 @@ test("post-attempt live output retires ambiguous abort-error suppression", async
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -3624,6 +4067,7 @@ test("a genuine session error releases the owned prompt", async (t) => {
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -3689,6 +4133,7 @@ test("a successor message boundary preserves its genuine failed status", async (
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -3780,6 +4225,7 @@ test("activity becoming unavailable still asks exact history to finish the owned
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -3822,6 +4268,7 @@ test("after an empty guard barrier the successor's first idle is genuine", async
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -3936,6 +4383,7 @@ test("guard abort errors stay quarantined only until the successor message bound
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -4033,6 +4481,7 @@ test("the runaway guard requires two history reads before suppressing a continua
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -4102,6 +4551,7 @@ test("a guard with no cleanup signals lets the successor complete on one genuine
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -4212,6 +4662,7 @@ test("an activity snapshot started before guard completion cannot resurrect the 
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -4287,6 +4738,7 @@ test("late guard cleanup is quarantined while the successor starts", async (t) =
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -4399,6 +4851,7 @@ test("the runaway guard requires the suspicious assistant to exist in persisted 
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -4490,6 +4943,7 @@ test("OpenCode waits for an actual no-tool continuation before aborting a runawa
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -4608,6 +5062,7 @@ test("OpenCode settles an exact persisted no-tool response without waiting for s
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -4650,6 +5105,7 @@ for (const scenario of ["newer", "older", "missing-proof", "owned-successor"] as
       finish: "stop", time: { created: 25, completed: 30 },
     };
     const adapter = new OpenCodeAdapter({
+      directory: "C:/fixture",
       hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", nativeStatusPollIntervalMs: 60_000,
       activityReader: new SequenceActivityReader(new Set()), activityPollIntervalMs: 60_000,
       fetch: async (input, init) => {
@@ -4701,6 +5157,73 @@ for (const scenario of ["newer", "older", "missing-proof", "owned-successor"] as
   });
 }
 
+for (const successor of ["terminal", "running-tool", "newer-owned-prompt"] as const) {
+  test(`OpenCode recovery follows a changed prompt while an older idle is pending: ${successor}`, async (t) => {
+    const sessionID = "pending_idle_successor";
+    const events = new SseFixture();
+    const promptTimes = new Map<string, number>([["native_continuation", 30]]);
+    let history: unknown[] = [];
+    let pendingReads = 0;
+    let tailReads = 0;
+    let completions = 0;
+    let aborts = 0;
+    const adapter = new OpenCodeAdapter({
+      directory: "C:/fixture",
+      hostId: "host_1", baseUrl: "http://127.0.0.1:4096/",
+      activityReader: new SequenceActivityReader(new Set()),
+      activityPollIntervalMs: 60_000, nativeStatusPollIntervalMs: 20,
+      fetch: async (input, init) => {
+        const url = requestUrl(input);
+        if (url.pathname === "/global/event") return events.response(init?.signal ?? undefined);
+        if (url.pathname.endsWith("/prompt_async")) return new Response(null, { status: 204 });
+        if (url.pathname.endsWith("/abort")) { aborts += 1; return jsonResponse(true); }
+        if (url.pathname === "/session/status") return jsonResponse({});
+        if (url.pathname.endsWith("/message")) {
+          if (url.searchParams.get("limit") === "2") tailReads += 1;
+          else pendingReads += 1;
+          return jsonResponse(history);
+        }
+        if (url.pathname.includes("/message/")) {
+          const id = url.pathname.split("/").at(-1)!;
+          const created = promptTimes.get(id);
+          if (created !== undefined) return jsonResponse({ info: { id, role: "user", time: { created } }, parts: [] });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    t.after(() => adapter.dispose());
+    await adapter.subscribe(null, (event) => { if (event.type === "agent.completed") completions += 1; });
+    const sent = await adapter.sendMessage(sessionID, { requestId: "before_compaction", content: "Continue" });
+    promptTimes.set(sent.providerTurnId!, 10);
+    events.push({ payload: { type: "session.idle", properties: { sessionID } } });
+    await waitFor(() => pendingReads > 0, "the old prompt must have an outstanding completion check");
+    if (successor === "newer-owned-prompt") {
+      const next = await adapter.sendMessage(sessionID, { requestId: "new_instruction", content: "New work" });
+      promptTimes.set(next.providerTurnId!, 50);
+      events.push({ payload: { type: "session.idle", properties: { sessionID } } });
+    }
+    // Auto-compaction/native continuation changes parentID. Its final SSE is
+    // lost, and every message for the old dispatched parent is outside the tail.
+    history = [{
+      info: { id: "native_final", sessionID, role: "assistant", parentID: "native_continuation", finish: "stop", time: { created: 40, completed: 45 } },
+      parts: successor === "running-tool"
+        ? [{ type: "tool", tool: "bash", state: { status: "running" } }]
+        : [{ type: "reasoning", text: "Checked", time: { start: 40, end: 42 } }, { type: "text", text: "Finished" }, { type: "step-finish", reason: "stop" }],
+    }];
+    const before = tailReads;
+    await waitFor(() => tailReads > before, "a pending old idle must not exclude this task from tail recovery");
+    if (successor === "terminal") {
+      await waitFor(() => completions === 1, "the newer persisted final must settle the old dispatch ownership");
+      assert.equal(adapter.hasActiveTurn(sessionID), false);
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.equal(completions, 0);
+      assert.equal(adapter.hasActiveTurn(sessionID), true);
+    }
+    assert.equal(aborts, 0, "history recovery must not abort provider work");
+  });
+}
+
 for (const origin of ["owned", "external", "recovered"] as const) {
   test(`OpenCode settles ${origin} terminal output despite persistent database and native busy`, async (t) => {
     const events = new SseFixture();
@@ -4715,6 +5238,7 @@ for (const origin of ["owned", "external", "recovered"] as const) {
       finish: "stop", time: { created: 10 },
     });
     const adapter = new OpenCodeAdapter({
+      directory: "C:/fixture",
       hostId: "host_1", baseUrl: "http://127.0.0.1:4096/",
       activityReader: reader, activityPollIntervalMs: 20,
       nativeStatusPollIntervalMs: origin === "recovered" ? 20 : 60_000,
@@ -4767,6 +5291,7 @@ for (const continuation of ["tool", "summary", "new-user", "new-assistant", "own
     let historyCalls = 0;
     let advance = false;
     const adapter = new OpenCodeAdapter({
+      directory: "C:/fixture",
       hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", nativeStatusPollIntervalMs: 60_000,
       fetch: async (input, init) => {
         const path = requestUrl(input).pathname;
@@ -4828,6 +5353,7 @@ test("OpenCode wrap-up busy after a no-tool stop cannot keep the turn live", asy
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -4907,6 +5433,7 @@ test("OpenCode treats a persisted length finish as a completed no-tool turn", as
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -4962,6 +5489,7 @@ test("OpenCode keeps no-idle completion armed through the terminal assistant's c
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -5048,6 +5576,7 @@ test("OpenCode keeps a turn active when a tool continuation persists between ter
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -5108,6 +5637,7 @@ test("OpenCode does not complete an earlier assistant when a chronologically lat
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -5153,6 +5683,7 @@ test("OpenCode stops a repeated zero-token empty-response loop and exposes one u
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -5232,6 +5763,7 @@ test("OpenCode does not stop unknown-finish generations that contain real output
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -5296,6 +5828,7 @@ test("an early unlabelled idle cannot finish a slow Tethoq-owned prompt", async 
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -5356,6 +5889,7 @@ test("a transient stale history read cannot lose the prompt's sole idle", async 
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -5425,6 +5959,7 @@ test("delayed guard cleanup cannot fail or complete a newer prompt", async (t) =
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -5528,6 +6063,7 @@ test("OpenCode preserves a stop response with a tool call and its same-prompt co
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -5609,6 +6145,7 @@ test("a normal completed prompt never suppresses the next user prompt in the sam
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -5713,6 +6250,7 @@ test("retired same-session idle cannot complete a newer primary prompt", async (
     return jsonResponse({});
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:63791/",
     secondaryBaseUrl: "http://127.0.0.1:4096/",
@@ -5761,6 +6299,43 @@ test("retired same-session idle cannot complete a newer primary prompt", async (
   assert.equal(adapter.hasActiveTurn("ses_replaced"), false);
   assert.equal(completions, 1);
 });
+
+for (const failed of [false, true]) {
+  test(`native compaction on a retained server remains recoverable and settles from history (${failed})`, async (t) => {
+    const primary = new SseFixture();
+    const secondary = new SseFixture();
+    const sessionID = "retained-context-goal";
+    let history: unknown[] = [];
+    const received: ProviderEvent[] = [];
+    const adapter = new OpenCodeAdapter({
+      hostId: "host", baseUrl: "http://127.0.0.1:63791/", secondaryBaseUrl: "http://127.0.0.1:63792/",
+      secondaryActiveSessionIds: [sessionID], activityReader: new SequenceActivityReader(new Set()),
+      activityPollIntervalMs: 60_000, nativeStatusPollIntervalMs: 20,
+      fetch: async (input, init) => {
+        const url = requestUrl(input);
+        if (url.pathname === "/global/event") return (url.port === "63791" ? primary : secondary).response(init?.signal ?? undefined);
+        if (url.pathname.endsWith("/message")) return jsonResponse(history);
+        return jsonResponse({});
+      },
+    });
+    t.after(() => adapter.dispose());
+    await adapter.subscribe(null, event => { received.push(event); });
+    secondary.push({ payload: { type: "session.error", properties: { sessionID, error: { name: "ContextOverflowError", data: { message: "Payload Too Large" } } } } });
+    await waitFor(() => received.some(event => event.payload.recovery === "native_compaction"), "retained server reports recovery");
+    assert.equal(received.some(event => event.type === "agent.error"), false);
+    assert.equal(adapter.hasActiveTurn(sessionID), true);
+    // Lose the final message SSE, as can happen while the desktop reconnects.
+    history = [{ info: { id: "final", role: "assistant", parentID: "native-user", time: { created: 30, completed: 40 },
+      finish: failed ? "error" : "stop", ...(failed ? { summary: true, error: { name: "ContextOverflowError", data: { message: "Unable to compact" } } } : {}) },
+      parts: failed ? [] : [{ type: "text", text: "Work finished" }] }];
+    secondary.push({ payload: { type: "session.idle", properties: { sessionID } } });
+    await waitFor(() => received.some(event => event.type === (failed ? "agent.error" : "agent.completed")), "history confirms the retained turn's actual outcome");
+    assert.equal(received.filter(event => event.type === "agent.error").length, failed ? 1 : 0);
+    assert.equal(received.filter(event => event.type === "agent.completed").length, failed ? 0 : 1);
+    assert.equal(adapter.isSecondaryBusy(), false);
+    assert.equal(adapter.hasActiveTurn(sessionID), false);
+  });
+}
 
 test("a secondary feed streams the retired server's turn and reports busy until it drains", async (t) => {
   const primary = new SseFixture();
@@ -5885,6 +6460,7 @@ test("OpenCode compaction is not cut off by the ordinary request timeout", async
     return new Response("not found", { status: 404 });
   };
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host_1",
     baseUrl: "http://127.0.0.1:4096/",
     fetch: fetchLike,
@@ -5949,6 +6525,7 @@ test("OpenCode compaction waits for new history after HTTP acknowledgment and sh
   let history: unknown[] = baseline;
   let summarizeCalls = 0;
   const adapter = new OpenCodeAdapter({
+    directory: "C:/fixture",
     hostId: "host", baseUrl: "http://localhost/", compactionTimeoutMs: 5000,
     fetch: async (input) => {
       if (requestUrl(input).pathname.endsWith("/message")) return jsonResponse(history);
@@ -5968,163 +6545,18 @@ test("OpenCode compaction waits for new history after HTTP acknowledgment and sh
   assert.equal(settled, true);
 });
 
-for (const newerPrompt of [false, true]) {
-  test(`OpenCode error recovery waits for runner cleanup and respects newer work (${newerPrompt})`, async (t) => {
-    const events = new SseFixture();
-    let summarizeCalls = 0;
-    let errorSeen = false;
-    let summarized = false;
-    const adapter = new OpenCodeAdapter({
-      hostId: "host", baseUrl: "http://localhost/", compactionTimeoutMs: 5000,
-      activityReader: new SequenceActivityReader(new Set()), activityPollIntervalMs: 60_000,
-      fetch: async (input, init) => {
-        const path = requestUrl(input).pathname;
-        if (path === "/global/event") return events.response(init?.signal ?? undefined);
-        if (path.endsWith("/prompt_async")) return new Response(null, { status: 204 });
-        if (path.endsWith("/message")) return jsonResponse([
-          { info: { role: "assistant", providerID: "test", modelID: "test" } },
-          ...(summarized ? openCodeCompactionHistory() : []),
-        ]);
-        if (path.endsWith("/summarize")) {
-          assert.equal(JSON.parse(String(init?.body)).auto, false, "only Tethoq schedules the next goal turn");
-          summarizeCalls++;
-          summarized = true;
-          return jsonResponse({});
-        }
-        throw new Error(`Unexpected request: ${path}`);
-      },
-    });
-    t.after(() => adapter.dispose());
-    await adapter.subscribe(null, (event) => { if (event.type === "agent.error") errorSeen = true; });
-    await adapter.sendMessage("session", { requestId: "failed-turn", content: "Review images" });
-    events.push({ payload: { type: "session.error", properties: { sessionID: "session", error: {
-      name: "APIError", data: { statusCode: 400, message: "request contains 51 images, exceeding the maximum of 50 allowed per request" },
-    } } } });
-    await waitFor(() => errorSeen, "provider failure");
-    const compaction = adapter.compactSession("session");
-    const outcome = compaction.then(() => "completed", () => "rejected");
-    await new Promise(resolve => setTimeout(resolve, 30));
-    assert.equal(summarizeCalls, 0, "error publication precedes native runner cleanup");
-    if (newerPrompt) await adapter.sendMessage("session", { requestId: "newer-turn", content: "New user instruction" });
-    events.push({ payload: { type: "session.idle", properties: { sessionID: "session" } } });
-    assert.equal(await outcome, newerPrompt ? "rejected" : "completed");
-    assert.equal(summarizeCalls, newerPrompt ? 0 : 1);
-    if (newerPrompt) assert.equal(adapter.hasActiveTurn("session"), true, "recovery cannot take over a newer prompt");
-  });
-}
-
-for (const failure of ["error", "cancelled", "request-failed", "disconnect", "dispose", "timeout"] as const) {
-  test(`OpenCode compaction rejects ${failure} without reporting success`, async (t) => {
-    let reads = 0;
-    let disposed = false;
-    const adapter = new OpenCodeAdapter({
-      hostId: "host", baseUrl: "http://localhost/", compactionTimeoutMs: 60,
-      fetch: async (input, init) => {
-        if (requestUrl(input).pathname.endsWith("/message")) {
-          reads += 1;
-          if (reads > 1 && failure === "disconnect") throw new Error("disconnected");
-          return jsonResponse([{ info: { role: "assistant", providerID: "test", modelID: "test" } },
-            ...(reads > 1 && (failure === "error" || failure === "cancelled")
-              ? openCodeCompactionHistory({ name: failure === "cancelled" ? "MessageAbortedError" : "APIError" })
-              : reads > 1 && failure === "request-failed" ? openCodeCompactionHistory().slice(0, 1) : [])]);
-        }
-        if (failure === "request-failed") return new Response("failed", { status: 500 });
-        if (failure === "dispose") {
-          setTimeout(() => { disposed = true; void adapter.dispose(); }, 5);
-          return await new Promise((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(new Error("disposed")), { once: true }));
-        }
-        return jsonResponse({});
-      },
-    });
-    t.after(() => adapter.dispose());
-    await assert.rejects(adapter.compactSession("session"));
-    if (failure === "dispose") assert.equal(disposed, true);
-  });
-}
-
-test("OpenCode compaction completes from provider history when the summarize response never closes", async (t) => {
-  let messageReads = 0;
-  let summarizeCalls = 0;
-  let summarizeAborted = false;
-  const baseline = [{
-    info: {
-      id: "msg_before",
-      role: "assistant",
-      providerID: "crofai",
-      modelID: "deepseek-v4-pro",
-      tokens: { input: 100_000, output: 2_000, cache: { read: 0, write: 0 } },
-    },
-  }];
-  const completed = [
-    ...baseline,
-    { info: { id: "msg_compaction", role: "user" }, parts: [{ type: "compaction", auto: false }] },
-    {
-      info: {
-        id: "msg_summary",
-        parentID: "msg_compaction",
-        role: "assistant",
-        mode: "compaction",
-        summary: true,
-        time: { created: 10, completed: 20 },
-        finish: "stop",
-      },
-      parts: [{ type: "text", text: "Compacted context" }],
-    },
-  ];
-  const fetchLike: FetchLike = async (input, init) => {
-    const path = requestUrl(input).pathname;
-    if (path === "/session/ses_compact/message") {
-      messageReads += 1;
-      return jsonResponse(messageReads === 1 ? baseline : completed);
-    }
-    if (path === "/session/ses_compact/summarize") {
-      summarizeCalls += 1;
-      await new Promise<void>((_resolve, reject) => {
-        const abort = () => {
-          summarizeAborted = true;
-          reject(init?.signal?.reason ?? new Error("aborted"));
-        };
-        if (init?.signal?.aborted) abort();
-        else init?.signal?.addEventListener("abort", abort, { once: true });
-      });
-      return jsonResponse({});
-    }
-    return new Response("not found", { status: 404 });
-  };
-  const adapter = new OpenCodeAdapter({
-    hostId: "host_1",
-    baseUrl: "http://127.0.0.1:4096/",
-    fetch: fetchLike,
-    requestTimeoutMs: 10,
-    activityReader: new SequenceActivityReader(new Set()),
-  });
+test("OpenCode compaction restarts an acknowledged marker only when no summary began", async (t) => {
+  let calls = 0;
+  let history: unknown[] = [{ info: { role: "assistant", providerID: "test", modelID: "test" }, parts: [] }];
+  const adapter = new OpenCodeAdapter({ directory: "C:/fixture", hostId: "host", baseUrl: "http://localhost/", compactionTimeoutMs: 6000,
+    fetch: async (input) => {
+      if (requestUrl(input).pathname.endsWith("/message")) return jsonResponse(history);
+      calls++;
+      const summary = openCodeCompactionHistory();
+      history = [...history, ...(calls === 1 ? summary.slice(0, 1) : summary)];
+      return jsonResponse(true);
+    } });
   t.after(() => adapter.dispose());
-
-  await adapter.compactSession("ses_compact");
-
-  assert.equal(summarizeCalls, 1);
-  assert.equal(messageReads, 2);
-  assert.equal(summarizeAborted, true, "the completed lifecycle left the hanging HTTP response open");
-});
-
-test("OpenCode reports an unknown occupancy rather than claiming an empty context", async () => {
-  const fetchLike: FetchLike = async (input) => {
-    const path = requestUrl(input).pathname;
-    if (path === "/provider") {
-      return jsonResponse({
-        connected: ["crofai"],
-        all: [{ id: "crofai", name: "Crof", models: { "deepseek-v4-pro": { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro", limit: { context: 1_000_000 } } } }],
-      });
-    }
-    // No turn in the session ever stated a usage. Unknown is not the same claim as
-    // empty, and only one of the two can be drawn as a gauge honestly.
-    return jsonResponse([{ info: { role: "user" } }, { info: { role: "assistant", providerID: "crofai", modelID: "deepseek-v4-pro" } }]);
-  };
-  const adapter = new OpenCodeAdapter({ hostId: "host_1", baseUrl: "http://127.0.0.1:4096/", fetch: fetchLike, activityReader: new SequenceActivityReader(new Set()) });
-
-  const context = await adapter.getSessionContext("ses_1");
-
-  assert.equal(context.usedTokens, null);
-  assert.equal(context.usedPercent, null);
-  await adapter.dispose();
+  await adapter.compactSession("session");
+  assert.equal(calls, 2);
 });

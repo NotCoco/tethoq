@@ -164,11 +164,13 @@ export interface TimelineItem {
   kind: TimelineKind;
   /** Provider-supplied assistant phase when the harness distinguishes progress from its final answer. */
   phase?: "commentary" | "final_answer";
+  /** A displayed artifact is visible output, but never evidence that the model's turn ended. */
+  presentationOnly?: boolean;
   title?: string;
   body: string;
   detail?: string;
   /** App-owned notice presentation for a non-terminal event such as a failed EYES tool call. */
-  notice?: "eyes_failure" | "eyes_inspection";
+  notice?: "eyes_failure" | "eyes_inspection" | "mesh_failure" | "interruption";
   state?: "running" | "completed" | "failed";
   /** Stable Mesh delegation identity for one materialized child task. */
   delegationId?: string;
@@ -216,6 +218,8 @@ export type TimelineOrigin =
 export interface TimelineImage {
   name: string;
   mimeType?: string;
+  /** Identifies deferred bytes so a late load cannot overwrite a newer preview. */
+  retrievalId?: string;
   /** Only renderer-safe data-image or HTTPS URLs are retained for display. */
   dataUrl?: string;
   /** The readable message is visible while its deferred preview is transferring. */

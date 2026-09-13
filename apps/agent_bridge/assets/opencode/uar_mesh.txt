@@ -8,15 +8,22 @@ const configuredRuntimePath = process.env.UAR_MESH_RUNTIME
 const legacyRuntimePath = join(homedir(), ".tethoq", "mesh-tool-runtime.json")
 const runtimeDirectory = join(homedir(), ".tethoq", "mesh-runtimes")
 const runtimeResponseTimeoutMs = 2_000
+const runtimeActiveTimeoutMs = 30_000
+const runtimeRecoveryTimeoutMs = 30_000
 // The only EYES sentence a provider model may see when the visual-support pipe
 // itself is unreachable. Real usage, auth, and model failures keep their own
 // terminal errors; transport noise must never leak a raw pipe diagnostic.
 const eyesTransportFailure = "EYES could not inspect the image. Try again or choose another EYES model."
 
 class RuntimeConnectError extends Error {
-  constructor(error) {
-    super(error instanceof Error ? error.message : String(error), { cause: error })
+  constructor(error, mayHaveRun = false, canForget = false) {
+    super(mayHaveRun
+      ? "Tethoq lost the tool connection before its result arrived. The action may have been accepted; check the task or child state before sending it again."
+      : "The Tethoq tool runtime is reconnecting. Try again shortly.", { cause: error })
     this.name = "RuntimeConnectError"
+    this.code = mayHaveRun ? "TOOL_DELIVERY_UNKNOWN" : "RUNTIME_UNAVAILABLE"
+    this.mayHaveRun = mayHaveRun
+    this.canForget = canForget
   }
 }
 
@@ -24,6 +31,7 @@ class RuntimeTaskNotOwnedError extends Error {
   constructor(message) {
     super(message || "This Tethoq runtime does not own the task")
     this.name = "RuntimeTaskNotOwnedError"
+    this.code = "TASK_NOT_OWNED_HERE"
   }
 }
 
@@ -36,33 +44,61 @@ class RuntimeEyesNotConfiguredError extends Error {
 }
 
 async function call(sessionID, name, input, callId) {
-  const runtimes = await matchingRuntimes(name)
+  // OpenCode caches the tool module for the life of its server. Resolve the
+  // installed transport per invocation so app updates also reach active servers.
+  if (!import.meta.url.startsWith("file:")) return await invoke(sessionID, name, input, callId)
+  const url = new URL(import.meta.url)
+  url.search = ""
+  url.hash = ""
+  const source = await readFile(url, "utf8")
+  // Import the dependency-free transport by content. Bun can retain the old
+  // file module even when its URL query changes; a data URL identifies the bytes.
+  const transport = source.replace(/^import \{ tool \} from [^\r\n]+\r?\n/mu, "")
+    .replace(/^export const [\s\S]*/mu, "")
+  const current = await import(`data:text/javascript;base64,${Buffer.from(transport).toString("base64")}`)
+  return await current.invoke(sessionID, name, input, callId)
+}
+
+// A plain function export is not a provider tool; only tool definitions register.
+export async function invoke(sessionID, name, input, callId) {
+  let deadline
+  const waitDeadline = name === "mesh_wait" ? Date.now() + Math.min(300, Math.max(1, input.timeout_seconds ?? 120)) * 1000 : undefined
+  const attempted = new Set()
   let lastError
   let configurationError
   let taskNotOwnedError
-  for (const runtime of runtimes) {
-    try {
-      return await callRuntime(runtime, sessionID, name, input, callId)
-    } catch (error) {
-      if (error instanceof RuntimeEyesNotConfiguredError) {
-        configurationError = error
-        continue
+  do {
+    const runtimes = await matchingRuntimes(name)
+    for (const runtime of runtimes) {
+      const key = JSON.stringify([runtime.hostId, runtime.pipePath, runtime.token])
+      if (attempted.has(key)) continue
+      attempted.add(key)
+      try {
+        return await callRuntime(runtime, sessionID, name, waitDeadline === undefined ? input : { ...input, timeout_seconds: Math.max(1, Math.ceil((waitDeadline - Date.now()) / 1000)) }, callId)
+      } catch (error) {
+        if (error instanceof RuntimeEyesNotConfiguredError) { configurationError = error; continue }
+        if (error instanceof RuntimeTaskNotOwnedError) {
+          if (!taskNotOwnedError) taskNotOwnedError = error
+          continue
+        }
+        if (!(error instanceof RuntimeConnectError) || error.mayHaveRun) throw error
+        lastError = error
+        deadline ??= Math.min(Date.now() + runtimeRecoveryTimeoutMs, waitDeadline === undefined ? Infinity : waitDeadline + runtimeRecoveryTimeoutMs)
+        if (error.canForget) await forgetDeadRuntime(runtime)
       }
-      if (error instanceof RuntimeTaskNotOwnedError) {
-        // A later dead descriptor's connect failure must not mask the
-        // meaningful ownership miss once every runtime has been tried.
-        if (!taskNotOwnedError) taskNotOwnedError = error
-        continue
-      }
-      if (!(error instanceof RuntimeConnectError)) throw error
-      lastError = error
-      await forgetDeadRuntime(runtime)
     }
-  }
-  throw configurationError || taskNotOwnedError || lastError || new Error("No active Tethoq tool runtime supports this command")
+    deadline ??= Date.now() + runtimeRecoveryTimeoutMs
+    if (configurationError || taskNotOwnedError || Date.now() >= deadline) break
+    await new Promise(resolve => setTimeout(resolve, 250))
+  } while (Date.now() < deadline)
+  throw configurationError || taskNotOwnedError || lastError || new Error("The Tethoq tool runtime is reconnecting. Try again shortly.")
 }
 
 async function forgetDeadRuntime(runtime) {
+  if (Number.isInteger(runtime.pid) && runtime.pid > 0) {
+    try { process.kill(runtime.pid, 0); return }
+    catch (error) { if (error?.code !== "ESRCH") return }
+  }
   // Crashed bridges leak descriptors that would otherwise be retried on every
   // later tool call. Remove the file that still names this exact unreachable
   // runtime; identity is rechecked so a recycled path is never deleted.
@@ -122,52 +158,66 @@ function dedupeRuntimes(runtimes) {
   })
 }
 
+function canRepeatRuntimeRead(name, input) {
+  return ["mesh_list_children", "mesh_list_sessions", "mesh_wait", "mesh_read_result", "browser_get_state", "browser_inspect", "browser_inspect_all"].includes(name)
+    || name === "tethoq_goal" && input.status === undefined
+}
+
 async function callRuntime(runtime, sessionID, name, input, callId) {
   const parentSessionId = [runtime.hostId, "opencode", sessionID].map(encodeURIComponent).join("/")
   return await new Promise((resolve, reject) => {
+    const repeatable = canRepeatRuntimeRead(name, input)
     let socket
-    try {
-      socket = createConnection(runtime.pipePath)
-    } catch (error) {
-      reject(new RuntimeConnectError(error))
-      return
-    }
+    let settled = false
+    let sent = false
     let buffer = ""
+    let deadline
+    const finish = (error, value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(deadline)
+      socket?.setTimeout(0)
+      socket?.destroy()
+      if (error) reject(error)
+      else resolve(value)
+    }
+    const failed = (error) => finish(new RuntimeConnectError(error, sent && !repeatable,
+      !sent && ["ENOENT", "ECONNREFUSED"].includes(error?.code)))
+    try { socket = createConnection(runtime.pipePath) }
+    catch (error) { failed(error); return }
+    const waitSeconds = name === "mesh_wait" && typeof input.timeout_seconds === "number" ? Math.min(300, Math.max(1, input.timeout_seconds)) : 300
+    deadline = setTimeout(() => failed(new Error("Tethoq tool execution timed out")), (waitSeconds + 30) * 1000)
     socket.setEncoding("utf8")
-    socket.setTimeout(runtimeResponseTimeoutMs, () => {
-      socket.destroy()
-      reject(new RuntimeConnectError(new Error("Tethoq runtime response timed out")))
-    })
-    socket.once("error", (error) => reject(new RuntimeConnectError(error)))
+    socket.setTimeout(repeatable ? runtimeResponseTimeoutMs : runtimeActiveTimeoutMs, () => failed(new Error("Tethoq runtime response timed out")))
+    socket.once("error", failed)
+    socket.once("end", () => { if (!settled) failed(new Error("Tethoq runtime closed before replying")) })
+    socket.once("close", () => { if (!settled) failed(new Error("Tethoq runtime disconnected")) })
     socket.on("data", (chunk) => {
+      if (settled) return
+      socket.setTimeout(runtimeActiveTimeoutMs)
       buffer += chunk
+      if (buffer.length > 16 * 1024 * 1024) { failed(new Error("Tethoq tool response is too large")); return }
       const newline = buffer.indexOf("\n")
       if (newline < 0) return
-      socket.setTimeout(0)
-      socket.destroy()
-      try {
-        const response = JSON.parse(buffer.slice(0, newline))
-        if (!response.ok) {
-          if (response.code === "TASK_NOT_OWNED_HERE") throw new RuntimeTaskNotOwnedError(response.error)
-          if (response.code === "EYES_NOT_CONFIGURED") throw new RuntimeEyesNotConfiguredError(response.error)
-          throw new Error(response.error ?? "Mesh tool failed")
-        }
-        resolve(JSON.stringify(response.result))
-      } catch (error) {
-        reject(error)
+      let response
+      try { response = JSON.parse(buffer.slice(0, newline)) }
+      catch (error) { failed(error); return }
+      if (!response || typeof response.ok !== "boolean") { failed(new Error("Invalid Tethoq tool response")); return }
+      if (!response.ok) {
+        if (response.code === "TASK_NOT_OWNED_HERE") { finish(new RuntimeTaskNotOwnedError(response.error)); return }
+        if (response.code === "EYES_NOT_CONFIGURED") { finish(new RuntimeEyesNotConfiguredError(response.error)); return }
+        const error = new Error(response.error || "Tethoq tool failed")
+        if (typeof response.code === "string") error.code = response.code
+        finish(error)
+        return
       }
+      finish(undefined, JSON.stringify(response.result))
     })
     socket.once("connect", () => {
-      socket.write(`${JSON.stringify({
-        token: runtime.token,
-        parentSessionId,
-        tool: name,
-        input,
-        context: {
-          ...(callId ? { callId } : {}),
-          lifecycleOwner: "provider",
-        },
-      })}\n`)
+      sent = true
+      socket.write(JSON.stringify({ token: runtime.token, parentSessionId, tool: name, input,
+        context: { ...(callId ? { callId } : {}), lifecycleOwner: "provider" },
+      }) + "\n")
     })
   })
 }
@@ -181,7 +231,7 @@ export const list_children = tool({
 })
 
 export const tethoq_goal = tool({
-  description: "Read the Tethoq goal in this task's private instructions, or stop its automatic prompts by marking it complete after verifying success or blocked when progress requires user input or an external change. Call this before your final response when done or blocked; saying so in prose does not update the goal. Blocking does not claim success. Never create or reopen a goal.",
+  description: "Read the Tethoq goal in this task's private instructions, or mark it complete only after verifying the full objective. Mark blocked only when the same genuine blocker has repeated for at least three consecutive goal turns and no meaningful progress is possible without user input or an external change. A resumed blocked goal starts a fresh three-turn audit. Hard, slow, uncertain, or incomplete work is not blocked. Call this before your final response when done or blocked; saying so in prose does not update the goal. Blocking stops automatic prompts without claiming success. Never create or reopen a goal.",
   args: { status: tool.schema.enum(["complete", "blocked"]).optional() },
   async execute(args, context) {
     return await call(context.sessionID, "tethoq_goal", args)
@@ -199,8 +249,20 @@ export const list_sessions = tool({
   },
 })
 
+export const tethoq_show_image = tool({
+  description: "Display an existing local PNG, JPEG, GIF, or WebP image (up to 25 MB) directly to the user, inline in this task, instead of sending a file link. Saves a copy in the task history. Does not generate or inspect images and works without model vision support. On success the user sees the image; do not send it again as a link.",
+  args: {
+    path: tool.schema.string().min(1).max(32768).describe("Absolute local image path."),
+    caption: tool.schema.string().max(2000).optional(),
+    request_id: tool.schema.string().min(1).max(256).describe("A unique ID for this presentation. Reuse only to retry the same path and caption."),
+  },
+  async execute(args, context) {
+    return await call(context.sessionID, "tethoq_show_image", args)
+  },
+})
+
 export const message_session = tool({
-  description: "Send a message to another indexed Tethoq task. Steers active work when supported or waits for idle; queued user messages run first.",
+  description: "Send a message to another indexed Tethoq task through its isolated inbox. This never steers or changes its user queue.",
   args: {
     target_session_id: tool.schema.string(),
     message: tool.schema.string().max(32000),
@@ -214,7 +276,7 @@ export const message_session = tool({
 export const dispatch_delegation = tool({
   description: "Dispatch every pre-authorized target for this turn using parent-authored instructions. Provider, model, and reasoning choices cannot be supplied or changed here.",
   args: {
-    delegation_id: tool.schema.string().max(256).describe("Copy the exact delegation_id from this turn's private Mesh guidance. This is an existing prepared ID; never invent a new one."),
+    delegation_id: tool.schema.string().max(256).optional().describe("Omit to use the current prepared Mesh selection. Supply the exact ID from this turn's private guidance only to disambiguate pending selections or retry a specific dispatch. Never copy an ID from earlier tool history."),
     assignments: tool.schema.array(tool.schema.object({
       target_index: tool.schema.number().int().min(0).max(3),
       instruction: tool.schema.string().min(1).max(32000),
@@ -240,7 +302,7 @@ export const wait = tool({
   description: "Optionally wait for selected delegated children when the current response needs their result. Children remain tracked if the parent finishes first.",
   args: {
     child_session_ids: tool.schema.array(tool.schema.string()).optional(),
-    timeout_seconds: tool.schema.number().int().min(1).max(900).optional(),
+    timeout_seconds: tool.schema.number().int().min(1).max(300).optional(),
   },
   async execute(args, context) {
     return await call(context.sessionID, "mesh_wait", args)
@@ -262,8 +324,8 @@ export const tethoq_turn_support = tool({
     try {
       return await call(context.sessionID, "tethoq_turn_support", args, context.callID || context.callId)
     } catch (error) {
-      if (error instanceof RuntimeEyesNotConfiguredError) throw error
-      if (error instanceof RuntimeConnectError || error instanceof RuntimeTaskNotOwnedError) throw new Error(eyesTransportFailure)
+      if (error?.code === "EYES_NOT_CONFIGURED") throw error
+      if (["RUNTIME_UNAVAILABLE", "TOOL_DELIVERY_UNKNOWN", "TASK_NOT_OWNED_HERE"].includes(error?.code)) throw new Error(eyesTransportFailure)
       if (error instanceof Error && /No active Tethoq tool runtime supports this command/.test(error.message)) throw new Error(eyesTransportFailure)
       throw error
     }

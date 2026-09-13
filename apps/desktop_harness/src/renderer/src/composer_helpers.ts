@@ -1,4 +1,5 @@
 import { matchReasoningEffort } from "../../../../../packages/protocol/src/reasoning";
+import { maxMessageAttachments as maximumMessageAttachments } from "../../../../../packages/protocol/src/attachments";
 import AttachmentEncodingWorker from "./attachment_encoding.worker.ts?worker&inline";
 import type { SessionState } from "./types";
 
@@ -32,6 +33,7 @@ export interface TranscriptionSource {
 }
 
 export const maximumMessageAttachmentBytes = 50 * 1024 * 1024;
+export { maximumMessageAttachments };
 
 export function parentSessionIdForBack(session: {
   readonly parentSessionId?: string | undefined;
@@ -131,7 +133,7 @@ export function insertedSlashCommand(command: ComposerSlashCommand, value = "", 
 export function appendAttachmentsWithinLimits<T extends { readonly path: string; readonly byteLength: number }>(
   current: readonly T[],
   incoming: readonly T[],
-  maximumCount = 4,
+  maximumCount = maximumMessageAttachments,
   maximumBytes = maximumMessageAttachmentBytes,
 ): { readonly items: readonly T[]; readonly acceptedCount: number; readonly rejectedForCount: boolean; readonly rejectedForBytes: boolean } {
   const items = [...current];
@@ -221,6 +223,7 @@ export function isAmbiguousSelectionValue(value: string | null | undefined): boo
 }
 
 type SessionPresentationItem = {
+  readonly presentationOnly?: boolean;
   readonly id?: string;
   readonly presentationId?: string;
   readonly messageId?: string;
@@ -238,6 +241,8 @@ const turnContinuationKinds = new Set(["reasoning", "tool", "command", "file", "
 const compactionBoundaryText = /(?:\b(?:context|conversation|session)\s+(?:was\s+|has\s+been\s+|automatically\s+)?compacted\b|\b(?:automatic\s+|context\s+|session\s+)?compaction\s+(?:complete|completed)\b)/iu;
 
 function isTurnContinuationAfterFinal(item: SessionPresentationItem): boolean {
+  if (item.presentationOnly) return false;
+  if (item.notice === "interruption") return false;
   if (item.state === "running") return true;
   if (turnContinuationKinds.has(item.kind ?? "")) return true;
   if (item.kind !== "assistant") return false;
@@ -259,7 +264,8 @@ function timelineItemIdentity(item: SessionPresentationItem): string | null {
 export function latestVisibleEndingIdentity(timeline: readonly SessionPresentationItem[]): string | null {
   let ending: string | null = null;
   for (const item of timeline) {
-    const endingKind = item.kind === "error"
+    if (item.presentationOnly) continue;
+    const endingKind = item.notice === "interruption" ? "interruption" : item.kind === "error"
       ? "error"
       : item.kind === "assistant" && item.phase === "final_answer" && item.state !== "running" ? "final" : null;
     if (endingKind === null) continue;
@@ -308,7 +314,8 @@ function hasRunningEyesInspection(session: { readonly state: string }, timeline:
   if (session.state !== "working" && session.state !== "idle") return false;
   for (let index = timeline.length - 1; index >= 0; index -= 1) {
     const item = timeline[index]!;
-    if (item.kind === "user" || item.kind === "error" || item.state === "failed" || item.notice === "eyes_failure"
+    if (item.presentationOnly) continue;
+    if (item.kind === "user" || item.kind === "error" || item.state === "failed" || item.notice === "eyes_failure" || item.notice === "interruption"
       || item.kind === "assistant" && item.phase === "final_answer"
       || (item.kind === "assistant" || item.title === "System") && compactionBoundaryText.test(`${item.title ?? ""} ${item.body ?? ""}`)) return false;
     if (item.kind === "tool" && item.notice === "eyes_inspection" && item.state === "running") return true;
@@ -372,7 +379,7 @@ export function sessionNeedsTranscriptCatchUp(
   }
   const latestTurn = timeline.slice(latestUser + 1);
   if (latestTurnHasCompletedFinal(latestTurn)) return false;
-  const failed = latestTurn.some((item) => item.kind === "error" || item.state === "failed");
+  const failed = latestTurn.some((item) => item.kind === "error" || item.state === "failed" || item.notice === "interruption");
   if (failed || session.state === "failed" || session.state === "offline" || session.state === "disconnected") return false;
 
   const unfinished = latestTurn.some((item) => item.kind !== "user" && item.state === "running");
@@ -420,6 +427,7 @@ export function latestTurnHasCompletedFinal(
   let continuation = -1;
   for (let index = latestUser + 1; index < timeline.length; index += 1) {
     const item = timeline[index];
+    if (item?.presentationOnly) continue;
     if (item?.kind === "assistant" && item.phase === "final_answer" && item.state !== "running"
       && !compactionBoundaryText.test(`${item.title ?? ""} ${item.body ?? ""}`.trim())) completedFinal = index;
     else if (item && isTurnContinuationAfterFinal(item)) continuation = index;
@@ -451,12 +459,15 @@ export function presentedSessionState(
 
   let finalIndex = -1;
   let errorIndex = -1;
+  let interruptionIndex = -1;
   let continuationIndex = -1;
   for (let index = latestUser + 1; index < timeline.length; index += 1) {
     const item = timeline[index];
+    if (item?.presentationOnly) continue;
     if (item?.kind === "assistant" && item.phase === "final_answer" && item.state !== "running"
       && !compactionBoundaryText.test(`${item.title ?? ""} ${item.body ?? ""}`.trim())) finalIndex = index;
     if (item?.kind === "error") errorIndex = index;
+    if (item?.notice === "interruption") interruptionIndex = index;
     if (item && isTurnContinuationAfterFinal(item)) continuationIndex = index;
   }
 
@@ -464,11 +475,12 @@ export function presentedSessionState(
   // A newer running row is stronger evidence than the previous turn's final;
   // an old standalone `working` scalar remains too weak to revive that final.
   if (hasFreshProviderWorkingState(session, timeline, workingBoundary)
-    || session.state === "working" && continuationIndex > Math.max(finalIndex, errorIndex)) return "working";
+    || session.state === "working" && continuationIndex > Math.max(finalIndex, errorIndex, interruptionIndex)) return "working";
   // While a newer turn is still waiting for its visible ending, the ending at
   // the boundary belongs to the preceding turn. A task-complete transport flag
   // therefore retires live controls but must not label that old final as the
   // outcome of the newer turn.
+  if (!boundaryNeedsVisibleEnding && interruptionIndex > Math.max(finalIndex, errorIndex)) return "idle";
   if (!boundaryNeedsVisibleEnding && finalIndex > errorIndex) return "completed";
   if (!boundaryNeedsVisibleEnding && errorIndex >= 0) return session.state === "failed" ? "failed" : "idle";
   // `completed` without a visible final is only task-complete transport
@@ -598,7 +610,9 @@ export function resolveReportedSessionSelection(
 ): ConcreteModelSelection | null {
   const reportedModelId = current.modelId?.trim();
   if (isAmbiguousSelectionValue(reportedModelId)) {
-    return resolveConcreteModelSelection(models, current, preferred);
+    const resolved = resolveConcreteModelSelection(models, current, preferred);
+    if (!resolved) return null;
+    return isAmbiguousSelectionValue(current.reasoningEffort) ? { modelId: resolved.modelId } : resolved;
   }
   const reportedModel = models.find((model) => model.id === reportedModelId || model.name === reportedModelId);
   const modelId = reportedModel?.id ?? reportedModelId!;
@@ -609,8 +623,9 @@ export function resolveReportedSessionSelection(
       : matchReasoningEffort(reportedEffort, reportedModel.efforts.filter((effort) => !isAmbiguousSelectionValue(effort)));
     return { modelId, reasoningEffort: normalizedEffort ?? reportedEffort };
   }
-  if (reportedModel === undefined) return { modelId };
-  return resolveConcreteModelSelection(models, { modelId }) ?? { modelId };
+  // An omitted/native-default effort is not the first advertised variant.
+  // Inventing that value here both paints Minimal and sends it on the next turn.
+  return { modelId };
 }
 
 export async function uploadAttachments(
@@ -831,7 +846,8 @@ export function appendTranscript(content: string, transcript: string): string {
 export function growTextarea(textarea: HTMLTextAreaElement | HTMLDivElement, maxHeight = 184): void {
   textarea.style.height = "auto";
   textarea.style.height = `${Math.min(textarea.scrollHeight, maxHeight)}px`;
-  textarea.style.overflowY = textarea.scrollHeight > maxHeight ? "auto" : "hidden";
+  // In-flow pickers can leave less space than the editor's requested height.
+  textarea.style.overflowY = textarea.scrollHeight > textarea.clientHeight ? "auto" : "hidden";
 }
 
 interface AttachmentEncodingResult {

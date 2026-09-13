@@ -5,7 +5,7 @@ import type { TaskListMode, TaskOverride } from "@shared/desktop_api";
 import { MAX_TASK_TITLE_CHARACTERS } from "@shared/desktop_api";
 import { reasoningDisplayLabel } from "../../../../../packages/protocol/src/reasoning";
 import { EmptyState, ProviderLogo, providerDisplayName, relativeTime } from "./components";
-import { listChildSessions } from "./bridge";
+import { useTaskChildren } from "./session_metadata";
 import { AlertIcon, ArchiveIcon, BranchIcon, BridgeIcon, ChatIcon, CheckIcon, ChevronDownIcon, ChevronRightIcon, ClockIcon, FolderIcon, FolderPlusIcon, GridIcon, InfoIcon, MicrophoneIcon, PinIcon, PlusIcon, RenameIcon, SearchIcon, SettingsIcon, SlidersIcon, SubagentsIcon, XIcon } from "./icons";
 import { maximumUiSearchCharacters } from "./search_helpers";
 import type { RuntimeConnectionPresentation } from "./progressive_startup";
@@ -547,11 +547,12 @@ function sidebarChildStateLabel(state: Session["state"]): string {
   return state === "completed" ? "Completed" : "Idle";
 }
 
-function SessionSubagentControl({ compact = false, session, providers, onOpenChild }: { compact?: boolean; session: Session; providers: readonly Provider[]; onOpenChild: (session: Session) => void }) {
+export function SessionSubagentControl({ compact = false, session, providers, onOpenChild }: { compact?: boolean; session: Session; providers: readonly Provider[]; onOpenChild: (session: Session) => void }) {
   const [open, setOpen] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [children, setChildren] = useState<readonly Session[]>([]);
-  const [childrenLoaded, setChildrenLoaded] = useState(false);
+  const childMetadata = useTaskChildren(session, open, open);
+  const children = childMetadata.data ?? [];
+  const childrenLoaded = childMetadata.data !== undefined;
+  const loading = (!childrenLoaded || (children.length === 0 && (session.childCount ?? 0) > 0 && childMetadata.loading)) && !childMetadata.error;
   const [popoverStyle, setPopoverStyle] = useState<CSSProperties>({});
   const root = useRef<HTMLDivElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
@@ -562,7 +563,7 @@ function SessionSubagentControl({ compact = false, session, providers, onOpenChi
     requestAnimationFrame(() => trigger.current?.focus());
   };
   const closeFromOutside = () => setOpen(false);
-  const displayedChildCount = childrenLoaded ? children.length : (session.childCount ?? 0);
+  const displayedChildCount = children.length || (session.childCount ?? 0);
   const countLabel = `${displayedChildCount} sub-agent${displayedChildCount === 1 ? "" : "s"}`;
   const compactCountCapped = compact && displayedChildCount >= 1_000;
   const visibleChildCount = compactCountCapped ? "1k+" : displayedChildCount;
@@ -604,36 +605,6 @@ function SessionSubagentControl({ compact = false, session, providers, onOpenChi
       document.removeEventListener("scroll", position, true);
     };
   }, [open]);
-  useEffect(() => {
-    if (!open) return;
-    let disposed = false;
-    let inFlight = false;
-    const refreshChildren = async (initial: boolean) => {
-      if (inFlight) return;
-      inFlight = true;
-      if (initial) setLoading(true);
-      try {
-        const next = await listChildSessions(session.id);
-        if (!disposed) {
-          setChildren(next);
-          setChildrenLoaded(true);
-        }
-      } catch {
-        if (!disposed && initial) setChildren([]);
-      } finally {
-        inFlight = false;
-        if (!disposed && initial) setLoading(false);
-      }
-    };
-    void refreshChildren(true);
-    // Child state can change in a provider other than the parent's provider.
-    // Refresh only while this small live view is open, and never overlap reads.
-    const timer = window.setInterval(() => { void refreshChildren(false); }, 1_500);
-    return () => {
-      disposed = true;
-      window.clearInterval(timer);
-    };
-  }, [open, session.id]);
   if (!displayedChildCount) return null;
   return <div className={`session-subagents ${compact ? "compact" : ""} ${open ? "open" : ""}`} ref={root}>
     <button ref={trigger} type="button" className="session-subagents-trigger" aria-label={countLabel} aria-haspopup="dialog" aria-expanded={open} aria-controls={popoverId} data-tooltip={open ? undefined : countLabel} onClick={(event) => { event.stopPropagation(); if (open) close(); else setOpen(true); }}>
@@ -649,7 +620,7 @@ function SessionSubagentControl({ compact = false, session, providers, onOpenChi
           <span><strong>{child.agentNickname || child.title}</strong><small className="session-subagent-metadata" aria-label={reasoning ? `${child.model}, reasoning ${reasoning}` : child.model}><span className="session-subagent-model">{child.model}</span>{reasoning ? <><span className="session-subagent-separator" aria-hidden="true">·</span><span className="session-subagent-reasoning">{reasoning}</span></> : null}</small></span>
           <span className="session-subagent-state">{child.state === "working" ? <span className="spinner" aria-hidden="true" /> : null}<span>{sidebarChildStateLabel(child.state)}</span></span><ChevronRightIcon />
         </button>;
-      })}{!loading && children.length === 0 ? <p>No sub-agents available.</p> : null}
+      })}{!loading && children.length === 0 ? <p>{childMetadata.error ? "Sub-agents are unavailable. Try reopening this panel." : "No sub-agents available."}</p> : null}
     </section>, document.body) : null}
   </div>;
 }

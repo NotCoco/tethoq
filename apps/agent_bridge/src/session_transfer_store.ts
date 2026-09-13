@@ -12,6 +12,8 @@ export interface SessionTransferRecord {
   readonly copiedMessages?: readonly RemoteMessage[];
   readonly sideChatPreview?: string;
   readonly requestId?: string;
+  /** A newly copied branch waits for an explicit user send or Continue. */
+  readonly paused?: boolean;
 }
 
 export interface SessionTransferState {
@@ -58,6 +60,7 @@ function messages(value: unknown): readonly RemoteMessage[] | undefined {
 
 function transfer(value: unknown): SessionTransferRecord {
   if (!isRecord(value) || typeof value.pending !== "boolean") throw new Error("Persisted session transfer is invalid");
+  if (value.paused !== undefined && typeof value.paused !== "boolean") throw new Error("Persisted branch pause is invalid");
   const sessionId = boundedString(value.sessionId, "session ID", 16_384)!;
   const relation = relationship(value.relationship);
   const summary = boundedString(value.summary, "handoff summary", 200_000, true);
@@ -74,6 +77,7 @@ function transfer(value: unknown): SessionTransferRecord {
     sessionId,
     relationship: relation,
     pending: value.pending,
+    ...(value.paused !== undefined ? { paused: value.paused } : {}),
     ...(summary !== undefined ? { summary } : {}),
     ...(prompt !== undefined ? { prompt } : {}),
     ...(bootstrap !== undefined ? { bootstrap } : {}),

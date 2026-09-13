@@ -29,6 +29,7 @@ export interface DesktopPreferences {
   readonly savedProjectDirectories: readonly string[];
   /** Local handler used for task folders and paths surfaced in transcripts. */
   readonly localOpenHandlerId: LocalOpenHandlerId;
+  readonly openLinksInApp: boolean;
   /** Window close behaviour. Tray is the default so running work survives a stray close. */
   readonly closeAction: DesktopCloseAction;
   /** Operating-system login item state. `tray` starts Tethoq without opening a window. */
@@ -131,6 +132,7 @@ export function validateDesktopPreferences(value: unknown): DesktopPreferences {
     reasoningDisplay: input.reasoningDisplay === "expanded" ? "expanded" : "compact",
     taskListMode: input.taskListMode === "project" ? "project" : "recent",
     savedProjectDirectories: normalizeSavedProjectDirectories(input.savedProjectDirectories),
+    openLinksInApp: input.openLinksInApp === true,
     localOpenHandlerId: typeof input.localOpenHandlerId === "string" && LOCAL_OPEN_HANDLER_IDS.has(input.localOpenHandlerId as LocalOpenHandlerId)
       ? input.localOpenHandlerId as LocalOpenHandlerId
       : "system",
@@ -183,7 +185,7 @@ export class DesktopPreferencesStore {
 
   public static async load(path: string): Promise<DesktopPreferencesStore> {
     const store = new JsonFileStore(path, validateDesktopPreferences);
-    const defaults: DesktopPreferences = { version: DESKTOP_PREFERENCES_VERSION, experimentalFeatures: false, reasoningDisplay: "compact", taskListMode: "recent", savedProjectDirectories: [], localOpenHandlerId: "system", closeAction: "tray", launchAtLogin: "off", alerts: "all", agentDefaults: {}, globalAgentsPath: null, taskOverrides: {}, allowForeignSubagents: false, foreignSubagentOverrides: {}, ears: defaultEarsSettings };
+    const defaults: DesktopPreferences = { version: DESKTOP_PREFERENCES_VERSION, experimentalFeatures: false, reasoningDisplay: "compact", taskListMode: "recent", savedProjectDirectories: [], localOpenHandlerId: "system", openLinksInApp: false, closeAction: "tray", launchAtLogin: "off", alerts: "all", agentDefaults: {}, globalAgentsPath: null, taskOverrides: {}, allowForeignSubagents: false, foreignSubagentOverrides: {}, ears: defaultEarsSettings };
     const value = await store.read(defaults);
     const validated = validateDesktopPreferences(value);
     if (JSON.stringify(validated) !== JSON.stringify(value)) await store.write(validated);
@@ -226,6 +228,10 @@ export class DesktopPreferencesStore {
 
   public async setReasoningDisplay(value: "compact" | "expanded"): Promise<DesktopPreferences> {
     return await this.#commit({ ...this.#value, reasoningDisplay: value });
+  }
+
+  public async setOpenLinksInApp(enabled: boolean): Promise<DesktopPreferences> {
+    return await this.#commit({ ...this.#value, openLinksInApp: enabled });
   }
 
   public async setTaskListMode(value: TaskListMode): Promise<DesktopPreferences> {

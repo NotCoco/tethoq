@@ -57,7 +57,7 @@ function runElectron(mainPath, htmlPath) {
     const timeout = setTimeout(() => {
       child.kill();
       reject(new Error(`Mounted Composer QA timed out.\n${stderr}`));
-    }, 60_000);
+    }, 90_000);
     child.stdout.on("data", (chunk) => { stdout += chunk; });
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.once("error", (error) => { clearTimeout(timeout); reject(error); });
@@ -71,11 +71,12 @@ function runElectron(mainPath, htmlPath) {
   });
 }
 
-test("mounted Composer preserves pending content and closes transient panels cleanly", { timeout: 75_000 }, async () => {
+test("mounted Composer preserves pending content and closes transient panels cleanly", { timeout: 105_000 }, async () => {
   const outputDirectory = join(tmpdir(), `tethoq-composer-mounted-${process.pid}-${Date.now()}`);
   const rendererBundle = join(outputDirectory, "renderer.js");
   const htmlPath = join(outputDirectory, "index.html");
   const mainPath = join(outputDirectory, "main.cjs");
+  const preloadPath = join(outputDirectory, "preload.cjs");
   await mkdir(outputDirectory, { recursive: true });
   try {
     await build({
@@ -252,7 +253,7 @@ test("mounted Composer preserves pending content and closes transient panels cle
             mounted = null;
             await settle(1);
           };
-          const mount = async ({ providerId = "codex", sessionModel = providerId + "-model", sessionEffort = "medium", sessionState = "working", externalWriter = false, draft = false, initialDraft = "", initialAttachments = [], initialWorkflowAttachments = [], initialAnnotations = [], initialQueue = [], queuedSteerFailure = null, queuedSteerError = null, queuedSteerRecovery = "failed", queuedSteerSessionStateAfterFailure = null, goal = null, earsSettings = undefined, deferDelivery = false, deferQueuedDelivery = false, deferDelegation = false, deferSchedule = false, scheduleFailure = null, strictMode = false } = {}) => {
+          const mount = async ({ providerId = "codex", sessionModel = providerId + "-model", sessionEffort = "medium", sessionState = "working", externalWriter = false, draft = false, initialDraft = "", initialAttachments = [], initialWorkflowAttachments = [], initialAnnotations = [], selectImages = async () => [], initialQueue = [], queuedSteerFailure = null, queuedSteerError = null, queuedSteerRecovery = "failed", queuedSteerSessionStateAfterFailure = null, goal = null, earsSettings = undefined, deferDelivery = false, deferQueuedDelivery = false, deferQueuedEdit = false, deferDelegation = false, deferSchedule = false, scheduleFailure = null, strictMode = false } = {}) => {
             await unmount();
             const host = document.createElement("div");
             host.id = "root";
@@ -265,6 +266,7 @@ test("mounted Composer preserves pending content and closes transient panels cle
             };
             const snapshot = { providers, models, sessions: [session], timelines: { [session.id]: [] } };
             const calls = [];
+            const derivedSessions = [];
             const notifications = [];
             let permission = "ask";
             const queue = [...initialQueue];
@@ -286,6 +288,10 @@ test("mounted Composer preserves pending content and closes transient panels cle
             let setComposerVisible = null;
             let pendingDelivery = null;
             let pendingQueuedDelivery = null;
+            let pendingQueuedEdit = null;
+            let deferQueueReads = false;
+            const pendingQueueReads = [];
+            let requestQueueRefresh = null;
             let pendingDelegation = null;
             let pendingSchedule = null;
             const schedules = [];
@@ -301,17 +307,40 @@ test("mounted Composer preserves pending content and closes transient panels cle
                if (type === "ears.process") return { texts: payload.attachmentIds.map(() => "Heard through EARS") };
                if (type === "message_queue.list") {
                  if (queuedSteerFailed && queuedSteerRecovery === "list-failure") throw new Error("simulated queue recovery read failure");
-                 return { messages: [...queue] };
+                 const messages = [...queue];
+                 if (deferQueueReads) await new Promise(resolve => { pendingQueueReads.push(resolve); });
+                 return { messages };
+               }
+               if (type === "message_queue.draft") {
+                 const message = queue.find(item => item.id === payload.messageId);
+                 check(message, "Queued draft is missing");
+                 return { ...message, version: "draft-" + message.id, workflows: message.workflows ?? [],
+                   attachments: message.attachments.map(({ dataBase64, dataUrl, ...info }) => info) };
+               }
+               if (type === "message_queue.draft_attachment") {
+                 const message = queue.find(item => item.id === payload.messageId);
+                 const encoded = message?.attachments[payload.index]?.dataBase64;
+                 if (typeof encoded !== "string") throw new Error("Original attachment is unavailable");
+                 const dataBase64 = encoded.slice(payload.offset, payload.offset + 480 * 1024);
+                 const next = payload.offset + dataBase64.length;
+                 return { dataBase64, offset: payload.offset, totalCharacters: encoded.length, nextOffset: next < encoded.length ? next : null };
+               }
+               if (type === "message_queue.cancel") {
+                 if (deferQueuedEdit) await new Promise(resolve => { pendingQueuedEdit = resolve; });
+                 const index = queue.findIndex(item => item.id === payload.messageId);
+                 if (index < 0 || queue[index].cancelled === false) return { cancelled: false };
+                 queue.splice(index, 1);
+                 return { cancelled: true };
                }
               if (type === "session.permissions.get" || type === "session.permissions.set") {
                 if (type.endsWith(".set")) permission = payload.value;
                 return { controls: [{ id: "tools", label: "Tool permissions", value: permission, options: [{ value: "ask", label: "Ask" }, { value: "deny", label: "Deny" }] }], note: "Applies to this task." };
               }
               if (type === "attachment.upload.begin") return { uploadId: "upload-" + (++upload), chunkBytes: 32768 };
+              if (type === "session.branch") return { session: { ...session, id: "paused-branch", state: "idle" }, copiedMessageCount: 4 };
               if (type === "attachment.upload.complete") return { attachmentId: "attachment-" + upload };
-              if (type === "message_queue.enqueue" || (type === "delegation.prepare" && payload.mode === "queue")) {
-                const message = { id: "queued-" + calls.length, sessionId: session.id, content: payload.content ?? payload.prompt ?? "", state: "queued", attachments: [],
-                  ...(type === "delegation.prepare" ? { mesh: { targets: payload.targets, segments: payload.presentationSegments } } : {}) };
+              if (type === "message_queue.enqueue") {
+                const message = { id: "queued-" + calls.length, sessionId: session.id, content: payload.content ?? "", state: "queued", attachments: [] };
                 queue.push(message);
                 return { message };
               }
@@ -388,9 +417,11 @@ test("mounted Composer preserves pending content and closes transient panels cle
               renderedSnapshot = current;
               commitSnapshot = setCurrent;
               const currentSession = current.sessions.find((item) => item.id === session.id);
+              const [queueRevision, setQueueRevision] = React.useState(0);
+              requestQueueRefresh = () => setQueueRevision(value => value + 1);
               if (!composerVisible) return null;
               return <Composer
-                snapshot={current} session={currentSession} request={request} selectImages={async () => []} preview={false}
+                snapshot={current} session={currentSession} request={request} selectImages={selectImages} preview={false} queueRevision={queueRevision}
                 notify={(message, tone) => { notifications.push({ message, tone }); }} updateSnapshot={setCurrent} onHydrateProviderModels={hydrateProviderModels} onBrowser={() => undefined} onManageWorkflow={() => undefined}
                 onBeforeSubmit={() => { beforeSubmitCalls += 1; attachmentWidgetsAtSubmitBoundary = document.querySelectorAll(".image-attachment-chip, .file-attachment-chip").length; }}
                 initialDraft={draftStore.content} initialAttachments={draftStore.attachments} initialWorkflowAttachments={draftStore.workflowAttachments} initialAnnotations={draftStore.annotations}
@@ -407,7 +438,7 @@ test("mounted Composer preserves pending content and closes transient panels cle
                   setDraftRestoreRevision((value) => value + 1);
                   return restored;
                 }}
-                onDerivedSession={() => undefined}
+                onDerivedSession={(session) => derivedSessions.push(session)}
                 onCreateDraftSend={async (input) => { calls.push({ type: "draft.create_send", payload: input }); }}
                 onMaterializeDraft={async (input, action) => { materializeActions.push({ input, action }); }}
                 onCreateSideChat={async (...args) => { sideChatCreates.push(args); }}
@@ -424,7 +455,7 @@ test("mounted Composer preserves pending content and closes transient panels cle
             };
             root.render(strictMode ? <React.StrictMode><Harness /></React.StrictMode> : <Harness />);
             mounted = {
-              root, host, calls, snapshot: () => renderedSnapshot,
+              root, host, calls, derivedSessions, snapshot: () => renderedSnapshot,
               beforeSubmitCalls: () => beforeSubmitCalls,
               attachmentWidgetsAtSubmitBoundary: () => attachmentWidgetsAtSubmitBoundary,
               refreshSession: async (incoming) => {
@@ -438,6 +469,11 @@ test("mounted Composer preserves pending content and closes transient panels cle
               refreshModels: async (providerId, incoming) => {
                 check(commitSnapshot, "Mounted snapshot updater is unavailable");
                 commitSnapshot((current) => ({ ...current, models: { ...current.models, [providerId]: [...incoming] } }));
+                await settle();
+              },
+              completeTurn: async (updatedAt) => {
+                commitSnapshot((current) => ({ ...current, sessions: current.sessions.map((item) => item.id === session.id
+                  ? { ...item, state: "idle", updatedAt } : item) }));
                 await settle();
               },
               injectTimeline: async (item) => {
@@ -454,6 +490,10 @@ test("mounted Composer preserves pending content and closes transient panels cle
               rejectDelivery: (error) => { check(pendingDelivery, "Deferred delivery rejecter is unavailable"); const pending = pendingDelivery; pendingDelivery = null; pending.reject(error); },
               resolveQueuedDelivery: () => { check(pendingQueuedDelivery, "Deferred queue delivery resolver is unavailable"); const pending = pendingQueuedDelivery; pendingQueuedDelivery = null; pending.resolve(); },
               rejectQueuedDelivery: (error) => { check(pendingQueuedDelivery, "Deferred queue delivery rejecter is unavailable"); const pending = pendingQueuedDelivery; pendingQueuedDelivery = null; pending.reject(error); },
+              resolveQueuedEdit: () => { check(pendingQueuedEdit, "Deferred queue edit resolver is unavailable"); const resolve = pendingQueuedEdit; pendingQueuedEdit = null; resolve(); },
+              holdQueueReads: () => { deferQueueReads = true; },
+              refreshQueue: async () => { requestQueueRefresh(); await settle(); },
+              resolveQueueRead: async () => { const resolve = pendingQueueReads.shift(); check(resolve, "Deferred queue read is unavailable"); resolve(); await settle(); },
               resolveDelegation: (value = {}) => { check(pendingDelegation, "Deferred delegation resolver is unavailable"); const pending = pendingDelegation; pendingDelegation = null; pending.resolve(value); },
               rejectDelegation: (error) => { check(pendingDelegation, "Deferred delegation rejecter is unavailable"); const pending = pendingDelegation; pendingDelegation = null; pending.reject(error); },
               resolveSchedule: () => { check(pendingSchedule, "Deferred schedule resolver is unavailable"); const pending = pendingSchedule; pendingSchedule = null; pending.resolve(); },
@@ -486,7 +526,59 @@ test("mounted Composer preserves pending content and closes transient panels cle
           };
 
            try {
+             progress("long draft containment with slash suggestions");
+             const longDraft = "Keep every line of this long draft inside the composer while choosing a command. ".repeat(90);
+             const checkComposerBounds = (label) => {
+               const box = element('.composer-box').getBoundingClientRect();
+               for (const selector of ['.composer-entry-row', '#composer-message', '.composer-primary-actions']) {
+                 const bounds = element(selector).getBoundingClientRect();
+                 check(bounds.top >= box.top && bounds.bottom <= box.bottom - 5,
+                   label + ': ' + selector + ' escaped the composer: ' + JSON.stringify({ box: box.toJSON(), bounds: bounds.toJSON() }));
+               }
+               check(composer().scrollHeight > composer().clientHeight && getComputedStyle(composer()).overflowY === "auto", label + ': long draft is not scrollable');
+             };
+             for (const [width, height] of [[1200, 800], [760, 480], [520, 640]]) {
+               await window.composerLayoutQa.resize(width, height);
+               await settle();
+               for (const rich of [false, true]) {
+                 await mount({ sessionState: "idle", initialDraft: longDraft });
+                 if (rich) {
+                   await setField(composer(), longDraft + "/mesh");
+                   await click(buttonWithText(element('.mesh-panel'), "Mesh 1"));
+                   check(composer().isContentEditable, "Selected Mesh target did not use the rich editor");
+                 }
+                 checkComposerBounds("Without slash");
+                 await setField(composer(), longDraft + "/");
+                 check(document.querySelector('.slash-command-palette'), "Long draft did not open slash suggestions");
+                 checkComposerBounds("With slash");
+                 const palette = element('.slash-command-palette');
+                 check(palette.clientHeight >= 43, "Slash suggestions lost the space needed for one complete option");
+                 const draftHeight = composer().clientHeight;
+                 await window.composerLayoutQa.capture('slash-' + width + '-' + height + (rich ? '-rich' : '-plain'));
+                 await pressKey(composer(), "Escape");
+                 check(!document.querySelector('.slash-command-palette'), "Escape did not close slash suggestions");
+                 checkComposerBounds("Dismissed slash");
+                 check(composer().clientHeight > draftHeight, "Closing suggestions did not return their space to the draft");
+                 check(plainComposerValue() === longDraft + "/", "Closing slash suggestions changed the draft");
+               }
+               await mount({ sessionState: "idle", initialDraft: longDraft, initialWorkflowAttachments: [workflowAttachment] });
+               await setField(composer(), longDraft + "/");
+               checkComposerBounds("Slash with attachments");
+               check(document.querySelector('.workflow-attachment-chip'), "Layout discarded the attachment");
+             }
+             await window.composerLayoutQa.resize(1200, 800);
+             await mount({ sessionState: "idle", initialDraft: longDraft.slice(0, 700) });
+             await setField(composer(), longDraft.slice(0, 700) + " /");
+             checkComposerBounds("Draft smaller than the normal maximum");
              progress("provider-neutral draft feature menu");
+             const branchState = await mount({ providerId: "opencode", sessionModel: "opencode-go/deepseek-v4-pro", sessionState: "working", initialDraft: "Keep this unsent instruction" });
+             await openAction("Branch in New Task");
+             check(branchState.calls.filter((call) => call.type === "session.branch").length === 1, "Branch action did not request exactly one copy");
+             const branchPayload = branchState.calls.find((call) => call.type === "session.branch").payload;
+             check(branchPayload.sessionId === "mounted-session" && branchPayload.prompt === undefined, "Branch submitted the unsent draft");
+             check(branchState.derivedSessions.length === 1 && branchState.derivedSessions[0].state === "idle", "Branch did not open the paused child");
+             check(!branchState.calls.some((call) => call.type === "message.send" || call.type === "session.continue" || call.type === "message_queue.enqueue"), "Branch started a response");
+             check(plainComposerValue() === "Keep this unsent instruction", "Branch changed the source draft");
              let state = await mount({ providerId: "opencode", sessionModel: "opencode-go/deepseek-v4-pro", sessionEffort: "high", draft: true, sessionState: "idle", initialDraft: "Keep this OpenCode draft" });
              await click(element('button[aria-label="More message actions"]'));
              const draftActionLabels = [...element('.composer-actions-menu [role="menu"]').querySelectorAll("button")].map((button) => button.textContent ?? "");
@@ -731,6 +823,8 @@ test("mounted Composer preserves pending content and closes transient panels cle
             await state.injectTimeline(canonicalEcho);
             check(state.snapshot().timelines["mounted-session"].length === 1, "The canonical pre-ack echo was not retained");
             check(state.snapshot().timelines["mounted-session"][0].id === canonicalEcho.id, "The canonical pre-ack echo did not adopt the optimistic row");
+            const completedAt = new Date(Date.now() + 1_000).toISOString();
+            await state.completeTurn(completedAt);
             state.resolveDelivery({});
             await settle(6);
             const acceptedTimeline = state.snapshot().timelines["mounted-session"];
@@ -738,6 +832,15 @@ test("mounted Composer preserves pending content and closes transient panels cle
             check(acceptedTimeline[0].id === canonicalEcho.id, "Acknowledgement discarded the canonical provider identity");
             check(acceptedTimeline[0].images?.[0]?.dataUrl === "data:image/png;base64,AQ==", "Canonical image placeholder lost the accepted local preview");
             check(revokedObjectUrls.has(acceptedPreviewUrl), "Accepted delivery retained its obsolete object URL");
+            check(state.snapshot().sessions[0].state === "idle", "A late delivery receipt reopened the completed task");
+            check(state.snapshot().sessions[0].updatedAt === completedAt, "A late delivery receipt rolled back the task activity timestamp");
+            await setField(composer(), "Start the next turn");
+            send().click();
+            await settle(5);
+            check(state.calls.filter((call) => call.type === "session.send_message").length === 2, "The next prompt was not sent after the previous turn completed before acknowledgement");
+            check(!state.calls.some((call) => call.type === "message_queue.enqueue"), "A late delivery receipt diverted the next turn into the queue");
+            state.resolveDelivery({});
+            await settle(4);
 
             progress("failed composer transaction across remount");
             const failedPreviewUrl = URL.createObjectURL(new Blob([Uint8Array.of(2)], { type: "image/png" }));
@@ -801,9 +904,18 @@ test("mounted Composer preserves pending content and closes transient panels cle
             check(unknownTimeline[0].images?.[0]?.name === "unknown.png", "Ambiguous direct delivery lost its submitted attachment presentation");
             check(plainComposerValue() === "" && state.draft().content === "", "Ambiguous direct delivery restored the submitted text into the composer");
             check(state.draft().attachments.length === 0 && !document.querySelector('.image-attachment-chip'), "Ambiguous direct delivery restored the consumed attachment into the composer");
-            check(state.snapshot().sessions[0].state === "working", "Ambiguous direct delivery rolled back the optimistic working state");
+            check(state.snapshot().sessions[0].state === "idle", "An unresolved delivery alone left the task in optimistic working state");
             check(!state.calls.some((call) => call.type === "attachment.upload.cancel"), "Ambiguous direct delivery cancelled an upload that the provider may own");
             check(state.notifications().some((notification) => notification.message === "The provider acknowledgement was lost" && notification.tone === "error"), "Ambiguous direct delivery did not surface its unresolved status");
+            await setField(composer(), "A separate follow-up instruction");
+            send().click();
+            await settle(5);
+            check(state.calls.filter((call) => call.type === "session.send_message").length === 2, "An unresolved delivery incorrectly held the next prompt in the queue");
+            const nativeWorkingAt = new Date(Date.now() + 1_000).toISOString();
+            await state.refreshSession({ ...state.snapshot().sessions[0], state: "working", updatedAt: nativeWorkingAt });
+            state.rejectDelivery(new DesktopBridgeRequestError({ code: "DELIVERY_UNKNOWN", message: "The provider acknowledgement was lost", retryable: false }));
+            await settle(6);
+            check(state.snapshot().sessions[0].state === "working" && state.snapshot().sessions[0].updatedAt === nativeWorkingAt, "An unresolved receipt erased newer provider activity");
             nativeRevokeObjectUrl(unknownPreviewUrl);
 
             progress("provider-reported model resync");
@@ -839,6 +951,23 @@ test("mounted Composer preserves pending content and closes transient panels cle
             await state.refreshModels("opencode", [models.opencode[1]]);
             check(currentModel().getAttribute("aria-label")?.includes("opencode-go/deepseek-v4-pro"), "A temporarily missing catalogue row painted the task's old model instead of the pending model");
 
+            progress("OpenCode native-default reasoning does not turn into Minimal");
+            state = await mount({ providerId: "opencode", sessionModel: "opencode-go/muse-spark-1.3-contributor", sessionEffort: "default", sessionState: "idle" });
+            await state.refreshModels("opencode", [{ id: "opencode-go/muse-spark-1.3-contributor", name: "Muse Spark 1.3 Contributor", efforts: ["minimal", "low", "medium", "high", "xhigh"], defaultEffort: "minimal" }]);
+            const reasoningChoice = () => element('button[aria-label^="Choose reasoning effort"]');
+            check(reasoningChoice().textContent?.includes("Choose"), "An unknown/native-default effort was painted as Minimal");
+            await setField(composer(), "Keep the existing provider settings");
+            await assertSubmittedWithoutInterrupt(state, "session.send_message");
+            check(state.calls.find((call) => call.type === "session.send_message")?.payload.reasoningEffort === undefined, "The composer silently sent the first variant");
+            await click(reasoningChoice());
+            await click(buttonWithText(element('.effort-choice'), "Extra high"));
+            await state.refreshModels("opencode", [...state.snapshot().models.opencode]);
+            await state.refreshSession({ ...state.snapshot().sessions[0], effort: "default" });
+            check(reasoningChoice().textContent?.includes("Extra high"), "An unrelated refresh erased explicit reasoning");
+            await setField(composer(), "Use my chosen reasoning");
+            await assertSubmittedWithoutInterrupt(state, "message_queue.enqueue");
+            check(state.calls.find((call) => call.type === "message_queue.enqueue")?.payload.reasoningEffort === "xhigh", "Explicit reasoning did not reach the queued request");
+
             progress("external writer ownership handoff");
             state = await mount({ sessionState: "idle", externalWriter: true });
             check(globalThis.__attachmentWorkerConstructions === 1, "Composer did not prewarm one attachment worker after its first paint");
@@ -857,6 +986,65 @@ test("mounted Composer preserves pending content and closes transient panels cle
             check(queueCalls.length === queueCallsBefore + 1, "The active follow-up was not queued exactly once");
             check(document.querySelectorAll('.queued-message-row').length === 1, "The active follow-up was not painted exactly once");
             check(document.querySelector('.queued-message-row')?.textContent?.includes("Queue this exactly once"), "The visible queue row lost its instruction");
+
+            progress("queued Edit unqueues once into the main composer and preserves a newer draft");
+            state = await mount({ initialDraft: "My other draft", deferQueuedEdit: true, initialQueue: [
+              { id: "queued-edit", sessionId: "mounted-session", content: "Edit this instruction", state: "queued", attachments: [] },
+              { id: "queued-sibling", sessionId: "mounted-session", content: "Keep this queued", state: "queued", attachments: [] },
+            ] });
+            await click(element('button[aria-label="Queued instruction actions"]'));
+            const queuedEditButton = buttonWithText(document, "Edit message");
+            queuedEditButton.click();
+            queuedEditButton.click();
+            await settle();
+            check(state.calls.filter(call => call.type === "message_queue.cancel").length === 1, "Double Edit created duplicate cancellation requests");
+            await setField(composer(), "Newer unsent draft");
+            state.resolveQueuedEdit();
+            await settle(5);
+            check(composer().value === "Edit this instruction\n\nNewer unsent draft", "Edit lost the queued text or the latest unsent draft");
+            check(document.activeElement === composer(), "Edit did not focus the main composer");
+            check(document.querySelectorAll('.queued-message-row').length === 1 && document.querySelector('.queued-message-row').textContent.includes("Keep this queued"), "Edit removed the wrong queued messages");
+            check(!document.querySelector('.queued-message-row input, .queued-message-row textarea'), "Edit opened an inline queue editor");
+            check(!state.calls.some(call => ["message_queue.edit", "message_queue.enqueue", "session.send_message"].includes(call.type)), "Edit sent or requeued content");
+
+            progress("queued Edit restores original attachments, workflow, and annotations together");
+            const editAudio = { name: "voice.mp3", mimeType: "audio/mpeg", byteLength: 3, dataBase64: "BAUG", durationSeconds: 1 };
+            const editImage = { name: "original.png", mimeType: "image/png", byteLength: 400_001, dataBase64: btoa("a".repeat(400_001)) };
+            state = await mount({ providerId: "opencode", initialQueue: [{ id: "queued-rich-edit", sessionId: "mounted-session",
+              content: '# Response annotations:\n<response-annotations>\n[{"text":"Selected text","annotation":"Voice feedback","audioAttachmentIndex":0}]\n</response-annotations>\n\n## My request:\nEdit with context',
+              state: "queued", attachments: [editImage, editAudio, { name: "notes.md", mimeType: "text/markdown", byteLength: 3, dataBase64: "AQID" }], workflows: [workflowAttachment] }] });
+            await click(element('button[aria-label="Queued instruction actions"]'));
+            await click(buttonWithText(document, "Edit message"));
+            const editedRichDraft = state.draft();
+            check(composer().value === "Edit with context", "Edit exposed the annotation transport envelope");
+            check(editedRichDraft.attachments.length === 2 && editedRichDraft.attachments[0].dataBase64 === editImage.dataBase64 && editedRichDraft.attachments[1].dataBase64 === "AQID", "Edit lost or shortened the original image/file bytes");
+            check(editedRichDraft.annotations.length === 1 && editedRichDraft.annotations[0].audio?.dataBase64 === editAudio.dataBase64, "Edit lost the voice annotation or duplicated its audio attachment");
+            check(editedRichDraft.workflowAttachments[0]?.id === workflowAttachment.id, "Edit lost its workflow attachment");
+            check(state.calls.filter(call => call.type === "message_queue.draft_attachment").length === 4, "The original image was not recovered in bounded chunks");
+            check(state.calls.findIndex(call => call.type === "message_queue.cancel") > state.calls.findLastIndex(call => call.type === "message_queue.draft_attachment"), "Edit removed the message before its bytes were recovered");
+
+            progress("failed queued Edit preserves the queue and composer without duplicating delivery");
+            for (const failure of ["already-sending", "missing-attachment"]) {
+              state = await mount({ initialDraft: "Keep my draft", initialQueue: [{ id: "queued-edit-failed", sessionId: "mounted-session", content: "Keep queued", state: "queued",
+                cancelled: failure !== "already-sending", attachments: failure === "missing-attachment" ? [{ name: "missing.png", mimeType: "image/png", byteLength: 3 }] : [] }] });
+              await click(element('button[aria-label="Queued instruction actions"]'));
+              await click(buttonWithText(document, "Edit message"));
+              check(composer().value === "Keep my draft", failure + " overwrote the main draft");
+              check(document.querySelectorAll('.queued-message-row').length === 1, failure + " lost the queued instruction");
+              check(state.notifications().some(item => item.tone === "error"), failure + " failed silently");
+              if (failure === "missing-attachment") check(!state.calls.some(call => call.type === "message_queue.cancel"), "Missing attachment was dequeued before recovery");
+            }
+
+            progress("queued Edit persists the recovered draft after the composer unmounts");
+            state = await mount({ deferQueuedEdit: true, initialQueue: [{ id: "queued-edit-unmount", sessionId: "mounted-session", content: "Restore after navigation", state: "queued", attachments: [] }] });
+            await click(element('button[aria-label="Queued instruction actions"]'));
+            await click(buttonWithText(document, "Edit message"));
+            await state.setComposerVisible(false);
+            state.resolveQueuedEdit();
+            await settle();
+            check(state.draft().content === "Restore after navigation", "Navigation lost a successfully unqueued draft");
+            await state.setComposerVisible(true);
+            check(composer().value === "Restore after navigation", "Returning to the task did not restore the unqueued draft");
 
             progress("queued Steer promotes immediately and prevents duplicate delivery");
             state = await mount({
@@ -912,6 +1100,27 @@ test("mounted Composer preserves pending content and closes transient panels cle
             canonicalSteerRows = state.snapshot().timelines["mounted-session"].filter((item) => item.kind === "user" && item.body === "Adopt this canonical steer echo");
             check(canonicalSteerRows.length === 1 && canonicalSteerRows[0].id === "canonical-steer-user", "Steer acknowledgement remounted or duplicated its adopted canonical row");
 
+            progress("queue cancellation paints before slow refresh and ignores older responses");
+            state = await mount({ initialQueue: [
+              { id: "cancel-now", sessionId: "mounted-session", content: "Remove this immediately", state: "queued", attachments: [] },
+              { id: "cancel-sibling", sessionId: "mounted-session", content: "Keep this sibling", state: "queued", attachments: [] },
+            ] });
+            state.holdQueueReads();
+            await state.refreshQueue();
+            await click(element('button[aria-label="Remove queued instruction"]'));
+            check(document.querySelectorAll('.queued-message-row').length === 1, "Confirmed removal waited for provider history");
+            check(!element('button[aria-label="Remove queued instruction"]').disabled, "A slow refresh kept other queue actions busy");
+            await state.resolveQueueRead();
+            check(document.querySelectorAll('.queued-message-row').length === 1 && element('.queued-message-row').textContent.includes("Keep this sibling"), "A pre-cancellation queue response resurrected the removed row");
+            await state.resolveQueueRead();
+            check(document.querySelectorAll('.queued-message-row').length === 1, "The refreshed queue lost its unrelated sibling");
+
+            progress("queue cancellation rejection retains the instruction");
+            state = await mount({ initialQueue: [{ id: "cannot-cancel", sessionId: "mounted-session", content: "Already delivering", state: "queued", attachments: [], cancelled: false }] });
+            await click(element('button[aria-label="Remove queued instruction"]'));
+            check(document.querySelectorAll('.queued-message-row').length === 1, "A rejected removal hid an instruction still owned by the provider");
+            check(state.notifications().some(item => item.message.includes("already being sent")), "Rejected cancellation hid its failure");
+
             progress("ambiguous queued Steer loads one non-retryable tombstone");
             state = await mount({
               sessionState: "working",
@@ -927,7 +1136,8 @@ test("mounted Composer preserves pending content and closes transient panels cle
             check(unknownQueueRows.length === 1 && unknownQueueRows[0].textContent?.includes("Do not retry this ambiguous steer"), "Ambiguous queued delivery lost or duplicated its authoritative tombstone");
             check(unknownQueueRows[0].classList.contains('queued-message-failed'), "Ambiguous queued delivery did not paint the authoritative failed state");
             check(unknownQueueRows[0].querySelector('button[aria-label="Steer with this queued instruction"]')?.disabled, "Ambiguous queued delivery exposed a retryable Steer action");
-            check(!unknownQueueRows[0].querySelector('button[aria-label="Remove queued instruction"]')?.disabled, "Ambiguous queued delivery disabled its safe Remove action");
+            check(!unknownQueueRows[0].querySelector('button[aria-label="Dismiss delivery notice"]')?.disabled, "Ambiguous queued delivery disabled its safe Dismiss action");
+            check(unknownQueueRows[0].querySelector('.queued-delivery-status')?.textContent === "Delivery unconfirmed", "Uncertain delivery appeared as an ordinary waiting instruction");
             await click(unknownQueueRows[0].querySelector('button[aria-label="Queued instruction actions"]'));
             const unknownQueueActions = [...document.querySelectorAll('.queued-message-menu [role="menuitem"]')];
             for (const label of ["Edit message", "Open in side chat", "Send to new task"]) {
@@ -937,6 +1147,11 @@ test("mounted Composer preserves pending content and closes transient panels cle
             check(!state.snapshot().timelines["mounted-session"].some((item) => item.kind === "user" && item.body === "Do not retry this ambiguous steer"), "Ambiguous queued delivery retained its speculative transcript row beside the tombstone");
             check(state.calls.filter((call) => call.type === "message_queue.list").length === 2, "Ambiguous queued delivery did not perform exactly one authoritative recovery read");
             check(state.notifications().some((notification) => notification.message === "The queued acknowledgement was lost" && notification.tone === "error"), "Ambiguous queued delivery did not surface its unresolved status");
+            state.holdQueueReads();
+            await click(element('button[aria-label="Dismiss delivery notice"]'));
+            check(!document.querySelector('.queued-message-row'), "Dismissing an uncertain notice waited for history recovery");
+            check(state.notifications().some(item => item.message === "Delivery notice dismissed"), "Dismissal claimed to cancel an instruction the provider may already have accepted");
+            await state.resolveQueueRead();
 
             progress("failed queued Steer restores its original queue position");
             state = await mount({
@@ -1028,6 +1243,55 @@ test("mounted Composer preserves pending content and closes transient panels cle
             state = await mount({ providerId: "opencode", initialAttachments: [{ kind: "file", name: "notes.txt", path: "notes.txt", mimeType: "text/plain", byteLength: 1, dataBase64: "QQ==", origin: "file-picker" }] });
             progress("file-only submit");
             await assertSubmittedWithoutInterrupt(state, "message_queue.enqueue");
+
+            progress("twelve mixed attachments, excess paste, removal, and submit");
+            const twelveAttachments = Array.from({ length: 12 }, (_, index) => ({
+              ...(index % 2 ? { kind: "file" } : {}),
+              name: "attachment-" + index + (index % 2 ? ".txt" : ".png"),
+              path: "attachment-" + index,
+              mimeType: index % 2 ? "text/plain" : "image/png",
+              byteLength: 1, dataBase64: "AQ==", origin: "file-picker",
+            }));
+            state = await mount({ providerId: "opencode", initialAttachments: twelveAttachments });
+            check(document.querySelectorAll('.image-attachment-chip, .file-attachment-chip').length === 12, "The composer did not paint all twelve attachments");
+            const excessPaste = () => {
+              const data = new DataTransfer();
+              data.items.add(new File([Uint8Array.of(1)], "extra.png", { type: "image/png" }));
+              const event = new Event("paste", { bubbles: true, cancelable: true });
+              Object.defineProperty(event, "clipboardData", { value: data });
+              composer().dispatchEvent(event);
+            };
+            const postsBeforeExcess = globalThis.__attachmentWorkerPosts ?? 0;
+            excessPaste();
+            await settle(5);
+            check(state.draft().attachments.length === 12, "Excess paste changed the twelve-item draft");
+            check(state.notifications().some(item => item.message.includes("up to 12 items")), "Excess paste did not explain the twelve-item limit");
+            check((globalThis.__attachmentWorkerPosts ?? 0) === postsBeforeExcess, "Rejected paste started an unnecessary encoding worker");
+            await click(element('button[aria-label="Remove attachment-0.png"]'));
+            excessPaste();
+            await settle(5);
+            check(state.draft().attachments.length === 12 && document.querySelector('button[aria-label="Remove extra.png"]'), "Removing an attachment did not free a slot");
+            await assertSubmittedWithoutInterrupt(state, "message_queue.enqueue");
+            check(state.calls.find(call => call.type === "message_queue.enqueue")?.payload.attachmentIds?.length === 12, "Twelve mixed attachments did not reach the queue intact");
+
+            progress("image picker rejection preserves draft and explains limit");
+            state = await mount({ initialDraft: "Keep this draft", initialAttachments: [twelveAttachments[0]], selectImages: async () => { throw new Error("Choose up to 12 files at a time"); } });
+            await click(element('button[aria-label="Add attachment"]'));
+            await click(buttonWithText(element('.composer-attachment-menu [role="menu"]'), "Attach image"));
+            check(state.notifications().some(item => item.message === "Choose up to 12 files at a time" && item.tone === "error"), "Image picker failure was not surfaced");
+            check(state.draft().content === "Keep this draft" && state.draft().attachments.length === 1, "Image picker rejection lost the existing draft");
+
+            progress("voice annotations share the twelve-item submit limit");
+            const elevenAudio = Array.from({ length: 11 }, (_, index) => ({ ...earsAudio, name: "clip-" + index + ".mp3", path: "dictation:clip-" + index }));
+            const voiceAnnotation = { id: "voice-limit", text: "Selected response", annotation: "", audio: { ...earsAudio, path: "dictation:annotation" } };
+            state = await mount({ providerId: "direct", sessionModel: "direct-audio", sessionEffort: "low", initialAttachments: elevenAudio, initialAnnotations: [voiceAnnotation], earsSettings: { enabled: false, providerId: null, modelId: null, mode: "verbatim" } });
+            await assertSubmittedWithoutInterrupt(state, "message_queue.enqueue");
+            check(state.calls.find(call => call.type === "message_queue.enqueue")?.payload.attachmentIds?.length === 12, "The twelfth attachment from a voice annotation was not sent");
+            state = await mount({ providerId: "direct", sessionModel: "direct-audio", sessionEffort: "low", initialAttachments: [...elevenAudio, { ...earsAudio, path: "dictation:twelfth" }], initialAnnotations: [voiceAnnotation], earsSettings: { enabled: false, providerId: null, modelId: null, mode: "verbatim" } });
+            await click(send());
+            check(state.notifications().some(item => item.message.includes("up to 12 items per message, including voice annotations")), "A thirteenth voice attachment escaped the submit guard");
+            check(!state.calls.some(call => call.type === "attachment.upload.begin" || call.type === "message_queue.enqueue"), "Over-limit voice attachments began uploading");
+            check(state.draft().attachments.length === 12 && state.draft().annotations.length === 1, "Rejected voice attachments were not preserved for editing");
 
             progress("OpenCode PDF presentation uses one attachment card");
             const pdfAttachment = { kind: "file", name: "canary.pdf", path: "canary.pdf", mimeType: "application/pdf", byteLength: 1, dataBase64: "QQ==", origin: "file-picker" };
@@ -1301,7 +1565,7 @@ test("mounted Composer preserves pending content and closes transient panels cle
             check(document.querySelector('.mesh-panel'), "Clicking inside the Mesh target panel closed it");
             await click(element('button[aria-label="Choose model and reasoning for Mesh 1"]'));
             check(plainComposerValue() === "/mesh" && !document.querySelector('.composer-inline-mesh'), "Mesh disclosure committed instead of opening details");
-            check(element('.mesh-model-picker button[role="radio"][aria-checked="true"]') === document.activeElement, "Mesh details did not focus its selected model");
+            check(element('.mesh-model-picker-search input') === document.activeElement, "Mesh details did not focus model search");
             check(element('.mesh-model-picker-reasoning').closest('.mesh-model-picker-scroll') === null, "Mesh reasoning remained trapped in the scrolling model list");
             check([...element('.mesh-model-picker-reasoning-options').querySelectorAll('button[role="radio"]')].map((button) => button.textContent?.trim()).join(",") === "Medium", "Mesh reasoning did not start with exactly the selected model's efforts");
             check(!document.querySelector('.mesh-panel'), "Mesh quick choices remained stacked behind the detailed picker");
@@ -1317,11 +1581,26 @@ test("mounted Composer preserves pending content and closes transient panels cle
             progress("mesh accepted per-session recency");
             await setField(composer(), "/mesh");
             await click(element('button[aria-label="Choose model and reasoning for Mesh 1"]'));
-            await click(buttonWithText(element('.mesh-model-picker'), "Mesh 1 Alternate"));
+            const meshSearch = element('.mesh-model-picker-search input');
+            await setField(meshSearch, "aLtErNaTe");
+            check(element('.mesh-model-picker-scroll').querySelectorAll('button[role="radio"]').length === 1 && buttonWithText(element('.mesh-model-picker-scroll'), "Mesh 1 Alternate"), "Mesh search did not filter model names case-insensitively");
+            check(buttonWithText(element('.mesh-model-picker-reasoning-options'), "Medium").getAttribute("aria-checked") === "true", "Filtering Mesh models changed the selected reasoning");
+            const searchHome = new KeyboardEvent("keydown", { key: "Home", bubbles: true, cancelable: true });
+            meshSearch.dispatchEvent(searchHome);
+            check(!searchHome.defaultPrevented && document.activeElement === meshSearch, "Mesh search intercepted text-editing keys");
+            await pressKey(meshSearch, "ArrowDown");
+            check(document.activeElement === buttonWithText(element('.mesh-model-picker-scroll'), "Mesh 1 Alternate"), "Mesh search did not support keyboard selection of a result");
             check([...element('.mesh-model-picker-reasoning-options').querySelectorAll('button[role="radio"]')].map((button) => button.textContent?.trim()).join(",") === "High,Max", "Changing the Mesh model did not replace the visible reasoning choices");
             await click(buttonWithText(element('.mesh-model-picker-reasoning-options'), "High"));
             check(buttonWithText(element('.mesh-model-picker-reasoning-options'), "High").getAttribute("aria-checked") === "true", "Mesh reasoning could not be selected directly");
             await click(buttonWithText(element('.mesh-model-picker-reasoning-options'), "Max"));
+            meshSearch.focus();
+            await setField(meshSearch, "no-such-model");
+            check(element('.mesh-model-empty').textContent?.includes("No matching models") && !document.querySelector('.mesh-model-picker-scroll button[role="radio"]'), "Mesh search did not explain an empty result");
+            await pressKey(meshSearch, "ArrowDown");
+            check(document.activeElement === meshSearch && buttonWithText(element('.mesh-model-picker-reasoning-options'), "Max").getAttribute("aria-checked") === "true", "An empty Mesh search changed focus or reasoning");
+            await setField(meshSearch, "");
+            check(element('.mesh-model-picker-scroll').querySelectorAll('button[role="radio"]').length === 2 && buttonWithText(element('.mesh-model-picker-scroll'), "Mesh 1 Alternate").getAttribute("aria-checked") === "true", "Clearing Mesh search did not restore models and preserve the selection");
             await click(buttonWithText(element('.mesh-model-picker'), "Add to mesh"));
             check(element('button[aria-label="Edit Mesh 1 target"]').title.includes("Mesh 1 Alternate · Max"), "Mesh detail choice did not paint its concrete reasoning");
             await setField(composer(), "Remember this Mesh target");
@@ -1445,26 +1724,8 @@ test("mounted Composer preserves pending content and closes transient panels cle
             check(repeated.payload.presentationSegments.map((segment) => segment.type).join(",") === "text,mesh,text,mesh,text", "Sent references lost their inline order");
             check(repeated.payload.presentationSegments.map((segment) => segment.type === "text" ? segment.text : [firstToken, secondToken][segment.targetIndex]).join("") === beforeTrimmedSend, "Trimming whitespace moved Mesh references away from their surrounding text");
 
-            progress("Mesh respects Queue mode and remains visibly queued");
-            for (const queuedProvider of ["opencode", "grok", "codex"]) {
-              state = await mount({ providerId: queuedProvider, deferDelegation: true });
-              await setField(composer(), "/mesh");
-              await click(buttonWithText(element('.mesh-panel'), "Mesh 1"));
-              await setField(composer(), "Once the current work is done, ask for feedback");
-              await click(send());
-              const queuedMeshCall = state.calls.find((call) => call.type === "delegation.prepare");
-              check(queuedMeshCall?.payload.mode === "queue", "A Mesh message steered instead of respecting Queue mode for " + queuedProvider);
-              check(state.snapshot().timelines["mounted-session"].length === 0, "A queued Mesh message appeared as a sent transcript row");
-              check(element('.queued-strip').textContent.includes("Once the current work is done"), "A queued Mesh message is not visibly queued");
-              check(element('.queued-mesh-targets').textContent.includes("Mesh 1"), "The queued message lost its model badge");
-              check(queuedMeshCall.payload.targets[0].reasoningEffort === "max", "Queue mode lost the selected reasoning level");
-              await click(element('button[aria-label="Steer with this queued instruction"]'));
-              check(state.calls.find((call) => call.type === "message_queue.deliver")?.payload.mode === "steer", "Explicit Mesh queue steering lost its mode");
-              check(state.snapshot().timelines["mounted-session"][0]?.mesh?.targets[0]?.reasoningEffort === "max", "Explicit steering lost the queued Mesh badge");
-            }
-
             progress("mesh delivery keeps follow-up composition");
-            state = await mount({ deferDelegation: true, sessionState: "idle" });
+            state = await mount({ deferDelegation: true });
             await setField(composer(), "/mesh");
             await click(buttonWithText(element('.mesh-panel'), "Mesh 1"));
             await setField(composer(), "First mesh instruction");
@@ -1472,8 +1733,9 @@ test("mounted Composer preserves pending content and closes transient panels cle
             const pendingMeshRow = state.snapshot().timelines["mounted-session"][0];
             check(pendingMeshRow?.body === "First mesh instruction" && pendingMeshRow.mesh?.targets.length === 1, "Mesh must paint the complete message and badges before delivery resolves");
             check(state.calls.find((call) => call.type === "delegation.prepare").requestId === pendingMeshRow.delegationId, "Mesh transport and presentation need the same stable identity");
-            await state.injectTimeline({ id: "mesh-provider-echo", messageId: "mesh-provider-message", kind: "user", body: pendingMeshRow.body, timestamp: pendingMeshRow.timestamp, state: "completed" });
+            await state.injectTimeline({ id: "mesh-provider-echo", messageId: "mesh-provider-message", kind: "user", body: "[Mesh target 0: mesh-1 / mesh-1-alternate / max]" + pendingMeshRow.body, timestamp: pendingMeshRow.timestamp, state: "completed" });
             check(state.snapshot().timelines["mounted-session"].length === 1 && state.snapshot().timelines["mounted-session"][0].mesh?.targets.length === 1, "The provider echo duplicated the Mesh message or erased its badges");
+            check(state.snapshot().timelines["mounted-session"][0].body === pendingMeshRow.body, "The provider's routing references replaced the visible Mesh prompt");
             check(plainComposerValue() === "", "Mesh send did not clear the submitted prompt immediately");
             check(!document.querySelector('.composer-inline-mesh'), "Mesh send left submitted targets in the live composer");
             const preparedMeshCall = state.calls.find((call) => call.type === "delegation.prepare");
@@ -1487,7 +1749,6 @@ test("mounted Composer preserves pending content and closes transient panels cle
             check(plainComposerValue() === "Follow-up typed while mesh starts", "Successful Mesh delivery erased follow-up typing");
             check(!send().disabled, "Successful Mesh delivery left the composer stuck in its sending state");
 
-            state = await mount({ deferDelegation: true, sessionState: "idle" });
             await setField(composer(), "/mesh");
             await click(buttonWithText(element('.mesh-panel'), "Mesh 1"));
             await setField(composer(), "Failed mesh instruction");
@@ -1501,7 +1762,7 @@ test("mounted Composer preserves pending content and closes transient panels cle
             check(!send().disabled, "Failed Mesh delivery left the composer stuck in its sending state");
 
             progress("uncertain Mesh delivery retains the sent message");
-            state = await mount({ deferDelegation: true, sessionState: "idle" });
+            state = await mount({ deferDelegation: true });
             await setField(composer(), "/mesh");
             await click(buttonWithText(element('.mesh-panel'), "Mesh 1"));
             await setField(composer(), "Do not duplicate an uncertain send");
@@ -1515,7 +1776,7 @@ test("mounted Composer preserves pending content and closes transient panels cle
             const mentionStorageKeys = ["tethoq:mesh-recent-targets:v1", "tethoq:mesh-recent-models:v1"];
             const mentionStorageBackup = mentionStorageKeys.map((key) => localStorage.getItem(key));
             for (const key of mentionStorageKeys) localStorage.removeItem(key);
-            state = await mount({ deferDelegation: true, sessionState: "idle" });
+            state = await mount({ deferDelegation: true });
             await setField(composer(), "@");
             check(element('.mesh-mention-panel').textContent.includes("Use /mesh"), "First-use mentions did not explain how to populate recent models");
             await pressKey(composer(), "Enter");
@@ -1663,13 +1924,34 @@ test("mounted Composer preserves pending content and closes transient panels cle
       loader: { ".css": "css" },
     });
     await writeFile(htmlPath, '<!doctype html><html><head><link rel="stylesheet" href="./renderer.css"></head><body><script type="module" src="./renderer.js"></script></body></html>', "utf8");
+    await writeFile(preloadPath, `const { contextBridge, ipcRenderer } = require("electron");
+      contextBridge.exposeInMainWorld("composerLayoutQa", {
+        resize: (width, height) => ipcRenderer.invoke("composer-qa-resize", width, height),
+        capture: (name) => ipcRenderer.invoke("composer-qa-capture", name),
+      });`, "utf8");
     await writeFile(mainPath, String.raw`
       const path = require("node:path");
-      const { app, BrowserWindow } = require("electron");
+      const { app, BrowserWindow, ipcMain } = require("electron");
       app.commandLine.appendSwitch("disable-gpu");
       app.setPath("userData", path.join(__dirname, "profile"));
       app.whenReady().then(async () => {
-        const window = new BrowserWindow({ show: false, x: -10000, y: -10000, width: 1200, height: 800, webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false } });
+        const window = new BrowserWindow({ show: false, x: -10000, y: -10000, width: 1200, height: 800, webPreferences: { offscreen: true, preload: path.join(__dirname, "preload.cjs"), contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false } });
+        ipcMain.handle("composer-qa-resize", (_event, width, height) => window.setContentSize(width, height));
+        ipcMain.handle("composer-qa-capture", async (_event, name) => {
+          if (!process.env.TETHOQ_COMPOSER_QA_ARTIFACT_DIR) return;
+          const fs = require("node:fs/promises");
+          await fs.mkdir(process.env.TETHOQ_COMPOSER_QA_ARTIFACT_DIR, { recursive: true });
+          // Wait for the compositor and ResizeObserver-driven surface outline,
+          // rather than capturing the hidden window's previous frame.
+          for (let frame = 0; frame < 2; frame += 1) await new Promise((resolve, reject) => {
+            const painted = () => { clearTimeout(timer); resolve(); };
+            const timer = setTimeout(() => { window.webContents.removeListener("paint", painted); reject(new Error("Composer paint timed out")); }, 2000);
+            window.webContents.once("paint", painted);
+            window.webContents.invalidate();
+          });
+          const image = await window.webContents.capturePage();
+          await fs.writeFile(path.join(process.env.TETHOQ_COMPOSER_QA_ARTIFACT_DIR, name + ".png"), image.toPNG());
+        });
         await window.loadFile(process.argv[2]);
         // The full sequence can exceed 25 seconds while every scenario is
         // progressing. Bound each scenario here; runElectron caps the whole run.

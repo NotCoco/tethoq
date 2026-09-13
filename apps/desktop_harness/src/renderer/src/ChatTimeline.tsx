@@ -14,7 +14,7 @@ const routineActivityKinds = new Set<TimelineItem["kind"]>(["tool", "command", "
 
 function isRoutineActivity(item: TimelineItem): boolean {
   if (isContextHandoffItem(item)) return false;
-  return item.notice !== "eyes_failure" && (routineActivityKinds.has(item.kind)
+  return item.notice !== "eyes_failure" && item.notice !== "mesh_failure" && (routineActivityKinds.has(item.kind)
     || item.kind === "subagent" && !!item.childSessionId && (item.state === "completed" || item.state === "failed"));
 }
 
@@ -115,7 +115,8 @@ export function timelineBoundaryLabel(item: TimelineItem): string | null {
   const title = cleanTitle(item.title ?? "");
   const body = item.body.trim();
   let label: string | null = null;
-  if (isCompactionItem(item)) label = "Session compacted";
+  if (item.notice === "interruption") label = "Task interrupted";
+  else if (isCompactionItem(item)) label = "Session compacted";
   else if (systemTitle.test(title) && body.length <= 240) label = body || "System update";
   else if (/^\s*\[(?:system|notice)\]\s*/iu.test(body) && body.length <= 240) {
     label = body.replace(/^\s*\[(?:system|notice)\]\s*/iu, "").trim() || "System update";
@@ -248,10 +249,11 @@ export type AssistantIdentityMode = "none" | "final" | "live";
 export function assistantIdentityMode(timeline: readonly TimelineItem[], index: number, active: boolean): AssistantIdentityMode {
   const item = timeline[index];
   if (item?.kind !== "assistant" || !hasVisibleTimelineContent(item) || timelineBoundaryLabel(item)) return "none";
+  if (item.presentationOnly) return "none";
   let newestAssistant = -1;
   for (let cursor = timeline.length - 1; cursor >= 0; cursor -= 1) {
     const candidate = timeline[cursor]!;
-    if (candidate.kind === "assistant" && hasVisibleTimelineContent(candidate) && !timelineBoundaryLabel(candidate)) {
+    if (candidate.kind === "assistant" && !candidate.presentationOnly && hasVisibleTimelineContent(candidate) && !timelineBoundaryLabel(candidate)) {
       newestAssistant = cursor;
       break;
     }
@@ -265,7 +267,7 @@ export function assistantIdentityMode(timeline: readonly TimelineItem[], index: 
   let lastAssistant = -1;
   for (let cursor = start; cursor < end; cursor += 1) {
     const candidate = timeline[cursor]!;
-    if (candidate.kind === "assistant" && hasVisibleTimelineContent(candidate) && !timelineBoundaryLabel(candidate)) lastAssistant = cursor;
+    if (candidate.kind === "assistant" && !candidate.presentationOnly && hasVisibleTimelineContent(candidate) && !timelineBoundaryLabel(candidate)) lastAssistant = cursor;
   }
   if (index !== lastAssistant) return "none";
   return isNewest && (active || item.state === "running") ? "live" : "final";
@@ -280,9 +282,10 @@ export function shouldShowAssistantIdentity(timeline: readonly TimelineItem[], i
 export function finalAnswerCopyText(timeline: readonly TimelineItem[], index: number): string {
   const item = timeline[index];
   if (item?.kind !== "assistant") return "";
+  if (item.presentationOnly) return item.body.trim();
   const [start, end] = turnBounds(timeline, index);
   const assistantItems = timeline.slice(start, end).filter((candidate) =>
-    candidate.kind === "assistant" && hasVisibleTimelineContent(candidate) && !timelineBoundaryLabel(candidate));
+    candidate.kind === "assistant" && !candidate.presentationOnly && hasVisibleTimelineContent(candidate) && !timelineBoundaryLabel(candidate));
   const phaseAware = assistantItems.some((candidate) => candidate.phase !== undefined);
   const finalItems = phaseAware ? assistantItems.filter((candidate) => candidate.phase === "final_answer") : assistantItems;
   return visibleAssistantText((finalItems.length ? finalItems : [item]).map((candidate) => candidate.body.trim()).filter(Boolean).join("\n\n"));
@@ -371,7 +374,7 @@ function foldedAssistantIndexes(timeline: readonly TimelineItem[], active: boole
         // must never disappear inside a collapsed Reasoning span: besides hiding
         // the event from the reader, doing so lets many older byte pages collapse
         // into the same single DOM row and makes upward history look stuck.
-        return item?.kind === "assistant" && hasVisibleTimelineContent(item) && timelineBoundaryLabel(item) === null;
+        return item?.kind === "assistant" && !item.presentationOnly && hasVisibleTimelineContent(item) && timelineBoundaryLabel(item) === null;
       });
       const explicitFinals = assistants.filter((index) => timeline[index]?.phase === "final_answer");
       const finals = explicitFinals.length ? new Set(explicitFinals) : new Set(assistants.slice(-1));
@@ -469,7 +472,7 @@ export function groupTimeline(timeline: readonly TimelineItem[], active = false)
 /** A separator is useful only when an answer follows visible work in the same turn. */
 export function shouldSeparateFinalAnswer(timeline: readonly TimelineItem[], index: number, active = false): boolean {
   const item = timeline[index];
-  if (item?.kind !== "assistant" || !hasVisibleTimelineContent(item) || item.phase === "commentary" || item.state === "running" || timelineBoundaryLabel(item)) return false;
+  if (item?.kind !== "assistant" || item.presentationOnly || !hasVisibleTimelineContent(item) || item.phase === "commentary" || item.state === "running" || timelineBoundaryLabel(item)) return false;
   // While the turn is live, an older unphased assistant row is still part of
   // the provider's output stream. The final-answer boundary is a settled-turn
   // affordance; drawing it here creates a false large gap before the answer.
@@ -478,10 +481,10 @@ export function shouldSeparateFinalAnswer(timeline: readonly TimelineItem[], ind
   while (start > 0 && timeline[start - 1]?.kind !== "user") start -= 1;
   let end = index + 1;
   while (end < timeline.length && timeline[end]?.kind !== "user") end += 1;
-  const assistants = timeline.slice(start, end).filter((candidate) => candidate.kind === "assistant" && hasVisibleTimelineContent(candidate) && !timelineBoundaryLabel(candidate));
+  const assistants = timeline.slice(start, end).filter((candidate) => candidate.kind === "assistant" && !candidate.presentationOnly && hasVisibleTimelineContent(candidate) && !timelineBoundaryLabel(candidate));
   const phaseAware = assistants.some((candidate) => candidate.phase !== undefined);
   if (phaseAware && item.phase !== "final_answer") return false;
-  const laterAssistant = timeline.slice(index + 1, end).some((candidate) => candidate.kind === "assistant" && hasVisibleTimelineContent(candidate) && !timelineBoundaryLabel(candidate)
+  const laterAssistant = timeline.slice(index + 1, end).some((candidate) => candidate.kind === "assistant" && !candidate.presentationOnly && hasVisibleTimelineContent(candidate) && !timelineBoundaryLabel(candidate)
     && (item.phase === "final_answer" ? candidate.phase === "final_answer" : true));
   if (laterAssistant) return false;
   return timeline.slice(start, index).some((item) => item.kind !== "user" && !timelineBoundaryLabel(item));
@@ -499,7 +502,7 @@ export function activityLabel(item: TimelineItem): "Read" | "Write" | "Edit" | "
   if (item.kind === "tool" && cleanTitle(item.title ?? "") === "Question") return "Activity";
   if (item.kind === "command") return "Run";
   if (item.kind === "subagent") return "Delegate";
-  if (item.kind === "error") return "Issue";
+  if (item.kind === "error" || item.state === "failed") return "Issue";
   if (item.kind === "tool" && (/<(?:a|button|input|select|textarea)\b[^>]*\bnode_id=/iu.test(item.body) || /"(?:url|title)"\s*:/u.test(item.body))) return "Read";
   const value = `${item.title ?? ""} ${item.kind}`.toLowerCase();
   if (/\b(read|inspect(?:ed|ing)?|open(?:ed|ing)?|fetch(?:ed|ing)?|find|found|list(?:ed|ing)?|view(?:ed|ing)?|search(?:ed|ing)?|browse(?:d|ing)?|scan(?:ned|ning)?)\b/u.test(value)) return "Read";
@@ -710,8 +713,7 @@ const ActivityDisclosure = memo(function ActivityDisclosure({ item }: { item: Ti
   const [enlarged, setEnlarged] = useState(false);
   const toggle = (): void => setExpanded((current) => !current);
   const label = activityLabel(item);
-  const actionLabel = item.kind === "subagent" ? "Spawned sub-agent" : label;
-  const visibleLabel = item.state === "failed" ? `${actionLabel} failed` : actionLabel;
+  const visibleLabel = item.kind === "subagent" ? "Spawned sub-agent" : label;
   const target = activityTarget(item);
   const body = readableActivityBody(item.body);
   const long = body.length > 1_600 || body.split("\n").length > 22;
@@ -923,6 +925,9 @@ export function withCurrentActivity(timeline: readonly TimelineItem[], active: b
     // so the shimmer cannot bounce backward through the transcript.
     for (let index = timeline.length - 1; index >= 0; index -= 1) {
       const item = timeline[index]!;
+      // Inline images use final-answer layout to stay visible, but displaying
+      // an artifact does not end the provider's current reasoning span.
+      if (item.presentationOnly) continue;
       if (item.kind === "user") break;
       // These are hard presentation boundaries even when stale provider metadata
       // before them still says running. A compaction in particular begins a new
@@ -999,9 +1004,9 @@ export function normalizeFinalAnswerOrder(timeline: readonly TimelineItem[], act
       start = end;
       continue;
     }
-    let finalIndex = turn.findIndex((item) => item.kind === "assistant" && item.phase === "final_answer");
+    let finalIndex = turn.findIndex((item) => item.kind === "assistant" && !item.presentationOnly && item.phase === "final_answer");
     if (finalIndex < 0) {
-      const hasPhaseMetadata = turn.some((item) => item.kind === "assistant" && item.phase !== undefined && hasVisibleTimelineContent(item));
+      const hasPhaseMetadata = turn.some((item) => item.kind === "assistant" && !item.presentationOnly && item.phase !== undefined && hasVisibleTimelineContent(item));
       // Providers without a final-answer phase (OpenCode emits none) never
       // qualify for the explicit path above. Once the turn has settled, its last
       // visible assistant row is the answer, and any tool/file rows the provider
@@ -1011,7 +1016,7 @@ export function normalizeFinalAnswerOrder(timeline: readonly TimelineItem[], act
       if (!hasPhaseMetadata && !turn.some((item) => item.state === "running")) {
         for (let index = turn.length - 1; index >= 0; index -= 1) {
           const candidate = turn[index];
-          if (candidate !== undefined && candidate.kind === "assistant" && hasVisibleTimelineContent(candidate) && !timelineBoundaryLabel(candidate)) {
+          if (candidate !== undefined && candidate.kind === "assistant" && !candidate.presentationOnly && hasVisibleTimelineContent(candidate) && !timelineBoundaryLabel(candidate)) {
             finalIndex = index;
             break;
           }
@@ -1060,7 +1065,8 @@ export function anchorMeshChildren(timeline: readonly TimelineItem[]): readonly 
   const owners = new Set(timeline.flatMap((item) => item.kind === "user" && item.delegationId ? [item.delegationId] : []));
   const children = new Map<string, TimelineItem[]>();
   for (const item of timeline) {
-    if (item.kind !== "subagent" || !item.childSessionId || !item.delegationId || !owners.has(item.delegationId)) continue;
+    if (!(item.kind === "subagent" && item.childSessionId || item.notice === "mesh_failure")
+      || !item.delegationId || !owners.has(item.delegationId)) continue;
     const siblings = children.get(item.delegationId) ?? [];
     siblings.push(item);
     children.set(item.delegationId, siblings);
@@ -1555,7 +1561,7 @@ function ChatTimelineImpl({ timeline, providerId, provider, providerStatus, reas
         onOpenSubagent={onOpenSubagent}
       />;
     }
-    if (group.item.kind === "error" || group.item.notice === "eyes_failure") {
+    if (group.item.kind === "error" || group.item.notice === "eyes_failure" || group.item.notice === "mesh_failure") {
       const noticeKey = `${annotationOwnerId}:${group.item.id}`;
       const canContinue = group.item.id === recoverableNoticeId && !continuedNotices.has(noticeKey);
       const continueNotice = onContinue && canContinue ? () => {

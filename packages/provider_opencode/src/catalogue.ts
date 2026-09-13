@@ -24,8 +24,6 @@ export interface OpenCodeSessionIndexPage {
 export interface OpenCodeSessionIndexReader {
   /** `undefined` means the local index is unavailable and HTTP should be used. */
   readPage(options: ListSessionsOptions): Promise<OpenCodeSessionIndexPage | undefined>;
-  /** Lightweight usage metadata; never reads text, images, or tool-output parts. */
-  readMessageInfo?(sessionId: string, limit: number): Promise<readonly unknown[] | undefined>;
   close(): void;
 }
 
@@ -120,27 +118,6 @@ export class SqliteOpenCodeSessionIndexReader implements OpenCodeSessionIndexRea
 
   public close(): void {
     this.#disposed = true;
-  }
-
-  public async readMessageInfo(sessionId: string, limit: number): Promise<readonly unknown[] | undefined> {
-    if (this.#disposed || !existsSync(this.#databasePath)) return undefined;
-    try {
-      const rows = await readOpenCodeSqliteRows(this.#databasePath, `
-        SELECT data FROM message WHERE session_id = ?
-        ORDER BY time_created DESC, id DESC LIMIT ?
-      `, [sessionId, pageLimit(limit)]);
-      if (rows.length === 0) return undefined;
-      return [...rows].reverse().map((row) => {
-        if (!isRecord(row) || typeof row.data !== "string") throw new Error("Invalid OpenCode message metadata");
-        const info: unknown = JSON.parse(row.data);
-        if (!isRecord(info) || typeof info.role !== "string") throw new Error("Invalid OpenCode message metadata");
-        return { info };
-      });
-    } catch {
-      // Local state is opt-in and version-dependent. An unreadable schema must
-      // fall back to the documented HTTP endpoint, never report zero usage.
-      return undefined;
-    }
   }
 }
 

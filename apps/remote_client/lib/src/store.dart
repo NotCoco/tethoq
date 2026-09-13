@@ -525,6 +525,14 @@ class RemoteAppStore extends ChangeNotifier {
   final Map<String, DelegationSelection> agentDefaults =
       <String, DelegationSelection>{};
   final Map<String, String> _liveAssistantText = <String, String>{};
+  final Map<
+      String,
+      ({
+        String text,
+        String reasoning,
+        DateTime? startedAt,
+        RemoteMessage message
+      })> _liveAssistantSnapshots = {};
   final Map<String, String> _liveAssistantReasoning = <String, String>{};
   final Map<String, DateTime> _liveAssistantStartedAt = <String, DateTime>{};
   final Set<String> _historySyncs = <String>{};
@@ -932,14 +940,24 @@ class RemoteAppStore extends ChangeNotifier {
   }
 
   RemoteMessage? liveAssistantMessageFor(String sessionId) {
-    final reasoning = _liveAssistantReasoning[sessionId]?.trim() ?? '';
-    final text = _liveAssistantText[sessionId]?.trim() ?? '';
+    final rawReasoning = _liveAssistantReasoning[sessionId] ?? '';
+    final rawText = _liveAssistantText[sessionId] ?? '';
+    final startedAt = _liveAssistantStartedAt[sessionId];
+    final cached = _liveAssistantSnapshots[sessionId];
+    if (cached != null &&
+        cached.text == rawText &&
+        cached.reasoning == rawReasoning &&
+        cached.startedAt == startedAt) {
+      return cached.message;
+    }
+    final reasoning = rawReasoning.trim();
+    final text = rawText.trim();
     if (reasoning.isEmpty && text.isEmpty) return null;
-    return RemoteMessage(
+    final message = RemoteMessage(
       id: 'live-assistant-$sessionId',
       sessionId: sessionId,
       role: 'assistant',
-      createdAt: _liveAssistantStartedAt[sessionId] ?? DateTime.now(),
+      createdAt: startedAt ?? DateTime.now(),
       parts: <ContentPart>[
         if (reasoning.isNotEmpty)
           ContentPart(
@@ -949,6 +967,13 @@ class RemoteAppStore extends ChangeNotifier {
       ],
       status: 'streaming',
     );
+    _liveAssistantSnapshots[sessionId] = (
+      text: rawText,
+      reasoning: rawReasoning,
+      startedAt: startedAt,
+      message: message,
+    );
+    return message;
   }
 
   String? latestReasoningArtifactFor(String sessionId) {
@@ -4797,9 +4822,7 @@ class RemoteAppStore extends ChangeNotifier {
         ),
       ];
     }
-    _liveAssistantText.remove(sessionId);
-    _liveAssistantReasoning.remove(sessionId);
-    _liveAssistantStartedAt.remove(sessionId);
+    _clearLiveAssistant(sessionId);
     final sessionIndex = sessions.indexWhere((item) => item.id == sessionId);
     if (sessionIndex >= 0) {
       sessions[sessionIndex] = sessions[sessionIndex].copyWith(
@@ -5136,6 +5159,9 @@ class RemoteAppStore extends ChangeNotifier {
 
     try {
       _upsertSession(branch.session);
+      if (trimmedPrompt?.isNotEmpty == true) {
+        setDraft(branch.session.id, trimmedPrompt!);
+      }
       selectedSession = branch.session;
       _markSessionRead(branch.session.id, branch.session.lastActivityAt);
       _notifyListenersAfterAcknowledgement();
@@ -5843,6 +5869,7 @@ class RemoteAppStore extends ChangeNotifier {
     messages.clear();
     events.clear();
     _liveAssistantText.clear();
+    _liveAssistantSnapshots.clear();
     _liveAssistantReasoning.clear();
     _liveAssistantStartedAt.clear();
     _historySyncs.clear();
@@ -6936,6 +6963,8 @@ class RemoteAppStore extends ChangeNotifier {
         }
         syncVisibleHistory = _visibleSessionId == sessionId &&
             (event.type == 'message.remote_received' ||
+                (event.type == 'message.completed' &&
+                    event.payload['requiresHistoryRefresh'] == true) ||
                 event.type == 'agent.completed' ||
                 event.type == 'agent.error' ||
                 event.type == 'agent.interrupted' ||
@@ -7021,6 +7050,8 @@ class RemoteAppStore extends ChangeNotifier {
   }
 
   void _projectLiveMessageEvent(AgentEvent event) {
+    // This is a separate persisted image, not completion of the model's text.
+    if (event.payload['tethoqPresentedImage'] == true) return;
     final sessionId = event.sessionId;
     if (sessionId == null) return;
     final subagentParts = jsonList(event.payload['parts'])
@@ -7134,6 +7165,7 @@ class RemoteAppStore extends ChangeNotifier {
   }
 
   bool _clearLiveAssistant(String sessionId) {
+    _liveAssistantSnapshots.remove(sessionId);
     final textRemoved = _liveAssistantText.remove(sessionId) != null;
     final reasoningRemoved = _liveAssistantReasoning.remove(sessionId) != null;
     final startedAtRemoved = _liveAssistantStartedAt.remove(sessionId) != null;

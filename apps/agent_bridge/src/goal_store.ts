@@ -22,7 +22,6 @@ function validGoal(sessionId: string, value: unknown): value is SessionGoal {
     && value.objective.length <= sessionGoalObjectiveMaxLength
     && sessionGoalStatuses.includes(value.status as never)
     && value.source === "tethoq"
-    && (value.activationId === undefined || (typeof value.activationId === "string" && value.activationId.trim().length > 0 && value.activationId.length <= 256))
     && (value.tokenBudget === null || (typeof value.tokenBudget === "number" && Number.isSafeInteger(value.tokenBudget) && value.tokenBudget > 0))
     && typeof value.tokensUsed === "number" && Number.isSafeInteger(value.tokensUsed) && value.tokensUsed >= 0
     && typeof value.timeUsedSeconds === "number" && Number.isSafeInteger(value.timeUsedSeconds) && value.timeUsedSeconds >= 0

@@ -1,0 +1,289 @@
+// Runs inside OpenCode, at the boundary shared by normal and compaction requests.
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, readFile, writeFile, rename, readdir, unlink, lstat, rmdir } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve, basename, extname, sep } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const version = 1;
+const hour = 60 * 60 * 1000;
+const hash = value => createHash("sha256").update(value).digest("hex");
+const locks = new Map();
+async function locked(key, action) {
+  const previous = locks.get(key) ?? Promise.resolve();
+  const next = previous.catch(() => {}).then(action);
+  locks.set(key, next);
+  try { return await next; } finally { if (locks.get(key) === next) locks.delete(key); }
+}
+async function json(path) {
+  try { return JSON.parse(await readFile(path, "utf8")); }
+  catch (error) { if (error.code === "ENOENT") return; throw error; }
+}
+async function save(path, value) {
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  try { await writeFile(temporary, JSON.stringify(value)); await rename(temporary, path); }
+  finally { await unlink(temporary).catch(() => {}); }
+}
+const image = part => part?.type === "file" && /^image\//i.test(part.mime ?? "");
+const viewer = name => name === "read" || /(?:^|__)view_image$/.test(name ?? "");
+
+export default async function tethoqImages({ client, directory, serverUrl }, options = {}) {
+  const revision = options.revision;
+  if (typeof revision !== "string") throw new Error("Tethoq image loader is missing its revision");
+  const stateRoot = options.stateRoot ?? join(homedir(), ".tethoq", "opencode-images");
+  const cacheRoot = resolve(options.cacheRoot ?? join(tmpdir(), "tethoq", "opencode-images"));
+  const now = options.now ?? Date.now;
+  const key = hash(`${new URL(serverUrl).port}\n${process.platform === "win32" ? resolve(directory).toLowerCase() : resolve(directory)}`);
+  const readyPath = join(stateRoot, `ready-${key}.json`);
+  const instance = randomUUID();
+  const currentTurns = new Map();
+  await mkdir(stateRoot, { recursive: true });
+  await mkdir(cacheRoot, { recursive: true });
+  const statePath = id => join(stateRoot, `${hash(id)}.json`);
+  const folder = id => join(cacheRoot, hash(id));
+  const cachedImage = part => {
+    if (!image(part) || !part.url?.startsWith("file:")) return false;
+    try {
+      const path = resolve(fileURLToPath(part.url));
+      return process.platform === "win32"
+        ? path.toLowerCase().startsWith((cacheRoot + sep).toLowerCase())
+        : path.startsWith(cacheRoot + sep);
+    } catch { return false; }
+  };
+  async function state(id) {
+    if (typeof id !== "string") return;
+    const value = await json(statePath(id));
+    return value?.sessionID === id && value.version === version ? value : undefined;
+  }
+  async function touch(id, currentUserMessageID) {
+    if (typeof id !== "string") return;
+    return locked(statePath(id), async () => {
+      const value = await state(id);
+      if (!value) return;
+      await save(statePath(id), { ...value, lastActivity: now(),
+        ...(currentUserMessageID ? { currentUserMessageID, turnStartedAt: now() } : {}) });
+    });
+  }
+  async function sweep() {
+    for (const name of await readdir(stateRoot)) {
+      if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
+      await locked(join(stateRoot, name), async () => {
+        const value = await json(join(stateRoot, name));
+        if (!value || typeof value.sessionID !== "string" || name !== `${hash(value.sessionID)}.json`
+          || !Number.isFinite(value.lastActivity) || now() - value.lastActivity < hour) return;
+        if (value.busyPid) {
+          try { process.kill(value.busyPid, 0); return; } catch { /* A crashed runner cannot keep images forever. */ }
+        }
+        const target = folder(value.sessionID);
+        // Delete only regular files immediately inside this owned session folder.
+        // Never follow links or remove the user's original image/project files.
+        const stat = await lstat(target).catch(error => { if (error.code !== "ENOENT") throw error; });
+        if (!stat || !stat.isDirectory() || stat.isSymbolicLink()) return;
+        for (const entry of await readdir(target, { withFileTypes: true })) {
+          if (entry.isFile() || entry.isSymbolicLink()) await unlink(join(target, entry.name)).catch(error => { if (error.code !== "ENOENT") throw error; });
+        }
+        await rmdir(target).catch(error => { if (!['ENOENT', 'ENOTEMPTY'].includes(error.code)) throw error; });
+      });
+    }
+  }
+  async function archive(id, part, identity) {
+    const url = part.url ?? "";
+    const safeName = basename((part.filename || `image.${part.mime.split('/')[1] || 'png'}`).replaceAll("\\", "/"))
+      .replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120) || "image.png";
+    const suffix = extname(safeName);
+    const target = join(folder(id), `${safeName.slice(0, safeName.length - suffix.length)}-${hash(identity).slice(0, 16)}${suffix}`);
+    let bytes;
+    if (/^data:image\/[^;,]+;base64,/i.test(url)) bytes = Buffer.from(url.slice(url.indexOf(',') + 1), "base64");
+    else if (url.startsWith("file:")) {
+      const source = fileURLToPath(url);
+      if (resolve(source).startsWith(folder(id) + (process.platform === "win32" ? "\\" : "/"))) {
+        // Keep an expired reference expired. Never resurrect it from history.
+        return { ...part, url };
+      }
+      const stat = await lstat(source).catch(() => undefined);
+      if (stat?.isFile() && !stat.isSymbolicLink() && stat.size <= 25 * 1024 * 1024) {
+        bytes = await readFile(source).catch(error => { if (error.code !== "ENOENT") throw error; });
+      }
+    }
+    // Keep ownership information when an inherited cache file has expired, so
+    // a later fork of this repaired chat can recover its image policy as well.
+    if (!bytes && cachedImage(part)) return { ...part, url, filename: safeName,
+      metadata: { ...part.metadata, tethoqImagesUnavailable: true } };
+    if (!bytes) return { ...part, url: "", filename: safeName };
+    await mkdir(folder(id), { recursive: true });
+    const targetFolder = await lstat(folder(id));
+    if (!targetFolder.isDirectory() || targetFolder.isSymbolicLink()) throw new Error("Invalid temporary image directory");
+    await writeFile(target, bytes, { flag: "wx" }).catch(error => { if (error.code !== "EEXIST") throw error; });
+    return { ...part, url: pathToFileURL(target).href, filename: part.filename ?? safeName };
+  }
+  async function pixels(part) {
+    if (!part.url?.startsWith("file:")) return;
+    const path = fileURLToPath(part.url);
+    if (!resolve(path).startsWith(cacheRoot + (process.platform === "win32" ? "\\" : "/"))) return;
+    const stat = await lstat(path).catch(() => undefined);
+    if (!stat?.isFile() || stat.isSymbolicLink() || stat.size > 25 * 1024 * 1024) return;
+    return { ...part, url: `data:${part.mime};base64,${(await readFile(path)).toString("base64")}` };
+  }
+  function reference(part) {
+    const location = !part.metadata?.tethoqImagesUnavailable && part.url?.startsWith('file:')
+      ? `${fileURLToPath(part.url)}. Use read to view it if needed; temporary images expire after one hour of chat inactivity.`
+      : 'temporary image unavailable; reattach it if needed.';
+    return `[Image: ${part.filename ?? 'image'}; ${location}]`;
+  }
+  async function persist(part) {
+    const result = await client._client.patch({
+      url: `/session/${encodeURIComponent(part.sessionID)}/message/${encodeURIComponent(part.messageID)}/part/${encodeURIComponent(part.id)}`,
+      body: part, headers: { "Content-Type": "application/json" }, throwOnError: true,
+    });
+    if (result.error) throw new Error("Could not save temporary image references");
+  }
+  async function archiveHistory(id) {
+    if (!await state(id) || !client._client.get) return;
+    await locked(statePath(id), async () => {
+      const value = await state(id);
+      if (!value) return;
+      let before;
+      const cursors = new Set();
+      do {
+        const result = await client._client.get({ url: `/session/${encodeURIComponent(id)}/message`,
+          query: { limit: 100, ...(before ? { before } : {}) }, throwOnError: true });
+        if (!Array.isArray(result.data)) throw new Error("Image history unavailable");
+        for (const row of result.data) for (const part of row.parts ?? []) {
+          if (image(part)) {
+            const cached = await archive(id, part, `${row.info.id}/${part.id}`);
+            if (cached.url !== part.url || cached.metadata?.tethoqImagesUnavailable !== part.metadata?.tethoqImagesUnavailable) await persist(cached);
+          } else if (part.type === "tool" && part.state?.status === "completed" && part.state.attachments?.some(image)) {
+            const cached = structuredClone(part);
+            for (let n = 0; n < cached.state.attachments.length; n++) {
+              const attachment = cached.state.attachments[n];
+              if (image(attachment)) cached.state.attachments[n] = await archive(id, attachment, `${row.info.id}/${part.id}/${n}`);
+            }
+            if (JSON.stringify(cached) !== JSON.stringify(part)) await persist(cached);
+          }
+        }
+        before = result.response?.headers.get("x-next-cursor");
+        if (before && cursors.has(before)) throw new Error("Image history cursor repeated");
+        if (before) cursors.add(before);
+      } while (before && !value.archivedHistory);
+      // Subsequent requests archive at the transform boundary. A recent page
+      // at idle catches interrupted work without re-scanning the entire chat.
+      await save(statePath(id), { ...value, archivedHistory: true });
+    });
+  }
+  await sweep();
+  const timer = setInterval(() => { void sweep().catch(() => {}); }, 30_000);
+  timer.unref?.();
+  await save(readyPath, { version, revision, pid: process.pid, instance });
+  return {
+    async dispose() {
+      clearInterval(timer);
+      currentTurns.clear();
+      if ((await json(readyPath))?.instance === instance) await unlink(readyPath).catch(() => {});
+    },
+    async "chat.message"(input, output) {
+      currentTurns.set(input.sessionID, { currentUserMessageID: output.message.id, turnStartedAt: now() });
+      await sweep();
+      // Native task-tool children can start before their creation event arrives.
+      if (!await state(input.sessionID) && client.session?.get) {
+        const seen = new Set([input.sessionID]);
+        let id = input.sessionID;
+        while (seen.size < 32) {
+          const result = await client.session.get({ path: { id }, throwOnError: true });
+          id = result.data?.parentID;
+          if (!id || seen.has(id)) break;
+          if (await state(id)) {
+            await save(statePath(input.sessionID), { version, sessionID: input.sessionID, lastActivity: now() });
+            break;
+          }
+          seen.add(id);
+        }
+      }
+      // Includes old, compacted-away history when upgrading an existing task.
+      await archiveHistory(input.sessionID);
+      await touch(input.sessionID, output.message.id);
+    },
+    async event({ event }) {
+      const properties = event.properties ?? {};
+      // Reads, catalogue refreshes and heartbeats are deliberately not activity.
+      const id = properties.sessionID ?? properties.part?.sessionID ?? properties.info?.sessionID;
+      if (["message.part.delta", "message.part.updated", "session.idle", "session.error"].includes(event.type)) await touch(id).catch(() => {});
+      if (event.type === "session.status" && typeof id === "string") {
+        await locked(statePath(id), async () => {
+          const value = await state(id);
+          if (value) await save(statePath(id), { ...value, busyPid: properties.status?.type === "idle" ? null : process.pid });
+        }).catch(() => {});
+      }
+      if (event.type === "session.idle" || event.type === "session.error") {
+        // A stopped turn may never reach another model request. Archive any
+        // screenshots it left behind as well, without marking them as viewed.
+        await archiveHistory(id).catch(() => {});
+        currentTurns.delete(id);
+      }
+      if (event.type === "session.created" && properties.info?.parentID) {
+        const parent = await state(properties.info.parentID);
+        if (parent) await locked(statePath(properties.info.id), async () => {
+          if (!await state(properties.info.id)) await save(statePath(properties.info.id), { version, sessionID: properties.info.id, lastActivity: now() });
+        }).catch(() => {});
+      }
+    },
+    async "experimental.chat.messages.transform"(_input, output) {
+      const id = output.messages.find(row => row.info?.sessionID)?.info.sessionID;
+      if (typeof id !== "string") return;
+      // Native forks copy message parts but have no parentID. Recover their
+      // registration from our own cache references, including expired files.
+      if (!await state(id) && output.messages.some(row => row.parts.some(part =>
+        cachedImage(part) || (part.type === "tool" && part.state?.attachments?.some(cachedImage))))) {
+        await locked(statePath(id), async () => {
+          if (!await state(id)) await save(statePath(id), { version, sessionID: id, lastActivity: now(),
+            ...currentTurns.get(id) });
+        });
+      }
+      if (!await state(id)) return;
+      await sweep();
+      await locked(statePath(id), async () => {
+        const value = await state(id);
+        if (!value) return;
+        // A restarted task may have old history but no recorded current prompt.
+        // In that case historical images are references, never fresh attachments.
+        const current = value.currentUserMessageID;
+        const currentRow = output.messages.find(row => row.info.id === current);
+        let remaining = 30 - (currentRow?.parts.filter(image).length ?? 0);
+        if (remaining < 0) throw new Error("This message has more than 30 images. Send fewer images in this turn.");
+        for (const row of output.messages) {
+          for (let index = 0; index < row.parts.length; index++) {
+            const part = row.parts[index];
+            if (image(part)) {
+              const cached = await archive(id, part, `${row.info.id}/${part.id}`);
+              if (cached.url !== part.url || cached.metadata?.tethoqImagesUnavailable !== part.metadata?.tethoqImagesUnavailable) await persist(cached);
+              const visible = row.info.role === "user" && row.info.id === current ? await pixels(cached) : undefined;
+              row.parts[index] = visible ?? { id: part.id, sessionID: part.sessionID, messageID: part.messageID,
+                type: "text", text: reference(cached) };
+            } else if (part.type === "tool" && part.state?.status === "completed" && part.state.attachments?.some(image)) {
+              const cached = structuredClone(part);
+              const visible = [];
+              const references = [];
+              const fresh = viewer(part.tool) && !part.state.metadata?.tethoqImagesViewed
+                && (row.info.parentID === current || (!currentRow && row.info.time?.created >= value.turnStartedAt));
+              for (let n = 0; n < cached.state.attachments.length; n++) {
+                const attachment = cached.state.attachments[n];
+                if (!image(attachment)) { visible.push(attachment); continue; }
+                const file = await archive(id, attachment, `${row.info.id}/${part.id}/${n}`);
+                cached.state.attachments[n] = file;
+                references.push(reference(file));
+                if (fresh && remaining > 0) {
+                  const viewed = await pixels(file);
+                  if (viewed) { visible.push(viewed); remaining--; }
+                }
+              }
+              cached.state.metadata = { ...cached.state.metadata, tethoqImagesViewed: true };
+              if (JSON.stringify(cached) !== JSON.stringify(part)) await persist(cached);
+              row.parts[index] = { ...cached, state: { ...cached.state, attachments: visible,
+                output: `${cached.state.output ?? ''}\n${references.join('\n')}` } };
+            }
+          }
+        }
+        await save(statePath(id), { ...value, lastActivity: now() });
+      });
+    },
+  };
+}

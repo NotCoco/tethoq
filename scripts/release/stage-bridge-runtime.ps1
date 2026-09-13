@@ -159,6 +159,7 @@ foreach ($runtimePackage in $runtimePackages) {
 $opencodeAssetTarget = Join-Path $appRoot 'apps\agent_bridge\assets\opencode'
 New-Item -ItemType Directory -Path $opencodeAssetTarget -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $bridgeRoot 'assets\opencode\uar_mesh.txt') -Destination $opencodeAssetTarget
+Copy-Item -LiteralPath (Join-Path $bridgeRoot 'assets\opencode\tethoq_images.txt') -Destination $opencodeAssetTarget
 $piAssetTarget = Join-Path $appRoot 'apps\agent_bridge\assets\pi'
 New-Item -ItemType Directory -Path $piAssetTarget -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $bridgeRoot 'assets\pi\tethoq_tools.txt') -Destination $piAssetTarget

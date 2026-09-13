@@ -207,9 +207,30 @@ test("App keeps scheduled Mesh commands draft-local, retry-safe, and visually st
           const materializeCalls = [];
           const delegationCalls = [];
           const createdSessions = new Map();
+          const scheduledRecords = new Map();
+          const scheduleReplies = new Map();
+          let retryGate = deferred();
+          let retryCalls = 0;
+          let onEvents;
+          let sequence = 0;
+          const emit = async (events) => {
+            onEvents({ events: events.map((event) => ({
+              ...event,
+              sequence: ++sequence,
+              eventId: "schedule-event-" + sequence,
+              occurredAt: new Date().toISOString(),
+            })), latestSequence: sequence, replayGap: false });
+            await settle();
+          };
           const request = async (type, payload = {}, requestId) => {
-            if (type === "sessions.list") return envelope({ sessions: [sourceSession] });
-            if (type === "scheduled_task.list") return envelope({ tasks: [] });
+            if (type === "sessions.list") return envelope({ sessions: [sourceSession, ...createdSessions.values()] });
+            if (type === "scheduled_task.list") return envelope({ tasks: [...scheduledRecords.values()].filter((task) => task.status !== "started" && task.status !== "cancelled") });
+            if (type === "scheduled_task.retry") {
+              retryCalls += 1;
+              const task = { ...scheduledRecords.get(payload.scheduledTaskId), status: "dispatching", dispatchingAt: new Date().toISOString() };
+              await retryGate.promise;
+              return envelope({ task });
+            }
             if (type === "approval.list") return envelope({ approvals: [] });
             if (type === "user_input.list") return envelope({ requests: [] });
             if (type === "models.list") {
@@ -251,7 +272,7 @@ test("App keeps scheduled Mesh commands draft-local, retry-safe, and visually st
             if (type === "scheduled_task.create") {
               scheduleCalls.push({ payload: structuredClone(payload), requestId });
               await scheduleGate.promise;
-              return envelope({ task: {
+              const task = {
                 requestId,
                 targetSessionId: "scheduled-task:" + requestId,
                 providerId: payload.providerId,
@@ -264,7 +285,9 @@ test("App keeps scheduled Mesh commands draft-local, retry-safe, and visually st
                 modelId: payload.modelId,
                 reasoningEffort: payload.reasoningEffort,
                 meshTargets: payload.meshTargets,
-              } });
+              };
+              if (!scheduledRecords.has(requestId)) scheduledRecords.set(requestId, task);
+              return envelope({ task: scheduleReplies.get(requestId) ?? task });
             }
             return envelope({});
           };
@@ -275,7 +298,7 @@ test("App keeps scheduled Mesh commands draft-local, retry-safe, and visually st
             preferencesState: async () => preferences,
             preferencesAction: async () => preferences,
             notifyReady: () => undefined,
-            onEventBatch: () => remove,
+            onEventBatch: (listener) => { onEvents = listener; return () => { onEvents = undefined; }; },
             onRuntimeState: () => remove,
             browserState: async () => browserState,
             browserAction: async () => browserState,
@@ -365,6 +388,11 @@ test("App keeps scheduled Mesh commands draft-local, retry-safe, and visually st
             const part = (value) => String(value).padStart(2, "0");
             const localValue = due.getFullYear() + "-" + part(due.getMonth() + 1) + "-" + part(due.getDate()) + "T" + part(due.getHours()) + ":" + part(due.getMinutes());
             await setField(scheduleField, localValue);
+            await setField(composer, "x".repeat(32_001));
+            await click(element('.composer-schedule-panel button[type="submit"]'));
+            check(scheduleCalls.length === 0, "Oversized Mesh was saved and would fail only when due");
+            check(element('.composer-schedule-error').textContent.includes("32,000"), "Oversized Mesh did not explain its limit");
+            await setField(composer, "Schedule this prompt");
             await click(element('.composer-schedule-panel button[type="submit"]'));
             await waitFor(() => scheduleCalls.length === 1, "deferred scheduled_task.create");
             const firstScheduleCall = structuredClone(scheduleCalls[0]);
@@ -501,6 +529,88 @@ test("App keeps scheduled Mesh commands draft-local, retry-safe, and visually st
             check(delegationCalls[0].parentSessionId !== sendDraftId && !delegationCalls.some((call) => String(call.parentSessionId).startsWith("draft-")), "delegation.prepare leaked a local draft id");
             check(delegationCalls[0].prompt === "Materialize delegated prompt", "Materialized Mesh send changed its prompt");
             check(document.querySelector('[data-session-id="materialized-mesh-parent-1"] > .session-row.selected'), "Materialized Mesh parent was not selected");
+
+            // The native task may finish before the original save response
+            // arrives, or before a same-ID retry returns after reconnecting.
+            for (const replyKind of ["stale-pending", "already-started", "newer-response", "cancelled"]) {
+              await click(element(".new-task-button"));
+              await setField(element("#composer-message"), "Late schedule response " + replyKind + " /schedule");
+              await waitFor(() => document.querySelector(".composer-schedule-panel"), "late response schedule panel");
+              await setField(element('.composer-schedule-panel input[type="datetime-local"]'), localValue);
+              scheduleGate = deferred();
+              const callIndex = scheduleCalls.length;
+              await click(element('.composer-schedule-panel button[type="submit"]'));
+              await waitFor(() => scheduleCalls.length === callIndex + 1, "late response schedule request");
+              const call = scheduleCalls[callIndex];
+              const placeholderId = "scheduled-task:" + call.requestId;
+              const targetId = replyKind === "cancelled" ? placeholderId : "finished-" + call.requestId;
+              const now = new Date().toISOString();
+              const settled = {
+                ...call.payload, requestId: call.requestId, targetSessionId: targetId,
+                createdAt: now, dispatchingAt: now,
+                status: replyKind === "cancelled" ? "cancelled" : "started",
+                ...(replyKind === "cancelled" ? { cancelledAt: now } : { startedAt: now }),
+              };
+              scheduledRecords.set(call.requestId, settled);
+              if (replyKind === "already-started" || replyKind === "newer-response") scheduleReplies.set(call.requestId, settled);
+              if (replyKind !== "cancelled") {
+                createdSessions.set(targetId, { ...sourceSession, id: targetId, providerSessionId: targetId,
+                  title: call.payload.title, preview: "Scheduled work finished", state: "completed" });
+              }
+              await emit([replyKind === "already-started" ? {
+                type: "session.catalog_changed", providerId: call.payload.providerId, payload: {},
+              } : {
+                type: "scheduled_task.updated", sessionId: targetId, providerId: call.payload.providerId,
+                payload: { task: replyKind === "newer-response" ? { ...settled, status: "dispatching", startedAt: undefined } : settled, change: replyKind === "cancelled" ? "cancelled" : "updated",
+                  ...(replyKind !== "cancelled" ? { previousTargetSessionId: placeholderId } : {}) },
+              }]);
+              if (replyKind !== "cancelled") {
+                await waitFor(() => document.querySelector('[data-session-id="' + targetId + '"]'), "finished provider task hydration");
+                await emit([{ type: "agent.completed", sessionId: targetId, providerId: call.payload.providerId, payload: {} }]);
+              }
+              scheduleGate.resolve();
+              await waitFor(() => !document.querySelector(".composer-schedule-panel"), "late save response handled");
+              check(!document.querySelector('[data-session-id="' + placeholderId + '"]'), "Late response resurrected a retired schedule placeholder: " + replyKind);
+              check(!document.querySelector(".scheduled-task-notice"), "Late response restored a finished schedule notice: " + replyKind);
+              if (replyKind !== "cancelled") {
+                const row = element('[data-session-id="' + targetId + '"] > .session-row');
+                check(row.classList.contains("selected"), "Late response did not select the materialized task");
+                check(!row.querySelector('[aria-label="Working"]'), "Late response painted completed work as running");
+              }
+            }
+
+            await click(element(".new-task-button"));
+            await setField(element("#composer-message"), "Retry a materialized schedule /schedule");
+            await setField(element('.composer-schedule-panel input[type="datetime-local"]'), localValue);
+            scheduleGate = deferred();
+            await click(element('.composer-schedule-panel button[type="submit"]'));
+            const retryCall = scheduleCalls.at(-1);
+            const retryId = "retry-" + retryCall.requestId;
+            const failedTask = {
+              ...retryCall.payload, requestId: retryCall.requestId, targetSessionId: retryId,
+              status: "failed", failureMessage: "Provider was unavailable", createdAt: new Date().toISOString(),
+              dispatchingAt: new Date().toISOString(), failedAt: new Date().toISOString(),
+            };
+            scheduledRecords.set(retryCall.requestId, failedTask);
+            scheduleReplies.set(retryCall.requestId, failedTask);
+            createdSessions.set(retryId, { ...sourceSession, id: retryId, providerSessionId: retryId, state: "idle" });
+            scheduleGate.resolve();
+            await waitFor(() => document.querySelector('.scheduled-task-notice[data-status="failed"]'), "failed materialized schedule");
+            retryGate = deferred();
+            await click(buttonWithText(element(".scheduled-task-actions"), "Retry now"));
+            check(retryCalls === 1, "Retry was not submitted once");
+            const startedTask = { ...failedTask, status: "started", startedAt: new Date().toISOString() };
+            scheduledRecords.set(retryCall.requestId, startedTask);
+            createdSessions.set(retryId, { ...createdSessions.get(retryId), state: "completed" });
+            await emit([
+              { type: "scheduled_task.updated", sessionId: retryId, providerId: retryCall.payload.providerId, payload: { change: "updated", task: startedTask } },
+              { type: "agent.completed", sessionId: retryId, providerId: retryCall.payload.providerId, payload: {} },
+            ]);
+            check(!document.querySelector(".scheduled-task-notice"), "Provider completion did not retire the schedule");
+            retryGate.resolve();
+            await settle();
+            check(!document.querySelector(".scheduled-task-notice"), "Late retry acknowledgement restored Starting after completion");
+            check(!element('[data-session-id="' + retryId + '"] > .session-row').querySelector('[aria-label="Working"]'), "Late retry acknowledgement restored active state");
 
             window.__schedulingQaResult = { ok: true, originalDraftId, retainedDraftId, scheduledId, secondScheduledId, meshParentId: delegationCalls[0].parentSessionId };
           } catch (error) {

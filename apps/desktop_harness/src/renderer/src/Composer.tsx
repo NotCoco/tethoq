@@ -10,7 +10,7 @@ import {
   parseSimplifyCommand,
   type SimplifySettings,
 } from "../../../../../packages/protocol/src/simplify";
-import type { JsonObject, ProviderWalletStatus, QueuedMessage } from "../../../../../packages/protocol/src/index";
+import type { JsonObject, ProviderWalletStatus } from "../../../../../packages/protocol/src/index";
 import type { DesktopPreferencesState, EarsSettings, ScreenCaptureSource, SelectedFile, SelectedImage, VisionProxySelection, VisionProxyStatus, VisionProxyTarget, WorkflowAttachment, WorkflowDescriptor } from "@shared/desktop_api";
 import {
   composeEarsDestinationText,
@@ -23,7 +23,7 @@ import {
   routeAcceptsEarsAudio,
   type EarsAudioRoute,
 } from "../../../../../packages/protocol/src/ears";
-import { reasoningDisplayLabel, type ReasoningLabelContext } from "../../../../../packages/protocol/src/reasoning";
+import { matchReasoningEffort, reasoningDisplayLabel, resolveModelReasoningProfile, type ReasoningLabelContext } from "../../../../../packages/protocol/src/reasoning";
 import { IconButton, LoadingState, ProviderLogo } from "./components";
 import { clearSessionGoal, isDeliveryUnknownError, loadSessionGoal, refreshProviders, setSessionGoal } from "./bridge";
 import { ChatTimeline } from "./ChatTimeline";
@@ -75,6 +75,7 @@ import {
   insertedSlashCommand,
   isDictationAudioAttachment,
   maximumMessageAttachmentBytes,
+  maximumMessageAttachments,
   isAmbiguousSelectionValue,
   modelCatalogRoute,
   modelMatchesCatalogQuery,
@@ -102,6 +103,7 @@ import {
 } from "./composer_helpers";
 import "./composer.css";
 import { serializeResponseAnnotations, type ResponseAnnotation } from "./response_annotations";
+import { readQueuedComposerDraft } from "./queued_draft";
 import { mergeAcceptedComposerRow, rollbackOptimisticComposerRow } from "./timeline_merge";
 
 type Request = (type: string, payload?: JsonObject, requestId?: string) => Promise<Record<string, unknown>>;
@@ -487,16 +489,17 @@ function SimplifyIcon() {
   return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5h14M5.5 10h9M8 15h4" /></svg>;
 }
 
-function ChoiceMenu({ value, label, options, onChange, className = "", triggerDescription }: {
+function ChoiceMenu({ value, label, options, onChange, className = "", triggerDescription, placeholder }: {
   value: string;
   label: string;
   options: ReadonlyArray<{ value: string; label: string; description?: string; disabled?: boolean }>;
   onChange: (value: string) => void;
   className?: string;
   triggerDescription?: string;
+  placeholder?: string;
 }) {
   const [open, setOpen] = useState(false);
-  const selected = options.find((option) => option.value === value) ?? options[0];
+  const selected = options.find((option) => option.value === value) ?? (placeholder ? { label: placeholder } : options[0]);
   if (!selected) return null;
   return <div className={`composer-choice composer-setting ${className}`}>
     {triggerDescription ? <span className="composer-setting-label">{triggerDescription}</span> : null}
@@ -1941,7 +1944,10 @@ function MeshModelPicker({ snapshot, provider, existing, initial, onHydrateProvi
   onClose: () => void;
 }) {
   const panel = useRef<HTMLDivElement>(null);
+  const search = useRef<HTMLInputElement>(null);
+  const [query, setQuery] = useState("");
   const models = snapshot.models[provider.id] ?? [];
+  const visibleModels = models.filter((model) => modelMatchesCatalogQuery(query, provider.id, provider.name, model));
   const startingTarget = existing ?? initial;
   const currentSelection = startingTarget
     ? { ...(startingTarget.modelId ? { modelId: startingTarget.modelId } : {}), ...(startingTarget.reasoningEffort ? { reasoningEffort: startingTarget.reasoningEffort } : {}) }
@@ -1986,13 +1992,25 @@ function MeshModelPicker({ snapshot, provider, existing, initial, onHydrateProvi
     if (effort && !efforts.includes(effort)) setEffort(chosenModel.defaultEffort ?? efforts[0] ?? "");
   }, [chosenModel, effort, efforts, modelId, models]);
   useEffect(() => {
-    const frame = requestAnimationFrame(() => (panel.current?.querySelector<HTMLElement>('button[role="radio"][aria-checked="true"]')
-      ?? panel.current?.querySelector<HTMLElement>('button[role="radio"]')
-      ?? panel.current?.querySelector<HTMLElement>("button"))?.focus());
+    const frame = requestAnimationFrame(() => search.current?.focus());
     return () => cancelAnimationFrame(frame);
   }, []);
+  useEffect(() => {
+    const list = panel.current?.querySelector<HTMLElement>(".mesh-model-picker-scroll");
+    if (list) list.scrollTop = 0;
+  }, [query]);
   const navigateRadios = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     if (event.nativeEvent.isComposing || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    if (event.target === search.current) {
+      if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+      const modelButtons = panel.current?.querySelectorAll<HTMLButtonElement>('.mesh-model-picker-scroll button[role="radio"]');
+      const next = event.key === "ArrowDown" ? modelButtons?.[0] : modelButtons?.[modelButtons.length - 1];
+      if (!next) return;
+      event.preventDefault();
+      next.focus();
+      next.click();
+      return;
+    }
     if (!["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
     const radios = [...(panel.current?.querySelectorAll<HTMLButtonElement>('button[role="radio"]:not(:disabled)') ?? [])];
     if (!radios.length) return;
@@ -2006,10 +2024,14 @@ function MeshModelPicker({ snapshot, provider, existing, initial, onHydrateProvi
   };
   return <div ref={panel} className="mesh-model-picker" role="dialog" aria-label={`Choose model for ${provider.name}`} onKeyDown={navigateRadios}>
     <header><button type="button" aria-label="Back to mesh targets" onClick={onBack}><ChevronRightIcon /></button><span className="mesh-model-picker-title"><ProviderLogo providerId={provider.id} provider={provider} size={24}/><span><strong>{provider.name}</strong><small>Model and reasoning</small></span></span><button type="button" aria-label="Close model picker" onClick={onClose}><XIcon /></button></header>
+    <label className="model-catalog-search mesh-model-picker-search"><SearchIcon /><input ref={search} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search models" aria-label={`Search models for ${provider.name}`} /></label>
     <div className="mesh-model-picker-scroll">
       {catalogueLoading ? <p className="mesh-catalogue-status" role="status"><span className="spinner" />Refreshing models…</p> : null}
       {catalogueError ? <div className="mesh-catalogue-error" role="alert" title={catalogueError}><span>Couldn’t refresh models. Showing the last loaded choices.</span><button type="button" onClick={() => setCatalogueRevision((current) => current + 1)}>Try again</button></div> : null}
-      {models.length ? <section><h4>Model</h4>{models.map((model) => <button type="button" role="radio" aria-checked={model.id === modelId} key={model.id} className={model.id === modelId ? "selected" : ""} onClick={() => chooseModel(model.id)}><span><strong>{model.name}</strong></span><span className="mesh-row-meta">{model.id === modelId ? <CheckIcon /> : null}</span></button>)}</section> : <div className="mesh-model-empty"><strong>Harness default model</strong><small>This coding tool does not expose model choices.</small></div>}
+      {visibleModels.length ? <section><h4>Model</h4>{visibleModels.map((model) => {
+        const source = model.sourceProviderName || model.endpointName || model.sourceProviderId || provider.name;
+        return <button type="button" role="radio" aria-checked={model.id === modelId} key={model.id} className={model.id === modelId ? "selected" : ""} title={`${model.name} · ${source}`} aria-label={`${model.name} · ${source}`} onClick={() => chooseModel(model.id)}><span><strong>{model.name}</strong><small className="mesh-model-source">{source}</small></span><span className="mesh-row-meta">{model.id === modelId ? <CheckIcon /> : null}</span></button>;
+      })}</section> : models.length ? <div className="mesh-model-empty" role="status"><strong>No matching models</strong><small>Try another model name.</small></div> : <div className="mesh-model-empty"><strong>Harness default model</strong><small>This coding tool does not expose model choices.</small></div>}
     </div>
     {efforts.length ? <section className="mesh-model-picker-reasoning" aria-label={`Reasoning for ${chosenModel?.name ?? provider.name}`}><span className="mesh-model-picker-reasoning-title"><strong>Reasoning</strong><small>{chosenModel?.name}</small></span><div className="mesh-model-picker-reasoning-options" role="radiogroup" aria-label="Reasoning effort">{efforts.map((value) => <button type="button" role="radio" aria-checked={value === effort} key={value} className={value === effort ? "selected" : ""} onClick={() => setEffort(value)}><span>{reasoningLabel(value, { providerId: provider.id, modelId, displayName: chosenModel?.name })}</span>{value === effort ? <CheckIcon /> : null}</button>)}</div></section> : null}
     <footer><button type="button" onClick={onClose}>Cancel</button><button type="button" className="primary" disabled={catalogueLoading || (models.length > 0 && !modelId)} onClick={commit}>{existing ? "Save target" : "Add to mesh"}</button></footer>
@@ -2395,7 +2417,6 @@ export interface QueuedMessageView {
   readonly state: "queued" | "sending" | "failed";
   readonly attachmentCount: number;
   readonly attachments: readonly QueuedAttachmentView[];
-  readonly mesh?: QueuedMessage["mesh"];
   readonly retryable?: boolean;
   readonly error?: string;
 }
@@ -2505,10 +2526,6 @@ export function queuedMessagesForSession(value: unknown, sessionId: string): rea
       attachmentCount: attachments.length,
       attachments,
       retryable: message.retryable !== false,
-      ...(message.mesh && typeof message.mesh === "object" && !Array.isArray(message.mesh)
-        && Array.isArray((message.mesh as QueuedMessage["mesh"])?.targets)
-        && Array.isArray((message.mesh as QueuedMessage["mesh"])?.segments)
-        ? { mesh: message.mesh as NonNullable<QueuedMessage["mesh"]> } : {}),
       ...(typeof message.error === "string" && message.error.trim() ? { error: message.error } : {}),
     };
     if (attachments.some((attachment) => attachment.dataUrl)) {
@@ -2527,6 +2544,9 @@ export function queuedMessagePreview(content: string): string {
 
 /** Moves one queued instruction into the transcript without waiting for steer acknowledgement. */
 function optimisticQueuedSteerTimelineItem(message: QueuedMessageView, id: string, timestamp: string): TimelineItem {
+  // An upload acknowledgement contains metadata only. Steer can be clicked
+  // before the background queue refresh merges the locally retained preview.
+  message = mergeQueuedAttachmentPreviews(message);
   const images = message.attachments
     .filter((attachment) => attachment.mimeType.toLowerCase().startsWith("image/"))
     .map((attachment) => ({
@@ -2551,7 +2571,6 @@ function optimisticQueuedSteerTimelineItem(message: QueuedMessageView, id: strin
     presentationId: id,
     kind: "user",
     body: message.content,
-    ...(message.mesh ? { mesh: message.mesh } : {}),
     ...(images.length ? { images } : {}),
     ...(audio.length ? { audio } : {}),
     ...(files.length ? { files } : {}),
@@ -2631,50 +2650,36 @@ function ComposerSurfaceOutline() {
   return <svg ref={ref} className="composer-surface-outline" viewBox={`0 0 ${width} ${totalHeight}`} preserveAspectRatio="none" style={{ top: -shelfHeight, height: totalHeight }} aria-hidden="true"><path d={path} vectorEffect="non-scaling-stroke"/></svg>;
 }
 
-function QueuedMessageRow({ message, snapshot, busy, canSteer, queueingEnabled, onSteer, onRemove, onEdit, onSideChat, onNewTask, onToggleQueueing }: {
+function QueuedMessageRow({ message, busy, canSteer, queueingEnabled, onSteer, onRemove, onEdit, onSideChat, onNewTask, onToggleQueueing }: {
   message: QueuedMessageView;
-  snapshot: DesktopSnapshot;
   busy: boolean;
   canSteer: boolean;
   queueingEnabled: boolean;
   onSteer: () => Promise<void>;
   onRemove: () => Promise<void>;
-  onEdit: (content: string) => Promise<void>;
+  onEdit: () => Promise<void>;
   onSideChat: () => Promise<void>;
   onNewTask: () => void;
   onToggleQueueing: () => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
-  const [editing, setEditing] = useState(false);
-  const [value, setValue] = useState(message.content);
-  const [saving, setSaving] = useState(false);
   const deliveryUnresolved = message.retryable === false;
-  useEffect(() => { if (!editing) setValue(message.content); }, [editing, message.content]);
-  const save = async () => {
-    const next = value.trim();
-    if (!next || next === message.content || saving) { setEditing(false); return; }
-    setSaving(true);
-    try { await onEdit(next); setEditing(false); }
-    finally { setSaving(false); }
-  };
-  return <article className={`queued-message-row queued-message-${message.state}`} aria-label={`Queued instruction: ${queuedMessagePreview(message.content)}`} onContextMenu={(event) => {
-    if (editing) return;
+  return <article className={`queued-message-row queued-message-${message.state}`} aria-label={`${deliveryUnresolved ? "Delivery unconfirmed" : "Queued instruction"}: ${queuedMessagePreview(message.content)}`} onContextMenu={(event) => {
     event.preventDefault();
     setMenuOpen(true);
   }}>
-    <span className="queued-state" aria-hidden="true">{message.state === "sending" ? <span className="spinner"/> : <QueueGlyph/>}</span>
-    {editing ? <div className="queued-message-edit"><input autoFocus value={value} aria-label="Edit queued instruction" onChange={(event) => setValue(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void save(); } else if (event.key === "Escape") setEditing(false); }}/><button type="button" disabled={saving || !value.trim()} onClick={() => void save()}>{saving ? <span className="spinner"/> : <CheckIcon/>}<span>Save</span></button></div> : <div className="queued-message-content">{message.attachments.length ? <div className="queued-attachment-widgets">{message.attachments.map((attachment, index) => <QueuedAttachmentWidget key={`${attachment.name}-${attachment.mimeType}-${index}`} attachment={attachment}/>)}</div> : null}<strong>{queuedMessagePreview(message.content)}</strong></div>}
-    {message.mesh ? <div className="queued-mesh-targets" aria-label="Queued Mesh targets">{message.mesh.targets.map((target, index) => <span key={index} className="composer-mesh-widget message-mesh-widget"><span className="composer-mesh-widget-body">{meshTargetModelLabel(snapshot, target)}{target.reasoningEffort ? ` · ${reasoningLabel(target.reasoningEffort, { providerId: target.providerId, modelId: target.modelId })}` : ""}</span></span>)}</div> : null}
-    {!editing ? <div className="queued-message-actions">
+    <span className="queued-state" aria-hidden="true">{message.state === "sending" ? <span className="spinner"/> : deliveryUnresolved ? <InfoIcon/> : <QueueGlyph/>}</span>
+    <div className="queued-message-content">{message.attachments.length ? <div className="queued-attachment-widgets">{message.attachments.map((attachment, index) => <QueuedAttachmentWidget key={`${attachment.name}-${attachment.mimeType}-${index}`} attachment={attachment}/>)}</div> : null}<strong>{queuedMessagePreview(message.content)}</strong>{deliveryUnresolved ? <small className="queued-delivery-status">Delivery unconfirmed</small> : null}</div>
+    <div className="queued-message-actions">
       {canSteer ? <button type="button" className="queued-steer" disabled={busy || message.state === "sending" || deliveryUnresolved} aria-label="Steer with this queued instruction" data-tooltip="Steer" onClick={() => void onSteer()}><SendIcon/><span>Steer</span></button> : null}
-      <button type="button" disabled={busy || message.state === "sending"} aria-label="Remove queued instruction" data-tooltip="Remove" onClick={() => void onRemove()}><XIcon/></button>
+      <button type="button" disabled={busy || message.state === "sending"} aria-label={deliveryUnresolved ? "Dismiss delivery notice" : "Remove queued instruction"} data-tooltip={deliveryUnresolved ? "Dismiss notice" : "Remove"} onClick={() => void onRemove()}><XIcon/></button>
       <Popover label="Queued instruction actions" className="queued-message-menu" open={menuOpen} onOpen={setMenuOpen} trigger={<MoreIcon/>}>
-        <button type="button" role="menuitem" disabled={deliveryUnresolved} onClick={() => { setMenuOpen(false); setEditing(true); }}><SlidersIcon/><span><strong>Edit message</strong></span></button>
+        <button type="button" role="menuitem" disabled={busy || message.state === "sending" || deliveryUnresolved} onClick={() => { setMenuOpen(false); void onEdit(); }}><SlidersIcon/><span><strong>Edit message</strong></span></button>
         <button type="button" role="menuitem" disabled={busy || deliveryUnresolved} onClick={() => { setMenuOpen(false); void onSideChat(); }}><ChatIcon/><span><strong>Open in side chat</strong></span></button>
         <button type="button" role="menuitem" disabled={busy || deliveryUnresolved} onClick={() => { setMenuOpen(false); onNewTask(); }}><BranchIcon/><span><strong>Send to new task</strong></span></button>
         <button type="button" role="menuitem" onClick={() => { setMenuOpen(false); onToggleQueueing(); }}><QueueGlyph/><span><strong>{queueingEnabled ? "Turn off queuing" : "Turn on queuing"}</strong></span></button>
       </Popover>
-    </div> : null}
+    </div>
   </article>;
 }
 
@@ -3003,11 +3008,15 @@ export function SideChatPanel({ session, provider, timeline, request, selectImag
   };
 
   const add = async () => {
-    const selected = await selectImages();
-    const next = appendAttachmentsWithinLimits(attachments, selected);
-    commitDraft((current) => ({ ...current, attachments: next.items.filter((item): item is SelectedImage => !isSelectedFile(item)) }));
-    if (next.rejectedForBytes) notify("Attachments can total up to 50 MiB per message.", "error");
-    else if (next.rejectedForCount) notify("You can attach up to four items per message.", "error");
+    try {
+      const selected = await selectImages();
+      const next = appendAttachmentsWithinLimits(localDraftRef.current.attachments, selected);
+      commitDraft((current) => ({ ...current, attachments: next.items.filter((item): item is SelectedImage => !isSelectedFile(item)) }));
+      if (next.rejectedForBytes) notify("Attachments can total up to 50 MiB per message.", "error");
+      else if (next.rejectedForCount) notify(`You can attach up to ${maximumMessageAttachments} items per message.`, "error");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : String(error), "error");
+    }
   };
   const send = async () => {
     const submittedDraft = localDraftRef.current;
@@ -3104,19 +3113,11 @@ type VisualAction = "browser" | "workflow";
 type VisionPickerMode = VisualAction | "settings";
 
 function visionReasoningEfforts(model: VisionProxyTarget["models"][number] | undefined): readonly string[] {
-  if (!model) return [];
-  const metadata = model.nativeMetadata as Record<string, unknown>;
-  const raw = metadata.supportedReasoningEfforts ?? metadata.reasoningEfforts ?? metadata.supported_reasoning_efforts;
-  if (!Array.isArray(raw)) return [];
-  const values = raw.map((value) => {
-    if (typeof value === "string") return value;
-    if (!value || typeof value !== "object") return "";
-    const item = value as Record<string, unknown>;
-    return typeof item.reasoningEffort === "string" ? item.reasoningEffort : typeof item.id === "string" ? item.id : "";
-  }).filter((value) => Boolean(value) && !isAmbiguousSelectionValue(value));
-  const nativeDefault = [metadata.defaultReasoningEffort, metadata.default_reasoning_effort]
-    .find((value): value is string => typeof value === "string" && !isAmbiguousSelectionValue(value));
-  return nativeDefault && values.includes(nativeDefault) ? [nativeDefault, ...values.filter((value) => value !== nativeDefault)] : values;
+  return visionReasoningProfile(model).efforts;
+}
+
+function visionReasoningProfile(model: VisionProxyTarget["models"][number] | undefined) {
+  return model ? resolveModelReasoningProfile({ providerId: model.providerId, modelId: model.id, displayName: model.displayName, advertised: model.nativeMetadata }) : { efforts: [] };
 }
 
 type EyesApiEndpoint = "google" | "xai";
@@ -3159,12 +3160,14 @@ function endpointForSelection(
 function endpointDefaultSelection(
   targets: readonly VisionProxyTarget[],
   endpoint: EyesApiEndpoint,
+  saved?: VisionProxySelection | null,
 ): { readonly modelId: string; readonly effort: string } | null {
   const candidates = (targets.find((target) => target.providerId === "direct")?.models ?? [])
     .filter((candidate) => directEyesEndpoint(candidate) === endpoint);
-  const model = candidates.find((candidate) => candidate.isDefault) ?? candidates[0];
+  const savedModel = saved?.providerId === "direct" ? candidates.find((candidate) => candidate.id === saved.modelId) : undefined;
+  const model = savedModel ?? candidates.find((candidate) => candidate.isDefault) ?? candidates[0];
   if (!model) return null;
-  return { modelId: model.id, effort: visionReasoningEfforts(model)[0] ?? "" };
+  return { modelId: model.id, effort: savedModel ? saved?.reasoningEffort ?? "" : visionReasoningProfile(model).defaultEffort ?? "" };
 }
 
 function sameEyesSelection(
@@ -3313,7 +3316,7 @@ function resolvedVisionPickerSelection(
   const preferredTarget = preferredEndpoint === undefined ? undefined : targets.find((target) => target.providerId === "direct" && target.models.some((model) => directEyesEndpoint(model) === preferredEndpoint));
   const preferredModel = preferredTarget?.models.find((model) => directEyesEndpoint(model) === preferredEndpoint);
   if (preferredTarget && preferredModel) {
-    return { providerId: preferredTarget.providerId, modelId: preferredModel.id, effort: visionReasoningEfforts(preferredModel)[0] ?? "", persistedUnavailable: false };
+    return { providerId: preferredTarget.providerId, modelId: preferredModel.id, effort: visionReasoningProfile(preferredModel).defaultEffort ?? "", persistedUnavailable: false };
   }
   if (status.configured) {
     const configuredTarget = targets.find((target) => target.providerId === status.configured?.providerId);
@@ -3323,7 +3326,7 @@ function resolvedVisionPickerSelection(
     return {
       providerId: configuredTarget.providerId,
       modelId: configuredModel.id,
-      effort: status.configured.reasoningEffort && efforts.includes(status.configured.reasoningEffort) ? status.configured.reasoningEffort : efforts[0] ?? "",
+      effort: matchReasoningEffort(status.configured.reasoningEffort, efforts) ?? status.configured.reasoningEffort ?? "",
       persistedUnavailable: false,
     };
   }
@@ -3645,10 +3648,11 @@ export function VisionEyesPicker({ snapshot, session, request, action, liveStatu
     return () => { hydrationGeneration.current += 1; };
   }, [hydrate]);
 
-  const target = targets.find((item) => item.providerId === providerId);
-  const selectedModel = target?.models.find((item) => item.id === modelId);
-  const efforts = visionReasoningEfforts(selectedModel);
   const savedSelection = status?.configured ?? undefined;
+  const apiDraftResolved = apiDraft ? endpointDefaultSelection(targets, apiDraft, savedSelection) : null;
+  const target = targets.find((item) => item.providerId === (apiDraft ? "direct" : providerId));
+  const selectedModel = target?.models.find((item) => item.id === (apiDraft ? apiDraftResolved?.modelId : modelId));
+  const efforts = visionReasoningEfforts(selectedModel);
   // Enabling and turning off share one authoritative re-read so neither can
   // leave the panel showing a state this task did not actually save.
   const readAuthoritativeStatus = async (generation: number): Promise<VisionProxyStatus | undefined> => {
@@ -3698,15 +3702,20 @@ export function VisionEyesPicker({ snapshot, session, request, action, liveStatu
   };
   // The choice Save will persist: either the endpoint row's resolved model or
   // the harness boxes, whichever surface was touched last.
-  const apiDraftResolved = apiDraft ? endpointDefaultSelection(targets, apiDraft) : null;
   const draftSelection: { readonly providerId: string; readonly modelId: string; readonly reasoningEffort?: string } | null = apiDraft
-    ? (apiDraftResolved ? { providerId: "direct", modelId: apiDraftResolved.modelId, ...(apiDraftResolved.effort ? { reasoningEffort: apiDraftResolved.effort } : {}) } : null)
+    ? (apiDraftResolved ? { providerId: "direct", modelId: apiDraftResolved.modelId, ...(effort ? { reasoningEffort: effort } : {}) } : null)
     : (providerId && modelId && selectedModel ? { providerId, modelId, ...(effort ? { reasoningEffort: effort } : {}) } : null);
   const draftChanged = apiDraft && !apiDraftResolved
     ? endpointForSelection(targets, savedSelection) !== apiDraft
     : !sameEyesSelection(draftSelection, savedSelection ?? null);
   const configure = async (choice = draftSelection, keepOpen = false) => {
     if (saveInFlight.current) return;
+    const choiceModel = targetsRef.current.find((item) => item.providerId === choice?.providerId)?.models.find((item) => item.id === choice?.modelId);
+    const choiceEfforts = visionReasoningEfforts(choiceModel);
+    if (choice && choiceEfforts.length && !matchReasoningEffort(choice.reasoningEffort, choiceEfforts)) {
+      setSelectionError("Choose a reasoning level for EYES before saving.");
+      return;
+    }
     if (apiDraft && !choice) {
       setSelectionError("Visual models are still unavailable. Retry discovery, then apply your selection.");
       return;
@@ -3805,7 +3814,7 @@ export function VisionEyesPicker({ snapshot, session, request, action, liveStatu
     setApiDraft(apiDraft === endpoint ? null : endpoint);
     setProviderId("");
     setModelId("");
-    setEffort("");
+    setEffort(endpointDefaultSelection(targets, endpoint, savedSelection)?.effort ?? "");
   };
 
   const chooseHarnessInstead = () => {
@@ -3884,6 +3893,10 @@ export function VisionEyesPicker({ snapshot, session, request, action, liveStatu
       if (!active.current) return;
       const resolved = endpointDefaultSelection(targetsRef.current, endpoint);
       if (resolved) {
+        setApiDraft(endpoint);
+        setEffort(resolved.effort);
+        apiTouched.current = true;
+        selectionTouched.current = true;
         await configure({ providerId: "direct", modelId: resolved.modelId, ...(resolved.effort ? { reasoningEffort: resolved.effort } : {}) }, action === "settings");
       }
     } catch {
@@ -3916,9 +3929,9 @@ export function VisionEyesPicker({ snapshot, session, request, action, liveStatu
   return <section ref={panel} className="chat-picker vision-eyes-picker" role="dialog" aria-label="Choose a vision model">
     <header><span><strong>Choose a model as eyes</strong>{action !== "settings" ? <small>This text-only session needs visual support for {action === "browser" ? "the browser" : "recorded workflows"}.</small> : null}</span><button type="button" aria-label="Close vision model selection" onClick={() => onClose()}><XIcon /></button></header>
     <div className="vision-picker-body">
-      {apiDraft ? <div className="vision-single-choice" aria-live="polite"><span><strong>{apiDraftLabel}</strong></span></div> : targets.length || targetDiscovery === "loading" ? <div className="vision-picker-fields" aria-busy={targetDiscovery === "loading" || statusDiscovery === "loading"}>
-        <label><span>Provider</span><select aria-label="Vision provider" value={providerId} disabled={saving || targets.length === 0} onChange={(event) => { selectionTouched.current = true; const nextTarget = targets.find((item) => item.providerId === event.target.value); const nextModel = nextTarget?.models.find((item) => item.isDefault) ?? nextTarget?.models[0]; setProviderId(event.target.value); setModelId(nextModel?.id ?? ""); setEffort(visionReasoningEfforts(nextModel)[0] ?? ""); }}><option value="">{statusDiscovery === "loading" ? "Checking saved choice…" : "Choose provider"}</option>{targets.map((item) => <option key={item.providerId} value={item.providerId}>{item.displayName}</option>)}</select></label>
-        <div className="vision-picker-field"><span>Model</span><VisionModelPicker target={target} providerId={providerId} modelId={modelId} disabled={saving || !providerId} loading={targetDiscovery === "loading"} onChoose={(model) => { selectionTouched.current = true; setModelId(model.id); setEffort(visionReasoningEfforts(model)[0] ?? ""); }} /></div>
+      {apiDraft ? <div className="vision-single-choice" aria-live="polite"><span><strong>{apiDraftLabel}</strong><small>{selectedModel?.displayName ?? "Checking visual model…"}</small></span><label><span>Reasoning</span><select aria-label="Vision reasoning effort" value={effort} disabled={saving || !selectedModel || efforts.length === 0} onChange={(event) => { selectionTouched.current = true; setEffort(event.target.value); }}><option value="">{efforts.length ? "Choose effort" : "Not available"}</option>{efforts.map((item) => <option key={item} value={item}>{reasoningLabel(item, { providerId: "direct", modelId: selectedModel?.id, displayName: selectedModel?.displayName })}</option>)}</select></label></div> : targets.length || targetDiscovery === "loading" ? <div className="vision-picker-fields" aria-busy={targetDiscovery === "loading" || statusDiscovery === "loading"}>
+        <label><span>Provider</span><select aria-label="Vision provider" value={providerId} disabled={saving || targets.length === 0} onChange={(event) => { selectionTouched.current = true; const nextTarget = targets.find((item) => item.providerId === event.target.value); const nextModel = nextTarget?.models.find((item) => item.isDefault) ?? nextTarget?.models[0]; setProviderId(event.target.value); setModelId(nextModel?.id ?? ""); setEffort(visionReasoningProfile(nextModel).defaultEffort ?? ""); }}><option value="">{statusDiscovery === "loading" ? "Checking saved choice…" : "Choose provider"}</option>{targets.map((item) => <option key={item.providerId} value={item.providerId}>{item.displayName}</option>)}</select></label>
+        <div className="vision-picker-field"><span>Model</span><VisionModelPicker target={target} providerId={providerId} modelId={modelId} disabled={saving || !providerId} loading={targetDiscovery === "loading"} onChoose={(model) => { selectionTouched.current = true; setModelId(model.id); setEffort(visionReasoningProfile(model).defaultEffort ?? ""); }} /></div>
         <label><span>Reasoning</span><select aria-label="Vision reasoning effort" value={effort} disabled={saving || !selectedModel || efforts.length === 0} onChange={(event) => { selectionTouched.current = true; setEffort(event.target.value); }}><option value="">{efforts.length ? "Choose effort" : "Not available"}</option>{efforts.map((item) => <option key={item} value={item}>{reasoningLabel(item, { providerId, modelId, displayName: selectedModel?.displayName })}</option>)}</select></label>
       </div> : targetDiscovery === "ready" ? <div className="chat-picker-empty"><strong>No image-capable model is ready</strong><small>Add a Gemini or Grok key below, or connect a visual model in an Agent.</small></div> : <div className="chat-picker-empty"><strong>Visual model discovery unavailable</strong><small>Retry here without closing the panel.</small></div>}
       {apiDraft ? <div className="vision-single-actions"><button type="button" onClick={() => { setEditingEndpoint(apiDraft); setApiKey(""); setCredentialError(""); }}>Replace key</button><button type="button" onClick={chooseHarnessInstead}>Use a harness model instead</button></div> : null}
@@ -4343,6 +4356,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
   const queuedMessagesGeneration = useRef(0);
   useEffect(() => () => { queuedMessagesGeneration.current += 1; }, []);
   const queuedSteerDeliveries = useRef(new Set<string>());
+  const queuedDraftRestorations = useRef(new Set<string>());
   const transportQueueSuppressions = useRef<readonly TransportQueueSuppression[]>([]);
   const [queuedNewTaskMessage, setQueuedNewTaskMessage] = useState<QueuedMessageView | null>(null);
   const [cancellingQueuedId, setCancellingQueuedId] = useState<string | null>(null);
@@ -4871,7 +4885,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
       }
     }
     if (next.rejectedForBytes) notify("Attachments can total up to 50 MiB per message.", "error");
-    else if (next.rejectedForCount) notify("You can attach up to four items per message.", "error");
+    else if (next.rejectedForCount) notify(`You can attach up to ${maximumMessageAttachments} items per message.`, "error");
     return next;
   }, [commitAttachments, notify]);
 
@@ -4887,7 +4901,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
     const next = appendAttachmentsWithinLimits(attachmentsRef.current, [audio]);
     commitAttachments(next.items);
     if (next.rejectedForBytes) notify("Attachments can total up to 50 MiB per message.", "error");
-    else if (next.rejectedForCount) notify("You can attach up to four items per message.", "error");
+    else if (next.rejectedForCount) notify(`You can attach up to ${maximumMessageAttachments} items per message.`, "error");
     return next.acceptedCount > 0;
   }, [commitAttachments, notify]);
 
@@ -5033,6 +5047,12 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
         setScheduleFailure("Enter a task before scheduling it.");
         return;
       }
+      if (scheduledContent.length > (submittedMeshTargets.length ? 32_000 : 100_000)) {
+        setScheduleFailure(submittedMeshTargets.length
+          ? "A scheduled Mesh task must contain at most 32,000 characters."
+          : "A scheduled task must contain at most 100,000 characters.");
+        return;
+      }
       if (!session.workingDirectory.trim()) {
         setScheduleFailure("Choose a project folder before scheduling this task.");
         return;
@@ -5141,16 +5161,6 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
     const submittedSelectionRevision = selectionRevision.current;
     sendingRef.current = true;
     setSending(true);
-    const blockedByAttention = holdsFollowUpQueue || turnInFlight.current || transportQueueSuppressions.current.length > 0;
-    const liveGuidance = !submittedAsGoal && (mode === "steer" || (!queueingEnabled && canSteer));
-    const requestType = composerMessageRequestType({
-      liveGuidance,
-      hasAttachments: submittedDraft.attachments.length > 0 || submittedDraft.annotations.some((annotation) => annotation.audio !== undefined),
-      blockedByAttention,
-      queueingEnabled: submittedAsGoal || queueingEnabled,
-      externalWriter: session.externalWriter === true,
-    });
-    const queuedSubmission = requestType === "message_queue.enqueue";
     if (meshTargets.length > 0) {
       const submittedMeshTargets = [...meshTargetsRef.current];
       const acceptedId = `local-${Date.now()}`;
@@ -5172,44 +5182,42 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
       setMeshModelPicker(null);
       setMeshOpen(false);
       commitContent("");
-      if (!queuedSubmission) updateSnapshot((current) => current ? {
+      updateSnapshot((current) => current ? {
         ...current,
         timelines: { ...current.timelines, [session.id]: [...(current.timelines[session.id] ?? []), optimisticRow] },
         sessions: current.sessions.map((item) => item.id === session.id
           ? { ...item, state: "working", preview: trimmed, updatedAt: acceptedTimestamp } : item),
       } : current);
       try {
-        if (submittedAsGoal && !queuedSubmission) {
+        if (submittedAsGoal) {
           const nextGoal = await setSessionGoal(session.id, { objective: trimmed, status: "active", tokenBudget: null });
           onGoalRef.current?.(nextGoal);
         }
         // An empty prompt is a deliberate mesh send: the bridge and the parent
         // agent compose the instruction, so the send control stays enabled.
-        const response = await request("delegation.prepare", {
+        await request("delegation.prepare", {
           parentSessionId: session.id,
           prompt: trimmed,
           targets: submittedMeshTargets.map(meshTargetRoute),
           presentationSegments,
-          mode: queuedSubmission ? "queue" : requestType === "session.steer_message" ? "steer" : "send",
-          ...(submittedAsGoal && queuedSubmission ? { goal: true } : {}),
           ...(model ? { modelId: model } : {}),
           ...(effort ? { reasoningEffort: effort } : {}),
         }, acceptedId);
-        if (queuedSubmission) {
-          const queued = queuedMessagesForSession({ messages: [response.message] }, session.id)[0];
-          if (queued) setQueuedMessages((current) => current.some((item) => item.id === queued.id) ? current : [...current, queued]);
-          void loadQueuedMessages();
-        }
         persistMeshRecentTargetsForSession(session.id, submittedMeshTargets);
         if (submittedAsGoal) setMode("queue");
         setMeshRecentRevision((current) => current + 1);
-        if (!queuedSubmission) notify(requestType === "session.steer_message" ? "Task steered" : "Mesh delegation started");
+        notify("Mesh request sent");
       } catch (error) {
         if (isDeliveryUnknownError(error)) {
+          updateSnapshot((current) => current ? {
+            ...current,
+            sessions: current.sessions.map((item) => item.id === session.id && item.state === "working" && item.updatedAt === acceptedTimestamp
+              ? { ...item, state: session.state } : item),
+          } : current);
           notify(error.message, "error");
           return;
         }
-        if (!queuedSubmission) updateSnapshot((current) => current ? {
+        updateSnapshot((current) => current ? {
           ...current,
           timelines: { ...current.timelines, [session.id]: rollbackOptimisticComposerRow(current.timelines[session.id] ?? [], acceptedId) },
           sessions: current.sessions.map((item) => item.id === session.id && item.updatedAt === acceptedTimestamp
@@ -5249,6 +5257,16 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
       annotations: submittedDraft.annotations.map(({ audio: _audio, ...annotation }) => annotation),
     } : submittedDraft;
     const optimisticRow = optimisticComposerTimelineItem(acceptedId, acceptedTimestamp, simplified.content, optimisticDraft);
+    const blockedByAttention = holdsFollowUpQueue || turnInFlight.current || transportQueueSuppressions.current.length > 0;
+    const liveGuidance = !submittedAsGoal && (mode === "steer" || (!queueingEnabled && canSteer));
+    const requestType = composerMessageRequestType({
+      liveGuidance,
+      hasAttachments: submittedDraft.attachments.length > 0 || submittedDraft.annotations.some((annotation) => annotation.audio !== undefined),
+      blockedByAttention,
+      queueingEnabled: submittedAsGoal || queueingEnabled,
+      externalWriter: session.externalWriter === true,
+    });
+    const queuedSubmission = requestType === "message_queue.enqueue";
     const transportOnlySubmission = queuedSubmission && session.externalWriter === true && !blockedByAttention;
     const appearsInTranscript = draftSession || switchingHarness || composerSubmissionAppearsInTranscript(requestType, transportOnlySubmission);
     // Submission owns this exact snapshot. Clear it and paint the matching user
@@ -5318,7 +5336,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
       if (!ears.enabled && dictationClips.length && !audioDictationAvailable) {
         throw new Error(`${chosenModel?.name ?? "This model"} does not accept direct audio. Enable EARS or choose an audio-capable model.`);
       }
-      if (combinedAttachments.length > 4) throw new Error("You can attach up to four items per message, including voice annotations.");
+      if (combinedAttachments.length > maximumMessageAttachments) throw new Error(`You can attach up to ${maximumMessageAttachments} items per message, including voice annotations.`);
       if (combinedAttachments.some((attachment) => attachment.byteLength <= 0 || attachment.byteLength > 25 * 1024 * 1024)) throw new Error("Attachments must be between 1 byte and 25 MiB each.");
       if (combinedAttachments.reduce((total, attachment) => total + attachment.byteLength, 0) > maximumMessageAttachmentBytes) throw new Error("Attachments can total up to 50 MiB per message.");
       let messageContent = simplified.content;
@@ -5449,7 +5467,10 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
         // blindly appending a second copy.
         deliveryAccepted = true;
         pendingUploadIds.length = 0;
-        if (!queuedSubmission) turnInFlight.current = true;
+        // Completion can arrive before the saved-message receipt. An older
+        // acknowledgement must not reopen that turn or force the next input to queue.
+        if (!queuedSubmission) turnInFlight.current = latestSnapshot.current.sessions
+          .find((item) => item.id === session.id)?.state === "working";
         if (appearsInTranscript) {
           updateSnapshot((current) => {
             if (!current) return current;
@@ -5465,9 +5486,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
               },
               sessions: current.sessions.map((item) => item.id === session.id ? {
                 ...item,
-                state: queuedSubmission ? item.state : "working",
                 preview: simplified.content,
-                updatedAt: acceptedRow.timestamp,
                 model,
                 ...(effort ? { effort } : {}),
                 // An accepted direct send starts a Tethoq-owned turn. Do not let
@@ -5518,6 +5537,13 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
         // The provider may own this exact submission. Keep its optimistic row,
         // consumed attachments, and cleared composer while the durable Bridge
         // tombstone reconciles; restoring any of them would expose a duplicate.
+        // The delivery itself does not prove a running turn. Release only our
+        // optimistic status; a newer provider status remains authoritative.
+        if (appearsInTranscript && !queuedSubmission) updateSnapshot((current) => current ? {
+          ...current,
+          sessions: current.sessions.map((item) => item.id === session.id && item.state === "working" && item.updatedAt === acceptedTimestamp
+            ? { ...item, state: session.state } : item),
+        } : current);
         deliveryAccepted = true;
         if (submittedAsGoal) setMode("queue");
         pendingUploadIds.length = 0;
@@ -5634,24 +5660,52 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
       else {
         queuedAttachmentPreviewCache.delete(messageId);
         queuedAttachmentPreviewOwners.delete(messageId);
-        notify("Queued instruction cancelled");
+        if (mounted.current && activeSessionId.current === session.id) {
+          // The cancellation is authoritative. A history refresh may be slow,
+          // and a list started before this acknowledgement must not restore it.
+          queuedMessagesGeneration.current += 1;
+          setQueuedMessages(current => current.filter(message => message.id !== messageId));
+        }
+        notify(queuedMessages.find(message => message.id === messageId)?.retryable === false ? "Delivery notice dismissed" : "Queued instruction cancelled");
       }
-      await loadQueuedMessages();
+      void loadQueuedMessages();
     } catch (error) {
       notify(error instanceof Error ? error.message : String(error), "error");
     } finally {
-      setCancellingQueuedId(null);
+      if (mounted.current) setCancellingQueuedId(null);
     }
   };
-  const editQueuedMessage = async (messageId: string, nextContent: string) => {
+  const editQueuedMessage = async (messageId: string) => {
+    if (queuedDraftRestorations.current.has(messageId) || sendingRef.current) return;
+    queuedDraftRestorations.current.add(messageId);
     setUpdatingQueuedId(messageId);
     try {
-      await request("message_queue.edit", { messageId, content: nextContent });
-      await loadQueuedMessages();
-      notify("Queued instruction updated");
+      const prepared = await readQueuedComposerDraft(request, messageId, session.id, async id => {
+        const attachment = await window.tethoqDesktop.recorderAction({ type: "attachment", id });
+        if (!attachment || Array.isArray(attachment) || !("promptReference" in attachment)) throw new Error("The queued workflow is unavailable");
+        return attachment as WorkflowAttachment;
+      });
+      if (!mounted.current || activeSessionId.current !== session.id) return;
+      const result = await request("message_queue.cancel", { messageId, draftVersion: prepared.version });
+      if (result.cancelled !== true) throw new Error("That queued instruction changed or already started sending.");
+      const restored = onRestoreFailedSubmission?.(prepared.draft) ?? mergeFailedComposerDraft(prepared.draft,
+        { content: contentRef.current, attachments: attachmentsRef.current, workflowAttachments: workflowAttachmentsRef.current, annotations: annotationsRef.current });
+      queuedAttachmentPreviewCache.delete(messageId);
+      queuedAttachmentPreviewOwners.delete(messageId);
+      if (mounted.current && activeSessionId.current === session.id) {
+        queuedMessagesGeneration.current += 1;
+        setQueuedMessages(current => current.filter(message => message.id !== messageId));
+        commitContent(restored.content);
+        commitAttachments(restored.attachments);
+        commitWorkflowAttachments(restored.workflowAttachments);
+        commitAnnotations(restored.annotations);
+        if (prepared.goal) setMode("goal");
+        requestAnimationFrame(() => { textarea.current?.focus(); textarea.current?.setSelectionRange(prepared.draft.content.length, prepared.draft.content.length); });
+      }
     } catch (error) {
       notify(error instanceof Error ? error.message : String(error), "error");
-    } finally { setUpdatingQueuedId(null); }
+      await loadQueuedMessages();
+    } finally { queuedDraftRestorations.current.delete(messageId); if (mounted.current) setUpdatingQueuedId(null); }
   };
   const deliverQueuedMessage = async (messageId: string) => {
     if (queuedSteerDeliveries.current.has(messageId)) return;
@@ -6070,7 +6124,15 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingAction?.requestId, session.id]);
   const attachmentActions = <>
-    <button type="button" role="menuitem" disabled={!canAttach} onClick={async () => { setAttachmentsOpen(false); const selected = await selectImages(); addImages(selected); }}><PaperclipIcon /><span><strong>Attach image</strong><small>{canAttach ? "Choose up to four images" : "Unavailable for this coding tool"}</small></span></button>
+    <button type="button" role="menuitem" disabled={!canAttach} onClick={async () => {
+      setAttachmentsOpen(false);
+      try {
+        const selected = await selectImages();
+        addImages(selected);
+      } catch (error) {
+        notify(error instanceof Error ? error.message : String(error), "error");
+      }
+    }}><PaperclipIcon /><span><strong>Attach image</strong><small>{canAttach ? `Choose up to ${maximumMessageAttachments} images` : "Unavailable for this coding tool"}</small></span></button>
     {supportsGenericFileAttachments(providerId) ? <button type="button" role="menuitem" disabled={!canAttachFiles || preview} onClick={async () => {
       setAttachmentsOpen(false);
       try {
@@ -6080,7 +6142,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
       } catch (error) {
         notify(error instanceof Error ? error.message : String(error), "error");
       }
-    }}><FileIcon /><span><strong>Attach file</strong><small>{canAttachFiles ? "Four attachments total · 25 MiB each" : "OpenCode is unavailable"}</small></span></button> : null}
+    }}><FileIcon /><span><strong>Attach file</strong><small>{canAttachFiles ? `${maximumMessageAttachments} attachments total · 25 MiB each` : "OpenCode is unavailable"}</small></span></button> : null}
     <button type="button" role="menuitem" disabled={!canAttach || preview} onClick={() => { setAttachmentsOpen(false); setCaptureOpen(true); }}><ScreenshotIcon /><span><strong>Capture screen region</strong><small>{canAttach ? "Drag, crop, and attach automatically" : "Unavailable for this coding tool"}</small></span></button>
     <button type="button" role="menuitem" onClick={() => { setAttachmentsOpen(false); if (draftSession) setWorkflowPickerOpen(true); else void openVisualAction("workflow"); }}><WorkflowIcon /><span><strong>Attach workflow</strong><small>Use recorded local context</small></span></button>
   </>;
@@ -6088,7 +6150,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
     <button type="button" role="menuitem" disabled={materializingAction !== null} onClick={() => { if (draftSession) void requestDraftAction("permission"); else { setActionsOpen(false); setGoalOpen(false); setEarsOpen(false); setPermissionOpen(true); } }}><SlidersIcon /><span><strong>Permissions</strong><small>Choose this task’s harness permissions</small></span></button>
     {draftSession ? <button type="button" role="menuitem" onClick={openDraftSchedule}><ClockIcon /><span><strong>Schedule task</strong><small>Run this text-only task later</small></span></button> : null}
     <button type="button" role="menuitem" disabled={deriving || materializingAction !== null} onClick={() => { if (draftSession) void requestDraftAction("handoff"); else { setActionsOpen(false); setHandoffOpen(true); } }}><ChatIcon /><span><strong>Context Handoff</strong><small>Same model drafts a pickup prompt in a side chat</small></span></button>
-    <button type="button" role="menuitem" disabled={deriving || materializingAction !== null} onClick={() => { if (draftSession) void requestDraftAction("branch"); else void branchSession(); }}><BranchIcon /><span><strong>Branch in New Task</strong><small>Continue from this exact conversation</small></span>{deriving || materializingAction === "branch" ? <span className="spinner" /> : null}</button>
+    <button type="button" role="menuitem" disabled={deriving || materializingAction !== null} onClick={() => { if (draftSession) void requestDraftAction("branch"); else void branchSession(); }}><BranchIcon /><span><strong>Branch in New Task</strong><small>Copy this conversation into a paused task</small></span>{deriving || materializingAction === "branch" ? <span className="spinner" /> : null}</button>
     <button type="button" role="menuitem" disabled={materializingAction !== null} onClick={() => { if (draftSession) void requestDraftAction("browser"); else void openVisualAction("browser"); }}><BrowserIcon /><span><strong>Open session browser</strong><small>Persistent, app-owned Chromium</small></span></button>
     <button type="button" role="menuitem" disabled={!onCreateSideChat || materializingAction !== null} onClick={() => { if (draftSession) void requestDraftAction("side_chat"); else { setActionsOpen(false); void onCreateSideChat?.(session.id).catch((error: unknown) => notify(error instanceof Error ? error.message : String(error), "error")); } }}><ChatIcon /><span><strong>Open side chat</strong><small>Ask with this task's current context</small></span></button>
     <button type="button" role="menuitem" disabled={!canDelegate || materializingAction !== null} onClick={() => { if (draftSession) void requestDraftAction("delegate"); else { setActionsOpen(false); setDelegationOpen(true); } }}><AgentIcon /><span><strong>Delegate task</strong><small>Start grouped child sessions</small></span></button>
@@ -6136,13 +6198,12 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
     {queuedMessages.length ? <div className="queued-strip" role="list" aria-label="Queued instructions">{queuedMessages.map((message) => <QueuedMessageRow
       key={message.id}
       message={message}
-      snapshot={snapshot}
       busy={cancellingQueuedId === message.id || updatingQueuedId === message.id}
       canSteer={canSteer}
       queueingEnabled={queueingEnabled}
       onSteer={() => deliverQueuedMessage(message.id)}
       onRemove={() => cancelQueuedMessage(message.id)}
-      onEdit={(next) => editQueuedMessage(message.id, next)}
+      onEdit={() => editQueuedMessage(message.id)}
       onSideChat={() => openQueuedInSideChat(message)}
       onNewTask={() => setQueuedNewTaskMessage(message)}
       onToggleQueueing={() => {
@@ -6157,7 +6218,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
       <div className="composer-footer" aria-label="Message options">
         <ModelPicker snapshot={snapshot} providerId={providerId} sessionModel={providerId === session.providerId ? session.model : ""} value={model} allowProviderChange={draftSession || onMaterializeDraft !== undefined} currentTaskProviderId={draftSession ? undefined : session.providerId} onChange={selectComposerModel} />
         {switchingHarness ? <span className="model-switch-notice" role="img" tabIndex={0} aria-label="Switching coding tools uses a private context summary; some earlier details may be lost" title="Your next message will switch coding tools using a private context summary. Some earlier details may be lost."><InfoIcon /></span> : null}
-        {effort && efforts.length ? <ChoiceMenu value={effort} options={efforts.map((item) => ({ value: item, label: reasoningLabel(item, { providerId, modelId: model, displayName: chosenModel?.name }) }))} onChange={selectComposerEffort} label="Choose reasoning effort" className="effort-choice" triggerDescription="Reasoning" /> : null}
+        {efforts.length ? <ChoiceMenu value={effort} options={efforts.map((item) => ({ value: item, label: reasoningLabel(item, { providerId, modelId: model, displayName: chosenModel?.name }) }))} onChange={selectComposerEffort} label="Choose reasoning effort" className="effort-choice" triggerDescription="Reasoning" placeholder={reasoningLabel(effort, { providerId, modelId: model, displayName: chosenModel?.name }) || "Choose"} /> : null}
       </div>
       {slashPaletteVisible ? <div className="slash-command-palette" id={slashListId} role="listbox" aria-label="Commands">
         {slashSuggestions?.map((command, index) => <button
@@ -6172,7 +6233,7 @@ export function Composer({ snapshot, session, workingBoundary, stopPresentationA
         ><SlashCommandIcon /><span><strong>{command.command}</strong><small>{command.description}</small></span><kbd>Enter</kbd></button>)}
       </div> : null}
       {scheduleOpen && draftSession && !meshOpen && meshPickerProvider === null ? <form className="composer-schedule-panel" ref={schedulePanel} role="dialog" aria-modal="false" aria-labelledby={scheduleTitleId} onSubmit={(event) => void submitDraftSchedule(event)}>
-        <header><span><ClockIcon /><span><strong id={scheduleTitleId}>Schedule task</strong><small>This task will start at your local time.</small></span></span><button type="button" aria-label="Close task scheduling" onClick={() => closeDraftSchedule()}><XIcon /></button></header>
+        <header><span><ClockIcon /><span><strong id={scheduleTitleId}>Schedule task</strong><small>Keep Tethoq running and this computer awake. Missed tasks start when Tethoq resumes.</small></span></span><button type="button" aria-label="Close task scheduling" onClick={() => closeDraftSchedule()}><XIcon /></button></header>
         <label htmlFor={scheduleFieldId}><span>Run at</span><input ref={scheduleField} id={scheduleFieldId} type="datetime-local" value={scheduleValue} readOnly={scheduleBusy || scheduleRetryPending} aria-invalid={scheduleError ? true : undefined} aria-describedby={`${scheduleFieldId}-resolved${scheduleError ? ` ${scheduleFieldId}-error` : ""}${scheduleRetryPending ? ` ${scheduleFieldId}-retry` : ""}`} onChange={(event) => { setScheduleValue(event.target.value); setScheduleFailure(null); }}/></label>
         <p id={`${scheduleFieldId}-resolved`} className="composer-schedule-resolved">{scheduleTime.date ? `Runs ${formatDraftScheduleLocalTime(scheduleTime.date)}` : "Uses this computer's local time."}</p>
         {scheduleRetryPending ? <p id={`${scheduleFieldId}-retry`} className="composer-schedule-resolved">Retrying resubmits the original task. Newer edits stay in this draft.</p> : null}

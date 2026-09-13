@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { posix, win32 } from "node:path";
+import { join, posix, win32 } from "node:path";
+import { openCodeMessageId } from "../../../packages/provider_opencode/src/opencode_adapter.js";
 import {
   DeviceActionVerifier,
   EventDeduper,
@@ -8,8 +9,8 @@ import {
   PairingManager,
   RequestLedger,
   isSessionState,
-  isJsonObject,
   makeGlobalSessionId,
+  meshParentPrompt,
   parseGlobalSessionId,
   earsCancelledMessage,
   earsInstruction,
@@ -99,6 +100,7 @@ import {
 } from "./dictation.js";
 import { RefreshCoordinator } from "./refresh.js";
 import { SessionCache } from "./session_cache.js";
+import { PresentedImageStore } from "./presented_images.js";
 import { recordStartupProfile } from "./startup_profile.js";
 import type { SessionSelection } from "./session_selection_store.js";
 import { UserInputRegistry } from "./user_inputs.js";
@@ -322,7 +324,15 @@ const queueDeliveryUnknownMessage = "Delivery could not be confirmed. Tethoq wil
 function remoteMessageMatchesQueueDelivery(message: RemoteMessage, delivery: QueueDeliveryRecord): boolean {
   if (message.role !== "user") return false;
   const expectedIds = new Set([delivery.requestId, delivery.providerMessageId].filter((value): value is string => value !== undefined));
+  if (delivery.providerId === "opencode") expectedIds.add(openCodeMessageId(delivery.requestId));
   if (!expectedIds.has(message.id) && !expectedIds.has(message.providerMessageId)) return false;
+  const images = message.parts.filter((part) => part.type === "image" && part.uri !== undefined
+    && (delivery.providerId !== "opencode" || /^data:image\/[^,]+,.+/u.test(part.uri)));
+  for (const attachment of delivery.attachments.filter((part) => part.mimeType.startsWith("image/"))) {
+    const index = images.findIndex((part) => part.type === "image" && part.name === attachment.name);
+    if (index < 0) return false;
+    images.splice(index, 1);
+  }
   const text = message.parts
     .filter((part): part is Extract<(typeof message.parts)[number], { readonly type: "text" }> => part.type === "text")
     .map((part) => part.text)
@@ -345,6 +355,8 @@ const provenDeliveryRejectionCodes = new Set([
   "ENDPOINT_UNKNOWN",
   "EXTERNAL_WRITER_UNAVAILABLE",
   "INITIALIZE_FAILED",
+  "IMAGE_POLICY_PENDING",
+  "IMAGE_POLICY_UNAVAILABLE",
   "LOCAL_BUDGET_EXHAUSTED",
   "MODEL_INVALID",
   "NOT_DELIVERED",
@@ -418,8 +430,8 @@ export const visionProxyAvailabilityInstructions = visionProxyAvailability("teth
 class TaskNotOwnedHereError extends Error {
   public readonly code = "TASK_NOT_OWNED_HERE" as const;
 
-  public constructor() {
-    super("This task is connected to another Tethoq runtime.");
+  public constructor(message = "This task is connected to another Tethoq runtime.") {
+    super(message);
     this.name = "TaskNotOwnedHereError";
   }
 }
@@ -653,6 +665,7 @@ export class AgentBridge {
   readonly #pendingContextHandoffs = new Map<string, PendingContextHandoff>();
   readonly #pendingBranchBootstraps = new Map<string, PendingBranchBootstrap>();
   readonly #branchCopies = new Map<string, readonly RemoteMessage[]>();
+  readonly #branchCreations = new Map<string, Promise<BranchSessionResult>>();
   readonly #sessionTransfers = new Map<string, SessionTransferRecord>();
   readonly #sessionDispatchTails = new Map<string, Promise<void>>();
   readonly #automaticVisionTurns = new Map<string, { cancelled: boolean }>();
@@ -660,6 +673,7 @@ export class AgentBridge {
   readonly #transcriptionSources: TranscriptionSourceRegistry;
   readonly #onTranscriptionCredentialChange: ((sourceId: string, apiKey: string | undefined) => void | Promise<void>) | undefined;
   readonly #queuedMessages = new Map<string, QueuedMessageRecord>();
+  readonly #queuedDraftVersions = new WeakMap<SendMessageRequest, string>();
   readonly #queueDeliveries = new Map<string, QueueDeliveryRecord>();
   readonly #queuePumps = new Set<string>();
   readonly #queueMutations = new Set<string>();
@@ -695,6 +709,7 @@ export class AgentBridge {
   readonly #goals = new Map<string, SessionGoal>();
   readonly #goalContinuations = new Map<string, { timer: ReturnType<typeof setTimeout>; sending: boolean; completedDuringSend: boolean }>();
   readonly #goalContextRecoveries = new Map<string, { goal: SessionGoal; pending: boolean }>();
+  readonly #sessionContextRecoveries = new Map<string, { pending: boolean }>();
   /** Local generations make delayed get/set/clear replies unable to clobber a newer event. */
   readonly #goalGenerations = new Map<string, number>();
   /** Provider ordering tokens are optional, but valuable when timestamps tie. */
@@ -713,7 +728,7 @@ export class AgentBridge {
   readonly #internalSessionIds = new Set<string>();
   readonly #internalTurnTerminals = new Map<string, InternalTurnTerminal[]>();
   readonly #activeVisionHelperTurns = new Map<string, ActiveVisionHelperTurn>();
-  readonly #internalSessionCreations = new Map<string, { depth: number; readonly events: ProviderEvent[] }>();
+  readonly #internalSessionCreations = new Map<string, { depth: number; readonly events: ProviderEvent[]; readonly knownSessionIds: ReadonlySet<string> }>();
   readonly #delegationPumps = new Set<string>();
   readonly #onDelegationsChange: ((tasks: readonly DelegationTask[]) => void) | undefined;
   readonly #onVisionProxiesChange: ((
@@ -740,6 +755,7 @@ export class AgentBridge {
   #relayConnected = false;
   #started = false;
   #clientTooling: ProviderClientTooling | undefined;
+  readonly #presentedImages: PresentedImageStore;
   #scheduledTasks: ScheduledTaskScheduler | undefined;
   #queueDeliveryRecoveryNeedsPersistence = false;
 
@@ -751,6 +767,7 @@ export class AgentBridge {
       readonly onStateChange?: (state: PairingState) => void;
       readonly onPairingConfirmed?: () => void;
       readonly attachmentUploads?: AttachmentUploadManager;
+      readonly presentedImageDirectory?: string;
       readonly dictationTranscriber?: DictationTranscriber;
       readonly transcriptionSources?: TranscriptionSourceRegistry;
       readonly onTranscriptionCredentialChange?: (sourceId: string, apiKey: string | undefined) => void | Promise<void>;
@@ -794,6 +811,7 @@ export class AgentBridge {
     this.#onPairingConfirmed = pairingOptions.onPairingConfirmed;
     this.#deviceVerifier = new DeviceActionVerifier(this.#pairing);
     this.#attachmentUploads = pairingOptions.attachmentUploads ?? new AttachmentUploadManager();
+    this.#presentedImages = new PresentedImageStore(pairingOptions.presentedImageDirectory ?? join(homedir(), ".tethoq", "presented-images"));
     this.#transcriptionSources = pairingOptions.transcriptionSources
       ?? (pairingOptions.dictationTranscriber === undefined
         ? defaultTranscriptionSourceRegistry()
@@ -1250,15 +1268,11 @@ export class AgentBridge {
     }
     if (previous === undefined && objective === undefined) throw new Error("Set a goal objective before changing its state");
     const now = new Date().toISOString();
-    const activationId = previous === undefined || replacingObjective || update.status === "active"
-      ? randomUUID()
-      : previous.activationId;
     const goal: SessionGoal = {
       sessionId: globalSessionId,
       objective: objective ?? previous!.objective,
       status: update.status ?? previous?.status ?? "active",
       source: "tethoq",
-      ...(activationId !== undefined ? { activationId } : {}),
       tokenBudget: update.tokenBudget !== undefined ? update.tokenBudget : previous?.tokenBudget ?? null,
       tokensUsed: replacingObjective ? 0 : previous?.tokensUsed ?? 0,
       timeUsedSeconds: replacingObjective ? 0 : previous?.timeUsedSeconds ?? 0,
@@ -1269,6 +1283,7 @@ export class AgentBridge {
     this.#goals.delete(globalSessionId);
     this.#goals.set(globalSessionId, goal);
     this.#goalGenerations.set(globalSessionId, generation + 1);
+    this.#goalContextRecoveries.delete(globalSessionId);
     const pendingContinuation = this.#goalContinuations.get(globalSessionId);
     if (pendingContinuation !== undefined) {
       clearTimeout(pendingContinuation.timer);
@@ -1319,6 +1334,10 @@ export class AgentBridge {
     }
     if ((native === undefined || native === false) && !hadLocalGoal) return { cleared: false, revision: this.#goalRevision };
     this.#nativeGoalRevisions.delete(globalSessionId);
+    this.#goalContextRecoveries.delete(globalSessionId);
+    const continuation = this.#goalContinuations.get(globalSessionId);
+    if (continuation !== undefined) clearTimeout(continuation.timer);
+    this.#goalContinuations.delete(globalSessionId);
     await this.persistGoals();
     const revision = this.appendGoalEvent("session.goal_cleared", globalSessionId, providerId);
     return { cleared: true, revision };
@@ -1893,7 +1912,7 @@ export class AgentBridge {
               adapter.getOlderMessages(providerSessionId, snapshot.providerOlderCursor),
             ]);
             await this.reconcileQueueDeliveriesFromMessages(globalSessionId, older.messages);
-            const opened = this.finishOpenSession(
+            const opened = await this.finishOpenSession(
               globalSessionId,
               session,
               older.pageOnly === true
@@ -1922,6 +1941,9 @@ export class AgentBridge {
         return { session: cached ?? await adapter.getSession(providerSessionId), ...anchoredMessagePage(snapshot, cursor, boundedLimit) };
       }
 
+      // A fresh bounded page must be allowed to replace a previously exhausted
+      // snapshot, even if the provider's live invalidation event was missed.
+      if (refresh) this.invalidateMessageSnapshot(globalSessionId);
       const generation = this.#messageSnapshotGenerations.get(globalSessionId) ?? 0;
       const snapshot = this.#messageSnapshots.get(globalSessionId);
       if (!refresh && cached !== undefined && snapshot !== undefined && snapshot.generation === generation && snapshot.freshUntil > Date.now()) {
@@ -1947,7 +1969,7 @@ export class AgentBridge {
         await this.reconcileQueueDeliveriesFromMessages(globalSessionId, history.messages);
         // sideChatHistory has exhausted the available history paths. Do not
         // advertise an older page that would repeat an unsupported native read.
-        const opened = this.finishOpenSession(globalSessionId, session, history.messages, generation, true, undefined, authoritativeSessionBaseline);
+        const opened = await this.finishOpenSession(globalSessionId, session, history.messages, generation, true, undefined, authoritativeSessionBaseline);
         return { session: opened.session, ...anchoredMessagePage(this.#messageSnapshots.get(globalSessionId)!, undefined, boundedLimit) };
       }
 
@@ -1972,7 +1994,7 @@ export class AgentBridge {
         // and must not be mistaken for permission to reconstruct the whole
         // transcript. Providers without a bounded path return their complete
         // history from getRecentMessages() themselves.
-        const opened = this.finishOpenSession(globalSessionId, session, recent.messages, generation, recent.complete, recent.olderCursor, authoritativeSessionBaseline);
+        const opened = await this.finishOpenSession(globalSessionId, session, recent.messages, generation, recent.complete, recent.olderCursor, authoritativeSessionBaseline);
         recordStartupProfile({ type: "bridge-session-open", phase: "recent.finished", ...profile, providerMessageCount: recent.messages.length });
         const recentSnapshot = this.#messageSnapshots.get(globalSessionId);
         if (recentSnapshot === undefined) throw new Error("Message history page expired; reopen the session");
@@ -2026,7 +2048,7 @@ export class AgentBridge {
     return this.finishOpenSession(globalSessionId, session, providerMessages, generation, true, undefined, authoritativeSessionBaseline);
   }
 
-  private finishOpenSession(
+  private async finishOpenSession(
     globalSessionId: string,
     session: RemoteSession,
     providerMessages: readonly RemoteMessage[],
@@ -2034,11 +2056,12 @@ export class AgentBridge {
     complete: boolean,
     providerOlderCursor?: string,
     authoritativeSessionBaseline?: { readonly cached: RemoteSession | undefined },
-  ): { readonly session: RemoteSession; readonly messages: readonly RemoteMessage[] } {
+  ): Promise<{ readonly session: RemoteSession; readonly messages: readonly RemoteMessage[] }> {
     if (this.isInternalSession(session)) {
       this.#internalSessionIds.add(globalSessionId);
       throw new Error("Internal helper transcripts are private and cannot be opened");
     }
+    const savedImages = await this.#presentedImages.messages(globalSessionId);
     if (authoritativeSessionBaseline !== undefined) {
       this.#cache.reconcileAuthoritative(session, authoritativeSessionBaseline.cached);
     } else if (this.#cache.get(globalSessionId) === undefined) {
@@ -2068,7 +2091,11 @@ export class AgentBridge {
     const messages = copied === undefined
       ? providerVisibleWithClientToolFailures
       : [...copyBranchMessages(copied, globalSessionId), ...providerVisibleWithClientToolFailures];
-    const decoratedMessages = this.decorateMeshMessages(globalSessionId, this.decorateCrossSessionMessages(globalSessionId, messages), complete);
+    const oldest = messages.length ? Math.min(...messages.map(message => Date.parse(message.createdAt))) : 0;
+    const visibleImages = complete ? savedImages : savedImages.filter(image => Date.parse(image.createdAt) >= oldest);
+    const withImages = visibleImages.length === 0 ? messages
+      : [...messages, ...visibleImages].sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
+    const decoratedMessages = this.decorateMeshMessages(globalSessionId, this.decorateCrossSessionMessages(globalSessionId, withImages), complete);
     this.cacheMessageSnapshot(globalSessionId, providerMessages, decoratedMessages, generation, complete, providerOlderCursor);
     this.notifySessionCatalogueChange();
     return { session: resolvedSession, messages: decoratedMessages };
@@ -2080,18 +2107,29 @@ export class AgentBridge {
     if (!tasks.length) return messages;
     const decorated = [...messages];
     const used = new Set<number>();
+    // Reserve authoritative identities before text matching. An older identical
+    // turn outside this page must not take a newer turn's provider message.
+    const owners = new Map<number, string>();
+    for (const task of tasks) {
+      const index = messages.findIndex((message, index) => message.role === "user" && !owners.has(index)
+        && (internalMessageReferences(message, task.id)
+          || task.parentTurnId !== undefined && internalMessageReferences(message, task.parentTurnId)));
+      if (index >= 0) owners.set(index, task.id);
+    }
     const oldest = messages.length ? Math.min(...messages.map((message) => Date.parse(message.createdAt))) : Infinity;
     for (const task of tasks) {
       const candidates = messages.map((message, index) => ({ message, index }))
-        .filter(({ message, index }) => message.role === "user" && !used.has(index));
-      const exact = candidates.find(({ message }) => internalMessageReferences(message, task.id)
-        || (task.parentTurnId !== undefined && internalMessageTurnIds(message).includes(task.parentTurnId)));
+        .filter(({ message, index }) => message.role === "user" && !used.has(index)
+          && (!owners.has(index) || owners.get(index) === task.id));
+      const exact = candidates.find(({ index }) => owners.get(index) === task.id);
       const startedAt = Date.parse(task.createdAt);
       const acceptedAt = Date.parse(task.parentTurnAcceptedAt ?? task.updatedAt);
+      const sentPrompt = parentDelegationPrompt(task).trim();
       const match = exact ?? candidates.filter(({ message }) => {
         const at = Date.parse(message.createdAt);
-        return task.prompt.trim().length > 0 && at >= startedAt - 5_000 && at <= acceptedAt + 120_000
-          && message.parts.filter((part) => part.type === "text").map((part) => part.text).join("\n").trim() === task.prompt.trim();
+        const text = message.parts.filter((part) => part.type === "text").map((part) => part.text).join("\n").trim();
+        return text.length > 0 && at >= startedAt - 5_000 && at <= acceptedAt + 120_000
+          && (text === sentPrompt || text === task.prompt.trim());
       }).sort((left, right) => Math.abs(Date.parse(left.message.createdAt) - startedAt) - Math.abs(Date.parse(right.message.createdAt) - startedAt))[0];
       // Bounded history must not inject older Mesh turns into the newest page.
       if (!match && !complete && startedAt < oldest && messages.length) continue;
@@ -2465,52 +2503,9 @@ export class AgentBridge {
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   }
 
-  public async enqueueDelegation(
-    parentSessionId: string,
-    prompt: string,
-    targets: readonly DelegationTarget[],
-    presentationSegments: readonly DelegationPresentationSegment[],
-    requestId: string,
-    selection: Readonly<Pick<RemoteSession, "modelId" | "reasoningEffort">> = {},
-    asGoal = false,
-  ): Promise<QueuedMessage> {
-    this.assertActive();
-    if (!requestId.trim() || requestId.length > 256) throw new Error("Delegation request ID is invalid");
-    if (!this.#clientTooling?.definitions.some((definition) => definition.name === "mesh_dispatch_delegation")) {
-      throw new Error("Parent-orchestrated Mesh is unavailable on this bridge");
-    }
-    if (asGoal && (!prompt.trim() || prompt.length > sessionGoalObjectiveMaxLength)) {
-      throw new Error(`Goal objective must contain between 1 and ${sessionGoalObjectiveMaxLength} characters`);
-    }
-    if (prompt.length > 32_000) throw new Error("A Mesh turn must contain at most 32000 visible characters");
-    this.validateDelegationTargetSelection(targets);
-    const segments = validateDelegationPresentation(prompt, targets, presentationSegments);
-    await this.validateDelegationTargetAvailability(targets);
-    return await this.enqueueMessage(parentSessionId, {
-      requestId, content: prompt, ...selection,
-      metadata: { tethoqQueuedMesh: { targets, segments } as unknown as JsonObject, ...(asGoal ? { tethoqGoalObjective: prompt } : {}) },
-    });
-  }
-
-  private async dispatchQueuedDelegation(
-    sessionId: string,
-    request: SendMessageRequest,
-    mode: "send" | "steer",
-    queueDelivery?: QueueDeliveryRecord,
-  ): Promise<SendMessageResult> {
-    const mesh = queuedMeshPresentation(request);
-    if (mesh === undefined) throw new Error("The queued Mesh instruction is missing its selected targets");
-    const result = await this.prepareDelegation(sessionId, request.content, mesh.targets, mesh.segments, request.requestId,
-      { ...(request.modelId !== undefined ? { modelId: request.modelId } : {}),
-        ...(request.reasoningEffort !== undefined ? { reasoningEffort: request.reasoningEffort } : {}) },
-      { mode, resumeStopped: false, ...(queueDelivery !== undefined ? { queueDelivery } : {}),
-        ...(typeof request.metadata?.tethoqGoalObjective === "string" ? { goalObjective: request.metadata.tethoqGoalObjective } : {}) });
-    return result.delivery;
-  }
-
   /**
-   * Prepares a Mesh turn without creating children. The visible prompt is sent
-   * through the parent's ordinary message path; only that turn receives the
+   * Prepares a Mesh turn without creating children. Inline chips become named
+   * references in the parent's message; only that turn receives the
    * private capability and target context needed to author worker assignments.
    */
   public async prepareDelegation(
@@ -2520,13 +2515,12 @@ export class AgentBridge {
     presentationSegments: readonly DelegationPresentationSegment[],
     idempotencyId: string,
     parentTurnSelection?: Readonly<Pick<RemoteSession, "modelId" | "reasoningEffort">>,
-    deliveryOptions: { readonly mode?: "send" | "steer"; readonly queueDelivery?: QueueDeliveryRecord; readonly resumeStopped?: boolean; readonly goalObjective?: string } = {},
   ): Promise<PreparedDelegationResult> {
     this.assertActive();
     const replay = this.#delegations.get(idempotencyId)?.task;
     if (replay?.parentTurnAcceptedAt === undefined) {
       if (replay?.interruptedAt !== undefined) throw new Error("This Mesh request was stopped by the user. Start a new Mesh turn to resume.");
-      if (deliveryOptions.resumeStopped !== false) await this.resumeStoppedSession(parentSessionId);
+      await this.resumeStoppedSession(parentSessionId);
     }
     const stopGeneration = this.#stopGenerations.get(parentSessionId) ?? 0;
     const parent = this.#cache.get(parentSessionId);
@@ -2603,27 +2597,15 @@ export class AgentBridge {
 
     try {
       this.assertSessionNotStopped(parentSessionId, stopGeneration);
-      const request: SendMessageRequest = {
+      const delivery = await this.sendMessageInternal(parentSessionId, {
         requestId: idempotencyId,
-        content: prompt.trim()
-          ? prompt
-          : hiddenProviderControlContent(`mesh-prepare:${idempotencyId}`),
-        developerInstructions: parentDelegationInstruction(runtime.task, this.#clientTooling !== undefined, parent.providerId),
+        content: parentDelegationPrompt(runtime.task),
+        developerInstructions: parentDelegationInstruction(runtime.task, this.#clientTooling !== undefined),
         clientToolOverrides: { mesh_dispatch_delegation: true },
         ...(selection.modelId !== undefined ? { modelId: selection.modelId } : {}),
         ...(selection.reasoningEffort !== undefined ? { reasoningEffort: selection.reasoningEffort } : {}),
-        metadata: { delegationId: idempotencyId, kind: "delegation_prepare",
-          ...(deliveryOptions.goalObjective !== undefined ? { tethoqGoalObjective: deliveryOptions.goalObjective } : {}) },
-      };
-      if (deliveryOptions.mode === "steer") {
-        const { providerSessionId } = this.assertSessionHost(parentSessionId);
-        const adapter = this.requireAdapter(parent.providerId);
-        if (adapter.steerMessage === undefined) throw new Error(`${parent.providerId} does not support steering active work`);
-        this.assertSteeringAvailable(parentSessionId, parent.providerId, providerSessionId, adapter, true, this.#cache.get(parentSessionId));
-      }
-      const delivery = deliveryOptions.mode === "steer"
-        ? await this.steerWithVision(parentSessionId, await this.withGlobalAgentInstructions(parentSessionId, request))
-        : await this.sendMessageInternal(parentSessionId, request, false, deliveryOptions.queueDelivery);
+        metadata: { delegationId: idempotencyId, kind: "delegation_prepare" },
+      });
       if (!delivery.accepted) {
         throw new ProviderAdapterError(
           parent.providerId,
@@ -2641,6 +2623,9 @@ export class AgentBridge {
         updatedAt: new Date().toISOString(),
       };
       this.appendDelegationEvent("delegation.started", current.task);
+      // A short parent turn may finish before the send acknowledgement arrives.
+      // Reconcile only after acceptance has established that this turn started.
+      await this.pumpDelegation(idempotencyId);
       return { delegation: current.task, delivery };
     } catch (error) {
       const current = this.#delegations.get(idempotencyId);
@@ -2859,7 +2844,7 @@ export class AgentBridge {
         throw error;
       }
     }
-    return await this.executeMeshTool(parentSessionId, tool, input);
+    return await this.executeMeshTool(parentSessionId, tool, input, context.signal);
   }
 
   private async publishBridgeOwnedEyesFailure(
@@ -2929,11 +2914,30 @@ export class AgentBridge {
     await this.persistBridgeOwnedClientToolFailures();
   }
 
-  public async executeMeshTool(parentSessionId: string, tool: string, input: JsonObject): Promise<JsonObject> {
+  public async presentedImageChunk(sessionId: string, retrievalId: string, offset: number): Promise<JsonObject> {
+    this.assertActive();
+    this.assertSessionHost(sessionId);
+    return await this.#presentedImages.chunk(sessionId, retrievalId, offset);
+  }
+
+  public async executeMeshTool(parentSessionId: string, tool: string, input: JsonObject, signal?: AbortSignal): Promise<JsonObject> {
     this.assertActive();
     this.assertSessionNotStopped(parentSessionId);
     this.assertSessionHost(parentSessionId);
-    if (this.#cache.get(parentSessionId) === undefined) throw new Error("Parent session is not loaded on this bridge");
+    if (this.#cache.get(parentSessionId) === undefined) throw new TaskNotOwnedHereError();
+    if (tool === "tethoq_show_image") {
+      if (this.isInternalSession(this.#cache.get(parentSessionId)!)) throw new Error("Internal helpers cannot present images to the user");
+      const message = await this.#presentedImages.present(parentSessionId,
+        requiredMeshString(input, "path", 32_768), optionalMeshString(input, "caption", 2_000) ?? "",
+        requiredMeshString(input, "request_id", 256));
+      this.invalidateMessageSnapshot(parentSessionId);
+      this.#events.append({ type: "message.completed", sessionId: parentSessionId,
+        providerId: this.assertSessionHost(parentSessionId).providerId,
+        payload: { messageId: message.id, role: "assistant", phase: "final_answer",
+          text: message.parts.flatMap(part => part.type === "text" ? [part.text] : []).join("\n"),
+          tethoqPresentedImage: true, requiresHistoryRefresh: true } });
+      return { shown: true, image_id: message.id, message: "The image is displayed inline in this task and saved in its history. Do not send a duplicate image or download link." };
+    }
     if (tool === "tethoq_goal") {
       const goal = this.#goals.get(parentSessionId);
       if (goal?.source !== "tethoq") throw new TaskNotOwnedHereError();
@@ -2944,8 +2948,30 @@ export class AgentBridge {
       return { status: updated.status };
     }
     if (tool === "mesh_dispatch_delegation") {
-      const delegationId = requiredMeshString(input, "delegation_id", 256);
       const assignments = parentDelegationAssignments(input);
+      const requestedId = input.delegation_id === undefined ? undefined : requiredMeshString(input, "delegation_id", 256);
+      const prepared = this.delegations(parentSessionId).filter((task) => task.orchestration === "parent");
+      const current = prepared.at(-1);
+      const pending = prepared.filter((task) => task.state === "awaiting_dispatch" && task.interruptedAt === undefined);
+      if (requestedId === undefined && pending.length > 1) {
+        throw new Error("More than one Mesh delegation is awaiting dispatch. Supply the exact delegation_id from the current turn's private Mesh guidance.");
+      }
+      const delegationId = requestedId ?? current?.id;
+      if (delegationId === undefined) throw new TaskNotOwnedHereError("There is no prepared Mesh delegation for this task on this runtime. The user must select Mesh targets first.");
+      const requested = this.#delegations.get(delegationId)?.task;
+      if (requested?.orchestration === "parent" && requested.parentSessionId === parentSessionId
+        && requested.dispatchFingerprint === undefined && requested.state === "failed"
+        && current !== undefined && pending.length === 1 && pending[0] === current && current.id !== requested.id) {
+        // Old tool calls stay in model history. Report the current selection
+        // without reviving a stopped request or silently changing its targets.
+        return {
+          dispatched: false,
+          status: "needs_current_delegation",
+          delegation_id: current.id,
+          targets: (current.targets ?? []).map((target) => ({ ...target })),
+          message: "That earlier Mesh request has ended. No workers were started by this call. Review the assignments for the current selected targets, then call mesh_dispatch_delegation again with this delegation_id or omit it. Do not reuse an ID from an earlier turn.",
+        };
+      }
       const delegation = await this.dispatchPreparedDelegation(parentSessionId, delegationId, assignments);
       return {
         delegation: delegation as unknown as JsonObject,
@@ -2997,9 +3023,11 @@ export class AgentBridge {
     }
     if (tool === "mesh_wait") {
       const children = this.meshChildIds(parentSessionId, input.child_session_ids);
-      const timeoutSeconds = optionalMeshInteger(input.timeout_seconds, 120, 1, 900);
+      const timeoutSeconds = optionalMeshInteger(input.timeout_seconds, 120, 1, 300);
       const deadline = Date.now() + timeoutSeconds * 1_000;
       while (Date.now() < deadline && children.some((id) => this.#cache.get(id)?.state === "working")) {
+        this.assertActive();
+        signal?.throwIfAborted();
         await new Promise((resolve) => setTimeout(resolve, 250));
       }
       const states = children.map((id) => ({ sessionId: id, state: this.#cache.get(id)?.state ?? "unknown" }));
@@ -3009,7 +3037,7 @@ export class AgentBridge {
       const child = this.requireMeshChild(parentSessionId, requiredMeshString(input, "child_session_id"));
       const childSessionId = child.sessionId!;
       const { providerSessionId } = this.assertSessionHost(childSessionId);
-      const messages = await this.requireAdapter(child.providerId).getMessages(providerSessionId);
+      const messages = await this.requireAdapter(child.providerId).getMessages(providerSessionId, { limit: 8 });
       const transcript = messages.slice(-8).flatMap((message) => {
         const text = message.parts.flatMap((part) => part.type === "text" || part.type === "reasoning" ? [part.text.trim()] : []).filter(Boolean).join("\n");
         return text.length === 0 ? [] : [{ role: message.role, text: text.slice(0, 8_000), status: message.status }];
@@ -3042,6 +3070,9 @@ export class AgentBridge {
     if (runtime.task.parentSessionId !== parentSessionId) {
       throw new Error("That Mesh delegation belongs to a different parent session");
     }
+    if (runtime.task.interruptedAt !== undefined && runtime.task.dispatchFingerprint === undefined) {
+      throw new Error("This Mesh request was stopped by the user. Start a new Mesh turn to resume.");
+    }
     const targets = runtime.task.targets;
     if (targets === undefined || targets.length === 0) throw new Error("That Mesh delegation has no authorized targets");
     const normalized = [...assignments].sort((left, right) => left.targetIndex - right.targetIndex);
@@ -3050,6 +3081,9 @@ export class AgentBridge {
       throw new Error("Mesh assignments must cover every authorized target exactly once");
     }
     assertTailoredParentAssignments(runtime.task.prompt, targets.length, normalized);
+    if (runtime.task.presentationSegments) {
+      assertTailoredParentAssignments(parentDelegationPrompt(runtime.task), targets.length, normalized);
+    }
     const fingerprint = createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
     if (runtime.task.dispatchFingerprint !== undefined) {
       if (runtime.task.dispatchFingerprint !== fingerprint) {
@@ -3188,6 +3222,9 @@ export class AgentBridge {
   }
 
   private requireMeshChild(parentSessionId: string, childSessionId: string): DelegationChild {
+    // OpenCode/Pi may see several Tethoq runtimes. A global child identity
+    // belongs to one host; let discovery reach it before judging parentage.
+    if (childSessionId.split("/").length === 3 && parseGlobalSessionId(childSessionId).hostId !== this.config.hostId) throw new TaskNotOwnedHereError();
     const children = this.delegations(parentSessionId).flatMap((task) => task.children);
     // Dispatch exposes an internal child record ID as well as its session ID.
     // Both are exact identities, but resolve them only inside this parent's set.
@@ -3351,6 +3388,9 @@ export class AgentBridge {
     const scheduler = this.requireScheduledTasks();
     const creation = { ...input, targetSessionId: scheduledTaskPlaceholderId(input.requestId) };
     scheduler.preflightCreate(creation);
+    if (input.meshTargets !== undefined && input.content.length > 32_000) {
+      throw new Error("A Mesh turn must contain at most 32000 visible characters");
+    }
     return await scheduler.create(creation);
   }
 
@@ -3520,6 +3560,7 @@ export class AgentBridge {
       this.#cache.upsert({
         ...session,
         relationship: record.relationship,
+        ...(record.paused === true ? { state: "idle" as const } : {}),
         ...(record.relationship.kind === "side_chat" ? {
           sessionKind: "side_chat" as const,
           parentSessionId: record.relationship.sourceSessionId,
@@ -3530,6 +3571,7 @@ export class AgentBridge {
           ...session.nativeMetadata,
           ...transferMetadata(record.relationship),
           ...nativeMetadata,
+          ...(record.paused === true ? { tethoqUserStopped: true, tethoqInterruptedAt: session.createdAt ?? session.lastActivityAt } : {}),
           ...(record.relationship.kind === "side_chat" ? { tethoqSessionKind: "side_chat" } : {}),
         },
       });
@@ -3648,7 +3690,13 @@ export class AgentBridge {
   }
 
   public async branchSession(sourceSessionId: string, prompt?: string): Promise<BranchSessionResult> {
-    return await this.createBranchSession(sourceSessionId, prompt, true);
+    const key = JSON.stringify([sourceSessionId, prompt?.trim() || undefined]);
+    const existing = this.#branchCreations.get(key);
+    if (existing !== undefined) return await existing;
+    const creation = this.withSessionDispatchLock(sourceSessionId, () => this.createBranchSession(sourceSessionId, prompt?.trim() || undefined, true));
+    this.#branchCreations.set(key, creation);
+    try { return await creation; }
+    finally { if (this.#branchCreations.get(key) === creation) this.#branchCreations.delete(key); }
   }
 
   private async createBranchSession(
@@ -3657,55 +3705,69 @@ export class AgentBridge {
     preferNative: boolean,
   ): Promise<BranchSessionResult> {
     this.assertActive();
+    // A send that already reached the provider may still be saving its message.
+    // Snapshot after that receipt, without waiting for the assistant's turn.
+    await Promise.all(this.#pendingProviderSends.get(sourceSessionId) ?? []);
     const { adapter, source, messages } = await this.transferSource(sourceSessionId);
-    const native = preferNative && adapter.branchSession !== undefined;
-    const strategy = native ? "native" as const : "transcript_bootstrap" as const;
-    const relationship: SessionRelationship = { kind: "branch", sourceSessionId, strategy };
+    // Native forks can omit an in-flight turn or retain live tool state. Freeze
+    // that exact visible snapshot in a fresh task instead of rewinding it.
+    let native = preferNative && adapter.branchSession !== undefined
+      && source.state !== "working" && source.state !== "needs_approval" && source.state !== "needs_input"
+      && !this.sessionTurnInFlight(sourceSessionId) && !this.#pendingProviderSends.has(sourceSessionId)
+      && !messages.some((message) => message.status === "streaming")
+      && !this.#branchCopies.has(sourceSessionId);
     const capabilities = await adapter.getCapabilities();
     if ((!native && (!capabilities.createSession || !capabilities.sendMessage)) || (prompt !== undefined && !capabilities.sendMessage)) {
       throw new Error(`${adapter.displayName} cannot create a conversation branch`);
     }
-    const fallback = native ? undefined : branchBootstrap(source, messages);
-    const created = native
-      ? await adapter.branchSession!(source.providerSessionId)
-      : await adapter.createSession({
-          workingDirectory: this.sessionWorkingDirectory(source),
-          title: `Branch: ${source.title}`.slice(0, 120),
-          ...(source.modelId !== undefined ? { modelId: source.modelId } : {}),
-          ...(source.reasoningEffort !== undefined ? { reasoningEffort: source.reasoningEffort } : {}),
-          metadata: transferMetadata(relationship),
-        });
-    const branchMetadata: JsonObject = fallback === undefined ? {} : {
-      tethoqBranchBootstrap: fallback.content,
-      tethoqBranchPending: true,
-    };
-    const session = transferredSession(created, source, relationship, branchMetadata);
-    assertFreshTransferSession(source, session);
-    this.#cache.upsert(session);
-    this.notifySessionCatalogueChange();
-    if (fallback !== undefined) {
-      this.#pendingBranchBootstraps.set(session.id, { bootstrap: fallback.content, relationship });
-      this.#branchCopies.set(session.id, messages);
+    let created: RemoteSession | undefined;
+    if (native) {
+      try { created = await adapter.branchSession!(source.providerSessionId); }
+      catch (error) {
+        if (!(error instanceof ProviderAdapterError) || error.code !== "BRANCH_SNAPSHOT_REQUIRED") throw error;
+        native = false;
+      }
     }
-    this.rememberSessionTransfer({
-      sessionId: session.id,
-      relationship,
-      pending: fallback !== undefined,
-      ...(fallback !== undefined ? {
-        bootstrap: fallback.content,
-        copiedMessages: persistableBranchMessages(messages),
-      } : {}),
-    });
-    if (prompt !== undefined) {
-      await this.sendMessage(session.id, {
-        requestId: `branch_${randomUUID()}`,
-        content: prompt,
+    const strategy = native ? "native" as const : "transcript_bootstrap" as const;
+    const relationship: SessionRelationship = { kind: "branch", sourceSessionId, strategy };
+    const fallback = native ? undefined : branchBootstrap(source, messages);
+    if (created === undefined) {
+      if (!capabilities.createSession || !capabilities.sendMessage) throw new Error(`${adapter.displayName} cannot copy the current conversation`);
+      created = await adapter.createSession({
+        workingDirectory: this.sessionWorkingDirectory(source),
+        title: `Branch: ${source.title}`.slice(0, 120),
         ...(source.modelId !== undefined ? { modelId: source.modelId } : {}),
         ...(source.reasoningEffort !== undefined ? { reasoningEffort: source.reasoningEffort } : {}),
         metadata: transferMetadata(relationship),
       });
     }
-    return { session, strategy, copiedMessageCount: messages.length };
+    const branchMetadata: JsonObject = fallback === undefined ? {} : {
+      tethoqBranchBootstrap: fallback.content,
+      tethoqBranchPending: true,
+    };
+    const session = { ...transferredSession(created, source, relationship, {
+      ...branchMetadata, tethoqUserStopped: true, tethoqInterruptedAt: created.createdAt ?? created.lastActivityAt,
+    }), state: "idle" as const };
+    delete (session as { providerStatus?: unknown }).providerStatus;
+    assertFreshTransferSession(source, session);
+    this.#cache.upsert(session);
+    this.notifySessionCatalogueChange();
+    if (fallback !== undefined) {
+      this.#pendingBranchBootstraps.set(session.id, { bootstrap: fallback.content, relationship });
+      this.#branchCopies.set(session.id, structuredClone(messages));
+    }
+    this.rememberSessionTransfer({
+      sessionId: session.id,
+      relationship,
+      pending: fallback !== undefined,
+      paused: true,
+      ...(prompt !== undefined ? { prompt } : {}),
+      ...(fallback !== undefined ? {
+        bootstrap: fallback.content,
+        copiedMessages: persistableBranchMessages(messages),
+      } : {}),
+    });
+    return { session, strategy, copiedMessageCount: messages.length, ...(prompt !== undefined ? { prompt } : {}) };
   }
 
   public sideChats(parentSessionId?: string): readonly RemoteSession[] {
@@ -3954,13 +4016,13 @@ export class AgentBridge {
     const adapter = this.requireAdapter(providerId);
     const cached = this.#cache.get(sourceSessionId);
     const [providerSession, history] = await Promise.all([
-      cached === undefined ? adapter.getSession(providerSessionId) : Promise.resolve(cached),
+      adapter.getSession(providerSessionId),
       allowPartialHistory ? this.sideChatHistory(adapter, providerSessionId, sourceSessionId)
-        : adapter.getMessages(providerSessionId).then((messages) => ({ messages, complete: true })),
+        : this.branchHistory(adapter, providerSessionId).then((messages) => ({ messages, complete: true })),
     ]);
     const providerMessages = history.messages;
     await this.reconcileQueueDeliveriesFromMessages(sourceSessionId, providerMessages);
-    this.#cache.upsert(providerSession);
+    this.#cache.reconcileAuthoritative(providerSession, cached);
     this.restoreSessionTransferLinks();
     const source = this.#cache.get(sourceSessionId) ?? providerSession;
     const providerVisible = clientVisibleBranchMessages(providerMessages);
@@ -3975,9 +4037,27 @@ export class AgentBridge {
     return { adapter, source, messages, historyComplete: history.complete };
   }
 
+  private async branchHistory(adapter: AgentProviderAdapter, providerSessionId: string): Promise<readonly RemoteMessage[]> {
+    if (adapter.getRecentMessages === undefined || adapter.getOlderMessages === undefined) return await adapter.getMessages(providerSessionId);
+    let page = await adapter.getRecentMessages(providerSessionId);
+    let messages = new Map(page.messages.map((message) => [message.id, message]));
+    const cursors = new Set<string>();
+    while (!page.complete) {
+      const cursor = page.olderCursor;
+      if (!cursor || cursors.has(cursor)) throw new Error("The provider could not supply the complete conversation for branching");
+      cursors.add(cursor);
+      page = await adapter.getOlderMessages(providerSessionId, cursor);
+      // Cursor pages may overlap. Keep the newest observation of each row.
+      messages = new Map([...page.messages.filter((message) => !messages.has(message.id)).map((message) => [message.id, message] as const), ...messages]);
+    }
+    // Native order also handles equal or unavailable timestamps across pages.
+    return [...messages.values()];
+  }
+
   public async sendMessage(globalSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
     const replay = this.#sendLedger.get(request.requestId);
     if (replay !== undefined) return replay;
+    this.#sessionContextRecoveries.delete(globalSessionId);
     await this.resumeStoppedSession(globalSessionId);
     return await this.sendMessageInternal(globalSessionId, request);
   }
@@ -3986,6 +4066,7 @@ export class AgentBridge {
     globalSessionId: string,
     request: Pick<SendMessageRequest, "requestId" | "modelId" | "reasoningEffort">,
   ): Promise<SendMessageResult> {
+    this.#sessionContextRecoveries.delete(globalSessionId);
     await this.resumeStoppedSession(globalSessionId);
     return await this.sendMessageInternal(globalSessionId, {
       ...request,
@@ -4000,13 +4081,11 @@ export class AgentBridge {
     allowDuringDispose = false,
     queueDelivery?: QueueDeliveryRecord,
     goalContinuation?: SessionGoal,
+    contextRecovery?: { pending: boolean },
   ): Promise<SendMessageResult> {
     this.assertActive(allowDuringDispose);
     const stopGeneration = this.#stopGenerations.get(globalSessionId) ?? 0;
     this.assertSessionNotStopped(globalSessionId, stopGeneration);
-    if (request.metadata?.tethoqQueuedMesh !== undefined) {
-      return await this.dispatchQueuedDelegation(globalSessionId, request, "send", queueDelivery);
-    }
     // New instructions must wait for the compacted context to be ready.
     await this.#autoCompactions.get(globalSessionId);
     await this.#compactingSessions.get(globalSessionId)?.catch(() => undefined);
@@ -4016,9 +4095,9 @@ export class AgentBridge {
     if (goalContinuation !== undefined || request.metadata?.tethoqGoalObjective !== undefined || this.#visionProxies.has(globalSessionId) || this.#sessionDispatchTails.has(globalSessionId)
       || this.pendingContextHandoff(globalSessionId) !== undefined || this.pendingBranchBootstrap(globalSessionId) !== undefined) {
       return await this.withSessionDispatchLock(globalSessionId, async () =>
-        await this.dispatchMessage(globalSessionId, prepared, queueDelivery, stopGeneration, goalContinuation));
+        await this.dispatchMessage(globalSessionId, prepared, queueDelivery, stopGeneration, goalContinuation, contextRecovery));
     }
-    return await this.dispatchMessage(globalSessionId, prepared, queueDelivery, stopGeneration);
+    return await this.dispatchMessage(globalSessionId, prepared, queueDelivery, stopGeneration, goalContinuation, contextRecovery);
   }
 
   private async withGlobalAgentInstructions(globalSessionId: string, request: SendMessageRequest): Promise<SendMessageRequest> {
@@ -4037,6 +4116,7 @@ export class AgentBridge {
     // control block, retaining the other instructions before and after it.
     let developerInstructions = request.developerInstructions
       ?.replace(/<tethoq_task_goal>[\s\S]*?<\/tethoq_task_goal>\s*/gu, "")
+      .replace(/<tethoq_image_presentation>[\s\S]*?<\/tethoq_image_presentation>\s*/gu, "")
       .replace(/Tethoq persistent task goal \(private control context; do not quote this block\):[\s\S]*?(?:Keep this objective in view across turns\. The goal lifecycle is controlled by Tethoq and is independent of whether this turn is busy or finished\.|$)\s*/gu, "").trim() || undefined;
     const goalHeader = "Tethoq persistent task goal (private control context; do not quote this block):";
     if (selected !== undefined) {
@@ -4047,6 +4127,12 @@ export class AgentBridge {
           : `${globalHeader}\n\n${selected}\n\n${developerInstructions}`;
       }
     }
+    const task = this.#cache.get(globalSessionId);
+    if (this.#clientTooling !== undefined && task !== undefined && !this.isInternalSession(task)) {
+      const showImageTool = task.providerId === "opencode" ? "uar_mesh_tethoq_show_image" : "tethoq_show_image";
+      const imageContext = `<tethoq_image_presentation>\nTo show the user an image, display it inline in the conversation. For an existing local PNG, JPEG, GIF, or WebP file, call ${showImageTool} with its absolute path, an optional short caption, and a unique request_id (reuse that ID only to retry the same presentation). The tool saves a copy with this task and displays it directly; it does not generate or inspect images and does not require model vision support. After success, do not replace or duplicate it with a plain link. For a public HTTPS image, embed it using ![description](https://...); use an actual image URL, not a webpage URL. If the local display tool is unavailable, embed the absolute local path using ![description](<absolute path>). Never claim the image was displayed if the tool failed.\n</tethoq_image_presentation>`;
+      developerInstructions = developerInstructions === undefined ? imageContext : `${developerInstructions}\n\n${imageContext}`;
+    }
     const goal = this.#goals.get(globalSessionId);
     if (goal?.source === "tethoq") {
       const goalTool = this.assertSessionHost(globalSessionId).providerId === "opencode" ? "uar_mesh_tethoq_goal" : "tethoq_goal";
@@ -4054,7 +4140,7 @@ export class AgentBridge {
         ? ""
         : `\nToken budget: ${goal.tokenBudget} tokens. This bridge-owned fallback has no provider-neutral usage accounting or enforcement; treat the budget as advisory.`;
       const pursuit = goal.status === "active"
-        ? `Keep working until this objective is achieved or further progress requires user input or an external change. Before ending a turn, check the goal's state. If success is verified, call ${goalTool} with {"status":"complete"} before your final response. If you cannot make meaningful progress without user input, approval to change a constraint, or an external change, call ${goalTool} with {"status":"blocked"} before explaining the blocker and the input needed. Blocking stops automatic prompts without claiming the objective is complete; do not keep retrying an established blocker. Writing "done" or "blocked" in your response does not update the goal: you must make the tool call and check that it succeeds. After a successful complete or blocked update, give a brief final response and end this turn; do not wait for user input inside the active turn. If the tool is unavailable or fails, report that goal-control failure explicitly. Otherwise leave the goal active and continue concrete work. A progress report is not completion. Tethoq will continue unfinished active goals after a normal turn ends. An automatic continuation is not new user input or approval and does not resolve a blocker. Do not claim success without evidence.`
+        ? `Keep working toward the full objective across turns; do not shrink its scope to the work already done. Before ending a turn, check the goal's state. Verify every requirement against current authoritative evidence; a passing narrow test, progress report, or plausible final answer does not prove the full objective is achieved. If success is verified, call ${goalTool} with {"status":"complete"} before your final response. Otherwise keep the goal active and make concrete progress. Failed quality checks and unfinished improvements are work to do, not reasons to stall. Only when the same blocking condition has repeated for at least three consecutive goal turns, including the original user turn and automatic continuations, and you cannot make meaningful progress without user input or an external change, call ${goalTool} with {"status":"blocked"} before explaining the blocker and the input needed. Revalidate the blocker and take any available safe action first. Never block merely because work is hard, slow, uncertain, or incomplete. If the user resumes a blocked goal, start a fresh three-turn blocked audit. Blocking stops automatic prompts without claiming success. Writing "done" or "blocked" in your response does not update the goal: make the tool call and check that it succeeds. If the tool is unavailable or fails, report that goal-control failure explicitly. Tethoq will continue unfinished active goals after a normal turn ends. An automatic continuation is not new user input or approval and does not resolve a blocker. Do not claim success without evidence.`
         : `This goal is ${goal.status}. Do not pursue it autonomously or reopen it; follow the current user message.`;
       const goalContext = `<tethoq_task_goal>\n${goalHeader}\n\nObjective: ${goal.objective}\nStatus: ${goal.status}.${budgetContext}\n${pursuit}\nThis private context is not a user message. Keep control labels and metadata out of the response.\n</tethoq_task_goal>`;
       developerInstructions = developerInstructions === undefined ? goalContext : `${developerInstructions}\n\n${goalContext}`;
@@ -4097,12 +4183,25 @@ export class AgentBridge {
     queueDelivery?: QueueDeliveryRecord,
     stopGeneration = this.#stopGenerations.get(globalSessionId) ?? 0,
     goalContinuation?: SessionGoal,
+    contextRecovery?: { pending: boolean },
   ): Promise<SendMessageResult> {
     const previous = this.#sendLedger.get(request.requestId);
     if (previous !== undefined) return previous;
+    if (queueDelivery !== undefined) this.#sessionContextRecoveries.delete(globalSessionId);
     const { providerId, providerSessionId, hostId } = parseGlobalSessionId(globalSessionId);
     if (hostId !== this.config.hostId) throw new Error("Session belongs to a different host");
     this.assertSessionNotStopped(globalSessionId, stopGeneration);
+    // Follow-ups and internal continuation controls often omit a selection.
+    // OpenCode treats an omitted variant as its native default, so carry this
+    // task's choice explicitly. Never borrow an effort when changing models.
+    const currentSelection = this.#cache.get(globalSessionId);
+    const sameModel = request.modelId === undefined || request.modelId === currentSelection?.modelId;
+    request = {
+      ...request,
+      ...(request.modelId === undefined && currentSelection?.modelId !== undefined ? { modelId: currentSelection.modelId } : {}),
+      ...(request.reasoningEffort === undefined && sameModel && currentSelection?.reasoningEffort !== undefined
+        ? { reasoningEffort: currentSelection.reasoningEffort } : {}),
+    };
     request = await this.withGlobalAgentInstructions(globalSessionId, request);
     const pending = this.pendingContextHandoff(globalSessionId);
     const pendingBranch = this.pendingBranchBootstrap(globalSessionId);
@@ -4142,13 +4241,8 @@ export class AgentBridge {
       providerSessionId,
       routedRequest,
       request.content,
-      goalContinuation,
     );
-    // A queued prompt can start/replace its goal while resolving instructions,
-    // after the queue pump first journals it. Bind ownership at actual dispatch.
-    if (delivery.state !== "in_flight" || delivery.goalActivationId !== this.activeGoalActivationId(globalSessionId)) {
-      delivery = await this.markQueueDeliveryInFlight(delivery);
-    }
+    if (delivery.state !== "in_flight") delivery = await this.markQueueDeliveryInFlight(delivery);
     const providerRequest = delivery.requestId === routedRequest.requestId
       ? routedRequest
       : { ...routedRequest, requestId: delivery.requestId };
@@ -4163,6 +4257,9 @@ export class AgentBridge {
       this.assertSessionNotStopped(globalSessionId, stopGeneration);
       if (goalContinuation !== undefined && !this.canContinueGoal(globalSessionId, goalContinuation)) {
         throw new Error("Goal continuation was superseded by a task or goal change");
+      }
+      if (contextRecovery !== undefined && this.#sessionContextRecoveries.get(globalSessionId) !== contextRecovery) {
+        throw new Error("Context recovery was superseded by a newer instruction");
       }
     }
     catch (error) {
@@ -4181,7 +4278,13 @@ export class AgentBridge {
         throw asDeliveryUnknown(providerId, error);
       }
       await this.markQueueDeliveryUnknown(delivery, error);
-      throw asDeliveryUnknown(providerId, error);
+      // Providers with an exact receipt lookup can resolve a late save without
+      // downloading the transcript or posting the instruction a second time.
+      if (adapter.getMessage !== undefined) await this.reconcileQueueDeliverySession(globalSessionId).catch(() => undefined);
+      const receipt = this.#queueDeliveries.get(delivery.messageId);
+      if (receipt?.state !== "confirmed") throw asDeliveryUnknown(providerId, error);
+      result = { accepted: true, providerTurnId: receipt.providerMessageId ?? (providerId === "opencode" ? openCodeMessageId(receipt.requestId) : receipt.requestId),
+        details: ["Provider history confirmed the instruction after its acknowledgement was lost."] };
     } finally {
       pendingSends.delete(sending);
       if (pendingSends.size === 0) this.#pendingProviderSends.delete(globalSessionId);
@@ -4389,7 +4492,8 @@ export class AgentBridge {
       ? [...this.#adapters.values()]
       : [this.requireAdapter(this.assertSessionHost(sessionId).providerId)];
     await Promise.allSettled(adapters.map((adapter) => this.refreshProviderQueue(adapter)));
-    await this.reconcileQueueDeliveries(sessionId === undefined ? undefined : this.assertSessionHost(sessionId).providerId);
+    if (sessionId === undefined) await this.reconcileQueueDeliveries();
+    else await this.reconcileQueueDeliverySession(sessionId);
     return this.queuedMessages(sessionId);
   }
 
@@ -4483,7 +4587,6 @@ export class AgentBridge {
     const { providerId, providerSessionId } = this.assertSessionHost(globalSessionId);
     const session = this.#cache.get(globalSessionId);
     if (session === undefined) throw new Error("Session is not loaded on this bridge");
-    this.assertNoUncertainDeliveryContent(globalSessionId, prepared.content);
     const adapter = this.requireAdapter(providerId);
     const consumption = (input.attachmentIds?.length ?? 0) > 0
       ? this.#attachmentUploads.consume(input.attachmentIds ?? [])
@@ -4523,7 +4626,6 @@ export class AgentBridge {
     // Desktop queue ownership semantics.
     const activeGrokFollowUp = providerId === "grok" && this.sessionHoldsFollowUpQueue(globalSessionId);
     if (adapter.enqueueQueuedMessage !== undefined
-      && request.metadata?.tethoqQueuedMesh === undefined
       && request.metadata?.tethoqGoalObjective === undefined
       && !this.sessionIsStopped(globalSessionId)
       && !activeGrokFollowUp
@@ -4567,7 +4669,6 @@ export class AgentBridge {
       throw error;
     }
     const id = `queued_${randomUUID()}`;
-    const mesh = queuedMeshPresentation(request);
     const view: QueuedMessage = {
       id,
       sessionId: globalSessionId,
@@ -4578,7 +4679,6 @@ export class AgentBridge {
       attachments: attachments.map(({ name, mimeType, byteLength }) => ({ name, mimeType, byteLength })),
       ...(input.modelId !== undefined ? { modelId: input.modelId } : {}),
       ...(input.reasoningEffort !== undefined ? { reasoningEffort: input.reasoningEffort } : {}),
-      ...(mesh !== undefined ? { mesh } : {}),
     };
     this.#queuedMessages.set(id, { view, request, providerOwned: false });
     this.appendQueueEvent("message.queued", view);
@@ -4587,17 +4687,64 @@ export class AgentBridge {
     return view;
   }
 
-  public async cancelQueuedMessage(messageId: string): Promise<boolean> {
-    return await this.withQueueMutation(messageId, async () =>
-      await this.cancelQueuedMessageInternal(messageId, "cancelled"));
+  public async readQueuedDraft(messageId: string): Promise<JsonObject> {
+    return await this.withQueueMutation(messageId, async () => {
+      const record = this.#queuedMessages.get(messageId);
+      if (!record || record.view.state === "sending" || record.view.retryable === false) throw new Error("That queued instruction is no longer available to edit");
+      if (record.providerOwned) {
+        const { providerId, providerSessionId } = this.assertSessionHost(record.view.sessionId);
+        const read = this.requireAdapter(providerId).readQueuedMessage;
+        if (read !== undefined) {
+          const original = await read.call(this.requireAdapter(providerId), providerSessionId, record.providerMessageId ?? messageId);
+          if (!original || original.content !== record.view.content || this.#queuedMessages.get(messageId) !== record) throw new Error("The queued instruction changed. Try Edit again.");
+          record.request = { ...record.request, ...original };
+        }
+      }
+      const original = record.request ?? { requestId: messageId, content: record.view.content };
+      if ((original.attachments?.length ?? 0) !== record.view.attachments.length) throw new Error("The provider has not made this instruction's original attachments available. It remains queued.");
+      record.request = original;
+      const version = this.#queuedDraftVersions.get(original) ?? randomUUID();
+      this.#queuedDraftVersions.set(original, version);
+      return { version, sessionId: record.view.sessionId, content: record.view.content,
+        attachments: (original.attachments ?? []).map((attachment, index) => ({ name: attachment.name, mimeType: attachment.mimeType,
+          byteLength: attachment.byteLength, ...(record.view.attachments[index]?.durationSeconds !== undefined ? { durationSeconds: record.view.attachments[index]!.durationSeconds! } : {}) })),
+        workflows: (original.workflows ?? []).map(({ id, name, eventCount, screenshotCount }) => ({ id, name, eventCount, screenshotCount })),
+        goal: original.metadata?.tethoqGoalObjective !== undefined };
+    });
   }
 
-  private async cancelQueuedMessageInternal(messageId: string, reason: string): Promise<boolean> {
+  private requireQueuedDraft(messageId: string, version: string): SendMessageRequest {
+    const record = this.#queuedMessages.get(messageId);
+    if (!record || record.view.state === "sending" || record.view.retryable === false || !record.request
+      || this.#queuedDraftVersions.get(record.request) !== version || record.view.content !== record.request.content) {
+      throw new Error("The queued instruction changed or started sending. Refresh the queue and try again.");
+    }
+    return record.request;
+  }
+
+  public queuedDraftAttachment(messageId: string, version: string, index: number, offset: number): JsonObject {
+    const attachment = this.requireQueuedDraft(messageId, version).attachments?.[index];
+    const chunkCharacters = 480 * 1024;
+    if (!Number.isSafeInteger(index) || index < 0 || !attachment || !Number.isSafeInteger(offset) || offset < 0
+      || offset % chunkCharacters !== 0 || offset >= attachment.dataBase64.length) throw new Error("Invalid queued attachment chunk");
+    const dataBase64 = attachment.dataBase64.slice(offset, offset + chunkCharacters);
+    const nextOffset = offset + dataBase64.length;
+    return { dataBase64, offset, totalCharacters: attachment.dataBase64.length, nextOffset: nextOffset < attachment.dataBase64.length ? nextOffset : null };
+  }
+
+  public async cancelQueuedMessage(messageId: string, draftVersion?: string): Promise<boolean> {
+    return await this.withQueueMutation(messageId, async () => {
+      if (draftVersion !== undefined) this.requireQueuedDraft(messageId, draftVersion);
+      return await this.cancelQueuedMessageInternal(messageId, "cancelled", draftVersion !== undefined);
+    });
+  }
+
+  private async cancelQueuedMessageInternal(messageId: string, reason: string, editing = false): Promise<boolean> {
     const record = this.#queuedMessages.get(messageId);
     if (record === undefined || record.view.state === "sending") return false;
     if (record.view.retryable === false) {
       const delivery = this.#queueDeliveries.get(messageId);
-      if (delivery?.state !== "unknown") return false;
+      if (delivery?.state !== "unknown" && delivery?.state !== "confirmed") return false;
       const dismissed: QueueDeliveryRecord = {
         ...delivery,
         dismissedAt: new Date().toISOString(),
@@ -4607,7 +4754,7 @@ export class AgentBridge {
       try {
         await this.persistQueueDeliveries();
       } catch (error) {
-        this.#queueDeliveries.set(messageId, delivery);
+        if (this.#queueDeliveries.get(messageId) === dismissed) this.#queueDeliveries.set(messageId, delivery);
         throw error;
       }
       this.#queuedMessages.delete(messageId);
@@ -4616,14 +4763,13 @@ export class AgentBridge {
         sessionId: record.view.sessionId,
         payload: { messageId, reason: "delivery_tombstone_dismissed" },
       });
-      void this.pumpQueue(record.view.sessionId);
       return true;
     }
     if (record.providerOwned) {
       const { providerId, providerSessionId } = this.assertSessionHost(record.view.sessionId);
       const adapter = this.requireAdapter(providerId);
       if (adapter.cancelQueuedMessage === undefined) return false;
-      const cancelled = await adapter.cancelQueuedMessage(providerSessionId, record.providerMessageId ?? messageId);
+      const cancelled = await adapter.cancelQueuedMessage(providerSessionId, record.providerMessageId ?? messageId, editing ? record.view.content : undefined);
       if (!cancelled) return false;
       if (!this.#queuedMessages.has(messageId)) return true;
     }
@@ -4655,7 +4801,6 @@ export class AgentBridge {
           false,
         );
       }
-      this.assertNoUncertainDeliveryContent(record.view.sessionId, normalized);
       if (record.providerOwned) {
         const { providerId, providerSessionId } = this.assertSessionHost(record.view.sessionId);
         const adapter = this.requireAdapter(providerId);
@@ -4701,13 +4846,8 @@ export class AgentBridge {
       const isGoal = record.request.metadata?.tethoqGoalObjective !== undefined;
       if (isGoal && normalized.length > sessionGoalObjectiveMaxLength) throw new Error(`Goal objective must contain between 1 and ${sessionGoalObjectiveMaxLength} characters`);
       const { error: _error, ...viewWithoutError } = record.view;
-      const mesh = queuedMeshPresentation(record.request);
-      const editedMesh = mesh === undefined ? undefined : { ...mesh, segments: editQueuedMeshPresentation(record.view.content, mesh.segments, normalized) };
-      if (editedMesh !== undefined && normalized.length > 32_000) throw new Error("A Mesh turn must contain at most 32000 visible characters");
-      record.view = { ...viewWithoutError, content: normalized, state: "queued", ...(editedMesh !== undefined ? { mesh: editedMesh } : {}) };
-      record.request = { ...record.request, content: normalized, metadata: { ...record.request.metadata,
-        ...(isGoal ? { tethoqGoalObjective: normalized } : {}),
-        ...(editedMesh !== undefined ? { tethoqQueuedMesh: editedMesh as unknown as JsonObject } : {}) } };
+      record.view = { ...viewWithoutError, content: normalized, state: "queued" };
+      record.request = { ...record.request, content: normalized, ...(isGoal ? { metadata: { ...record.request.metadata, tethoqGoalObjective: normalized } } : {}) };
       this.appendQueueEvent("message.queue_updated", record.view);
       return record.view;
     });
@@ -4881,6 +5021,17 @@ export class AgentBridge {
           }
 
           if (journal.state === "unknown" || journal.state === "in_flight") {
+            if (adapter.getMessage !== undefined) {
+              await this.reconcileQueueDeliverySession(record.view.sessionId).catch(() => undefined);
+              if (this.#queueDeliveries.get(messageId)?.state === "confirmed") {
+                this.invalidateMessageSnapshot(record.view.sessionId);
+                if (this.#cache.get(record.view.sessionId) === dispatchStateBaseline) {
+                  this.#cache.updateState(record.view.sessionId, "working", false);
+                }
+                void this.pumpCrossSessionInbox(record.view.sessionId);
+                return true;
+              }
+            }
             this.invalidateMessageSnapshot(record.view.sessionId);
             await this.refreshProviderQueue(adapter).catch(() => undefined);
             void this.reconcileQueueDeliverySession(record.view.sessionId).catch(() => undefined);
@@ -5202,7 +5353,6 @@ export class AgentBridge {
   }
 
   private async steerWithVision(globalSessionId: string, request: SendMessageRequest): Promise<SendMessageResult> {
-    if (request.metadata?.tethoqQueuedMesh !== undefined) return await this.dispatchQueuedDelegation(globalSessionId, request, "steer");
     const { providerId, providerSessionId } = this.assertSessionHost(globalSessionId);
     const adapter = this.requireAdapter(providerId);
     const stopGeneration = this.#stopGenerations.get(globalSessionId) ?? 0;
@@ -5314,17 +5464,43 @@ export class AgentBridge {
       if (helperId !== undefined) targets.add(helperId);
     }
     for (const id of targets) this.markSessionStopped(id);
-    const results = await Promise.allSettled([...targets].map(async (id) => {
+    const visited = new Set<string>();
+    const failures: string[] = [];
+    const failed = (id: string, error: unknown) => failures.push(
+      `${this.#cache.get(id)?.title ?? id}: ${error instanceof Error ? error.message : String(error)}`);
+    const stop = async (id: string): Promise<void> => {
+      if (visited.has(id)) return;
+      visited.add(id);
+      const goal = this.#goals.get(id);
+      const results = await Promise.allSettled([
+        goal?.source === "tethoq" && goal.status === "active" ? this.setSessionGoal(id, { status: "paused" }) : Promise.resolve(),
+        this.interruptSession(id),
+      ]);
+      for (const result of results) if (result.status === "rejected") failed(id, result.reason);
+      // Stop the parent before enumerating native children so a tool spawning a
+      // child at the cancellation boundary cannot escape. This lightweight read
+      // does not depend on the task-details cache or load any conversation history.
+      const { providerId, providerSessionId } = parseGlobalSessionId(id);
+      const adapter = this.requireAdapter(providerId);
+      if (adapter.listSubagentSessionIds === undefined) return;
       try {
-        const goal = this.#goals.get(id);
-        if (goal?.source === "tethoq" && goal.status === "active") await this.setSessionGoal(id, { status: "paused" });
-      } finally {
-        await this.interruptSession(id);
+        const children = (await adapter.listSubagentSessionIds(providerSessionId))
+          .map((childId) => makeGlobalSessionId(this.config.hostId, providerId, childId))
+          .filter((childId) => {
+            const kind = this.#cache.get(childId)?.relationship?.kind;
+            return kind !== "branch" && kind !== "side_chat" && kind !== "handoff";
+          });
+        for (const childId of children) {
+          if (targets.has(childId)) continue;
+          targets.add(childId);
+          this.markSessionStopped(childId);
+        }
+        await Promise.all(children.map(stop));
+      } catch (error) {
+        failed(id, error);
       }
-    }));
-    const failures = results.flatMap((result, index) => result.status === "rejected"
-      ? [`${this.#cache.get([...targets][index]!)?.title ?? [...targets][index]}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`]
-      : []);
+    };
+    await Promise.all([...targets].map(stop));
     if (failures.length > 0) throw new Error(`Could not stop every task. ${failures.join("; ")}`);
   }
 
@@ -5340,6 +5516,8 @@ export class AgentBridge {
 
   private async resumeStoppedSession(sessionId: string): Promise<void> {
     await this.#interruptions.get(sessionId);
+    const transfer = this.#sessionTransfers.get(sessionId);
+    if (transfer?.paused === true) this.rememberSessionTransfer({ ...transfer, paused: false });
     if (!this.sessionIsStopped(sessionId) && this.#cache.get(sessionId)?.nativeMetadata.tethoqInterruptedAt == null) return;
     this.#stoppedSessions.delete(sessionId);
     this.#cache.updateNativeMetadata(sessionId, { tethoqUserStopped: false, tethoqInterruptedAt: null });
@@ -5458,7 +5636,6 @@ export class AgentBridge {
       sessionId,
       payload: { state, reason },
     });
-    if (state === "working") void this.pumpCrossSessionInbox(sessionId);
     return state;
   }
 
@@ -5796,6 +5973,7 @@ export class AgentBridge {
   }
 
   private async disposeInternal(): Promise<void> {
+    await this.#presentedImages.flush();
     let scheduledTaskError: unknown;
     try {
       // Drain scheduled provider creation and prompt acceptance while adapters
@@ -5865,6 +6043,7 @@ export class AgentBridge {
     for (const continuation of this.#goalContinuations.values()) clearTimeout(continuation.timer);
     this.#goalContinuations.clear();
     this.#goalContextRecoveries.clear();
+    this.#sessionContextRecoveries.clear();
     this.#goals.clear();
     this.#goalGenerations.clear();
     this.#nativeGoalRevisions.clear();
@@ -5884,12 +6063,16 @@ export class AgentBridge {
   }
 
   private async receiveProviderEvent(event: ProviderEvent, identityResolved = false): Promise<void> {
+    const globalSessionId = event.providerSessionId === undefined ? undefined : makeGlobalSessionId(this.config.hostId, event.providerId, event.providerSessionId);
     const internalCreation = this.#internalSessionCreations.get(event.providerId);
-    if (internalCreation !== undefined && event.type !== "provider.disconnected") {
+    // Only an unknown task could be the helper being created. A slow EYES/EARS
+    // creation must not hold back activity or completion for ordinary chats.
+    if (internalCreation !== undefined && globalSessionId !== undefined
+      && !internalCreation.knownSessionIds.has(globalSessionId) && !this.#internalSessionIds.has(globalSessionId)
+      && event.type !== "provider.disconnected") {
       internalCreation.events.push(event);
       return;
     }
-    const globalSessionId = event.providerSessionId === undefined ? undefined : makeGlobalSessionId(this.config.hostId, event.providerId, event.providerSessionId);
     if (!identityResolved && globalSessionId !== undefined && !this.#internalSessionIds.has(globalSessionId)) {
       const pending = this.#unknownActiveSessionEvents.get(globalSessionId);
       if (pending !== undefined) {
@@ -6160,8 +6343,13 @@ export class AgentBridge {
       }
     }
     if (globalSessionId !== undefined && providerEventEndsActiveTurn(event)) {
+      const ownedTurn = this.#locallyOwnedActiveTurns.has(globalSessionId) || this.#pendingProviderSends.has(globalSessionId);
       this.#locallyOwnedActiveTurns.delete(globalSessionId);
       const goal = this.#goals.get(globalSessionId);
+      if (event.type === "agent.error" && event.payload.recovery === "compact_context"
+        && (goal?.source !== "tethoq" || goal.status !== "active")) {
+        this.recoverSessionContext(globalSessionId, ownedTurn);
+      }
       if (goal?.source === "tethoq" && goal.status === "active"
         && (event.type === "agent.interrupted" || event.type === "agent.error" || event.payload.state === "failed")) {
         const recovering = event.type === "agent.error" && event.payload.recovery === "compact_context"
@@ -6187,16 +6375,17 @@ export class AgentBridge {
     } else if (globalSessionId !== undefined && (event.type === "session.status_changed" || event.type === "session.updated")) {
       void this.pumpDelegationsForSession(globalSessionId);
     }
-    if (globalSessionId !== undefined && (event.type === "message.started"
-      || ((event.type === "session.status_changed" || event.type === "session.updated") && event.payload.state === "working"))) {
-      void this.pumpCrossSessionInbox(globalSessionId);
-    }
     if (globalSessionId !== undefined && event.type === "tool.completed"
       && this.#goalContextRecoveries.get(globalSessionId)?.pending === false
       && !this.#compactingSessions.has(globalSessionId) && !providerToolStatusFailed(event.payload)) {
       // A new tool result proves that a model request succeeded after recovery.
       // A repeated rejection with no intervening work gets no second retry.
       this.#goalContextRecoveries.delete(globalSessionId);
+    }
+    if (globalSessionId !== undefined && event.type === "tool.completed"
+      && this.#sessionContextRecoveries.get(globalSessionId)?.pending === false
+      && !this.#compactingSessions.has(globalSessionId) && !providerToolStatusFailed(event.payload)) {
+      this.#sessionContextRecoveries.delete(globalSessionId);
     }
   }
 
@@ -6290,6 +6479,12 @@ export class AgentBridge {
       return;
     }
     if (runtime.task.state === "awaiting_dispatch" && runtime.task.orchestration === "parent") {
+      // A cold resume publishes the previous idle record before starting the
+      // accepted turn. Neither that snapshot nor a later stale catalogue update
+      // can prove completion while a send or an adapter-owned turn is active.
+      if (runtime.task.parentTurnAcceptedAt === undefined
+        || this.#pendingProviderSends.has(runtime.task.parentSessionId)
+        || this.sessionTurnInFlight(runtime.task.parentSessionId)) return;
       const parentState = this.#cache.get(runtime.task.parentSessionId)?.state;
       if (parentState === "idle" || parentState === "completed" || parentState === "failed") {
         runtime.task = {
@@ -6884,30 +7079,10 @@ export class AgentBridge {
 
   private reconcileGoalContinuations(providerId: string): void {
     for (const [sessionId, goal] of this.#goals) {
-      if (this.#cache.get(sessionId)?.providerId !== providerId) continue;
-      if (goal.source === "tethoq" && goal.status === "active" && [...this.#queueDeliveries.values()].some((delivery) =>
-        delivery.sessionId === sessionId && delivery.state === "unknown" && this.deliveryBelongsToGoal(delivery, goal))) {
-        // Preserve uncertainty within this activation across restart/dismissal,
-        // without letting an older send veto a new or explicitly resumed goal.
-        void this.setSessionGoal(sessionId, { status: "blocked" }).catch(() => undefined);
-      } else if (this.goalAwaitsContinuation(sessionId, goal)) {
+      if (this.#cache.get(sessionId)?.providerId === providerId && this.goalAwaitsContinuation(sessionId, goal)) {
         this.scheduleGoalContinuation(sessionId);
       }
     }
-  }
-
-  private activeGoalActivationId(sessionId: string): string | undefined {
-    const goal = this.#goals.get(sessionId);
-    return goal?.source === "tethoq" && goal.status === "active" ? goal.activationId : undefined;
-  }
-
-  private deliveryBelongsToGoal(delivery: QueueDeliveryRecord, goal: SessionGoal): boolean {
-    if (goal.activationId !== undefined || delivery.goalActivationId !== undefined) {
-      return goal.activationId === delivery.goalActivationId;
-    }
-    // Older persisted goals/deliveries have no activation IDs. Keep their
-    // current-run uncertainty, but exclude sends predating the objective.
-    return Date.parse(delivery.createdAt) >= Date.parse(goal.createdAt);
   }
 
   private goalAwaitsContinuation(sessionId: string, goal: SessionGoal): boolean {
@@ -6921,9 +7096,55 @@ export class AgentBridge {
   private canContinueGoal(sessionId: string, goal: SessionGoal): boolean {
     return this.goalAwaitsContinuation(sessionId, goal) && !this.sessionHoldsFollowUpQueue(sessionId)
       && !this.hasPendingUserQueue(sessionId) && !this.#queuePumps.has(sessionId)
-      && ![...this.#crossSessionMessages.values()].some((message) => message.envelope.targetSessionId === sessionId
-        && (message.state === "pending" || message.state === "sending"))
       && !this.#crossSessionPumps.has(sessionId) && !this.#pendingProviderSends.has(sessionId);
+  }
+
+  private recoverSessionContext(sessionId: string, ownedTurn: boolean): boolean {
+    const previous = this.#sessionContextRecoveries.get(sessionId);
+    if (previous !== undefined) return previous.pending;
+    const session = this.#cache.get(sessionId);
+    if (!ownedTurn || session === undefined || this.sessionIsStopped(sessionId) || this.#disposed) return false;
+    const adapter = this.requireAdapter(session.providerId);
+    if (adapter.compactSession === undefined) return false;
+    const recovery = { pending: true };
+    this.#sessionContextRecoveries.set(sessionId, recovery);
+    const failedSends = [...(this.#pendingProviderSends.get(sessionId) ?? [])];
+    const stopGeneration = this.#stopGenerations.get(sessionId);
+    const goal = this.#goals.get(sessionId);
+    const stillCurrent = () => !this.#disposed && this.#sessionContextRecoveries.get(sessionId) === recovery
+      && this.#stopGenerations.get(sessionId) === stopGeneration && !this.sessionIsStopped(sessionId)
+      && this.#goals.get(sessionId) === goal;
+    // Register the queue barrier now, but leave the serial event feed free to
+    // deliver native cleanup and the summary that releases it.
+    void this.compactSession(sessionId, "automatic").then(async () => {
+      await Promise.allSettled(failedSends);
+      if (!stillCurrent() || this.#pendingProviderSends.has(sessionId)
+        || this.#locallyOwnedActiveTurns.has(sessionId) || adapter.hasActiveTurn?.(session.providerSessionId) === true) return;
+      this.#cache.updateState(sessionId, "idle", false);
+      if (this.queuedMessages(sessionId).length > 0
+        || this.crossSessionInbox(sessionId).some((message) => message.state === "pending" || message.state === "sending")) return;
+      recovery.pending = false;
+      const result = await this.sendMessageInternal(sessionId, {
+        requestId: `context_recovery_${randomUUID()}`,
+        content: hiddenProviderControlContent("continue"),
+        developerInstructions: "The previous model request exceeded the provider's image capacity. Tethoq compacted older context. Resume the user's latest task from the recorded progress without repeating completed actions or asking the user to resend the same instruction. Original images remain in the conversation and on disk; use available image tools to inspect any original that is still needed. Do not claim to see an image that is no longer in your active context. This is an internal recovery, not a new user instruction or approval.",
+        ...(session.modelId !== undefined ? { modelId: session.modelId } : {}),
+        ...(session.reasoningEffort !== undefined ? { reasoningEffort: session.reasoningEffort } : {}),
+      }, false, undefined, undefined, recovery);
+      if (!result.accepted) throw new Error("The provider did not accept the recovered turn");
+    }).catch(() => {
+      if (!stillCurrent()) return;
+      this.#cache.updateState(sessionId, "failed", false);
+      this.#events.append({ type: "agent.error", providerId: session.providerId, sessionId,
+        payload: { code: "CONTEXT_RECOVERY_FAILED", message: "Automatic image-context recovery could not finish. Your conversation and images are preserved; retry when the provider is available." } });
+    }).finally(() => {
+      recovery.pending = false;
+      if (!this.#disposed) {
+        void this.pumpQueue(sessionId);
+        void this.pumpCrossSessionInbox(sessionId);
+      }
+    });
+    return true;
   }
 
   private recoverGoalContext(sessionId: string, goal: SessionGoal): boolean {
@@ -6932,7 +7153,6 @@ export class AgentBridge {
       || this.#disposed || this.requireAdapter(session.providerId).compactSession === undefined) return false;
     const previous = this.#goalContextRecoveries.get(sessionId);
     if (previous?.goal === goal) return previous.pending;
-    if (this.#compactingSessions.has(sessionId)) return false;
     const recovery = { goal, pending: true };
     this.#goalContextRecoveries.set(sessionId, recovery);
     const stopGeneration = this.#stopGenerations.get(sessionId);
@@ -6975,7 +7195,7 @@ export class AgentBridge {
           const result = await this.sendMessageInternal(sessionId, {
             requestId: `goal_continue_${randomUUID()}`,
             content: hiddenProviderControlContent("continue"),
-            developerInstructions: "Check the active goal's status against your latest response before doing more work. If you already verified success or established that further progress requires user input or an external change, use the goal tool specified below to mark it complete or blocked now, then give a brief final acknowledgement and end this turn. Do not restart work or attempt another improvement while blocked. This automatic continuation is not new user input, approval, or a change that removes a blocker. Only if the goal remains actionable, continue from the current work and previous results and make the next concrete improvement. This is an internal continuation, not a new user message.",
+            developerInstructions: "Check the active goal's status against your latest response before doing more work. Audit completion against the full objective and current evidence. If it is verified, use the goal tool specified below to mark it complete. Otherwise classify the previous turn as concrete progress, a verified wait on a specific live process or tool handle, or no progress. Revalidate a no-progress turn and take the next available safe action; do not repeat a status report or an unexecuted plan. Use blocked only when the three-turn blocked audit below is satisfied. An observation timeout is not proof that a live job stopped; inspect the same handle before restarting work. This automatic continuation is not new user input, approval, or a change that removes a blocker. Continue from the current work and previous results and make the next concrete improvement. This is an internal continuation, not a new user message.",
             ...(session.modelId !== undefined ? { modelId: session.modelId } : {}),
             ...(session.reasoningEffort !== undefined ? { reasoningEffort: session.reasoningEffort } : {}),
           }, false, undefined, goal);
@@ -7211,12 +7431,11 @@ export class AgentBridge {
   }
 
   private queueDeliveryTombstone(delivery: QueueDeliveryRecord): QueuedMessageRecord {
-    const displayContent = delivery.displayContent ?? delivery.content;
     return {
       view: {
         id: delivery.messageId,
         sessionId: delivery.sessionId,
-        content: displayContent === hiddenProviderControlContent("continue") ? "Continue task" : displayContent,
+        content: delivery.displayContent ?? delivery.content,
         mode: "queue",
         state: "failed",
         createdAt: delivery.queuedCreatedAt,
@@ -7253,7 +7472,6 @@ export class AgentBridge {
     if (existing?.state === "confirmed") {
       throw new ProviderAdapterError(providerId, "DELIVERY_ALREADY_CONFIRMED", "Provider history already contains this queued instruction", false);
     }
-    this.assertNoUncertainDeliveryContent(record.view.sessionId, record.view.content);
     const attachments = record.view.attachments.map(({ name, mimeType, byteLength, durationSeconds }) => ({
       name,
       mimeType,
@@ -7298,29 +7516,21 @@ export class AgentBridge {
     return prepared;
   }
 
-  private assertNoUncertainDeliveryContent(sessionId: string, displayContent: string, goalContinuation?: SessionGoal): void {
-    const displayContentHash = queueDeliveryContentHash(displayContent);
-    const unresolved = [...this.#queueDeliveries.values()].find((delivery) =>
-      delivery.sessionId === sessionId
-      && (goalContinuation === undefined || this.deliveryBelongsToGoal(delivery, goalContinuation))
-      && queueDeliveryContentHash(delivery.displayContent ?? delivery.content) === displayContentHash
-      && (delivery.state === "unknown" || delivery.state === "in_flight"));
-    if (unresolved !== undefined) {
-      throw new ProviderAdapterError(unresolved.providerId, "DELIVERY_UNKNOWN", unresolved.error ?? queueDeliveryUnknownMessage, false);
-    }
-  }
-
   private async prepareDirectDelivery(
     sessionId: string,
     providerId: string,
     providerSessionId: string,
     request: SendMessageRequest,
     displayContent: string,
-    goalContinuation?: SessionGoal,
   ): Promise<QueueDeliveryRecord> {
-    // Hidden continuation controls share text across runs. Explicit resume may
-    // send a fresh control; ordinary user instructions keep global replay protection.
-    this.assertNoUncertainDeliveryContent(sessionId, displayContent, goalContinuation);
+    const displayContentHash = queueDeliveryContentHash(displayContent);
+    const unresolved = [...this.#queueDeliveries.values()].find((delivery) =>
+      delivery.sessionId === sessionId
+      && queueDeliveryContentHash(delivery.displayContent ?? delivery.content) === displayContentHash
+      && (delivery.state === "unknown" || delivery.state === "in_flight"));
+    if (unresolved !== undefined) {
+      throw new ProviderAdapterError(providerId, "DELIVERY_UNKNOWN", unresolved.error ?? queueDeliveryUnknownMessage, false);
+    }
     const requestMatch = [...this.#queueDeliveries.values()].find((delivery) => delivery.requestId === request.requestId);
     if (requestMatch?.state === "confirmed") {
       throw new ProviderAdapterError(providerId, "DELIVERY_ALREADY_CONFIRMED", "Provider history already contains this instruction", false);
@@ -7401,11 +7611,8 @@ export class AgentBridge {
   }
 
   private async markQueueDeliveryInFlight(delivery: QueueDeliveryRecord): Promise<QueueDeliveryRecord> {
-    const { goalActivationId: _previousActivationId, ...withoutGoalActivation } = delivery;
-    const goalActivationId = this.activeGoalActivationId(delivery.sessionId);
     const inFlight: QueueDeliveryRecord = {
-      ...withoutGoalActivation,
-      ...(goalActivationId !== undefined ? { goalActivationId } : {}),
+      ...delivery,
       state: "in_flight",
       updatedAt: new Date().toISOString(),
     };
@@ -7437,24 +7644,28 @@ export class AgentBridge {
   }
 
   private async markQueueDeliveryUnknown(delivery: QueueDeliveryRecord, error: unknown): Promise<void> {
+    const latest = this.#queueDeliveries.get(delivery.messageId) ?? delivery;
+    if (latest.state === "confirmed") return;
     const failure = error instanceof Error && error.message.trim() ? error.message.trim() : queueDeliveryUnknownMessage;
     const unknown: QueueDeliveryRecord = {
-      ...delivery,
+      ...latest,
       state: "unknown",
       updatedAt: new Date().toISOString(),
       error: failure,
     };
     this.#queueDeliveries.set(delivery.messageId, unknown);
-    const goal = this.#goals.get(delivery.sessionId);
-    if (goal?.source === "tethoq" && goal.status === "active" && this.deliveryBelongsToGoal(delivery, goal)) {
-      // Delivery uncertainty stops automation even if a disconnected provider
-      // still owns the turn. That ownership must not keep the goal active or
-      // let a later idle/reconnect replay a possibly accepted instruction.
-      await this.setSessionGoal(delivery.sessionId, { status: "blocked" }).catch(() => undefined);
+    if (unknown.dismissedAt !== undefined) {
+      await this.persistQueueDeliveries().catch(() => undefined);
+      return;
     }
     const current = this.#queuedMessages.get(delivery.messageId);
     const tombstone = this.queueDeliveryTombstone(unknown);
-    this.#queuedMessages.set(delivery.messageId, tombstone);
+    // An uncertain handoff is not ownership transfer. Keep the queued upload
+    // and its private context while the read-only receipt reconciliation runs.
+    this.#queuedMessages.set(delivery.messageId, {
+      ...tombstone,
+      ...(current?.request !== undefined ? { request: current.request } : {}),
+    });
     if (current === undefined) this.appendQueueEvent("message.queued", tombstone.view);
     else if (JSON.stringify(current.view) !== JSON.stringify(tombstone.view)) this.appendQueueEvent("message.queue_updated", tombstone.view);
     // `in_flight` was durably written before provider dispatch. If this update
@@ -7463,7 +7674,7 @@ export class AgentBridge {
   }
 
   private async markQueueDeliveryConfirmed(delivery: QueueDeliveryRecord): Promise<void> {
-    const { error: _error, ...deliveryWithoutError } = delivery;
+    const { error: _error, ...deliveryWithoutError } = this.#queueDeliveries.get(delivery.messageId) ?? delivery;
     this.#queueDeliveries.set(delivery.messageId, {
       ...deliveryWithoutError,
       state: "confirmed",
@@ -7481,7 +7692,8 @@ export class AgentBridge {
     result: SendMessageResult,
   ): Promise<void> {
     const delivery = [...this.#queueDeliveries.values()].find((candidate) =>
-      candidate.sessionId === sessionId
+      candidate.source === "direct"
+      && candidate.sessionId === sessionId
       && candidate.requestId === requestId);
     if (delivery !== undefined) {
       await this.markQueueDeliveryConfirmed(delivery);
@@ -7511,8 +7723,21 @@ export class AgentBridge {
     const existing = this.#queueDeliveryReconciliations.get(sessionId);
     if (existing !== undefined) return await existing;
     const reconcile = (async () => {
+      const deliveries = [...this.#queueDeliveries.values()].filter(delivery => delivery.sessionId === sessionId && delivery.state === "unknown");
+      if (deliveries.length === 0) return;
       const { providerId, providerSessionId } = this.assertSessionHost(sessionId);
-      const messages = await this.requireAdapter(providerId).getMessages(providerSessionId);
+      const adapter = this.requireAdapter(providerId);
+      let messages: readonly RemoteMessage[];
+      if (adapter.getMessage !== undefined) {
+        const receipts: RemoteMessage[] = [];
+        // Keep startup recovery bounded when several old deliveries need checking.
+        for (let offset = 0; offset < deliveries.length; offset += 4) {
+          const results = await Promise.allSettled(deliveries.slice(offset, offset + 4).map(delivery => adapter.getMessage!(providerSessionId,
+            delivery.providerMessageId ?? (providerId === "opencode" ? openCodeMessageId(delivery.requestId) : delivery.requestId))));
+          for (const result of results) if (result.status === "fulfilled" && result.value !== undefined) receipts.push(result.value);
+        }
+        messages = receipts;
+      } else messages = await adapter.getMessages(providerSessionId);
       await this.reconcileQueueDeliveriesFromMessages(sessionId, messages);
     })().finally(() => {
       if (this.#queueDeliveryReconciliations.get(sessionId) === reconcile) this.#queueDeliveryReconciliations.delete(sessionId);
@@ -7528,19 +7753,24 @@ export class AgentBridge {
       && messages.some((message) => remoteMessageMatchesQueueDelivery(message, delivery)));
     if (matches.length === 0) return;
     const previous = new Map(matches.map((delivery) => [delivery.messageId, delivery]));
+    const confirmed = new Map<string, QueueDeliveryRecord>();
     const now = new Date().toISOString();
     for (const delivery of matches) {
       const { error: _error, ...deliveryWithoutError } = delivery;
-      this.#queueDeliveries.set(delivery.messageId, {
+      const receipt: QueueDeliveryRecord = {
         ...deliveryWithoutError,
         state: "confirmed",
         updatedAt: now,
-      });
+      };
+      confirmed.set(delivery.messageId, receipt);
+      this.#queueDeliveries.set(delivery.messageId, receipt);
     }
     try {
       await this.persistQueueDeliveries();
     } catch {
-      for (const [messageId, delivery] of previous) this.#queueDeliveries.set(messageId, delivery);
+      for (const [messageId, delivery] of previous) {
+        if (this.#queueDeliveries.get(messageId) === confirmed.get(messageId)) this.#queueDeliveries.set(messageId, delivery);
+      }
       return;
     }
     for (const delivery of matches) {
@@ -7555,9 +7785,6 @@ export class AgentBridge {
       });
       this.invalidateMessageSnapshot(sessionId);
     }
-    // The provider may already be idle: history confirmation must release the
-    // queue itself instead of waiting for a terminal event that already passed.
-    void this.pumpQueue(sessionId);
   }
 
   private syncProviderQueue(providerId: string, source: readonly unknown[]): void {
@@ -7660,6 +7887,7 @@ export class AgentBridge {
 
   private sessionHoldsFollowUpQueue(globalSessionId: string): boolean {
     if (this.sessionIsStopped(globalSessionId)) return true;
+    if (this.#sessionContextRecoveries.get(globalSessionId)?.pending === true) return true;
     if (this.#goalContextRecoveries.get(globalSessionId)?.pending === true) return true;
     if (this.#compactingSessions.has(globalSessionId) || this.#autoCompactions.has(globalSessionId)) return true;
     const session = this.#cache.get(globalSessionId);
@@ -7678,11 +7906,8 @@ export class AgentBridge {
   private async pumpQueue(globalSessionId: string): Promise<void> {
     if (this.#queuePumps.has(globalSessionId) || this.#disposed) return;
     if (this.sessionHoldsFollowUpQueue(globalSessionId)) return;
-    // Dismissal retains duplicate-delivery evidence for that instruction, not a
-    // hidden permanent hold on every subsequent user-authored queue entry.
     if ([...this.#queueDeliveries.values()].some((delivery) =>
-      delivery.sessionId === globalSessionId
-      && (delivery.state === "in_flight" || (delivery.state === "unknown" && delivery.dismissedAt === undefined)))) return;
+      delivery.sessionId === globalSessionId && (delivery.state === "unknown" || delivery.state === "in_flight"))) return;
     const next = [...this.#queuedMessages.values()]
       .filter((record) => !record.providerOwned
         && !this.#queueMutations.has(record.view.id)
@@ -7812,45 +8037,31 @@ export class AgentBridge {
     }
   }
 
-  private crossSessionDeliveryMode(targetSessionId: string, supportsSteering: boolean): "send" | "steer" | undefined {
-    if (this.#disposed || this.sessionIsStopped(targetSessionId)
-      || this.#goalContextRecoveries.get(targetSessionId)?.pending === true
-      || this.#compactingSessions.has(targetSessionId) || this.#autoCompactions.has(targetSessionId)
-      || this.hasPendingUserQueue(targetSessionId) || this.#queuePumps.has(targetSessionId)) return undefined;
-    const target = this.#cache.get(targetSessionId);
-    if (target === undefined || !this.isCrossSessionTask(target)) return undefined;
-    // Coordination must reach a long-running goal at the provider's normal
-    // steering boundary; waiting for the whole task can strand it for hours.
-    if (target.state === "working") return supportsSteering ? "steer" : undefined;
-    return this.sessionHoldsFollowUpQueue(targetSessionId) ? undefined : "send";
-  }
-
   private async pumpCrossSessionInbox(targetSessionId: string): Promise<void> {
     if (this.#crossSessionPumps.has(targetSessionId) || this.#disposed) return;
+    if (this.sessionHoldsFollowUpQueue(targetSessionId)) return;
     const target = this.#cache.get(targetSessionId);
     if (target === undefined || !this.isCrossSessionTask(target)) return;
+    if (target.state === "working" || target.state === "needs_approval" || target.state === "needs_input"
+      || target.state === "disconnected" || target.state === "unknown") return;
     if (this.hasPendingUserQueue(targetSessionId) || this.#queuePumps.has(targetSessionId)) return;
     const next = [...this.#crossSessionMessages.values()]
       .filter((message) => message.envelope.targetSessionId === targetSessionId && message.state === "pending")
-      .sort((left, right) => left.envelope.createdAt.localeCompare(right.envelope.createdAt))[0];
+      .sort((left, right) => left.envelope.createdAt.localeCompare(right.envelope.createdAt) || left.envelope.id.localeCompare(right.envelope.id))[0];
     if (next === undefined) return;
     this.#crossSessionPumps.add(targetSessionId);
-    let shouldRepump = false;
+    const sending: CrossSessionMessage = {
+      ...next,
+      state: "sending",
+      attemptCount: next.attemptCount + 1,
+      updatedAt: new Date().toISOString(),
+    };
+    this.#crossSessionMessages.set(next.envelope.id, sending);
     try {
-      const adapter = this.requireAdapter(target.providerId);
-      const supportsSteering = adapter.steerMessage !== undefined && (await adapter.getCapabilities()).steering;
-      if (this.crossSessionDeliveryMode(targetSessionId, supportsSteering) === undefined) return;
-      const sending: CrossSessionMessage = {
-        ...next,
-        state: "sending",
-        attemptCount: next.attemptCount + 1,
-        updatedAt: new Date().toISOString(),
-      };
-      this.#crossSessionMessages.set(next.envelope.id, sending);
       await this.persistCrossSessionMessages();
-      // Stop, attention, compaction and user queues can change during persistence.
-      const mode = this.crossSessionDeliveryMode(targetSessionId, supportsSteering);
-      if (mode === undefined) {
+      // A user can enqueue while the durable state write is in flight. Recheck
+      // immediately before provider dispatch so user-authored work stays first.
+      if (this.hasPendingUserQueue(targetSessionId) || this.#queuePumps.has(targetSessionId)) {
         this.#crossSessionMessages.set(next.envelope.id, { ...sending, state: "pending", updatedAt: new Date().toISOString() });
         await this.persistCrossSessionMessages();
         return;
@@ -7860,7 +8071,7 @@ export class AgentBridge {
         throw new Error("Cross-task delivery envelope no longer matches its persisted inbox record");
       }
       const deliveryRequestId = crossSessionDeliveryRequestId(next.envelope.id);
-      const request: SendMessageRequest = {
+      const result = await this.sendMessageInternal(targetSessionId, {
         requestId: deliveryRequestId,
         content: crossSessionDispatchContent(next.envelope),
         metadata: {
@@ -7869,21 +8080,7 @@ export class AgentBridge {
           tethoqEnvelopeId: next.envelope.id,
           tethoqSourceSessionId: next.envelope.sourceSessionId,
         },
-      };
-      let result: SendMessageResult;
-      try {
-        result = mode === "steer"
-          ? await this.steerMessage(targetSessionId, request)
-          : await this.sendMessageInternal(targetSessionId, request);
-      } catch (error) {
-        // A definitive no-active-turn rejection is safe to retry at idle. A
-        // timeout or ambiguous acceptance must never send a second instruction.
-        if (mode !== "steer" || !(error instanceof ProviderAdapterError) || error.code !== "NO_ACTIVE_TURN") throw error;
-        this.#crossSessionMessages.set(next.envelope.id, { ...sending, state: "pending", updatedAt: new Date().toISOString() });
-        await this.persistCrossSessionMessages();
-        shouldRepump = this.crossSessionDeliveryMode(targetSessionId, supportsSteering) === "send";
-        return;
-      }
+      });
       if (!result.accepted) throw new Error(result.details.join(" ") || "The target harness did not accept the cross-task message");
       const deliveredAt = new Date().toISOString();
       const delivered: CrossSessionMessage = {
@@ -7902,12 +8099,11 @@ export class AgentBridge {
         sessionId: targetSessionId,
         payload: delivered as unknown as JsonObject,
       });
-      shouldRepump = true;
     } catch (error) {
       const current = this.#crossSessionMessages.get(next.envelope.id);
       if (current?.state !== "delivered") {
         const failed: CrossSessionMessage = {
-          ...(current ?? next),
+          ...(current ?? sending),
           state: "failed",
           updatedAt: new Date().toISOString(),
           error: error instanceof Error ? error.message.slice(0, 2_000) : String(error).slice(0, 2_000),
@@ -7917,7 +8113,6 @@ export class AgentBridge {
       }
     } finally {
       this.#crossSessionPumps.delete(targetSessionId);
-      if (shouldRepump) void this.pumpCrossSessionInbox(targetSessionId);
     }
   }
 
@@ -8010,7 +8205,7 @@ export class AgentBridge {
 
   private async persistCrossSessionMessages(): Promise<void> {
     await this.#onCrossSessionMessagesChange?.([...this.#crossSessionMessages.values()]
-      .sort((left, right) => left.envelope.createdAt.localeCompare(right.envelope.createdAt)));
+      .sort((left, right) => left.envelope.createdAt.localeCompare(right.envelope.createdAt) || left.envelope.id.localeCompare(right.envelope.id)));
   }
 
   private requirePrimarySession(sessionId: string): RemoteSession {
@@ -8467,7 +8662,12 @@ export class AgentBridge {
 
   private beginInternalSessionCreation(providerId: string): void {
     const existing = this.#internalSessionCreations.get(providerId);
-    if (existing === undefined) this.#internalSessionCreations.set(providerId, { depth: 1, events: [] });
+    if (existing === undefined) this.#internalSessionCreations.set(providerId, {
+      depth: 1, events: [],
+      // A concurrent catalogue refresh may discover the new helper before its
+      // creation call returns. Only identities known before creation bypass it.
+      knownSessionIds: new Set(this.#cache.all().filter(session => session.providerId === providerId).map(session => session.id)),
+    });
     else existing.depth += 1;
   }
 
@@ -8902,6 +9102,9 @@ function observedExternalLaunchesFromPayload(payload: JsonObject): ObservedExter
 function copyBranchMessages(messages: readonly RemoteMessage[], branchSessionId: string): readonly RemoteMessage[] {
   return messages.map((message, index) => ({
     ...message,
+    status: message.status === "streaming" ? "failed" as const : message.status,
+    parts: message.parts.map((part) => (part.type === "tool" || part.type === "command" || part.type === "subagent") && (part.status === "pending" || part.status === "running")
+      ? { ...part, status: "failed" as const } : part),
     id: `${branchSessionId}:copied:${index + 1}`,
     sessionId: branchSessionId,
     providerMessageId: `copied:${message.providerMessageId}:${index + 1}`,
@@ -9399,14 +9602,18 @@ function foreignSubagentInstruction(): string {
     foreignSubagentMarker,
     "This Tethoq session is allowed to delegate work to subagents that run on a different coding tool (harness) than your own.",
     'To find a candidate task on another tool, call mesh_list_sessions with an optional "query" search string and a "limit" from 1 to 25; it returns tasks with their stable session IDs and harness names.',
-    'To send a subagent request to that task, call mesh_message_session with "target_session_id" (a session ID from mesh_list_sessions), "message" (the work request), and "request_id" (a stable unique ID for this send; reuse it only when retrying the same target and message). The other task receives the request through its own inbox after any queued user messages, using native steering during active work when supported.',
+    'To send a subagent request to that task, call mesh_message_session with "target_session_id" (a session ID from mesh_list_sessions), "message" (the work request), and "request_id" (a stable unique ID for this send; reuse it only when retrying the same target and message). The other task receives the request through its own inbox after its user-authored work.',
     'Manage existing delegated child sessions with mesh_list_children, mesh_message_child ("child_session_id", "message"), mesh_wait ("child_session_ids", "timeout_seconds"), and mesh_read_result ("child_session_id").',
     "This capability is per session. When it is off for a session you must not spawn or message foreign subagents with these tools; say plainly that cross-tool subagents are disabled for this task instead of working around the restriction.",
   ].join("\n");
 }
 
-function parentDelegationInstruction(task: DelegationTask, sharedToolServer: boolean, providerId: string): string {
-  const toolName = (name: string): string => providerId === "opencode" ? name.replace(/^mesh_/u, "uar_mesh_") : name;
+/** Preserve the meaning of inline chips in the provider's actual user message. */
+function parentDelegationPrompt(task: DelegationTask): string {
+  return meshParentPrompt(task.targets!, task.presentationSegments!);
+}
+
+function parentDelegationInstruction(task: DelegationTask, sharedToolServer: boolean): string {
   const targets = task.targets ?? [];
   const targetList = targets.map((target, index) =>
     `Target ${index}: ${target.providerId}${target.modelId === undefined ? "" : ` / ${target.modelId}`}${target.reasoningEffort === undefined ? "" : ` / ${target.reasoningEffort}`}`,
@@ -9415,14 +9622,15 @@ function parentDelegationInstruction(task: DelegationTask, sharedToolServer: boo
   return [
     `[[UAR_MESH_PREPARED:${task.id}]]`,
     "This private context applies only to the current user turn. The user intentionally inserted one or more Mesh target chips into their message.",
+    "The [Mesh target N: ...] references in the user message are the selected workers. Dispatch them before starting implementation or spawning your own native subagents. Native subagents are additional workers and cannot substitute for the selected targets. If dispatch fails, report that failure and do not claim the selected workers ran.",
     "Interpret the complete user request and the ordered presentation below, then rewrite one self-contained, target-specific assignment for every selected target in your own words. The target selections are already authorized by the bridge; never put provider, model, or reasoning fields in the tool call.",
     "Infer ownership from the order and position of each Mesh chip, nearby provider or model names, pronouns and references such as first, second, it, that model, or the other one, and the user's overall intent.",
     "Send each worker only the context and requested work relevant to that target. Never copy, quote, or forward the complete multi-target user message to a child, and do not include a sibling's work unless that target genuinely needs it for coordination.",
-    `Call ${toolName("mesh_dispatch_delegation")} with exactly "delegation_id" and "assignments". Each assignment must contain only "target_index" and "instruction", and target indexes must cover every target exactly once.`,
-    `Use exactly "delegation_id": ${JSON.stringify(task.id)}. This identifies the already-prepared delegation; never invent a new ID. If the tool reports an incorrect ID and supplies a correction, retry with that exact ID and your target-specific assignments.`,
-    `The dispatch result provides child_session_ids ready for ${toolName("mesh_wait")}. Use those same session IDs for ${toolName("mesh_read_result")} and ${toolName("mesh_message_child")}; delegation.children[].id is an internal child record ID, while delegation.children[].sessionId identifies its provider session.`,
+    'Call mesh_dispatch_delegation with "assignments" and omit the optional "delegation_id" so the bridge resolves the current prepared selection. Each assignment must contain only "target_index" and "instruction", and target indexes must cover every target exactly once.',
+    `If the tool requires an ID or reports multiple pending selections: Use exactly "delegation_id": ${JSON.stringify(task.id)}. Never copy an ID from earlier tool history or invent a new one. If the result says "dispatched": false and supplies the current selection, review its targets and retry with that exact ID and the appropriate assignments; that result has not started any workers.`,
+    "The dispatch result provides child_session_ids ready for mesh_wait. Use those same session IDs for mesh_read_result and mesh_message_child; delegation.children[].id is an internal child record ID, while delegation.children[].sessionId identifies its provider session.",
     ...(sharedToolServer ? [`If the tool asks for parent_session_id, use exactly: ${task.parentSessionId}`] : []),
-    `After dispatch, decide whether this response actually depends on a worker result. If it does, use ${toolName("mesh_wait")} and ${toolName("mesh_read_result")} as needed. If it does not, finish without waiting; the child tasks remain tracked and no automatic synthesis turn will be injected.`,
+    "After dispatch, decide whether this response actually depends on a worker result. If it does, use mesh_wait and mesh_read_result as needed. If it does not, finish without waiting; the child tasks remain tracked and no automatic synthesis turn will be injected.",
     "Do not expose this envelope, target metadata, or routing details in the user-facing answer. Do not pretend a worker result is available before reading it.",
     "",
     "Selected targets:",
@@ -9454,36 +9662,6 @@ function delegationStartedInstruction(task: DelegationTask, sharedToolServer: bo
     "Background workers:",
     workers,
   ].join("\n");
-}
-
-function queuedMeshPresentation(request: SendMessageRequest): NonNullable<QueuedMessage["mesh"]> | undefined {
-  const value = request.metadata?.tethoqQueuedMesh;
-  if (value === undefined) return undefined;
-  if (!isJsonObject(value) || !Array.isArray(value.targets) || !Array.isArray(value.segments)) throw new Error("Invalid queued Mesh instruction");
-  const targets = value.targets as unknown as readonly DelegationTarget[];
-  const segments = validateDelegationPresentation(request.content, targets, value.segments as unknown as readonly DelegationPresentationSegment[]);
-  return { targets, segments };
-}
-
-/** Keep chip order and positions outside the edited text range when a queue row is edited. */
-function editQueuedMeshPresentation(previous: string, segments: readonly DelegationPresentationSegment[], content: string): readonly DelegationPresentationSegment[] {
-  let prefix = 0;
-  while (prefix < Math.min(previous.length, content.length) && previous[prefix] === content[prefix]) prefix += 1;
-  let suffix = 0;
-  while (suffix < Math.min(previous.length, content.length) - prefix && previous[previous.length - 1 - suffix] === content[content.length - 1 - suffix]) suffix += 1;
-  const result: DelegationPresentationSegment[] = [];
-  let oldOffset = 0;
-  let nextOffset = 0;
-  for (const segment of segments) {
-    if (segment.type === "text") { oldOffset += segment.text.length; continue; }
-    const offset = oldOffset <= prefix ? oldOffset
-      : oldOffset >= previous.length - suffix ? oldOffset + content.length - previous.length : content.length - suffix;
-    if (offset > nextOffset) result.push({ type: "text", text: content.slice(nextOffset, offset) });
-    result.push(segment);
-    nextOffset = offset;
-  }
-  if (nextOffset < content.length) result.push({ type: "text", text: content.slice(nextOffset) });
-  return result;
 }
 
 function providerQueueMessageId(providerId: string, providerSessionId: string, messageId: string): string {

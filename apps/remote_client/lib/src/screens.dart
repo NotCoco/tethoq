@@ -25,20 +25,29 @@ import 'store.dart';
 import 'transport.dart';
 
 class StoreScope extends InheritedNotifier<RemoteAppStore> {
-  const StoreScope(
-      {required RemoteAppStore store, required super.child, super.key})
-      : super(notifier: store);
+  const StoreScope({
+    required this.store,
+    required super.child,
+    bool listenToChanges = true,
+    super.key,
+  }) : super(notifier: listenToChanges ? store : null);
+
+  final RemoteAppStore store;
+
+  @override
+  bool updateShouldNotify(StoreScope oldWidget) =>
+      !identical(store, oldWidget.store) || super.updateShouldNotify(oldWidget);
 
   static RemoteAppStore of(BuildContext context) {
     final scope = context.dependOnInheritedWidgetOfExactType<StoreScope>();
-    if (scope?.notifier == null) throw StateError('StoreScope is missing');
-    return scope!.notifier!;
+    if (scope == null) throw StateError('StoreScope is missing');
+    return scope.store;
   }
 
   static RemoteAppStore read(BuildContext context) {
     final scope = context.getInheritedWidgetOfExactType<StoreScope>();
-    if (scope?.notifier == null) throw StateError('StoreScope is missing');
-    return scope!.notifier!;
+    if (scope == null) throw StateError('StoreScope is missing');
+    return scope.store;
   }
 }
 
@@ -4602,6 +4611,7 @@ class _SessionScreenState extends State<SessionScreen>
   late final _ConversationScrollController _scrollController;
   final GlobalKey _conversationViewportKey = GlobalKey();
   final Map<String, GlobalKey> _timelineKeys = <String, GlobalKey>{};
+  final _presentation = _ConversationPresentationCache();
   RemoteAppStore? _store;
   String? _routeHostId;
   bool _routeOriginCaptured = false;
@@ -8545,6 +8555,7 @@ class _SessionScreenState extends State<SessionScreen>
     var pendingKeepOpen = false;
     var apiDraftTouched = false;
     String? apiDraftEndpoint;
+    String? apiDraftReasoningEffort;
 
     Future<void> refreshTargets(
         BuildContext sheetContext, StateSetter setSheetState) async {
@@ -8716,15 +8727,25 @@ class _SessionScreenState extends State<SessionScreen>
                 choice.target.providerId == 'direct' &&
                 choice.model.id.startsWith('$apiDraftEndpoint::'));
             final endpointModel = endpointModels
+                    .where((choice) => savedSelection?.providerId == 'direct' &&
+                        choice.model.id == savedSelection?.modelId).firstOrNull ?? endpointModels
                     .where((choice) => choice.model.isDefault).firstOrNull ??
                 endpointModels.firstOrNull;
             final currentSelection = !apiDraftTouched ? savedSelection
                 : endpointModel == null ? null
                 : VisionProxySelection(providerId: 'direct', modelId: endpointModel.model.id,
-                    reasoningEffort: _defaultConcreteReasoningEffort(endpointModel.model));
+                    reasoningEffort: apiDraftReasoningEffort ??
+                        (savedSelection?.providerId == 'direct' && savedSelection?.modelId == endpointModel.model.id
+                            ? savedSelection?.reasoningEffort : _defaultConcreteReasoningEffort(endpointModel.model)));
+            final selectedApiModel = currentSelection?.providerId == 'direct'
+                ? choices.where((choice) => choice.target.providerId == 'direct' &&
+                    choice.model.id == currentSelection?.modelId).firstOrNull?.model
+                : null;
+            final apiEfforts = selectedApiModel?.reasoningEfforts ?? const <ReasoningEffortOption>[];
             final apiDraftChanged = apiDraftTouched &&
                 (currentSelection?.modelId != savedSelection?.modelId ||
                  currentSelection?.providerId != savedSelection?.providerId ||
+                 currentSelection?.reasoningEffort != savedSelection?.reasoningEffort ||
                  (apiDraftEndpoint != null && endpointModel == null));
             final hydrating =
                 loading || statusSyncing || walletLoading.any((item) => item);
@@ -8911,6 +8932,7 @@ class _SessionScreenState extends State<SessionScreen>
                         setSheetState(() {
                           apiDraftTouched = true;
                           apiDraftEndpoint = active ? null : route.id;
+                          apiDraftReasoningEffort = null;
                           actionError = null;
                         });
                       }
@@ -8948,6 +8970,27 @@ class _SessionScreenState extends State<SessionScreen>
                           : toggle,
                       );
                     }),
+                  if (selectedApiModel != null && apiEfforts.isNotEmpty)
+                    ListTile(
+                      key: const Key('vision-api-reasoning'),
+                      title: const Text('Reasoning'),
+                      subtitle: Text(selectedApiModel.displayName),
+                      trailing: DropdownButton<String>(
+                        value: apiEfforts.any((option) => option.id == currentSelection?.reasoningEffort)
+                            ? currentSelection?.reasoningEffort : null,
+                        hint: const Text('Choose'),
+                        items: apiEfforts.map((option) => DropdownMenuItem(
+                          value: option.id,
+                          child: Text(_effortDisplayLabel(option.id, selectedApiModel.id, 'direct')),
+                        )).toList(),
+                        onChanged: configuring ? null : (value) => setSheetState(() {
+                          apiDraftTouched = true;
+                          apiDraftEndpoint = selectedApiModel.id.split('::').first;
+                          apiDraftReasoningEffort = value;
+                          actionError = null;
+                        }),
+                      ),
+                    ),
                   if (wallets.any((wallet) => wallet?.apiKeyConfigured == true))
                     Padding(padding: const EdgeInsets.fromLTRB(20, 8, 20, 12),
                       child: FilledButton(
@@ -8955,6 +8998,10 @@ class _SessionScreenState extends State<SessionScreen>
                             ? null : () {
                                 if (apiDraftEndpoint != null && endpointModel == null) {
                                   setSheetState(() => actionError = 'Visual models are unavailable. Retry discovery, then apply your selection.');
+                                  return;
+                                }
+                                if (apiEfforts.isNotEmpty && !apiEfforts.any((option) => option.id == currentSelection?.reasoningEffort)) {
+                                  setSheetState(() => actionError = 'Choose a reasoning level for EYES before saving.');
                                   return;
                                 }
                                 unawaited(applySelection(sheetContext, setSheetState, currentSelection));
@@ -9995,8 +10042,7 @@ class _SessionScreenState extends State<SessionScreen>
       if (action == _SourceSessionAction.handoff) {
         created = (await store.contextHandoff(session.id)).session;
       } else {
-        created = (await store.branchSession(session.id, prompt: result.prompt))
-            .session;
+        created = (await store.branchSession(session.id)).session;
       }
     } on Object catch (caught) {
       if (mounted &&
@@ -10016,7 +10062,7 @@ class _SessionScreenState extends State<SessionScreen>
     }
 
     var destinationDraftDurable = true;
-    if (action == _SourceSessionAction.handoff) {
+    if (result.prompt.isNotEmpty) {
       store.setDraft(created.id, result.prompt);
       try {
         await store.flushDraftJournal();
@@ -10031,7 +10077,7 @@ class _SessionScreenState extends State<SessionScreen>
       }
     }
     if (result.ownsRetainedDictation &&
-        (action == _SourceSessionAction.branch || destinationDraftDurable) &&
+        destinationDraftDurable &&
         mounted &&
         _routeOriginIsCurrent(store) &&
         (store.activeHost == null ||
@@ -10461,8 +10507,8 @@ class _SessionScreenState extends State<SessionScreen>
     final modelOptions = session == null
         ? const <RemoteModel>[]
         : store.modelsByProvider[session.providerId] ?? const <RemoteModel>[];
-    final sessionWorking = session?.state == 'working' ||
-        store.liveAssistantMessageFor(widget.sessionId) != null;
+    final liveAssistant = store.liveAssistantMessageFor(widget.sessionId);
+    final sessionWorking = session?.state == 'working' || liveAssistant != null;
     final mediaSize = MediaQuery.sizeOf(context);
     final mediaQuery = MediaQuery.of(context);
     final conversationLayoutRevision = Object.hash(
@@ -10570,39 +10616,16 @@ class _SessionScreenState extends State<SessionScreen>
               _BranchRelation(target, 'Branched to ${target.title}'),
           ];
     final history = store.messages[widget.sessionId] ?? const <RemoteMessage>[];
-    final liveAssistant = store.liveAssistantMessageFor(widget.sessionId);
-    final presentedHistory =
-        _messagesWithMeshPresentations(history, delegationTasks);
-    final identityMessages = <RemoteMessage>[
-      ...presentedHistory,
-      if (liveAssistant != null) liveAssistant,
-    ];
-    final shimmeringReasoningMessage = sessionWorking
-        ? <RemoteMessage>[
-            ...presentedHistory,
-            if (liveAssistant != null) liveAssistant,
-          ]
-            .reversed
-            .where((message) =>
-                message.status == 'streaming' &&
-                message.role.toLowerCase() == 'assistant' &&
-                message.parts.any((part) =>
-                    _assistantTextTone(part, false) ==
-                    _AssistantTextTone.privateReasoning))
-            .firstOrNull
-        : null;
-    final liveEvents = (store.events[widget.sessionId] ?? const <AgentEvent>[])
-        .where((event) =>
-            _showsConversationEvent(event.type) &&
-            !_eventHasStructuredSubagent(event))
-        .toList(growable: false);
-    final activityGroups = _groupConversationActivity(liveEvents);
-    final conversationItems = _conversationTimelineItems(
-      identityMessages,
-      activityGroups,
+    _presentation.update(
+      history,
+      store.events[widget.sessionId] ?? const <AgentEvent>[],
       delegationTasks,
+      liveAssistant,
       sessionWorking,
     );
+    final identityMessages = _presentation.messages;
+    final shimmeringReasoningMessage = _presentation.shimmeringReasoningMessage;
+    final conversationItems = _presentation.items;
     final sessionApprovals = store.approvals.values
         .where((approval) =>
             approval.sessionId == widget.sessionId && !approval.isExpired())
@@ -10615,39 +10638,9 @@ class _SessionScreenState extends State<SessionScreen>
         inputRequests.length +
         (contextCompacting ? 1 : 0);
     final conversationPresentationRevision = Object.hash(
-      _messagePresentationRevision(identityMessages),
-      Object.hashAll(liveEvents.map((event) => Object.hash(
-            event.eventId,
-            event.sequence,
-            event.type,
-            _presentationFingerprint(event.payload),
-          ))),
+      _presentation.revision,
       Object.hashAll(sessionApprovals.map((approval) => approval.requestId)),
       Object.hashAll(inputRequests.map((request) => request.requestId)),
-      Object.hashAll(delegationTasks.map((task) => Object.hash(
-            task.id,
-            task.state,
-            task.createdAt,
-            task.error,
-            task.orchestration,
-            task.parentTurnId,
-            Object.hashAll(task.targets.map((target) => Object.hash(
-                  target.providerId,
-                  target.modelId,
-                  target.reasoningEffort,
-                ))),
-            Object.hashAll(task.presentationSegments.map((segment) =>
-                Object.hash(segment.type, segment.text, segment.targetIndex))),
-            Object.hashAll(task.children.map((child) => Object.hash(
-                  child.id,
-                  child.sessionId,
-                  child.providerId,
-                  child.modelId,
-                  child.reasoningEffort,
-                  child.state,
-                  child.error,
-                ))),
-          ))),
       contextCompacting,
       sessionContext?.compactionKind,
     );
@@ -12706,7 +12699,7 @@ class _SourceSessionActionSheetState extends State<_SourceSessionActionSheet>
               Text(
                 handoff
                     ? 'Create a clean task with a compact summary of this chat.'
-                    : 'Create a new task from this point without changing the source chat.',
+                    : 'Copy this conversation into a paused task. It waits until you send a message.',
                 style: Theme.of(context).textTheme.bodyMedium,
               ),
               const SizedBox(height: 15),
@@ -12720,7 +12713,7 @@ class _SourceSessionActionSheetState extends State<_SourceSessionActionSheet>
                   labelText: 'Extra instruction (optional)',
                   hintText: handoff
                       ? 'What should the new task focus on?'
-                      : 'What should happen next in the new task?',
+                      : 'Saved as a draft in the new task',
                   border: const OutlineInputBorder(),
                   suffixIcon: IconButton(
                     key: const Key('source-action-dictation'),
@@ -15311,6 +15304,70 @@ List<RemoteMessage> _messagesWithMeshPresentations(
   return next;
 }
 
+// Store updates replace message/event/task values, while their containing
+// lists can be mutated in place. Retain shallow snapshots, not the live lists,
+// so appends, replacements, prepends and removals all invalidate correctly.
+// The cache lives only as long as this conversation screen.
+class _ConversationPresentationCache {
+  List<RemoteMessage> _history = const [];
+  List<RemoteMessage> _presentedHistory = const [];
+  List<AgentEvent> _events = const [];
+  List<RemoteDelegationTask> _delegations = const [];
+  List<_ActivityEventGroup> _activities = const [];
+  RemoteMessage? _live;
+  bool? _working;
+  int revision = 0;
+  List<RemoteMessage> messages = const [];
+  List<_ConversationTimelineItem> items = const [];
+  RemoteMessage? shimmeringReasoningMessage;
+
+  void update(
+    List<RemoteMessage> history,
+    List<AgentEvent> events,
+    List<RemoteDelegationTask> delegations,
+    RemoteMessage? live,
+    bool working,
+  ) {
+    final historyChanged = !listEquals(_history, history);
+    final eventsChanged = !listEquals(_events, events);
+    final delegationsChanged = !listEquals(_delegations, delegations);
+    if (!historyChanged &&
+        !eventsChanged &&
+        !delegationsChanged &&
+        identical(_live, live) &&
+        _working == working) return;
+    if (historyChanged || delegationsChanged) {
+      _history = List.of(history);
+      _delegations = List.of(delegations);
+      _presentedHistory = _messagesWithMeshPresentations(history, delegations);
+    }
+    if (eventsChanged) {
+      _events = List.of(events);
+      _activities = _groupConversationActivity(events
+          .where((event) =>
+              _showsConversationEvent(event.type) &&
+              !_eventHasStructuredSubagent(event))
+          .toList(growable: false));
+    }
+    _live = live;
+    _working = working;
+    messages = <RemoteMessage>[..._presentedHistory, if (live != null) live];
+    items =
+        _conversationTimelineItems(messages, _activities, delegations, working);
+    shimmeringReasoningMessage = working
+        ? messages.reversed
+            .where((message) =>
+                message.status == 'streaming' &&
+                message.role.toLowerCase() == 'assistant' &&
+                message.parts.any((part) =>
+                    _assistantTextTone(part, false) ==
+                    _AssistantTextTone.privateReasoning))
+            .firstOrNull
+        : null;
+    revision++;
+  }
+}
+
 List<_ConversationTimelineItem> _conversationTimelineItems(
   List<RemoteMessage> messages,
   List<_ActivityEventGroup> activities,
@@ -16847,7 +16904,7 @@ Future<void> _openMarkdownLink(BuildContext context, String? href) async {
   }
 }
 
-class _SafeMessageMarkdown extends StatelessWidget {
+class _SafeMessageMarkdown extends StatefulWidget {
   const _SafeMessageMarkdown({
     required this.text,
     required this.style,
@@ -16859,8 +16916,31 @@ class _SafeMessageMarkdown extends StatelessWidget {
   final ProviderVisualTheme visual;
 
   @override
+  State<_SafeMessageMarkdown> createState() => _SafeMessageMarkdownState();
+}
+
+class _SafeMessageMarkdownState extends State<_SafeMessageMarkdown> {
+  ThemeData? _theme;
+  Widget? _body;
+
+  @override
+  void didUpdateWidget(_SafeMessageMarkdown oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.text != widget.text ||
+        oldWidget.style != widget.style ||
+        oldWidget.visual != widget.visual) {
+      _body = null;
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    if (_body != null && _theme == theme) return _body!;
+    _theme = theme;
+    final text = widget.text;
+    final style = widget.style;
+    final visual = widget.visual;
     final body =
         style ?? theme.textTheme.bodyMedium ?? const TextStyle(fontSize: 15);
     final subdued = theme.colorScheme.onSurface.withValues(alpha: .66);
@@ -16946,7 +17026,7 @@ class _SafeMessageMarkdown extends StatelessWidget {
     );
     // This renderer has no WebView/HTML execution path. Markdown images are
     // also replaced with inert references so remote content never loads itself.
-    return MarkdownBody(
+    return _body = MarkdownBody(
       data: text,
       selectable: true,
       styleSheet: sheet,

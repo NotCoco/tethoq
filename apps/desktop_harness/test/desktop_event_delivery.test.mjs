@@ -1,71 +1,64 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import test from "node:test";
-import vm from "node:vm";
-import ts from "typescript";
+import { mkdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { setImmediate as nextLoop } from "node:timers/promises";
+import test, { after } from "node:test";
+import { build } from "esbuild";
 
-// Exercise the actual runtime methods with a deterministic event-loop queue;
-// no Electron process, real provider or periodic heartbeat is needed.
-const source = await readFile(new URL("../src/main/runtime.ts", import.meta.url), "utf8");
-const tree = ts.createSourceFile("runtime.ts", source, ts.ScriptTarget.Latest, true);
-const runtime = tree.statements.find(node => ts.isClassDeclaration(node) && node.name?.text === "DesktopRuntime");
-const methods = ["queueEventFlush", "pollEvents"].map(name => {
-  const method = runtime.members.find(node => ts.isMethodDeclaration(node) && node.name.getText(tree) === name);
-  assert.ok(method, `Runtime method ${name} exists`);
-  return method.getText(tree);
-}).join("\n");
-const maximumBatch = source.match(/const MAX_EVENT_BATCH = (\d+);/u)?.[1];
-assert.ok(maximumBatch);
-const code = ts.transpileModule(`
-  const MAX_EVENT_BATCH = ${maximumBatch};
-  class RuntimeDeliveryFixture {
-    #bridge; #onEvents; #disposed = false; #eventFlushQueued = false; #latestSequence = 0;
-    constructor(bridge, onEvents) { this.#bridge = bridge; this.#onEvents = onEvents; }
-    notify() { this.queueEventFlush(); }
-    dispose() { this.#disposed = true; }
-    ${methods}
-  }
-  globalThis.RuntimeDeliveryFixture = RuntimeDeliveryFixture;
-`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+const appRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+const outputDirectory = join(tmpdir(), `tethoq-event-delivery-${process.pid}-${Date.now()}`);
+const bundle = join(outputDirectory, "events.mjs");
+await mkdir(outputDirectory, { recursive: true });
+after(() => rm(outputDirectory, { recursive: true, force: true }));
+await build({
+  stdin: { resolveDir: appRoot, contents: `
+    export { DesktopEventDelivery } from "./src/main/event_delivery.ts";
+    export { EventReplayBuffer } from "../../packages/protocol/src/event_buffer.ts";
+  `, loader: "ts" },
+  outfile: bundle, bundle: true, format: "esm", platform: "node", target: "node22",
+});
+const { DesktopEventDelivery, EventReplayBuffer } = await import(pathToFileURL(bundle).href);
 
-function fixture() {
-  const callbacks = [], pending = [], batches = [];
-  let sequence = 0;
-  const context = vm.createContext({ setImmediate: callback => callbacks.push(callback) });
-  vm.runInContext(code, context);
-  const bridge = { eventReplaySince: cursor => ({ events: pending.filter(event => event.sequence > cursor), latestSequence: sequence, replayGap: false }) };
-  const delivery = new context.RuntimeDeliveryFixture(bridge, batch => batches.push(batch));
-  return {
-    delivery, batches, callbacks,
-    append(type) { pending.push({ sequence: ++sequence, type }); delivery.notify(); },
-    tick() { assert.ok(callbacks.length, "a flush is scheduled"); callbacks.shift()(); },
-  };
-}
-
-test("a burst drains bounded batches promptly through text, coordination and completion", () => {
-  const run = fixture();
-  for (let index = 0; index < 1000; index++) run.append("message.delta");
-  run.append("message.remote_received"); run.append("agent.completed");
-  assert.equal(run.callbacks.length, 1, "native event bursts coalesce into one scheduled flush");
-  for (let index = 0; index < 6; index++) run.tick();
-  assert.deepEqual(run.batches.map(batch => batch.events.length), [200, 200, 200, 200, 200, 2]);
-  const delivered = run.batches.flatMap(batch => batch.events);
-  assert.equal(delivered.length, 1002);
-  assert.equal(delivered.at(-2).type, "message.remote_received");
-  assert.equal(delivered.at(-1).type, "agent.completed");
-  assert.deepEqual(delivered.map(event => event.sequence), Array.from({ length: 1002 }, (_, index) => index + 1));
-  assert.equal(run.callbacks.length, 0, "the drain stops when caught up");
+test("a tool-output burst delivers its final answer and idle without waiting for a heartbeat", async (t) => {
+  const buffer = new EventReplayBuffer("host-events");
+  const batches = [];
+  const delivery = new DesktopEventDelivery(sequence => buffer.replaySince(sequence), batch => batches.push(batch));
+  t.after(() => delivery.dispose());
+  const unsubscribe = buffer.subscribe(() => delivery.schedule());
+  t.after(unsubscribe);
+  for (let index = 0; index < 1_000; index += 1) buffer.append({ type: "command.output", payload: { text: String(index) } });
+  buffer.append({ type: "message.completed", payload: { text: "Done" } });
+  buffer.append({ type: "agent.completed" });
+  assert.equal(batches.length, 0, "a burst should coalesce before delivering to Electron");
+  for (let turn = 0; turn < 8; turn += 1) await nextLoop();
+  const events = batches.flatMap(batch => batch.events);
+  assert.deepEqual(events.map(event => event.sequence), Array.from({ length: 1_002 }, (_, index) => index + 1));
+  assert.equal(events.at(-1).type, "agent.completed");
+  assert.ok(batches.every(batch => batch.events.length <= 200), "main-process work must yield between bounded IPC batches");
+  for (const batch of batches) assert.equal(batch.latestSequence, batch.events.at(-1).sequence, "a batch must not skip buffered events in its cursor");
+  delivery.flush();
+  assert.equal(batches.flatMap(batch => batch.events).length, 1_002, "a later heartbeat must not replay the burst");
 });
 
-test("events appended between batches stay ordered and disposal cancels pending delivery", () => {
-  const run = fixture();
-  for (let index = 0; index < 210; index++) run.append("message.delta");
-  run.tick(); run.append("agent.completed");
-  assert.equal(run.callbacks.length, 1, "a new append shares the pending drain");
-  run.tick();
-  assert.equal(run.batches[1].events.length, 11);
-  assert.equal(run.batches[1].events.at(-1).sequence, 211);
-  run.append("message.delta"); run.delivery.dispose(); run.tick();
-  assert.equal(run.batches.length, 2);
-  assert.equal(run.callbacks.length, 0);
+test("reconnect gaps, newly appended events, and shutdown preserve delivery ordering", async () => {
+  const buffer = new EventReplayBuffer("host-reconnect", 401);
+  for (let index = 0; index < 800; index += 1) buffer.append({ type: "message.delta" });
+  const batches = [];
+  const delivery = new DesktopEventDelivery(sequence => buffer.replaySince(sequence), batch => {
+    batches.push(batch);
+    if (batches.length === 1) buffer.append({ type: "agent.completed" });
+  });
+  const unsubscribe = buffer.subscribe(() => delivery.schedule());
+  try {
+    delivery.schedule();
+    for (let turn = 0; turn < 5; turn += 1) await nextLoop();
+    assert.deepEqual(batches.flatMap(batch => batch.events).map(event => event.sequence), Array.from({ length: 402 }, (_, index) => index + 400));
+    assert.deepEqual(batches.map(batch => batch.replayGap), [true, false, false]);
+    buffer.append({ type: "message.delta" });
+    delivery.dispose();
+    await nextLoop();
+    assert.equal(batches.at(-1).latestSequence, 801, "shutdown must cancel pending IPC delivery");
+  } finally { unsubscribe(); delivery.dispose(); }
 });

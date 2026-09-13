@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { watch, type FSWatcher } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { open, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, extname, join } from "node:path";
+import { basename, dirname, extname, isAbsolute, join } from "node:path";
 import { connect, type Socket } from "node:net";
 
 import {
@@ -445,10 +445,40 @@ export class CodexDesktopQueue {
     });
   }
 
-  public async cancel(providerSessionId: string, messageId: string): Promise<boolean> {
+  public async readMessage(providerSessionId: string, messageId: string): Promise<SendMessageRequest | null> {
+    return await this.withMutation(async () => {
+      const message = (await this.readState())[providerSessionId]?.find(item => item.id === messageId);
+      if (!message) return null;
+      const sources: { info: ProviderQueuedMessageAttachment; source: Record<string, unknown> }[] = [];
+      nativeQueuedAttachments(message.context, (info, source) => sources.push({ info, source }));
+      const attachments = [];
+      for (const { info, source } of sources) {
+        let dataBase64 = [source.uploadSrc, source.src, source.imageDataUrl, source.dataUrl, source.previewSrc]
+          .map(value => typeof value === "string" ? value.match(/^data:[^;,]+;base64,([A-Za-z0-9+/]*={0,2})$/u)?.[1] : undefined)
+          .find(value => value !== undefined && (info.byteLength === 0 || Buffer.byteLength(value, "base64") === info.byteLength));
+        if (dataBase64 === undefined) {
+          const path = firstString(source.localPath, source.path, source.imagePath);
+          if (!path || !isAbsolute(path) || path.startsWith("\\\\") || path.startsWith("//")) throw new Error(`Cannot restore the original attachment: ${info.name}`);
+          const file = await open(path, "r");
+          try {
+            const stat = await file.stat();
+            if (!stat.isFile() || stat.size > 25 * 1024 * 1024) throw new Error("The queued attachment is unavailable or exceeds 25 MB");
+            dataBase64 = (await file.readFile()).toString("base64");
+          } finally { await file.close(); }
+        }
+        const byteLength = Buffer.byteLength(dataBase64, "base64");
+        if (byteLength > 25 * 1024 * 1024 || info.byteLength > 0 && info.byteLength !== byteLength) throw new Error(`The original queued attachment is unavailable: ${info.name}`);
+        attachments.push({ name: info.name, mimeType: info.mimeType, byteLength, dataBase64 });
+      }
+      return { requestId: message.id, content: message.text, attachments };
+    });
+  }
+
+  public async cancel(providerSessionId: string, messageId: string, expectedContent?: string): Promise<boolean> {
     return await this.withMutation(async () => {
       const state = await this.readState();
       const current = state[providerSessionId] ?? [];
+      if (expectedContent !== undefined && current.find(item => item.id === messageId)?.text !== expectedContent) return false;
       const next = current.filter((message) => message.id !== messageId);
       if (next.length === current.length) return false;
       await this.replaceConversationQueue(providerSessionId, state, next);
@@ -900,7 +930,10 @@ function normalizeQueuedMessage(providerSessionId: string, message: DesktopQueue
   };
 }
 
-function nativeQueuedAttachments(context: Record<string, unknown>): readonly ProviderQueuedMessageAttachment[] {
+function nativeQueuedAttachments(
+  context: Record<string, unknown>,
+  onAttachment?: (info: ProviderQueuedMessageAttachment, source: Record<string, unknown>) => void,
+): readonly ProviderQueuedMessageAttachment[] {
   const result: ProviderQueuedMessageAttachment[] = [];
   let previewCharacters = 0;
   const seen = new Set<string>();
@@ -924,13 +957,15 @@ function nativeQueuedAttachments(context: Record<string, unknown>): readonly Pro
     const key = `${name}\u0000${mimeType}\u0000${byteLength}\u0000${preview ?? ""}`;
     if (seen.has(key)) return;
     seen.add(key);
-    result.push({
+    const info: ProviderQueuedMessageAttachment = {
       name,
       mimeType,
       byteLength,
       ...(preview !== undefined ? { dataUrl: preview } : {}),
       ...(durationSeconds !== undefined ? { durationSeconds } : {}),
-    });
+    };
+    result.push(info);
+    onAttachment?.(info, value);
   };
   const appendArray = (value: unknown, fallbackName: string, fallbackMimeType: string): void => {
     if (!Array.isArray(value)) return;

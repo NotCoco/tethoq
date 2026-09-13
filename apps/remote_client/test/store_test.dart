@@ -953,6 +953,7 @@ void main() {
     });
     expect(branch.strategy, 'transcript_bootstrap');
     expect(branch.copiedMessageCount, 7);
+    expect(store.drafts[branch.session.id], 'Try the alternative implementation.');
     expect(store.selectedSession?.id, 'host/fake/branch');
   });
 
@@ -2212,6 +2213,36 @@ void main() {
     expect(store.messages[_sessionId]!.last.parts.single.summary,
         'Live assistant message');
     expect(store.liveAssistantMessageFor(_sessionId), isNull);
+  });
+
+  test('presenting an image does not consume or finish the live assistant', () {
+    final store = RemoteAppStore();
+    addTearDown(store.dispose);
+    store.sessions.add(RemoteSession(
+      id: _sessionId,
+      hostId: 'host',
+      providerId: 'fake',
+      providerSessionId: 'session-one',
+      title: 'Image task',
+      state: 'working',
+      lastActivityAt: DateTime.utc(2026, 8, 10, 10),
+      needsApproval: false,
+      stale: false,
+    ));
+    store.applyEventForTesting(_eventWithPayload(
+        'message.delta', 1, const <String, Object?>{'text': 'Still explaining'}));
+    store.applyEventForTesting(_eventWithPayload(
+        'message.completed', 2, const <String, Object?>{
+      'messageId': 'presented_image_test',
+      'role': 'assistant',
+      'text': 'An image caption',
+      'tethoqPresentedImage': true,
+      'requiresHistoryRefresh': true,
+    }));
+    expect(store.sessions.single.state, 'working');
+    expect(store.liveAssistantMessageFor(_sessionId)!.parts.single.summary,
+        'Still explaining');
+    expect(store.messages[_sessionId] ?? <RemoteMessage>[], isEmpty);
   });
 
   test('terminal completion settles the live assistant immediately', () {

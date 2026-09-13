@@ -51,17 +51,6 @@ test("OpenCode mesh tools install with session-scoped context outside the real u
   assert.match(source, /private turn-scoped Tethoq guidance/);
   assert.match(source, /args: \{ request: tool\.schema\.string\(\)\.min\(1\)\.max\(8000\) \}/);
   assert.doesNotMatch(source, /export const ask_eyes/);
-  const turnSupportStart = source.indexOf("export const tethoq_turn_support");
-  const turnSupportEnd = source.indexOf("\n})", turnSupportStart);
-  assert.ok(turnSupportStart >= 0 && turnSupportEnd > turnSupportStart);
-  // The execute path may reference the shared sanitized transport failure and
-  // the not-configured classifier, but the visible definition itself must not
-  // describe the private capability.
-  const turnSupportBlock = source.slice(turnSupportStart, turnSupportEnd)
-    .replaceAll("eyesTransportFailure", "")
-    .replaceAll("RuntimeEyesNotConfiguredError", "");
-  assert.doesNotMatch(turnSupportBlock, /eyes|image|visual|ask_eyes/iu,
-    "the model-visible OpenCode definition must not reveal the private turn capability");
   assert.match(source, /const eyesTransportFailure = "EYES could not inspect the image\. Try again or choose another EYES model\."/,
     "unreachable EYES transport must surface one sanitized failure, never a raw pipe diagnostic");
   const expectedBrowserTools = [
@@ -116,6 +105,8 @@ const tool = Object.assign((definition) => definition, { schema: {
     readonly args: Record<string, unknown>;
   }>;
   const browserTools = Object.fromEntries(Object.entries(loaded).filter(([name]) => name.startsWith("browser_")));
+  assert.doesNotMatch(JSON.stringify(loaded.tethoq_turn_support), /eyes|image|visual|ask_eyes/iu,
+    "the model-visible schema must not reveal the private turn capability");
   assert.deepEqual(Object.keys(browserTools).sort(), [
     "browser_activate", "browser_back", "browser_capture", "browser_click", "browser_close",
     "browser_forward", "browser_get_state", "browser_inspect", "browser_inspect_all", "browser_navigate",
@@ -137,7 +128,10 @@ const tool = Object.assign((definition) => definition, { schema: {
     assert.match(definition.description, /browser|page|tab/iu, `${name} needs model-visible browser guidance`);
   }
   assert.deepEqual(loaded.tethoq_goal?.args.status, { kind: "enum", values: ["complete", "blocked"], isOptional: true });
-  assert.match(loaded.tethoq_goal!.description, /stop its automatic prompts/);
+  assert.match(loaded.tethoq_goal!.description, /Blocking stops automatic prompts/);
+  assert.match(loaded.tethoq_goal!.description, /three consecutive goal turns/);
+  assert.deepEqual(Object.keys(loaded.tethoq_show_image!.args), ["path", "caption", "request_id"]);
+  assert.match(loaded.tethoq_show_image!.description, /inline in this task/);
 });
 
 test("OpenCode mesh finds the task-owning runtime without masking real EYES failures", async (context) => {

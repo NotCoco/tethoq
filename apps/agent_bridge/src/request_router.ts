@@ -286,7 +286,10 @@ function toJson(value: unknown): JsonObject {
 }
 
 function clientSession(session: RemoteSession): Omit<RemoteSession, "nativeMetadata"> & { readonly nativeMetadata: JsonObject } {
-  return { ...session, nativeMetadata: {} };
+  // The stopped-state timestamp drives Continue. Transcript bootstraps and all
+  // other provider metadata remain private.
+  const interruptedAt = session.nativeMetadata.tethoqInterruptedAt;
+  return { ...session, nativeMetadata: session.state === "idle" && typeof interruptedAt === "string" ? { tethoqInterruptedAt: interruptedAt } : {} };
 }
 
 const clientMessageBudgetBytes = 384 * 1024;
@@ -397,6 +400,7 @@ function clientMessageMetadata(message: RemoteMessage): JsonObject {
     || message.nativeMetadata.mode === "compaction" || message.nativeMetadata.agent === "compaction");
   return {
     ...(phase === "commentary" || phase === "final_answer" ? { phase } : {}),
+    ...(message.nativeMetadata.tethoqPresentedImage === true ? { tethoqPresentedImage: true } : {}),
     ...(compaction ? { summary: true } : {}),
   };
 }
@@ -516,6 +520,9 @@ export class BridgeRequestRouter {
   }
 
   public handle(request: RequestEnvelope): Promise<ResponseEnvelope> {
+    // Versioned reads are safe to repeat. Do not retain full attachment chunks
+    // in the ten-minute mutation ledger after they have returned to the composer.
+    if (request.type === "message_queue.draft_attachment") return this.execute(request);
     const previous = this.#ledger.get(request.requestId);
     if (previous !== undefined) return previous;
     const result = this.execute(request);
@@ -714,7 +721,11 @@ export class BridgeRequestRouter {
         const input = record(payload, "payload");
         const offset = input.offset === undefined ? 0 : input.offset;
         if (typeof offset !== "number") throw new Error("offset must be a number");
-        return this.#images.chunk(stringField(input, "sessionId"), stringField(input, "retrievalId"), offset);
+        const sessionId = stringField(input, "sessionId");
+        const retrievalId = stringField(input, "retrievalId");
+        return retrievalId.startsWith("presented_image_")
+          ? await this.bridge.presentedImageChunk(sessionId, retrievalId, offset)
+          : this.#images.chunk(sessionId, retrievalId, offset);
       }
       case "session.children": {
         const input = record(payload, "payload");
@@ -810,17 +821,6 @@ export class BridgeRequestRouter {
       case "delegation.prepare": {
         const input = record(payload, "payload");
         const targets = delegationTargets(input.targets);
-        const mode = input.mode ?? "send";
-        if (mode !== "send" && mode !== "queue" && mode !== "steer") throw new Error("Invalid Mesh delivery mode");
-        if (mode === "queue") {
-          return toJson({ message: await this.bridge.enqueueDelegation(
-            stringField(input, "parentSessionId"), textField(input, "prompt"), targets,
-            delegationPresentationSegments(input.presentationSegments), requestId,
-            { ...(typeof input.modelId === "string" && input.modelId.trim() ? { modelId: input.modelId.trim() } : {}),
-              ...(typeof input.reasoningEffort === "string" && input.reasoningEffort.trim() ? { reasoningEffort: input.reasoningEffort.trim() } : {}) },
-            input.goal === true,
-          ) });
-        }
         return toJson(await this.bridge.prepareDelegation(
           stringField(input, "parentSessionId"),
           textField(input, "prompt"),
@@ -833,7 +833,6 @@ export class BridgeRequestRouter {
               ? { reasoningEffort: input.reasoningEffort.trim() }
               : {}),
           },
-          { mode },
         ));
       }
       case "delegation.start": {
@@ -992,7 +991,14 @@ export class BridgeRequestRouter {
       }
       case "message_queue.cancel": {
         const input = record(payload, "payload");
-        return { cancelled: await this.bridge.cancelQueuedMessage(stringField(input, "messageId")) };
+        return { cancelled: await this.bridge.cancelQueuedMessage(stringField(input, "messageId"), input.draftVersion === undefined ? undefined : stringField(input, "draftVersion")) };
+      }
+      case "message_queue.draft": {
+        return await this.bridge.readQueuedDraft(stringField(payload, "messageId"));
+      }
+      case "message_queue.draft_attachment": {
+        if (typeof payload.index !== "number" || typeof payload.offset !== "number") throw new Error("Invalid attachment chunk");
+        return this.bridge.queuedDraftAttachment(stringField(payload, "messageId"), stringField(payload, "version"), payload.index, payload.offset);
       }
       case "message_queue.edit": {
         const input = record(payload, "payload");

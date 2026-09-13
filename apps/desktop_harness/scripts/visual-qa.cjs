@@ -1441,6 +1441,9 @@ async function capture(viewport) {
       } : null;
     })()`, true);
     const waitForChildLabel = async (expected) => await window.webContents.executeJavaScript(`new Promise((resolve, reject) => {
+      // State transitions are explicit: selecting a task now preloads its
+      // children, so request counts no longer describe user-visible progress.
+      document.body.dataset.qaSubagentState = ${JSON.stringify(expected.toLowerCase())};
       const started = Date.now();
       const check = () => {
         const row = document.querySelector('.session-subagents-popover > button');

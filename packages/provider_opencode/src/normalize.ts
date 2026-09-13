@@ -1,4 +1,5 @@
 import { basename } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
   makeGlobalSessionId,
   type ContentPart,
@@ -20,19 +21,20 @@ export function asJsonObject(value: unknown): JsonObject {
 }
 
 /** Read the documented error message, never transport bodies, headers or metadata. */
-export function normalizeOpenCodeError(value: unknown): { message: string; code: string; recovery?: "compact_context" } {
+export function normalizeOpenCodeError(value: unknown): { message: string; code: string; recovery?: "compact_context"; imageLimit?: number } {
   const error = isRecord(value) ? value : {};
   const data = isRecord(error.data) ? error.data : {};
   const raw = [data.message, error.message, value].find((item): item is string => typeof item === "string" && item.trim().length > 0);
   const code = typeof error.name === "string" ? error.name : "ProviderError";
-  const imageLimit = raw?.match(/request contains (\d+) images, exceeding the maximum of (\d+) allowed per request/iu);
+  const imageLimit = raw?.match(/request contains (\d+) images, exceeding the maximum of (\d+) allowed per request/iu)
+    ?? raw?.match(/too many images in request:\s*(\d+)\s*>\s*(\d+)\b/iu);
   if (code === "APIError" && (data.statusCode === 400 || data.statusCode === 413) && imageLimit
     && Number.isSafeInteger(Number(imageLimit[1])) && Number.isSafeInteger(Number(imageLimit[2]))
     && Number(imageLimit[2]) > 0 && Number(imageLimit[1]) > Number(imageLimit[2])) {
     return {
       code: "IMAGE_LIMIT_EXCEEDED",
-      message: `The conversation contains ${imageLimit[1]} images, but this provider allows ${imageLimit[2]} per request. Compact the older context before continuing; the conversation and original files will remain available.`,
-      recovery: "compact_context",
+      message: `This request contains ${imageLimit[1]} images, but this provider allows ${imageLimit[2]} per request. Send fewer images in this turn. Older images remain available by filename until the temporary cache expires.`,
+      imageLimit: Number(imageLimit[2]),
     };
   }
   const message = raw?.replace(/Bearer\s+\S+|\bsk-[\w-]+/giu, "[redacted]")
@@ -548,11 +550,72 @@ function isHiddenControlUserEntry(entry: Record<string, unknown>): boolean {
   return parts.some((part) => isRecord(part) && part.type === "text" && isHiddenControlText(part.text));
 }
 
+function compactionReplayPart(value: unknown, stripMedia = false): unknown {
+  if (!isRecord(value)) return value;
+  if (stripMedia && value.type === "file" && typeof value.mime === "string"
+    && (value.mime.startsWith("image/") || value.mime === "application/pdf")) {
+    return { type: "text", text: `[Attached ${value.mime}: ${value.filename ?? "file"}]` };
+  }
+  return Object.fromEntries(Object.entries(value).filter(([key]) => key !== "id" && key !== "messageID" && key !== "sessionID"));
+}
+
+/**
+ * OpenCode auto-overflow compaction clones the preceding prompt with new IDs,
+ * replacing image/PDF parts with attachment text. These copies are model input,
+ * not a second user action. Require the completed native compaction, the copied
+ * request settings, and matching parts; repeated prose alone is not evidence.
+ */
+function compactionReplayUserIds(entries: readonly unknown[]): ReadonlySet<string> {
+  type UserEntry = { info: Record<string, unknown>; parts: readonly unknown[] };
+  const hidden = new Set<string>();
+  let previousUser: UserEntry | undefined;
+  let compaction: { id: string; original: UserEntry; completedAt?: number } | undefined;
+  for (const entry of entries) {
+    if (!isRecord(entry)) continue;
+    const info = isRecord(entry.info) ? entry.info : entry;
+    const parts = Array.isArray(entry.parts) ? entry.parts : [];
+    const time = isRecord(info.time) ? info.time : {};
+    if (info.role === "user") {
+      const marker = parts.find((part) => isRecord(part) && part.type === "compaction");
+      if (isRecord(marker)) {
+        compaction = marker.auto === true && marker.overflow === true && previousUser && typeof info.id === "string"
+          ? { id: info.id, original: previousUser } : undefined;
+        continue;
+      }
+      // Our submitted prompts use openCodeMessageId's deterministic request hash;
+      // native compaction replays receive fresh OpenCode IDs instead.
+      if (compaction?.completedAt !== undefined && typeof info.id === "string" && !/^msg_[0-9a-f]{32}$/u.test(info.id)
+        && typeof time.created === "number") {
+        const delay = time.created - compaction.completedAt;
+        const original = compaction.original;
+        const expected = original.parts.map((part) => compactionReplayPart(part, true));
+        const copiedSettings = ["agent", "model", "format", "tools", "system"]
+          .every((key) => isDeepStrictEqual(info[key], original.info[key]));
+        // Parts are persisted individually. Recognize a matching prefix too,
+        // so an in-flight replay never flashes while its attachment copy arrives.
+        if (delay >= 0 && delay <= 2_000 && copiedSettings && expected.length > 0 && parts.length <= expected.length
+          && parts.every((part, index) => isDeepStrictEqual(compactionReplayPart(part), expected[index]))) {
+          hidden.add(info.id);
+        }
+      }
+      previousUser = { info, parts };
+      compaction = undefined;
+    } else if (compaction && info.role === "assistant" && info.parentID === compaction.id
+      && info.summary === true && info.finish === "stop" && info.error === undefined && typeof time.completed === "number") {
+      compaction.completedAt = time.completed;
+    } else {
+      compaction = undefined;
+    }
+  }
+  return hidden;
+}
+
 export function normalizeOpenCodeMessages(hostId: string, providerSessionId: string, value: unknown): readonly RemoteMessage[] {
   if (!Array.isArray(value)) return [];
   const sessionId = makeGlobalSessionId(hostId, "opencode", providerSessionId);
   const messages: RemoteMessage[] = [];
   const terminalParents = new Set<string>();
+  const compactionReplays = compactionReplayUserIds(value);
   const hiddenControlUserIds = new Set(value.flatMap((entry): readonly string[] => {
     if (!isRecord(entry) || !isHiddenControlUserEntry(entry)) return [];
     // Mesh bookkeeping hides a whole exchange. Continue hides only its input.
@@ -568,6 +631,7 @@ export function normalizeOpenCodeMessages(hostId: string, providerSessionId: str
     const id = typeof info.id === "string" ? info.id : `message_${messages.length}`;
     const role = info.role === "user" ? "user" : info.role === "assistant" ? "assistant" : "tool";
     const parentId = typeof info.parentID === "string" ? info.parentID : undefined;
+    if (role === "user" && compactionReplays.has(id)) continue;
     if (role === "user" && isHiddenControlUserEntry(entry)) continue;
     if (role === "assistant" && parentId !== undefined && hiddenControlUserIds.has(parentId)) continue;
     // A completed no-tool `stop` is the terminal answer for one OpenCode prompt.

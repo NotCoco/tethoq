@@ -351,7 +351,15 @@ class _HarnessMonogram extends StatelessWidget {
       );
 }
 
-ThemeData buildRemoteTheme(ProviderVisualTheme visual) {
+// Stable themes avoid invalidating every Theme.of dependency (including the
+// Markdown parser) on each streamed token. Visuals are immutable; Expando also
+// lets temporary/custom visuals be collected with their theme.
+final _remoteThemes = Expando<ThemeData>();
+
+ThemeData buildRemoteTheme(ProviderVisualTheme visual) =>
+    _remoteThemes[visual] ??= _buildRemoteTheme(visual);
+
+ThemeData _buildRemoteTheme(ProviderVisualTheme visual) {
   final colorScheme = ColorScheme.dark(
     primary: visual.accent,
     secondary: visual.accent,

@@ -33,8 +33,6 @@ export interface SessionGoal {
   readonly objective: string;
   readonly status: SessionGoalStatus;
   readonly source: "native" | "tethoq";
-  /** Identifies one explicit start/resume of a Tethoq goal across process restarts. */
-  readonly activationId?: string;
   readonly tokenBudget: number | null;
   readonly tokensUsed: number;
   readonly timeUsedSeconds: number;
@@ -187,6 +185,8 @@ export interface ContextHandoffResult {
 
 export interface BranchSessionResult {
   readonly session: RemoteSession;
+  /** Optional unsent draft; creating a branch never dispatches this text. */
+  readonly prompt?: string;
   readonly strategy: Extract<SessionRelationshipStrategy, "native" | "transcript_bootstrap">;
   readonly copiedMessageCount: number;
 }
@@ -299,10 +299,6 @@ export interface QueuedMessage {
   readonly modelId?: string;
   readonly reasoningEffort?: string;
   readonly error?: string;
-  readonly mesh?: {
-    readonly targets: readonly DelegationTarget[];
-    readonly segments: readonly DelegationPresentationSegment[];
-  };
   /** False quarantines an acknowledgement-ambiguous delivery until provider history confirms it. */
   readonly retryable?: boolean;
 }

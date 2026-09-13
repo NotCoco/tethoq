@@ -1,5 +1,6 @@
 import type { TimelineItem } from "./types";
 import { visibleContextTransferText } from "../../../../../packages/protocol/src/context_visibility";
+import { meshParentPrompt } from "../../../../../packages/protocol/src/mesh";
 
 /**
  * Folds one incoming row into the transcript.
@@ -8,15 +9,14 @@ import { visibleContextTransferText } from "../../../../../packages/protocol/src
  * already shown. Providers that resend the whole message replace it instead.
  */
 export function mergeTimeline(existing: TimelineItem[], incoming: TimelineItem): TimelineItem[] {
-  if (incoming.kind === "user" && incoming.origin?.kind === "cross_session") {
-    const origin = incoming.origin;
-    const remoteIndex = existing.findIndex((item) => item.kind === "user" && item.origin?.kind === "cross_session"
-      && item.origin.envelopeId === origin.envelopeId && item.origin.sourceSessionId === origin.sourceSessionId);
-    if (remoteIndex >= 0) return existing.map((item, index) => index === remoteIndex ? adoptCanonicalUserEcho(item, incoming) : item);
-  }
   if (incoming.kind === "user" && incoming.mesh && incoming.delegationId) {
+    const matches = (item: TimelineItem) => item.kind === "user"
+      && (item.delegationId === incoming.delegationId
+        || incoming.messageId !== undefined && item.messageId === incoming.messageId);
     const meshIndex = existing.findIndex((item) => item.kind === "user" && item.delegationId === incoming.delegationId);
-    if (meshIndex >= 0) return existing.map((item, index) => index === meshIndex ? adoptCanonicalUserEcho(item, incoming) : item);
+    const found = meshIndex >= 0 ? meshIndex : existing.findIndex(matches);
+    if (found >= 0) return existing.flatMap((item, index) => index === found
+      ? [adoptCanonicalUserEcho(item, incoming)] : matches(item) ? [] : [item]);
   }
   const exact = existing.findIndex((item) => item.id === incoming.id);
   if (exact < 0 && isPendingScheduledPresentation(incoming)
@@ -58,16 +58,15 @@ export function mergeTimeline(existing: TimelineItem[], incoming: TimelineItem):
           : scheduledUserEcho >= 0 ? scheduledUserEcho : optimisticUserEcho;
   if (found >= 0) return existing.map((item, index) => {
     if (index !== found) return item;
+    // A temporary Mesh history row is also an optimistic presentation; it must
+    // adopt the provider identity before the persisted-row coalescing path.
+    if (scheduledUserEcho >= 0 || optimisticUserEcho >= 0) return adoptCanonicalUserEcho(item, incoming);
     if (item.kind === "user" && incoming.kind === "user"
       && item.state !== "running" && item.streamDelta !== true
       && !composerEchoRow.test(item.id) && !composerEchoRow.test(incoming.id)) {
       const coalesced = coalescePersistedUserAction(item, incoming);
       return sameTimelineItem(item, coalesced) ? item : coalesced;
     }
-    // The composer row exists before the provider can echo the accepted prompt.
-    // Adopt that canonical identity in place, retaining local attachment previews,
-    // so one send never flashes as two user rows (or used to, as an assistant row).
-    if (scheduledUserEcho >= 0 || optimisticUserEcho >= 0) return adoptCanonicalUserEcho(item, incoming);
     // A replayed batch can deliver the same event twice. Re-appending its chunk
     // would silently duplicate text inside the streaming answer.
     if (incoming.sourceEventId !== undefined && incoming.sourceEventId === item.sourceEventId) return item;
@@ -79,7 +78,8 @@ export function mergeTimeline(existing: TimelineItem[], incoming: TimelineItem):
       : incoming.streamDelta === false
         ? false
         : incoming.state === "running" && item.state === "running" && incoming.body !== item.body;
-    return { ...item, ...incoming, body: appendBody ? `${item.body}${incoming.body}` : incoming.body };
+    return { ...item, ...incoming, body: appendBody ? `${item.body}${incoming.body}` : incoming.body,
+      ...(item.images !== undefined && incoming.images !== undefined ? { images: adoptCanonicalImages(item.images, incoming.images) } : {}) };
   });
   return [...existing, incoming];
 }
@@ -149,6 +149,7 @@ export function rollbackOptimisticComposerRow(
 }
 
 function adoptCanonicalUserEcho(local: TimelineItem, canonical: TimelineItem): TimelineItem {
+  const mesh = local.mesh ?? canonical.mesh;
   const {
     queuedNewTaskDeliveryId: _localDeliveryId,
     queuedNewTaskDeliveryState: _localDeliveryState,
@@ -164,8 +165,10 @@ function adoptCanonicalUserEcho(local: TimelineItem, canonical: TimelineItem): T
   return {
     ...localPresentation,
     ...canonicalPresentation,
-    presentationId: local.presentationId ?? local.id,
-    ...(local.mesh ?? canonical.mesh ? { mesh: local.mesh ?? canonical.mesh } : {}),
+    presentationId: canonical.mesh && !local.mesh
+      ? canonical.presentationId ?? local.presentationId ?? local.id
+      : local.presentationId ?? local.id,
+    ...(mesh ? { mesh, body: mesh.segments.flatMap((segment) => segment.type === "text" ? [segment.text] : []).join("") } : {}),
     ...(canonical.images !== undefined || local.images !== undefined ? { images: adoptCanonicalImages(local.images, canonical.images) } : {}),
     ...(canonical.audio !== undefined || local.audio !== undefined ? { audio: adoptCanonicalAudio(local.audio, canonical.audio) } : {}),
     ...(canonical.files === undefined && local.files !== undefined ? { files: local.files } : {}),
@@ -177,10 +180,14 @@ function adoptCanonicalUserEcho(local: TimelineItem, canonical: TimelineItem): T
 function adoptCanonicalImages(local: TimelineItem["images"], canonical: TimelineItem["images"]): NonNullable<TimelineItem["images"]> {
   if (canonical === undefined) return local ?? [];
   if (local === undefined) return canonical;
+  const consumed = new Set<number>();
   return canonical.map((image) => {
+    const index = local.findIndex((candidate, index) => !consumed.has(index)
+      && candidate.name === image.name && candidate.mimeType === image.mimeType);
+    if (index >= 0) consumed.add(index);
     if (image.dataUrl) return image;
-    const preview = local.find((candidate) => candidate.name === image.name && candidate.mimeType === image.mimeType);
-    return preview?.dataUrl ? { ...image, dataUrl: preview.dataUrl, loading: false } : image;
+    const preview = local[index];
+    return preview?.dataUrl ? { ...preview, ...image, dataUrl: preview.dataUrl, loading: false } : image;
   });
 }
 
@@ -298,7 +305,8 @@ function optimisticUserEchoIndex(existing: readonly TimelineItem[], incoming: Ti
   for (let index = existing.length - 1; index >= 0; index -= 1) {
     const candidate = existing[index]!;
     if (candidate.delegationId && incoming.delegationId && candidate.delegationId !== incoming.delegationId) continue;
-    const sameText = body && sentBody(candidate) === body;
+    const sameText = body && (sentBody(candidate) === body
+      || candidate.mesh && meshParentPrompt(candidate.mesh.targets, candidate.mesh.segments).trim() === body);
     const audioOnly = !body && emptyCanonicalUser(incoming) && audioOnlyComposerEcho(candidate);
     const attachmentOnly = !body
       && emptyCanonicalUser(incoming)
@@ -388,7 +396,6 @@ function echoedBackIndex(
   return nearest;
 }
 function timelineSemanticKey(item: TimelineItem): string | null {
-  if (item.kind === "user" && item.origin?.kind === "cross_session") return `cross_session:${item.origin.sourceSessionId}:${item.origin.envelopeId}`;
   if (item.messageId && (item.kind === "user" || item.kind === "assistant" || item.kind === "reasoning")) return `${item.kind}:${item.messageId}`;
   if (item.kind === "command" && item.messageId) return `command:${item.messageId}`;
   if (item.kind === "tool" && item.detail) return `tool:${item.detail}`;
@@ -417,12 +424,8 @@ function persistedUserAttachmentsCompatible(left: TimelineItem, right: TimelineI
 }
 
 function samePersistedUserAction(left: TimelineItem, right: TimelineItem): boolean {
-  if (left.origin?.kind === "cross_session" || right.origin?.kind === "cross_session") {
-    return left.kind === "user" && right.kind === "user"
-      && left.origin?.kind === "cross_session" && right.origin?.kind === "cross_session"
-      && left.origin.envelopeId === right.origin.envelopeId && left.origin.sourceSessionId === right.origin.sourceSessionId;
-  }
   if (left.kind !== "user" || right.kind !== "user" || composerEchoRow.test(left.id) || composerEchoRow.test(right.id)) return false;
+  if (left.delegationId && right.delegationId && left.delegationId !== right.delegationId) return false;
   if (sentBody(left) !== sentBody(right) || !persistedUserAttachmentsCompatible(left, right)) return false;
   const leftTurnId = left.turnId?.trim();
   const rightTurnId = right.turnId?.trim();
@@ -575,6 +578,7 @@ export function anchoredTimelineRevealStart(
 
 function completedFinalAnswer(item: TimelineItem): boolean {
   return item.kind === "assistant"
+    && !item.presentationOnly
     && item.phase === "final_answer"
     && item.state !== "running"
     && item.body.trim().length > 0;
@@ -657,7 +661,8 @@ function mergeHydratedImages(
     const next = incoming[incomingIndex]!;
     let currentIndex = merged.findIndex((image, index) => !consumed.has(index)
       && image.name === next.name
-      && (image.mimeType ?? "") === (next.mimeType ?? ""));
+      && (image.mimeType ?? "") === (next.mimeType ?? "")
+      && (image.retrievalId === undefined || next.retrievalId === undefined || image.retrievalId === next.retrievalId));
     if (currentIndex < 0 && incomingIndex < merged.length && !consumed.has(incomingIndex)) currentIndex = incomingIndex;
     if (currentIndex < 0) {
       merged.push({ ...next });
@@ -666,7 +671,9 @@ function mergeHydratedImages(
     }
     consumed.add(currentIndex);
     const existing = merged[currentIndex]!;
-    const readyDataUrl = existing.dataUrl ?? next.dataUrl;
+    if (existing.retrievalId !== undefined && next.retrievalId !== undefined && existing.retrievalId !== next.retrievalId) continue;
+    const readyDataUrl = existing.retrievalId !== undefined && existing.retrievalId === next.retrievalId
+      ? next.dataUrl ?? existing.dataUrl : existing.dataUrl ?? next.dataUrl;
     merged[currentIndex] = {
       ...existing,
       ...next,
@@ -687,6 +694,7 @@ export function mergeTimelineImageHydration(
   const consumedHydratedRows = new Set<number>();
   let changed = false;
   const merged = timeline.map((item) => {
+    if (item.images?.length === 0) return item;
     let hydratedIndex = rowIndexesById.get(item.id) ?? -1;
     if (hydratedIndex < 0 && item.kind === "user") {
       hydratedIndex = nearestPersistedUserActionIndex(hydratedRows, item, consumedHydratedRows);
@@ -745,6 +753,9 @@ export function reconcileTimelinePage(page: readonly TimelineItem[], live: reado
   const oldestPageTime = pageTimes.length ? Math.min(...pageTimes) : 0;
   const newestPageTime = pageTimes.length ? Math.max(...pageTimes) : 0;
   const adopt = (target: TimelineItem, liveItem: TimelineItem): TimelineItem => {
+    // A refreshed page may defer the same image again after cache eviction or
+    // reconnection. Keep its decoded preview mounted while those bytes arrive.
+    if (liveItem.images !== undefined) target = { ...target, images: adoptCanonicalImages(liveItem.images, target.images) };
     if (audioOnlyComposerEcho(liveItem) && emptyCanonicalUser(target)) {
       return {
         ...liveItem,
@@ -777,8 +788,13 @@ export function reconcileTimelinePage(page: readonly TimelineItem[], live: reado
   };
   const unmatched: TimelineItem[] = [];
   for (const liveItem of live) {
-    if (liveItem.kind === "user" && liveItem.delegationId) {
-      const meshIndex = nextPageIndex((item) => item.kind === "user" && item.delegationId === liveItem.delegationId);
+    if (liveItem.kind === "user") {
+      // The same canonical Mesh row may replace both its local presentation and
+      // a raw provider echo left by an earlier refresh. These are identity joins,
+      // so consuming one alias must not prevent the other from being retired.
+      const meshIndex = deduplicatedPage.findIndex((item) => item.kind === "user" && item.mesh
+        && (liveItem.delegationId !== undefined && item.delegationId === liveItem.delegationId
+          || liveItem.messageId !== undefined && item.messageId === liveItem.messageId));
       if (meshIndex >= 0) {
         consumedPageIndexes.add(meshIndex);
         merged[meshIndex] = adoptCanonicalUserEcho(liveItem, merged[meshIndex]!);
@@ -788,7 +804,9 @@ export function reconcileTimelinePage(page: readonly TimelineItem[], live: reado
     // Once the harness has returned your message, the row this app invented to show
     // it immediately has done its job. Adopt the provider identity without
     // replacing the mounted card or its ready local image preview.
-    if (liveItem.kind === "user" && composerEchoRow.test(liveItem.id) && !audioOnlyComposerEcho(liveItem)) {
+    if (liveItem.kind === "user"
+      && (composerEchoRow.test(liveItem.id) || liveItem.mesh && liveItem.messageId?.startsWith("tethoq-mesh:"))
+      && !audioOnlyComposerEcho(liveItem)) {
       const echoIndex = echoedBackIndex(deduplicatedPage, liveItem, consumedPageIndexes);
       if (echoIndex >= 0) {
         consumedPageIndexes.add(echoIndex);

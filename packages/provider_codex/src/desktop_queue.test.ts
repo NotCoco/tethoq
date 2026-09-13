@@ -5,7 +5,7 @@ import { writeFileSync, type FSWatcher } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 
 import { ProviderAdapterError } from "../../provider_contract/src/index.js";
@@ -22,6 +22,36 @@ class FakeQueueWatcher extends EventEmitter {
 function fakeWatcher(value: FakeQueueWatcher): FSWatcher {
   return value as unknown as FSWatcher;
 }
+
+test("Codex queued Edit reads original bytes and keeps identically named attachments distinct", async t => {
+  const root = await mkdtemp(join(tmpdir(), "tethoq-codex-queue-draft-"));
+  const statePath = join(root, "state.json"), filePath = join(root, "notes.md");
+  t.after(async () => {
+    assert.equal(dirname(resolve(root)), resolve(tmpdir()));
+    await rm(root, { recursive: true, force: true });
+  });
+  const image = Buffer.alloc(800_001, 71), notes = Buffer.from("Original notes");
+  await writeFile(filePath, notes);
+  const state = JSON.stringify({ "queued-follow-ups": { thread: [{ id: "draft", text: "Edit this", cwd: root, createdAt: Date.now(), context: {
+    imageAttachments: [
+      { filename: "same.png", mimeType: "image/png", byteLength: image.length, uploadSrc: "https://example.invalid/image", src: `data:image/png;base64,${image.toString("base64")}`, previewSrc: "data:image/png;base64,AQID" },
+      { filename: "same.png", mimeType: "image/png", byteLength: 3, src: "data:image/png;base64,BAUG" },
+    ],
+    fileAttachments: [{ filename: "notes.md", mimeType: "text/markdown", byteLength: notes.length, localPath: filePath }],
+  } }] } });
+  await writeFile(statePath, state);
+  const queue = new CodexDesktopQueue({ statePath, pipePath: "unused", onChanged: () => undefined });
+  t.after(() => queue.dispose());
+  await queue.start();
+  const draft = await queue.readMessage("thread", "draft");
+  assert.equal(draft?.content, "Edit this");
+  assert.deepEqual(draft?.attachments?.map(item => Buffer.from(item.dataBase64, "base64")), [image, Buffer.from([4, 5, 6]), notes]);
+  assert.equal(await queue.cancel("thread", "draft", "Stale text"), false);
+  assert.equal(await readFile(statePath, "utf8"), state, "reading a draft or rejecting a stale cancellation must leave the native queue intact");
+  await rm(filePath);
+  await assert.rejects(queue.readMessage("thread", "draft"), /ENOENT/);
+  assert.equal(await readFile(statePath, "utf8"), state, "missing files must not dequeue the message");
+});
 
 test("Codex reads current Desktop queue records without the removed browser-family field", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "tethoq-codex-queue-current-"));

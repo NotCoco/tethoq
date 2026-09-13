@@ -9,6 +9,7 @@ test("advertised reasoning efforts accept nested ACP and API spellings", () => {
   assert.deepEqual(extractAdvertisedReasoningEfforts({
     supportedReasoningEfforts: [{ reasoningEffort: "Low" }, { value: "High" }],
   }), ["Low", "High"]);
+  assert.deepEqual(extractAdvertisedReasoningEfforts({ supported_reasoning_efforts: [{ id: "high" }, { id: "xhigh" }] }), ["high", "xhigh"]);
   assert.deepEqual(extractAdvertisedReasoningEfforts({
     id: "grok-4.6",
     name: "Grok 4.6",
@@ -59,6 +60,13 @@ test("Extra high spellings collapse onto the advertised Grok effort", () => {
   assert.equal(matchReasoningEffort("extra high", ["low", "medium", "high", "xhigh"]), "xhigh");
   assert.equal(matchReasoningEffort("xhigh", ["low", "medium", "high", "x-high"]), "x-high");
   assert.equal(matchReasoningEffort("Default", ["low", "high"]), undefined);
+});
+
+test("an advertised first variant is not evidence of a default reasoning level", () => {
+  const input = { providerId: "opencode", modelId: "opencode-go/muse-spark-1.3-contributor" };
+  const variants = { minimal: {}, low: {}, medium: {}, high: {}, xhigh: {} };
+  assert.deepEqual(resolveModelReasoningProfile({ ...input, advertised: { variants } }), { efforts: Object.keys(variants) });
+  assert.equal(resolveModelReasoningProfile({ ...input, advertised: { variants, defaultReasoningEffort: "extra high" } }).defaultEffort, "xhigh");
 });
 
 test("Grok shows Low for the documented low effort instead of Codex Light", () => {

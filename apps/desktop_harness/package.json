@@ -14,11 +14,12 @@
   "scripts": {
     "postinstall": "node node_modules/electron/install.js",
     "dev": "electron-vite dev",
-    "build": "electron-vite build",
+    "build": "npm run build:bundle && node scripts/sync-unpacked.cjs --no-build --if-present --relaunch-if-running",
+    "build:bundle": "electron-vite build",
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit",
     "test": "node --test --test-concurrency=1 test/*.test.mjs",
-    "verify": "npm run typecheck && npm test && npm run build",
+    "verify": "npm run typecheck && npm run build && npm test",
     "qa:visual": "npm run build && electron scripts/visual-qa.cjs",
     "qa:fake-model": "npm run build && electron scripts/fake-model-qa.cjs",
     "qa:scroll-stability": "npm run build && electron scripts/scroll-stability-qa.cjs",
@@ -26,7 +27,7 @@
     "qa:opencode-tools": "npm run build && electron scripts/opencode-tool-activity-qa.cjs",
     "qa:opencode-queue": "npm run build && electron scripts/opencode-queue-steer-qa.cjs",
     "sync:unpacked": "node scripts/sync-unpacked.cjs",
-    "relaunch": "node scripts/sync-unpacked.cjs && node scripts/launch-unpacked.cjs",
+    "relaunch": "node scripts/sync-unpacked.cjs --launch",
     "build:brand-assets": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-brand-assets.ps1",
     "install:release-dependencies": "npm ci --prefix ../.. --no-audit --no-fund",
     "build:connector-sdk": "npm --prefix ../../packages/connector_sdk run build",
@@ -37,7 +38,7 @@
     "smoke:embedded-bridge": "node scripts/verify-embedded-bridge.cjs",
     "release:metadata": "node scripts/write-release-metadata.cjs",
     "release:draft": "node scripts/draft-update-release.cjs",
-    "pack:win": "npm run build:brand-assets && npm run install:release-dependencies && npm run build:connector-sdk && npm run package:bridge && npm run stage:bridge-companion && npm run build && electron-builder --win nsis --x64 --publish never && npm run smoke:embedded-bridge && npm run smoke:packaged && npm run release:metadata",
+    "pack:win": "npm run build:brand-assets && npm run install:release-dependencies && npm run build:connector-sdk && npm run package:bridge && npm run stage:bridge-companion && npm run build:bundle && electron-builder --win nsis --x64 --publish never && npm run smoke:embedded-bridge && npm run smoke:packaged && npm run release:metadata",
     "probe:mic": "electron scripts/probe-microphone.cjs"
   },
   "dependencies": {

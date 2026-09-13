@@ -100,6 +100,7 @@ class TrackingFakeProvider extends FakeProviderAdapter {
   public readonly createOptions: CreateSessionOptions[] = [];
   public messageReads = 0;
   public readonly sends: Array<{ readonly providerSessionId: string; readonly request: SendMessageRequest }> = [];
+  readonly #activeSessions = new Set<string>();
   public failNextSend = false;
 
   public override async createSession(options: CreateSessionOptions): Promise<RemoteSession> {
@@ -117,7 +118,12 @@ class TrackingFakeProvider extends FakeProviderAdapter {
       this.failNextSend = false;
       throw new ProviderAdapterError(this.providerId, "NOT_DELIVERED", `${this.providerId} rejected the scheduled task`, true);
     }
+    this.#activeSessions.add(providerSessionId);
     return { accepted: true, providerTurnId: `${this.providerId}-scheduled-turn`, details: [] };
+  }
+
+  public override hasActiveTurn(providerSessionId: string): boolean {
+    return this.#activeSessions.has(providerSessionId);
   }
 
   public override async getMessages(providerSessionId: string) {
@@ -438,7 +444,11 @@ test("scheduled Mesh prepares one OpenCode parent before dispatching tailored ch
   assert.deepEqual([grok.sends.length, codex.sends.length], [0, 0], "the scheduler bypassed parent-authored assignments");
   const parentTurn = opencode.sends.find((send) => send.request.metadata?.kind === "delegation_prepare");
   assert.ok(parentTurn, "the scheduled Mesh parent preparation turn was not sent");
-  assert.equal(parentTurn.request.content, prompt, "the scheduled parent did not receive the clean visible prompt");
+  assert.equal(parentTurn.request.content, `[Mesh target 0: grok / fake-careful / high][Mesh target 1: codex / fake-fast / max]${prompt}`);
+  const transcript = await bridge.openSession(started.targetSessionId);
+  assert.ok(transcript.messages.some((message) => message.role === "user"
+    && message.parts.some((part) => part.type === "text" && part.text === prompt)),
+  "the scheduled user's visible prompt must stay free of provider routing markers");
   assert.equal(parentTurn.request.modelId, "fake-fast", "the scheduled parent lost its durable model selection");
   assert.equal(parentTurn.request.reasoningEffort, "max", "the scheduled parent lost its durable reasoning selection");
   assert.match(parentTurn.request.developerInstructions ?? "", /mesh_dispatch_delegation/u);
@@ -552,6 +562,14 @@ test("scheduled Mesh rejects missing, duplicate, same-parent, and incomplete tar
   }
   assert.deepEqual([opencode.createCalls, grok.createCalls], [0, 0]);
   assert.equal(bridge.scheduledTasks().length, 0);
+  const oversized = await router.handle(request(hostId, "oversized-mesh", "scheduled_task.create", {
+    ...base,
+    content: "x".repeat(32_001),
+    meshTargets: [{ providerId: "grok" }],
+  }));
+  assert.equal(oversized.ok, false, "an impossible Mesh prompt was saved to fail only when due");
+  assert.equal(bridge.scheduledTasks().length, 0);
+  assert.deepEqual([opencode.createCalls, grok.createCalls], [0, 0]);
 });
 
 test("identical concurrent creation reuses one durable placeholder and dispatches one provider session", async (t) => {

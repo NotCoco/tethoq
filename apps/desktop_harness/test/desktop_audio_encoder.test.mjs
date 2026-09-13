@@ -1,52 +1,51 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
+import { build } from "esbuild";
 
-const appRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
-const require = createRequire(import.meta.url);
-
-/**
- * lamejs 1.2.1 was written for plain script tags. Several of its modules use
- * MPEGMode and friends as globals without requiring them, so under any bundler
- * encoding threw "MPEGMode is not defined" the moment a recording stopped, and
- * MP3 dictation could never produce a clip.
- */
-test("lamejs still depends on globals its own modules never require", async () => {
-  const unrequired = [];
-  for (const name of ["Encoder", "Lame", "PsyModel"]) {
-    const source = await readFile(join(appRoot, "node_modules", "lamejs", "src", "js", `${name}.js`), "utf8");
-    if (/\bMPEGMode\b/.test(source) && !/require\(['"]\.\/MPEGMode/.test(source)) unrequired.push(name);
+test("the production recorder encodes captured PCM into MP3 and releases its input", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "tethoq-audio-encoder-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const outfile = join(directory, "audio.mjs");
+  await build({
+    entryPoints: [fileURLToPath(new URL("../src/renderer/src/audio_dictation.tsx", import.meta.url))],
+    outfile, bundle: true, format: "esm", platform: "node", jsx: "automatic",
+  });
+  // Import the app's shim as well as its recorder. Recreating the shim here
+  // would accidentally repair the code this regression is supposed to check.
+  const { Mp3DictationRecorder } = await import(pathToFileURL(outfile).href);
+  let processor;
+  const released = [];
+  class AudioContext {
+    state = "running";
+    destination = {};
+    createMediaStreamSource() { return { connect() {} }; }
+    createScriptProcessor() {
+      processor = { connect() {}, disconnect() { released.push("processor"); } };
+      return processor;
+    }
+    async close() { this.state = "closed"; released.push("context"); }
   }
-  assert.ok(unrequired.length > 0, "lamejs no longer needs the global shim; the workaround can be removed");
-});
-
-test("publishing the classes as globals makes real MP3 encoding work", () => {
-  for (const name of ["MPEGMode", "Lame", "BitStream"]) {
-    globalThis[name] ??= require(`lamejs/src/js/${name}.js`);
-  }
-  const { Mp3Encoder } = require("lamejs");
-
-  const sampleRate = 44100;
-  const samples = new Int16Array(sampleRate);
-  for (let index = 0; index < samples.length; index += 1) {
-    samples[index] = Math.round(Math.sin((index / sampleRate) * 440 * 2 * Math.PI) * 12000);
-  }
-  const encoder = new Mp3Encoder(1, sampleRate, 128);
-  const frames = [encoder.encodeBuffer(samples), encoder.flush()].filter((chunk) => chunk.length > 0);
-  const total = frames.reduce((sum, chunk) => sum + chunk.length, 0);
-
-  assert.ok(total > 1_000, `expected real MP3 output, got ${total} bytes`);
-  // Every MPEG audio frame begins with eleven set sync bits.
-  assert.equal(frames[0][0] & 0xff, 0xff);
-  assert.equal(frames[0][1] & 0xe0, 0xe0);
-});
-
-test("the recorder publishes the globals lamejs needs before encoding", async () => {
-  const source = await readFile(join(appRoot, "src", "renderer", "src", "audio_dictation.tsx"), "utf8");
-  assert.match(source, /import MPEGMode from "lamejs\/src\/js\/MPEGMode\.js"/);
-  assert.match(source, /const lameGlobals[^=]*= \{ MPEGMode, Lame, BitStream \}/);
-  assert.match(source, /globalThis as Record<string, unknown>\)\[name\] = value/);
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "AudioContext");
+  Object.defineProperty(globalThis, "AudioContext", { configurable: true, value: AudioContext });
+  t.after(() => previous ? Object.defineProperty(globalThis, "AudioContext", previous) : delete globalThis.AudioContext);
+  const recorder = new Mp3DictationRecorder(() => {});
+  t.after(() => recorder.dispose());
+  await recorder.start({ getTracks: () => [{ stop() { released.push("track"); } }] });
+  const samples = Float32Array.from({ length: 44100 }, (_, i) => Math.sin(i / 44100 * 440 * 2 * Math.PI) * 0.4);
+  processor.onaudioprocess({ inputBuffer: { getChannelData: () => samples } });
+  const clip = await recorder.stop();
+  const bytes = Buffer.from(clip.dataBase64, "base64");
+  assert.equal(clip.mimeType, "audio/mpeg");
+  assert.equal(clip.origin, "dictation");
+  assert.equal(clip.durationSeconds, 1);
+  assert.equal(clip.byteLength, bytes.length);
+  assert.ok(bytes.length > 1000, "the recorder must return encoded audio, not an empty header");
+  assert.equal(bytes[0], 0xff);
+  assert.equal(bytes[1] & 0xe0, 0xe0, "MP3 output begins with an MPEG frame sync");
+  assert.deepEqual(released, ["processor", "track", "context"]);
+  assert.equal(processor.onaudioprocess, null);
 });

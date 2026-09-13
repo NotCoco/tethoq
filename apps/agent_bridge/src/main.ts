@@ -10,7 +10,7 @@ import { CrossSessionInboxStore, defaultCrossSessionInboxStatePath } from "./cro
 import { createConfiguredProviders } from "./providers.js";
 import { BridgeRelayClient, BridgeSocketServer } from "./transport.js";
 import { defaultMeshRuntimePath, MeshToolGateway } from "./mesh_tools.js";
-import { installOpenCodeMeshTools } from "./opencode_tools.js";
+import { installOpenCodeMeshTools, installOpenCodeImagePolicy } from "./opencode_tools.js";
 import { installPiTools } from "./pi_tools.js";
 import { installCodexMeshTools } from "./codex_tools.js";
 import { resolveCodexCommand } from "../../../packages/provider_codex/src/index.js";
@@ -164,6 +164,7 @@ const bridge = new AgentBridge(config, createConfiguredProviders(
   join(dirname(options.configPath), "direct-api-wallet.json"),
 ), {
   state: pairingState,
+  presentedImageDirectory: join(dirname(options.configPath), "presented-images"),
   onStateChange: (state) => pairingStore.scheduleWrite(state),
   onPairingConfirmed: () => {
     console.log("TETHOQ_PAIRING_CONFIRMED");
@@ -223,7 +224,7 @@ if (meshToolsReady) {
     console.log("Provider-owned tool configuration was left unchanged. Set TETHOQ_ALLOW_PROVIDER_CONFIG_MUTATION=1 to install shared mesh tools.");
   }
   if (allowProviderConfigMutation && config.enabledProviders.includes("opencode")) {
-    toolInstallers.push(installOpenCodeMeshTools().catch((error: unknown) => {
+    toolInstallers.push(Promise.all([installOpenCodeMeshTools(), installOpenCodeImagePolicy()]).then(() => undefined).catch((error: unknown) => {
       console.warn(`OpenCode mesh tool installation failed; OpenCode remains usable without mesh commands: ${error instanceof Error ? error.message : String(error)}`);
     }));
   }

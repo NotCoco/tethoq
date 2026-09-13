@@ -175,6 +175,45 @@ test("Stop leaves ordinary parented user chats outside the subagent tree", async
   assert.equal(opencode.stops.length, 0);
 });
 
+test("Stop discovers uncached native children after their parent stops and drains nested workers in parallel", async (t) => {
+  const { bridge, opencode } = await setup(t);
+  const parent = await bridge.createSession("opencode", { workingDirectory: "C:\\workspace" });
+  const children = await Promise.all(Array.from({ length: 20 }, () => opencode.createSession({ workingDirectory: "C:\\workspace" })));
+  const grandchild = await opencode.createSession({ workingDirectory: "C:\\workspace" });
+  for (const session of [parent, ...children, grandchild]) opencode.active.add(session.providerSessionId);
+  assert.ok(children.every(child => !bridge.sessions().some(session => session.id === child.id)));
+  let activeStops = 0;
+  let maximumActiveStops = 0;
+  const nativeStop = opencode.interrupt.bind(opencode);
+  opencode.interrupt = async id => {
+    activeStops++;
+    maximumActiveStops = Math.max(maximumActiveStops, activeStops);
+    await new Promise(resolve => setTimeout(resolve, 40));
+    await nativeStop(id);
+    activeStops--;
+  };
+  Object.assign(opencode, { listSubagentSessionIds: async (id: string) => {
+    assert.equal(opencode.active.has(id), false, "native children must be read after stopping their spawner");
+    if (id === parent.providerSessionId) return children.map(child => child.providerSessionId);
+    if (id === children[0]!.providerSessionId) return [grandchild.providerSessionId];
+    return [];
+  } });
+  const start = performance.now();
+  await bridge.interrupt(parent.id);
+  assert.equal(opencode.active.size, 0);
+  assert.equal(opencode.stops.length, 22);
+  assert.ok(maximumActiveStops >= 20, "siblings must not accumulate serial provider waits");
+  assert.ok(performance.now() - start < 1000);
+});
+
+test("failure to discover native children does not prevent the parent and known workers stopping", async (t) => {
+  const { bridge, parent, codex, opencode } = await setup(t);
+  await bridge.startDelegation(parent.id, "Review", [{ providerId: "opencode" }]);
+  Object.assign(opencode, { listSubagentSessionIds: async () => { throw new Error("Native child listing unavailable"); } });
+  await assert.rejects(bridge.interrupt(parent.id), /Native child listing unavailable/);
+  assert.equal(codex.active.size + opencode.active.size, 0);
+});
+
 test("Stop during Mesh target validation prevents the older preparation from resuming the parent", async (t) => {
   const { bridge, parent, codex, grok } = await setup(t);
   grok.capabilitiesGate = deferred();
